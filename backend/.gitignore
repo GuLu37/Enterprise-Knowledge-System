@@ -1,0 +1,81 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==================== 虚拟环境 ====================
+venv/
+ENV/
+env/
+.venv
+.env
+.env.local
+.env.*.local
+
+# ==================== IDE ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.project
+.pydevproject
+.settings/
+
+# ==================== 测试和覆盖 ====================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# ==================== 数据文件 ====================
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# ==================== 缓存 ====================
+.cache/
+*.cache
+
+# ==================== 模型文件 ====================
+models/
+*.bin
+*.pt
+*.pth
+
+# ==================== 临时文件 ====================
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ==================== 项目特定 ====================
+rag_metadata.db
+.milvus_data/
+uploads/
