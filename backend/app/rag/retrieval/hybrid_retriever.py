@@ -1,6 +1,6 @@
 """混合检索器 (密集 + 稀疏)"""
-from typing import List, Dict, Any, Optional
-from app.retrieval.base import BaseRetriever, RetrievalResult
+from typing import List, Dict, Any
+from .base import BaseRetriever, RetrievalResult
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)

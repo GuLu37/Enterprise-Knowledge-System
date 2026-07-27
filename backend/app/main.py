@@ -6,13 +6,16 @@ from pathlib import Path
 
 from app.config import settings
 from app.storage.sqlite_metadata import init_metadata_db
-from app.utils.logger import setup_logger
+from app.utils.logger import setup_logger, _init_loguru
 from app.api.routes import (
     documents_router,
     retrieval_router,
     chat_router,
     health_router,
 )
+
+# 全局日志初始化（在任何模块 import 之前完成，确保 uvicorn 日志也被接管）
+_init_loguru()
 
 # 设置日志
 logger = setup_logger(__name__)
@@ -89,5 +92,5 @@ if __name__ == "__main__":
         host=settings.SERVER_HOST,
         port=settings.SERVER_PORT,
         reload=settings.DEBUG,
-        log_level=settings.LOG_LEVEL.lower(),
+        log_config=None,  # 禁用 uvicorn 默认日志配置，由 loguru 统一接管
     )

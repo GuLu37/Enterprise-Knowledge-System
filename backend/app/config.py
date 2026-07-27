@@ -104,11 +104,6 @@ class Settings:
     MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE"))
     ALLOWED_FILE_TYPES: List[str] = os.getenv("ALLOWED_FILE_TYPES").strip("[]").replace('"', '').split(",")
 
-    # ==================== 文本处理配置 ====================
-    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE"))
-    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP"))
-    TEXT_SPLITTER_TYPE: str = os.getenv("TEXT_SPLITTER_TYPE")
-
     # ==================== 检索配置 ====================
     USE_DENSE_RETRIEVER: bool = os.getenv("USE_DENSE_RETRIEVER").lower() == "true"
     USE_SPARSE_RETRIEVER: bool = os.getenv("USE_SPARSE_RETRIEVER").lower() == "true"

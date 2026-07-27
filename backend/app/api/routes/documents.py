@@ -1,5 +1,6 @@
 """文档管理路由"""
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 import logging
 from app.services.document_service import ingest_document
 from app.services.document_service import list_documents as list_documents_service
@@ -12,14 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     上传文档
 
     - **file**: 要上传的文档文件
     """
     try:
-        return ingest_document(file)
+        return ingest_document(file, background_tasks=background_tasks)
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -52,7 +53,7 @@ async def delete_document(document_id: str):
     - **document_id**: 文档ID
     """
     try:
-        return delete_document_service(document_id)
+        return await run_in_threadpool(delete_document_service, document_id)
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
