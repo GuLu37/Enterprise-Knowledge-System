@@ -1,11 +1,36 @@
 """项目配置管理"""
+import json
 import os
+from pathlib import Path
 from typing import Optional, List
 from dotenv import load_dotenv
 
 # 加载 .env 文件（绝对路径，兼容任意工作目录）
-_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+APP_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = APP_DIR.parent
+_env_path = BACKEND_DIR / ".env"
 load_dotenv(_env_path, override=True)
+
+
+def _resolve_app_path(path_value: Optional[str], default: str) -> str:
+    """把应用内部路径固定解析到 backend/app 下，避免受启动目录影响。"""
+    path = Path(path_value or default)
+    if not path.is_absolute():
+        path = APP_DIR / path
+    return str(path.resolve())
+
+
+def _parse_list(value: Optional[str], default: str = "") -> List[str]:
+    """解析 JSON 数组配置，并统一清理空白和引号。"""
+    raw_value = (value or default).strip()
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        parsed = raw_value.strip("[]").split(",") if raw_value else []
+
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+    return [str(item).strip().strip('"').strip("'") for item in parsed if str(item).strip()]
 
 
 class Settings:
@@ -22,7 +47,10 @@ class Settings:
     SERVER_HOST: str = os.getenv("SERVER_HOST")
     SERVER_PORT: int = int(os.getenv("SERVER_PORT"))
     API_PREFIX: str = os.getenv("API_PREFIX")
-    CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS").strip("[]").replace('"', '').split(",")
+    CORS_ORIGINS: List[str] = _parse_list(
+        os.getenv("CORS_ORIGINS"),
+        '["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080"]',
+    )
 
     # ==================== LLM 配置 ====================
     # 默认 LLM 提供商
@@ -59,6 +87,10 @@ class Settings:
     # LLM请求超时时间（秒）
     LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT"))
 
+    # ==================== 聊天配置 ====================
+    # 前端可保留的最大对话线程数，防止本地历史过多导致页面和请求阻塞。
+    CHAT_MAX_CONVERSATIONS: int = int(os.getenv("CHAT_MAX_CONVERSATIONS"))
+
     # ==================== 向量化配置 ====================
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL")
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL")
@@ -88,7 +120,7 @@ class Settings:
     )
     MILVUS_MEMORY_COLLECTION_NAME: str = os.getenv(
         "MILVUS_MEMORY_COLLECTION_NAME",
-        "conversation_memory",
+        "memory_chunks",
     )
 
     VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE")
@@ -102,12 +134,7 @@ class Settings:
     # ==================== 文件存储配置 ====================
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR")
     MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE"))
-    ALLOWED_FILE_TYPES: List[str] = os.getenv("ALLOWED_FILE_TYPES").strip("[]").replace('"', '').split(",")
-
-    # ==================== 文本处理配置 ====================
-    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE"))
-    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP"))
-    TEXT_SPLITTER_TYPE: str = os.getenv("TEXT_SPLITTER_TYPE")
+    ALLOWED_FILE_TYPES: List[str] = _parse_list(os.getenv("ALLOWED_FILE_TYPES"))
 
     # ==================== 检索配置 ====================
     USE_DENSE_RETRIEVER: bool = os.getenv("USE_DENSE_RETRIEVER").lower() == "true"
@@ -123,7 +150,7 @@ class Settings:
     CACHE_TTL: int = int(os.getenv("CACHE_TTL"))
 
     # ==================== 日志配置 ====================
-    LOG_DIR: str = os.getenv("LOG_DIR")
+    LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")
     LOG_FILE_NAME: str = os.getenv("LOG_FILE_NAME")
 
     # ==================== Langsmith 配置（可选）====================

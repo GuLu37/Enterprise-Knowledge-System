@@ -1,45 +1,40 @@
 """检索路由"""
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+from fastapi import APIRouter, HTTPException
 import logging
+
+from app.api.schemas import RetrievalRequest, RetrievalResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/search")
-async def search(
-    query: str,
-    top_k: int = Query(5, ge=1, le=50),
-    use_dense: bool = True,
-    use_sparse: bool = True,
-    use_hybrid: bool = True,
-):
+def _build_response(query: str, top_k: int, method: str, results):
+    return {
+        "query": query,
+        "retrieval_method": method,
+        "results": results,
+        "top_k": top_k,
+    }
+
+
+@router.post("/search/hybrid", response_model=RetrievalResponse)
+async def hybrid_search(request: RetrievalRequest):
     """
-    检索文档
+    混合检索文档
 
     - **query**: 查询文本
     - **top_k**: 返回的最大结果数
-    - **use_dense**: 是否使用密集向量检索
-    - **use_sparse**: 是否使用稀疏检索 (BM25)
-    - **use_hybrid**: 是否使用混合检索
     """
     try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="查询文本不能为空")
+        from app.services.retrieval_service import (
+            retrieve_documents,
+            serialize_retrieval_results,
+        )
 
-        # TODO: 实现三重检索逻辑
-        return {
-            "query": query,
-            "results": [],
-            "top_k": top_k,
-            "retrieval_methods": {
-                "dense": use_dense,
-                "sparse": use_sparse,
-                "hybrid": use_hybrid,
-            },
-            "message": "检索功能待实现",
-        }
+        results = serialize_retrieval_results(
+            retrieve_documents(request.query, top_k=request.top_k)
+        )
+        return _build_response(request.query, request.top_k, "hybrid", results)
     except HTTPException:
         raise
     except Exception as e:
@@ -47,8 +42,8 @@ async def search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/search/dense")
-async def dense_search(query: str, top_k: int = Query(5, ge=1, le=50)):
+@router.post("/search/dense", response_model=RetrievalResponse)
+async def dense_search(request: RetrievalRequest):
     """
     密集向量检索 (语义相似度)
 
@@ -56,17 +51,20 @@ async def dense_search(query: str, top_k: int = Query(5, ge=1, le=50)):
     - **top_k**: 返回的最大结果数
     """
     try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="查询文本不能为空")
+        from app.core.embeddings import get_default_embeddings
+        from app.rag.retrieval.dense_retriever import DenseRetriever
+        from app.services.retrieval_service import serialize_retrieval_results
 
-        # TODO: 实现密集检索逻辑
-        return {
-            "query": query,
-            "retrieval_method": "dense",
-            "results": [],
-            "top_k": top_k,
-            "message": "密集检索功能待实现",
-        }
+        embeddings = get_default_embeddings()
+        dense_retriever = DenseRetriever(embeddings=embeddings, top_k=request.top_k)
+
+        results = dense_retriever.retrieve(request.query, top_k=request.top_k)
+        return _build_response(
+            request.query,
+            request.top_k,
+            "dense",
+            serialize_retrieval_results(results),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -74,8 +72,8 @@ async def dense_search(query: str, top_k: int = Query(5, ge=1, le=50)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/search/sparse")
-async def sparse_search(query: str, top_k: int = Query(5, ge=1, le=50)):
+@router.post("/search/sparse", response_model=RetrievalResponse)
+async def sparse_search(request: RetrievalRequest):
     """
     稀疏检索 (BM25 关键词)
 
@@ -83,17 +81,17 @@ async def sparse_search(query: str, top_k: int = Query(5, ge=1, le=50)):
     - **top_k**: 返回的最大结果数
     """
     try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="查询文本不能为空")
+        from app.rag.retrieval.sparse_retriever import SparseRetriever
+        from app.services.retrieval_service import serialize_retrieval_results
 
-        # TODO: 实现稀疏检索逻辑
-        return {
-            "query": query,
-            "retrieval_method": "sparse",
-            "results": [],
-            "top_k": top_k,
-            "message": "稀疏检索功能待实现",
-        }
+        sparse_retriever = SparseRetriever(top_k=request.top_k)
+        results = sparse_retriever.retrieve(request.query, top_k=request.top_k)
+        return _build_response(
+            request.query,
+            request.top_k,
+            "sparse",
+            serialize_retrieval_results(results),
+        )
     except HTTPException:
         raise
     except Exception as e:

@@ -1,6 +1,6 @@
 """检索器基类"""
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 from pydantic import BaseModel
 
 
@@ -30,32 +30,5 @@ class BaseRetriever(ABC):
 
         Returns:
             检索结果列表
-        """
-        pass
-
-    @abstractmethod
-    def add_document(self, content: str, metadata: Dict[str, Any] = None) -> str:
-        """
-        添加文档
-
-        Args:
-            content: 文档内容
-            metadata: 文档元数据
-
-        Returns:
-            文档ID
-        """
-        pass
-
-    @abstractmethod
-    def delete_document(self, document_id: str) -> bool:
-        """
-        删除文档
-
-        Args:
-            document_id: 文档ID
-
-        Returns:
-            删除是否成功
         """
         pass
