@@ -25,6 +25,9 @@ class Settings:
     CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS").strip("[]").replace('"', '').split(",")
 
     # ==================== LLM 配置 ====================
+    # 默认 LLM 提供商
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama")
+
     # Ollama 配置（本地模型）
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL")
@@ -42,9 +45,11 @@ class Settings:
     # OpenRouter 配置（可选）
     OPENROUTER_API_KEY: Optional[str] = os.getenv("OPENROUTER_API_KEY")
     OPENROUTER_API_BASE: Optional[str] = os.getenv("OPENROUTER_API_BASE")
+    OPENROUTER_MODEL: Optional[str] = os.getenv("OPENROUTER_MODEL")
 
     # Anthropic 配置（可选）
     ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
+    ANTHROPIC_MODEL: Optional[str] = os.getenv("ANTHROPIC_MODEL")
 
     # LLM 通用参数
     # 温度: 0=确定性最强(代码/数据抽取), 1=默认平衡, 2=最有创意
@@ -58,12 +63,33 @@ class Settings:
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL")
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL")
     EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION"))
+    EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "bge")
+
+    # BGE 本地向量化配置
+    BGE_MODEL_NAME: str = os.getenv("BGE_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
+    BGE_DEVICE: str = os.getenv("BGE_DEVICE", "auto")
+    BGE_MAX_LENGTH: int = int(os.getenv("BGE_MAX_LENGTH", "512"))
+    BGE_BATCH_SIZE: int = int(os.getenv("BGE_BATCH_SIZE", "16"))
+    BGE_NORMALIZE_EMBEDDINGS: bool = os.getenv("BGE_NORMALIZE_EMBEDDINGS", "true").lower() == "true"
+    BGE_QUERY_INSTRUCTION: str = os.getenv("BGE_QUERY_INSTRUCTION", "为这个句子生成表示以用于检索相关文章：")
+    # BGE 模型缓存目录；为空时使用 HuggingFace/Transformers 默认缓存目录
+    BGE_CACHE_DIR: Optional[str] = os.getenv("BGE_CACHE_DIR") or None
+    # 是否只从本地读取模型；true 时不会尝试联网下载 HuggingFace 模型
+    BGE_LOCAL_FILES_ONLY: bool = os.getenv("BGE_LOCAL_FILES_ONLY", "false").lower() == "true"
 
     # ==================== 向量数据库配置 ====================
     MILVUS_HOST: str = os.getenv("MILVUS_HOST")
     MILVUS_PORT: int = int(os.getenv("MILVUS_PORT"))
     MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME")
-    MILVUS_COLLECTION_NAME: str = os.getenv("MILVUS_COLLECTION_NAME")
+    # 文档向量和长期记忆分开存储，分别使用不同的 collection
+    MILVUS_DOC_COLLECTION_NAME: str = os.getenv(
+        "MILVUS_DOC_COLLECTION_NAME",
+        "doc_chunks",
+    )
+    MILVUS_MEMORY_COLLECTION_NAME: str = os.getenv(
+        "MILVUS_MEMORY_COLLECTION_NAME",
+        "conversation_memory",
+    )
 
     VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE")
     SEARCH_TOP_K: int = int(os.getenv("SEARCH_TOP_K"))
