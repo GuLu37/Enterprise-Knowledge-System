@@ -21,7 +21,7 @@ logger = setup_logger(__name__)
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # Startup
-    logger.info(f"🚀 启动 {settings.APP_NAME} (v{settings.APP_VERSION})")
+    logger.info(f"🚀 启动 {settings.APP_NAME} (v{settings.APP_VERSION}) ({settings.ENVIRONMENT})")
     logger.info(f"环境: {settings.ENVIRONMENT}")
     logger.info(f"调试模式: {settings.DEBUG}")
 

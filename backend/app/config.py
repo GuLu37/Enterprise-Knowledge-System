@@ -1,108 +1,113 @@
 """项目配置管理"""
-from pydantic_settings import BaseSettings
-from typing import Optional, List
 import os
+from typing import Optional, List
+from dotenv import load_dotenv
+
+# 加载 .env 文件（绝对路径，兼容任意工作目录）
+_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+load_dotenv(_env_path, override=True)
 
 
-class Settings(BaseSettings):
-    """应用配置"""
+class Settings:
+    """应用配置 - 所有值从 .env 文件通过 os.getenv() 加载"""
 
     # ==================== 应用基础配置 ====================
-    APP_NAME: str = "LangChain RAG Tutorial"
-    APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True
-    ENVIRONMENT: str = "development"  # development, staging, production
-    LOG_LEVEL: str = "INFO"
+    APP_NAME: str = os.getenv("APP_NAME")
+    APP_VERSION: str = os.getenv("APP_VERSION")
+    DEBUG: bool = os.getenv("DEBUG").lower() == "true"
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL")
 
     # ==================== 服务器配置 ====================
-    SERVER_HOST: str = "0.0.0.0"
-    SERVER_PORT: int = 8000
-    API_PREFIX: str = "/api/v1"
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
+    SERVER_HOST: str = os.getenv("SERVER_HOST")
+    SERVER_PORT: int = int(os.getenv("SERVER_PORT"))
+    API_PREFIX: str = os.getenv("API_PREFIX")
+    CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS").strip("[]").replace('"', '').split(",")
 
     # ==================== LLM 配置 ====================
     # Ollama 配置（本地模型）
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "mistral"  # qwen, llama2, mistral 等
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL")
 
     # OpenAI 配置（可选）
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_MODEL: str = "gpt-3.5-turbo"
-    OPENAI_BASE_URL: Optional[str] = None
+    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL")
+    OPENAI_BASE_URL: Optional[str] = os.getenv("OPENAI_BASE_URL")
 
     # DeepSeek 配置（可选）
-    DEEPSEEK_API_KEY: Optional[str] = None
+    DEEPSEEK_API_KEY: Optional[str] = os.getenv("DEEPSEEK_API_KEY")
+    DEEPSEEK_BASE_URL: Optional[str] = os.getenv("DEEPSEEK_BASE_URL")
+    DEEPSEEK_MODEL: Optional[str] = os.getenv("DEEPSEEK_MODEL")
+
+    # OpenRouter 配置（可选）
+    OPENROUTER_API_KEY: Optional[str] = os.getenv("OPENROUTER_API_KEY")
+    OPENROUTER_API_BASE: Optional[str] = os.getenv("OPENROUTER_API_BASE")
 
     # Anthropic 配置（可选）
-    ANTHROPIC_API_KEY: Optional[str] = None
+    ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
 
     # LLM 通用参数
-    LLM_TEMPERATURE: float = 0.7
-    LLM_MAX_TOKENS: int = 2000
-    LLM_TIMEOUT: int = 60
+    # 温度: 0=确定性最强(代码/数据抽取), 1=默认平衡, 2=最有创意
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE"))
+    # 最大输出TOKENS数量
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS"))
+    # LLM请求超时时间（秒）
+    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT"))
 
     # ==================== 向量化配置 ====================
-    # Ollama Embedding 配置
-    EMBEDDING_MODEL: str = "nomic-embed-text"  # Ollama 向量模型
-    EMBEDDING_BASE_URL: str = "http://localhost:11434"
-
-    # 向量维度
-    EMBEDDING_DIMENSION: int = 768
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL")
+    EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL")
+    EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION"))
 
     # ==================== 向量数据库配置 ====================
-    # Milvus 配置
-    MILVUS_HOST: str = "localhost"
-    MILVUS_PORT: int = 19530
-    MILVUS_DB_NAME: str = "rag_db"
-    MILVUS_COLLECTION_NAME: str = "documents"
+    MILVUS_HOST: str = os.getenv("MILVUS_HOST")
+    MILVUS_PORT: int = int(os.getenv("MILVUS_PORT"))
+    MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME")
+    MILVUS_COLLECTION_NAME: str = os.getenv("MILVUS_COLLECTION_NAME")
 
-    # 向量库参数
-    VECTOR_STORE_TYPE: str = "milvus"  # milvus, chroma, pinecone
-    SEARCH_TOP_K: int = 5
-    SIMILARITY_THRESHOLD: float = 0.5
+    VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE")
+    SEARCH_TOP_K: int = int(os.getenv("SEARCH_TOP_K"))
+    SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD"))
 
     # ==================== 元数据数据库配置 ====================
-    # SQLite 配置（默认）
-    DATABASE_URL: str = "sqlite:///./rag_metadata.db"
-
-    # PostgreSQL 配置（可选，用于生产环境）
-    # DATABASE_URL: str = "postgresql://user:password@localhost/rag_db"
+    # SQLite（开发）/ PostgreSQL（生产）
+    DATABASE_URL: str = os.getenv("DATABASE_URL")
 
     # ==================== 文件存储配置 ====================
-    UPLOAD_DIR: str = "./data/uploads"
-    MAX_UPLOAD_SIZE: int = 100 * 1024 * 1024  # 100MB
-    ALLOWED_FILE_TYPES: List[str] = [
-        "pdf", "txt", "md", "doc", "docx", "ppt", "pptx", "xlsx", "xls"
-    ]
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR")
+    MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE"))
+    ALLOWED_FILE_TYPES: List[str] = os.getenv("ALLOWED_FILE_TYPES").strip("[]").replace('"', '').split(",")
 
     # ==================== 文本处理配置 ====================
-    CHUNK_SIZE: int = 800
-    CHUNK_OVERLAP: int = 200
-    TEXT_SPLITTER_TYPE: str = "recursive"  # recursive, token, semantic
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE"))
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP"))
+    TEXT_SPLITTER_TYPE: str = os.getenv("TEXT_SPLITTER_TYPE")
 
     # ==================== 检索配置 ====================
-    # 三重检索参数
-    USE_DENSE_RETRIEVER: bool = True
-    USE_SPARSE_RETRIEVER: bool = True  # BM25
-    USE_HYBRID_RETRIEVER: bool = True
+    USE_DENSE_RETRIEVER: bool = os.getenv("USE_DENSE_RETRIEVER").lower() == "true"
+    USE_SPARSE_RETRIEVER: bool = os.getenv("USE_SPARSE_RETRIEVER").lower() == "true"
+    USE_HYBRID_RETRIEVER: bool = os.getenv("USE_HYBRID_RETRIEVER").lower() == "true"
 
-    # 检索权重
-    DENSE_WEIGHT: float = 0.6
-    SPARSE_WEIGHT: float = 0.4
+    DENSE_WEIGHT: float = float(os.getenv("DENSE_WEIGHT"))
+    SPARSE_WEIGHT: float = float(os.getenv("SPARSE_WEIGHT"))
 
     # ==================== 缓存配置 ====================
-    ENABLE_CACHE: bool = True
-    CACHE_DIR: str = "./data/cache"
-    CACHE_TTL: int = 3600  # 1小时
+    ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE").lower() == "true"
+    CACHE_DIR: str = os.getenv("CACHE_DIR")
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL"))
 
     # ==================== 日志配置 ====================
-    LOG_DIR: str = "./logs"
-    LOG_FILE_NAME: str = "app.log"
+    LOG_DIR: str = os.getenv("LOG_DIR")
+    LOG_FILE_NAME: str = os.getenv("LOG_FILE_NAME")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
+    # ==================== Langsmith 配置（可选）====================
+    LANGSMITH_TRACING: Optional[bool] = (
+        os.getenv("LANGSMITH_TRACING").lower() == "true"
+        if os.getenv("LANGSMITH_TRACING") else None
+    )
+    LANGSMITH_ENDPOINT: Optional[str] = os.getenv("LANGSMITH_ENDPOINT")
+    LANGSMITH_API_KEY: Optional[str] = os.getenv("LANGSMITH_API_KEY")
+    LANGSMITH_PROJECT: Optional[str] = os.getenv("LANGSMITH_PROJECT")
 
 
 # 全局配置实例
