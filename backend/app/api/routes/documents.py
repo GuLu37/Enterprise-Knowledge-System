@@ -2,9 +2,6 @@
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 import logging
-from app.services.document_service import ingest_document
-from app.services.document_service import list_documents as list_documents_service
-from app.services.document_service import delete_document as delete_document_service
 
 from app.utils.exceptions import DocumentException
 
@@ -20,6 +17,8 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
     - **file**: 要上传的文档文件
     """
     try:
+        from app.services.document_service import ingest_document
+
         return ingest_document(file, background_tasks=background_tasks)
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -37,6 +36,8 @@ async def list_documents(skip: int = 0, limit: int = 10):
     - **limit**: 返回的最大文档数
     """
     try:
+        from app.services.document_service import list_documents as list_documents_service
+
         return list_documents_service(skip=skip, limit=limit)
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -53,6 +54,8 @@ async def delete_document(document_id: str):
     - **document_id**: 文档ID
     """
     try:
+        from app.services.document_service import delete_document as delete_document_service
+
         return await run_in_threadpool(delete_document_service, document_id)
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))

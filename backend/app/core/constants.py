@@ -26,11 +26,19 @@ SUPPORTED_FILE_TYPES = {
 }
 
 # ==================== 默认参数 ====================
-DEFAULT_TOP_K = 5
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 2000
-DEFAULT_CHUNK_SIZE = 800
-DEFAULT_CHUNK_OVERLAP = 200
+#文档上传-固定大小切块规则
+DOCUMENT_TOP_K = 5
+DOCUMENT_TEMPERATURE = 0.7
+DOCUMENT_MAX_TOKENS = 2000
+DOCUMENT_CHUNK_SIZE = 600
+DOCUMENT_CHUNK_OVERLAP = 100
+
+#对话历史-固定大小切块规则
+CHAT_TOP_K = 5
+CHAT_TEMPERATURE = 0.3
+CHAT_MAX_TOKENS = 2000
+CHAT_CHUNK_SIZE = 500
+CHAT_CHUNK_OVERLAP = 80
 
 # ==================== LLM 模型列表 ====================
 OLLAMA_MODELS = ["mistral", "llama2", "neural-chat", "qwen", "zephyr"]

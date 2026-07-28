@@ -1,12 +1,4 @@
-"""API 路由模块"""
-from .documents import router as documents_router
-from .retrieval import router as retrieval_router
-from .chat import router as chat_router
-from .health import router as health_router
+"""API 路由模块。
 
-__all__ = [
-    "documents_router",
-    "retrieval_router",
-    "chat_router",
-    "health_router",
-]
+各路由在需要时由调用方按需导入，避免包初始化阶段预加载重型依赖。
+"""

@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 
+from openai.types import embedding_model
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -40,3 +41,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+vec = embedding_model.encode("测试文本")
+print(len(vec))

@@ -1,8 +1,13 @@
 """日志配置"""
+import asyncio
 import logging
 import sys
+import threading
+import warnings
 from pathlib import Path
+
 from loguru import logger as loguru_logger
+
 from app.config import settings
 
 # 创建日志目录
@@ -10,6 +15,36 @@ log_dir = Path(settings.LOG_DIR)
 log_dir.mkdir(parents=True, exist_ok=True)
 
 _initialized = False
+_ORIGINAL_STDOUT = sys.stdout
+_ORIGINAL_STDERR = sys.stderr
+
+
+class _StreamToLogger:
+    """把 stdout/stderr 的原始输出按行写入 loguru，覆盖 print 和未接管的报错输出。"""
+
+    def __init__(self, level: str):
+        self.level = level
+        self._buffer = ""
+
+    def write(self, message: str) -> int:
+        if not message:
+            return 0
+
+        self._buffer += message
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                loguru_logger.opt(depth=1).log(self.level, line)
+        return len(message)
+
+    def flush(self) -> None:
+        if self._buffer.strip():
+            loguru_logger.opt(depth=1).log(self.level, self._buffer.strip())
+        self._buffer = ""
+
+    def isatty(self) -> bool:
+        return False
 
 
 class _InterceptHandler(logging.Handler):
@@ -23,14 +58,51 @@ class _InterceptHandler(logging.Handler):
             level = record.levelno
 
         # 找到真实调用栈深度（跳过 logging 内部帧）
-        frame, depth = sys._getframe(6), 6
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
+        try:
+            frame, depth = sys._getframe(6), 6
+            while frame and frame.f_code.co_filename == logging.__file__:
+                frame = frame.f_back
+                depth += 1
+        except ValueError:
+            depth = 2
 
         loguru_logger.opt(depth=depth, exception=record.exc_info).log(
             level, record.getMessage()
         )
+
+
+def _install_exception_hooks() -> None:
+    """记录主线程、子线程和 asyncio 中未捕获的异常。"""
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        loguru_logger.opt(exception=(exc_type, exc_value, exc_traceback)).critical(
+            "未捕获异常"
+        )
+
+    def handle_thread_exception(args: threading.ExceptHookArgs):
+        loguru_logger.opt(
+            exception=(args.exc_type, args.exc_value, args.exc_traceback)
+        ).critical(f"线程未捕获异常: {args.thread.name if args.thread else 'unknown'}")
+
+    def handle_asyncio_exception(loop, context):
+        exception = context.get("exception")
+        message = context.get("message", "asyncio 未捕获异常")
+        if exception:
+            loguru_logger.opt(exception=exception).critical(message)
+        else:
+            loguru_logger.critical(message)
+
+    sys.excepthook = handle_exception
+    threading.excepthook = handle_thread_exception
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(handle_asyncio_exception)
+    except RuntimeError:
+        pass
 
 
 def _init_loguru() -> None:
@@ -52,21 +124,24 @@ def _init_loguru() -> None:
 
     # 控制台（带色彩）
     loguru_logger.add(
-        sys.stderr,
+        _ORIGINAL_STDERR,
         format=color_fmt,
         level=settings.LOG_LEVEL,
         colorize=True,
     )
 
-    # 文件（纯文本，自动轮转）
+    # 文件（纯文本，自动轮转）。level=0 表示尽可能记录所有级别，包括 TRACE/DEBUG。
     log_file = log_dir / settings.LOG_FILE_NAME
     loguru_logger.add(
         str(log_file),
         format=log_fmt,
-        level=settings.LOG_LEVEL,
+        level=0,
         rotation="500 MB",
         retention="10 days",
         encoding="utf-8",
+        backtrace=True,
+        diagnose=False,
+        enqueue=True,
     )
 
     # 桥接标准 logging → loguru（覆盖 uvicorn、fastapi、sqlalchemy 等）
@@ -82,12 +157,24 @@ def _init_loguru() -> None:
     # 接管 root logger，捕获未来动态创建的 logger
     logging.root.handlers = [intercept]
     logging.root.setLevel(0)
+    logging.captureWarnings(True)
+    warnings.simplefilter("default")
 
     # 单独确保 uvicorn 系列被接管
-    for uvicorn_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+    for uvicorn_logger_name in (
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "fastapi",
+        "sqlalchemy",
+    ):
         uv_log = logging.getLogger(uvicorn_logger_name)
         uv_log.handlers = [intercept]
         uv_log.propagate = False
+
+    sys.stdout = _StreamToLogger("INFO")
+    sys.stderr = _StreamToLogger("ERROR")
+    _install_exception_hooks()
 
 
 def setup_logger(name: str):

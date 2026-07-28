@@ -5,10 +5,12 @@ from typing import Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, UploadFile
+from pymilvus import MilvusClient
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.storage.sqlite_metadata import DocumentRecord, SessionLocal, init_metadata_db
+from app.storage.milvus_store import is_collection_loaded
 from app.utils.chunking import split_document_text
 from app.utils.exceptions import DocumentException
 from app.utils.logger import setup_logger
@@ -191,20 +193,18 @@ def _insert_document_chunks_to_milvus(
     file_type: str,
     content_type: Optional[str],
 ) -> List[str]:
-    """直接调用 MilvusClient.insert 写入文档切块。"""
+    """使用 MilvusClient 原生写入文档切块。"""
     from app.core.embeddings import get_default_embeddings
-    from app.storage.milvus_store import (
-        _ensure_document_collection,
-        _validate_vector_dimension,
-        get_milvus_client,
-    )
 
-    client = get_milvus_client()
-    _ensure_document_collection(client)
-    _validate_vector_dimension(client, settings.MILVUS_DOC_COLLECTION_NAME)
-
+    logger.info(f"开始初始化 BGE Embedding (document_id={document_id}, chunks={len(chunks)})")
     embeddings = get_default_embeddings()
+    logger.info(f"BGE Embedding 就绪，开始向量化 (document_id={document_id}, chunks={len(chunks)})")
     vectors = embeddings.embed_documents(chunks)
+    logger.info(f"BGE 向量化完成 (document_id={document_id}, vectors={len(vectors)})")
+    client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}",
+        db_name=settings.MILVUS_DB_NAME,
+    )
 
     rows = []
     for index, chunk in enumerate(chunks):
@@ -225,51 +225,37 @@ def _insert_document_chunks_to_milvus(
         collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
         data=rows,
     )
+    client.flush(collection_name=settings.MILVUS_DOC_COLLECTION_NAME)
     ids = [str(item) for item in result.get("ids", [])]
     logger.info(f"✓ Milvus 文档切块写入成功 (document_id={document_id}, chunks={len(ids)})")
     return ids
 
 
-def _delete_document_chunks_from_milvus(document_id: str) -> bool:
-    """直接调用 MilvusClient.delete 删除文档切块。"""
-    from app.storage.milvus_store import _ensure_document_collection, get_milvus_client
+def _delete_document_chunks_from_milvus(
+    document_id: str,
+    chunk_count: int,
+) -> bool:
+    """使用 MilvusClient 原生删除文档切块。"""
+
+    if chunk_count <= 0:
+        logger.warning(f"文档 chunk_count 为空，无需删除切块 (document_id={document_id})")
+        return False
 
     collection_name = settings.MILVUS_DOC_COLLECTION_NAME
-    client = get_milvus_client()
+    client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}",
+        db_name=settings.MILVUS_DB_NAME,
+    )
     if not client.has_collection(collection_name):
         logger.warning(f"Milvus collection 不存在，无需删除切块 ({collection_name})")
         return False
 
-    _ensure_document_collection(client)
-
-    load_collection = getattr(client, "load_collection", None)
-    if callable(load_collection):
-        load_collection(
-            collection_name=collection_name,
-            replica_number=1,
-            timeout=60,
-        )
-
-    for attempt in range(2):
-        try:
-            client.delete(
-                collection_name=collection_name,
-                filter=f'document_id == "{document_id}"',
-                timeout=30,
-            )
-            logger.info(f"✓ Milvus 文档切块删除成功 (document_id={document_id})")
-            return True
-        except Exception as e:
-            if attempt == 0 and "collection not loaded" in str(e).lower():
-                logger.warning(f"Milvus 仍未加载，准备重试删除 (document_id={document_id}): {e}")
-                if callable(load_collection):
-                    load_collection(
-                        collection_name=collection_name,
-                        replica_number=1,
-                        timeout=60,
-                    )
-                continue
-            raise
+    client.delete(
+        collection_name=collection_name,
+        filter=f'document_id == "{document_id}"',
+    )
+    logger.info(f"✓ Milvus 文档切块删除成功 (document_id={document_id})")
+    return True
 
 
 def _document_delete_requested(document_id: str) -> bool:
@@ -283,8 +269,7 @@ def _document_delete_requested(document_id: str) -> bool:
 
 
 def _validate_document_delete_prerequisites(db: Session, document_id: str) -> tuple[DocumentRecord, Path]:
-    """删除前校验 SQLite、本地文件、Milvus 三方数据是否同时存在。"""
-    from app.storage.milvus_store import _ensure_document_collection, get_milvus_client
+    """删除前校验 SQLite 与本地文件是否存在。"""
 
     record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
     if not record:
@@ -295,29 +280,6 @@ def _validate_document_delete_prerequisites(db: Session, document_id: str) -> tu
     file_path = Path(record.file_path)
     if not file_path.exists():
         raise DocumentException("本地文件不存在，无法执行删除")
-
-    client = get_milvus_client()
-    collection_name = settings.MILVUS_DOC_COLLECTION_NAME
-    if not client.has_collection(collection_name):
-        raise DocumentException("Milvus 文档 collection 不存在，无法执行删除")
-
-    _ensure_document_collection(client)
-    load_collection = getattr(client, "load_collection", None)
-    if callable(load_collection):
-        load_collection(
-            collection_name=collection_name,
-            replica_number=1,
-            timeout=60,
-        )
-
-    records = client.query(
-        collection_name=collection_name,
-        filter=f'document_id == "{document_id}"',
-        output_fields=["pk"],
-        timeout=10,
-    )
-    if not records:
-        raise DocumentException("Milvus 中未找到对应切块，无法执行删除")
 
     return record, file_path
 
@@ -332,11 +294,23 @@ def _process_document_upload(
     """后台执行文档解析、切块与向量写入。"""
     db: Session = SessionLocal()
     try:
+        logger.info(
+            f"后台处理开始 (document_id={document_id}, file={original_name}, path={stored_path})"
+        )
+
+        logger.info(f"开始抽取文本 (document_id={document_id})")
         text = extract_text_from_file(stored_path)
+        logger.info(
+            f"文本抽取完成 (document_id={document_id}, text_len={len(text)})"
+        )
         if not text.strip():
             raise DocumentException("文档内容为空，无法生成向量")
 
+        logger.info(f"开始切块 (document_id={document_id})")
         chunks = split_document_text(text)
+        logger.info(
+            f"切块完成 (document_id={document_id}, chunk_count={len(chunks)})"
+        )
         if not chunks:
             raise DocumentException("文档切块失败，未生成有效内容")
 
@@ -344,6 +318,7 @@ def _process_document_upload(
             logger.info(f"文档已请求删除，跳过后台向量写入 (document_id={document_id})")
             return
 
+        logger.info(f"开始写入 Milvus (document_id={document_id}, chunks={len(chunks)})")
         _insert_document_chunks_to_milvus(
             document_id=document_id,
             chunks=chunks,
@@ -351,22 +326,27 @@ def _process_document_upload(
             file_type=file_type,
             content_type=content_type,
         )
+        logger.info(f"Milvus 写入完成 (document_id={document_id})")
 
+        logger.info(f"开始更新文档状态为 ready (document_id={document_id})")
         record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
         if record:
             record.status = "ready"
             record.chunk_count = len(chunks)
             record.error_message = None
             db.commit()
+            logger.info(f"文档状态更新完成 (document_id={document_id}, status=ready)")
         logger.info(f"✓ 文档后台处理完成 (document_id={document_id}, chunks={len(chunks)})")
     except Exception as e:
         db.rollback()
         try:
+            logger.info(f"开始更新文档状态为 failed (document_id={document_id})")
             record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
             if record:
                 record.status = "failed"
                 record.error_message = str(e)
                 db.commit()
+                logger.info(f"文档状态更新完成 (document_id={document_id}, status=failed)")
         except Exception:
             db.rollback()
         logger.error(f"文档后台处理失败: {str(e)}")
@@ -467,26 +447,61 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
 
 
 def list_documents(skip: int = 0, limit: int = 10) -> Dict:
-    """分页查询 SQLite 中的文档元数据。"""
-    init_metadata_db()
-    db: Session = SessionLocal()
-    try:
-        total = db.query(DocumentRecord).count()
-        records = (
-            db.query(DocumentRecord)
-            .order_by(DocumentRecord.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-            .all()
-        )
+    """使用 MilvusClient 原生查询文档切块，并按 document_id 汇总。"""
+    client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}",
+        db_name=settings.MILVUS_DB_NAME,
+    )
+    collection_name = settings.MILVUS_DOC_COLLECTION_NAME
+
+    if not client.has_collection(collection_name) or not is_collection_loaded(client, collection_name):
         return {
-            "documents": [_serialize_record(record) for record in records],
-            "total": total,
+            "documents": [],
+            "total": 0,
             "skip": skip,
             "limit": limit,
         }
-    finally:
-        db.close()
+
+    rows = client.query(
+        collection_name=collection_name,
+        filter="",
+        output_fields=[
+            "document_id",
+            "source_name",
+            "file_type",
+            "content_type",
+            "chunk_index",
+        ],
+        limit=10000,
+    )
+
+    documents = {}
+    for row in rows:
+        document_id = row["document_id"]
+        document = documents.setdefault(
+            document_id,
+            {
+                "document_id": document_id,
+                "original_filename": row.get("source_name"),
+                "source_name": row.get("source_name"),
+                "file_type": row.get("file_type"),
+                "content_type": row.get("content_type"),
+                "chunk_count": 0,
+                "status": "ready",
+            },
+        )
+        document["chunk_count"] += 1
+
+    document_list = list(documents.values())
+    start = max(skip, 0)
+    end = start + max(limit, 0)
+
+    return {
+        "documents": document_list[start:end],
+        "total": len(document_list),
+        "skip": skip,
+        "limit": limit,
+    }
 
 
 def delete_document(document_id: str) -> Dict:
@@ -499,7 +514,7 @@ def delete_document(document_id: str) -> Dict:
         record.status = "deleting"
         db.commit()
 
-        milvus_deleted = _delete_document_chunks_from_milvus(document_id)
+        milvus_deleted = _delete_document_chunks_from_milvus(document_id, record.chunk_count)
         file_path.unlink()
 
         payload = _serialize_record(record)

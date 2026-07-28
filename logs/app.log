@@ -1,3 +1,0 @@
-2026-07-27 16:11:14 | INFO     | app.storage.milvus_store:get_vector_store:152 - ✓ Milvus 向量库初始化完成 (doc_chunks)
-2026-07-27 16:11:14 | INFO     | app.core.embeddings:__init__:39 - 初始化 BGE Embedding: E:/code/Enterprise Knowledge System/models/bge-base-zh-v1.5 (cpu)
-2026-07-27 16:11:15 | INFO     | app.core.embeddings:init_embeddings:156 - ✓ Embedding 初始化完成 (model: E:/code/Enterprise Knowledge System/models/bge-base-zh-v1.5)

@@ -1,11 +1,22 @@
 """项目配置管理"""
 import os
+from pathlib import Path
 from typing import Optional, List
 from dotenv import load_dotenv
 
 # 加载 .env 文件（绝对路径，兼容任意工作目录）
-_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+APP_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = APP_DIR.parent
+_env_path = BACKEND_DIR / ".env"
 load_dotenv(_env_path, override=True)
+
+
+def _resolve_app_path(path_value: Optional[str], default: str) -> str:
+    """把应用内部路径固定解析到 backend/app 下，避免受启动目录影响。"""
+    path = Path(path_value or default)
+    if not path.is_absolute():
+        path = APP_DIR / path
+    return str(path.resolve())
 
 
 class Settings:
@@ -118,7 +129,7 @@ class Settings:
     CACHE_TTL: int = int(os.getenv("CACHE_TTL"))
 
     # ==================== 日志配置 ====================
-    LOG_DIR: str = os.getenv("LOG_DIR")
+    LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")
     LOG_FILE_NAME: str = os.getenv("LOG_FILE_NAME")
 
     # ==================== Langsmith 配置（可选）====================
