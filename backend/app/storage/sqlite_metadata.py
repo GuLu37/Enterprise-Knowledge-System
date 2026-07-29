@@ -1,8 +1,9 @@
-"""SQLite 文档元数据存储"""
+"""SQL 文档元数据与用户账户存储。"""
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -44,10 +45,55 @@ class DocumentRecord(Base):
     )
 
 
+class UserAccount(Base):
+    """登录账户记录。"""
+
+    __tablename__ = "users"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    password_salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="admin")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class AuthSession(Base):
+    """登录会话记录。"""
+
+    __tablename__ = "auth_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    refresh_token_hash: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 def init_metadata_db():
     """创建或校验 SQLite 中的文档元数据表结构。"""
+    if settings.DATABASE_URL.startswith("sqlite:///"):
+        database_path = settings.DATABASE_URL.removeprefix("sqlite:///")
+        if database_path and database_path != ":memory:" and not database_path.startswith("file:"):
+            Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
-    logger.debug("✓ SQLite 文档元数据表初始化完成")
+    try:
+        from app.services.auth_service import seed_bootstrap_admin_user
+
+        seed_bootstrap_admin_user()
+    except Exception:
+        logger.exception("初始化用户表或 bootstrap 管理员失败")
+    logger.debug("✓ SQLite 元数据与认证表初始化完成")
 
 
 def get_db():

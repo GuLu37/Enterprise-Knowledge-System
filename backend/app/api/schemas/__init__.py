@@ -98,6 +98,45 @@ class ConversationDeleteResponse(BaseModel):
     memory_deleted: bool = False
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=6, max_length=128)
+    confirm_password: str = Field(min_length=6, max_length=128)
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    username: str
+    role: str
+    is_active: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    last_login_at: Optional[datetime] = None
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
+    access_expires_in: int = 0
+    refresh_expires_in: int = 0
+    user: UserResponse
+
+
 __all__ = [
     "ChatMessage",
     "ChatRequest",
@@ -111,4 +150,10 @@ __all__ = [
     "RetrievalRequest",
     "RetrievalResponse",
     "RetrievalResultResponse",
+    "LoginRequest",
+    "RegisterRequest",
+    "PasswordChangeRequest",
+    "RefreshTokenRequest",
+    "TokenResponse",
+    "UserResponse",
 ]

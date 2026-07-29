@@ -20,6 +20,38 @@ def _resolve_app_path(path_value: Optional[str], default: str) -> str:
     return str(path.resolve())
 
 
+def _resolve_backend_path(path_value: Optional[str], default: str) -> str:
+    """把路径固定解析到 backend 目录下，适合 data/uploads、data/cache 这类目录。"""
+    path = Path(path_value or default)
+    if not path.is_absolute():
+        path = BACKEND_DIR / path
+    return str(path.resolve())
+
+
+def _resolve_sqlite_url(url_value: Optional[str], default: str) -> str:
+    """把 SQLite 路径固定到 app/data 下，避免散落到其他目录。"""
+    raw_url = (url_value or default).strip()
+    if not raw_url.startswith("sqlite:///"):
+        return raw_url
+
+    database_path = raw_url.removeprefix("sqlite:///")
+    if not database_path or database_path == ":memory:" or database_path.startswith("file:"):
+        return raw_url
+
+    data_dir = APP_DIR / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = Path(database_path)
+    if path.is_absolute():
+        try:
+            path.relative_to(data_dir)
+            target_path = path
+        except ValueError:
+            target_path = data_dir / path.name
+    else:
+        target_path = data_dir / path.name
+    return f"sqlite:///{target_path.resolve().as_posix()}"
+
+
 def _parse_list(value: Optional[str], default: str = "") -> List[str]:
     """解析 JSON 数组配置，并统一清理空白和引号。"""
     raw_value = (value or default).strip()
@@ -91,6 +123,14 @@ class Settings:
     # 前端可保留的最大对话线程数，防止本地历史过多导致页面和请求阻塞。
     CHAT_MAX_CONVERSATIONS: int = int(os.getenv("CHAT_MAX_CONVERSATIONS"))
 
+    # ==================== 认证配置 ====================
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    REFRESH_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "30"))
+    BOOTSTRAP_ADMIN_USERNAME: Optional[str] = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "admin")
+    BOOTSTRAP_ADMIN_PASSWORD: Optional[str] = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "123456")
+    BOOTSTRAP_ADMIN_ROLE: str = os.getenv("BOOTSTRAP_ADMIN_ROLE", "admin")
+
     # ==================== 向量化配置 ====================
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL")
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL")
@@ -129,10 +169,16 @@ class Settings:
 
     # ==================== 元数据数据库配置 ====================
     # SQLite（开发）/ PostgreSQL（生产）
-    DATABASE_URL: str = os.getenv("DATABASE_URL")
+    DATABASE_URL: str = _resolve_sqlite_url(
+        os.getenv("DATABASE_URL"),
+        "sqlite:///./app/data/rag_metadata.db",
+    )
 
     # ==================== 文件存储配置 ====================
-    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR")
+    UPLOAD_DIR: str = _resolve_backend_path(
+        os.getenv("UPLOAD_DIR"),
+        "data/uploads",
+    )
     MAX_UPLOAD_SIZE: int = int(os.getenv("MAX_UPLOAD_SIZE"))
     ALLOWED_FILE_TYPES: List[str] = _parse_list(os.getenv("ALLOWED_FILE_TYPES"))
 
@@ -146,12 +192,14 @@ class Settings:
 
     # ==================== 缓存配置 ====================
     ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE").lower() == "true"
-    CACHE_DIR: str = os.getenv("CACHE_DIR")
+    CACHE_DIR: str = _resolve_backend_path(
+        os.getenv("CACHE_DIR"),
+        "data/cache",
+    )
     CACHE_TTL: int = int(os.getenv("CACHE_TTL"))
 
     # ==================== 日志配置 ====================
     LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")
-    LOG_FILE_NAME: str = os.getenv("LOG_FILE_NAME")
 
     # ==================== Langsmith 配置（可选）====================
     LANGSMITH_TRACING: Optional[bool] = (

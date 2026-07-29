@@ -3,12 +3,13 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.storage.sqlite_metadata import init_metadata_db
 from app.storage.milvus_store import initialize_collections
+from app.services.auth_service import require_current_user
 from app.utils.logger import setup_logger, _init_loguru
 
 # 全局日志初始化（在任何模块 import 之前完成，确保 uvicorn 日志也被接管）
@@ -20,24 +21,33 @@ logger = setup_logger(__name__)
 
 def _include_routes(app: FastAPI) -> None:
     """延迟导入并注册路由，减少启动阶段的重型依赖加载。"""
+    from app.api.routes.auth import router as auth_router
     from app.api.routes.documents import router as documents_router
     from app.api.routes.retrieval import router as retrieval_router
     from app.api.routes.chat import router as chat_router
 
     app.include_router(
+        auth_router,
+        prefix=f"{settings.API_PREFIX}/auth",
+        tags=["Auth"],
+    )
+    app.include_router(
         documents_router,
         prefix=f"{settings.API_PREFIX}/documents",
         tags=["Documents"],
+        dependencies=[Depends(require_current_user)],
     )
     app.include_router(
         retrieval_router,
         prefix=f"{settings.API_PREFIX}/retrieval",
         tags=["Retrieval"],
+        dependencies=[Depends(require_current_user)],
     )
     app.include_router(
         chat_router,
         prefix=f"{settings.API_PREFIX}/chat",
         tags=["Chat"],
+        dependencies=[Depends(require_current_user)],
     )
 
 
@@ -108,6 +118,17 @@ async def root():
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "docs": "/docs",
+    }
+
+
+@app.get("/health")
+async def health():
+    """健康检查接口，供反向代理、监控和外部探活使用。"""
+    return {
+        "status": "ok",
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT,
     }
 
 

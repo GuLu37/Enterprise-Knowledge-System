@@ -135,6 +135,7 @@ psycopg-pool==3.3.0
 langchain-milvus==0.3.3
 pymilvus==2.6.12
 SQLAlchemy==2.0.48
+pymysql==1.1.1
 
 
 # =========================================================
@@ -209,3 +210,5 @@ msoffcrypto-tool==6.0.0
 python-oxmsg==0.0.2
 olefile==0.47
 pypandoc-binary==1.17
+
+#TODO pip install -U pymilvus
