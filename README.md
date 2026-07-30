@@ -44,7 +44,7 @@ DEPLOYMENT.md
 2. FastAPI 返回 `access_token` 和 `refresh_token`。
 3. 前端自动在 401 时使用 refresh token 续签。
 4. 文档上传后进入处理流程，写入元数据数据库并同步到向量库。
-5. 聊天请求走检索增强生成，支持流式和非流式输出。
+5. 聊天请求先做意图路由，命中知识库意图后再进入完整 RAG 流程，支持流式和非流式输出。
 6. SQLite 元数据固定落在 `backend/app/data/rag_metadata.db`，不会散到其他目录。
 
 ```mermaid
@@ -60,6 +60,33 @@ sequenceDiagram
   F->>A: POST /api/v1/auth/refresh
   A-->>F: 新 token
 ```
+
+## 完整 RAG 流程
+
+```mermaid
+flowchart TD
+  Q[用户 query] --> I[LLM 意图路由]
+  I -->|direct| D[直接回答]
+  I -->|rag| M[Multi-Query 扩展\n生成 3~5 条同义/多角度变体]
+  M --> S1[密集检索\n每条 query 独立召回]
+  M --> S2[稀疏检索\n每条 query 独立召回]
+  S1 --> F[RRF 融合 + 初步去重]
+  S2 --> F
+  F --> R[Reranker 细粒度重排序]
+  R --> C[检索后过滤\n保留高相关引用资料]
+  C --> P[上下文组装 + Prompt 注入]
+  P --> L[LLM 生成最终答案]
+  L --> O[返回答案 + 引用资料]
+```
+
+流程说明：
+
+1. 先由 LLM 判断当前 query 是直接回答还是需要进入 RAG。
+2. 如果需要 RAG，先生成 3 到 5 条同义、多角度的查询变体。
+3. 每条查询变体分别进入密集检索和稀疏检索。
+4. 检索结果先做 RRF 融合和初步去重。
+5. 再经过 reranker 细粒度重排和过滤，只保留更精确的引用资料。
+6. 最后把资料组装进 Prompt，由 LLM 基于资料生成最终答案。
 
 ## 环境变量
 

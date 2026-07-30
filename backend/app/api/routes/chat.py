@@ -60,7 +60,7 @@ async def delete_conversation(conversation_id: str):
 
 @router.post("/generate", response_model=ChatResponse)
 async def generate_response(request: ChatRequest):
-    """生成一次支持 LLM 自主调用 RAG 工具的回答。"""
+    """生成一次先做意图路由、再按需调用 RAG 工具的回答。"""
     try:
         from app.services.chat_service import generate_chat
 
@@ -94,7 +94,7 @@ async def generate_response(request: ChatRequest):
 
 @router.post("/stream")
 async def stream_response(request: ChatRequest):
-    """流式生成回答，并转发工具调用及来源事件。"""
+    """流式生成回答，并转发 RAG 工具调用及来源事件。"""
 
     def event_stream():
         try:

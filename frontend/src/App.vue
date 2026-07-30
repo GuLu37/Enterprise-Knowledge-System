@@ -47,6 +47,7 @@ const DEFAULT_MAX_CONVERSATIONS = 20
 const APP_NAME = '企业知识库问答系统'
 const APP_VERSION = '1.0.0'
 const COPYRIGHT_URL = 'https://github.com/GuLu37'
+const SOURCE_DISPLAY_LIMIT = 3
 
 function createAssistantGreeting(content = '你好，我在这里。可以先上传文档，再直接提问。') {
   return {
@@ -194,6 +195,10 @@ function getConversationPreview(conversation) {
 
 function getConversationTurnCount(conversation) {
   return (conversation.messages || []).filter((message) => message.role === 'user' && !message.ephemeral).length
+}
+
+function getDisplaySources(message) {
+  return (message?.sources || []).slice(0, SOURCE_DISPLAY_LIMIT)
 }
 
 function findConversation(id = activeConversationId.value) {
@@ -1620,15 +1625,15 @@ watch(conversations, () => {
                     'assistant-no-sources': message.role === 'assistant' && (!message.sources || !message.sources.length),
                   }"
                 >
-                  <div v-if="message.role === 'assistant' && message.status === 'done' && message.sources?.length" class="sources">
+                  <div v-if="message.role === 'assistant' && message.status === 'done' && getDisplaySources(message).length" class="sources">
                     <button class="source-toggle" type="button" @click="toggleSources(message.id)">
                       <Wand2 :size="14" />
                       <span>引用资料</span>
-                      <span class="source-toggle__count">{{ message.sources.length }}</span>
+                      <span class="source-toggle__count">{{ getDisplaySources(message).length }}</span>
                       <ChevronDown :size="14" :class="{ open: expandedSources[message.id] }" />
                     </button>
                     <div v-if="expandedSources[message.id]" class="source-list">
-                      <div v-for="(source, index) in message.sources" :key="index" class="source-item">
+                      <div v-for="(source, index) in getDisplaySources(message)" :key="index" class="source-item">
                         <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
                         <div class="source-item__content">{{ source.content }}</div>
                       </div>

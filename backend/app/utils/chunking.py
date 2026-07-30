@@ -231,7 +231,7 @@ def estimate_text_tokens(text: str) -> int:
     normalized_text = (text or "").strip()
     if not normalized_text:
         return 0
-    tokens = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", normalized_text)
+    tokens = re.findall(r"[A-Za-z0-9_]+|[一-鿿]", normalized_text)
     return max(1, len(tokens))
 
 

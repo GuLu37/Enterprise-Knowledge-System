@@ -1,6 +1,7 @@
-"""聊天业务编排：让 LLM 自主决定是否调用 RAG 工具。"""
-import logging
+"""聊天业务编排：先做意图路由，命中知识库意图后调用 RAG 工具。"""
 import json
+import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -9,18 +10,16 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
 
 from app.services.memory_service import (
     search_long_term_memory,
     store_semantic_long_term_memory,
 )
-from app.tools.rag import create_rag_tools
+from app.tools.rag import run_rag_tool
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 3
 SHORT_MEMORY_STRATEGY_WINDOW = "window"
 SHORT_MEMORY_STRATEGY_SUMMARY = "summary"
 RETRIEVAL_METHOD_HYBRID = "hybrid"
@@ -38,16 +37,35 @@ SUMMARY_SYSTEM_PROMPT = (
 )
 
 RAG_SYSTEM_PROMPT = (
-    "你是企业知识库助手。对于闲聊、写作、翻译和不需要企业内部资料的问题，直接回答。"
-    "对于公司制度、业务流程、项目资料、上传文档或其他需要事实核验的问题，"
-    "请先调用 search_knowledge_base。调用工具后只能依据检索结果回答，"
-    "不能把没有检索到的内容当成事实；如果资料不足，请明确说明。"
+    "你是企业知识库助手。当前问题已识别为需要知识库检索。"
+    "请优先依据已检索到的资料回答，不能把没有检索到的内容当成企业内部事实。"
+    "如果资料不足，请明确说明缺少哪些依据，并给出可继续补充资料的方向。"
 )
 
 DIRECT_CHAT_SYSTEM_PROMPT = (
     "你是企业知识库助手。当前对话未启用知识库检索，请直接回答用户问题。"
     "不要假装查阅过企业内部文档；涉及内部事实且无法确认时，请明确说明。"
 )
+
+INTENT_ROUTER_SYSTEM_PROMPT = (
+    "你是一个企业对话意图路由器。"
+    "你的唯一任务是判断当前用户问题是否需要进入企业知识库检索流程。"
+    "请只输出严格 JSON，不要输出解释、前后缀或代码块。"
+    "JSON 结构必须是："
+    "{\"route\":\"rag\"|\"direct\",\"reason\":\"简短原因\",\"confidence\":0到1之间的小数}"
+    "判定规则："
+    "1. 需要企业制度、流程、项目资料、上传文档、公司内部事实核验、引用来源时，route=rag。"
+    "2. 只是闲聊、写作、翻译、润色、代码解释、总结、通用知识问答时，route=direct。"
+    "3. 如果当前问题依赖近期对话上下文，请结合上下文一起判断。"
+)
+
+INTENT_ROUTER_HUMAN_PROMPT = (
+    "请判断下面这条用户消息是否应该调用企业知识库检索。"
+    "如果需要调用知识库，请输出 route=rag；否则输出 route=direct。"
+    "用户消息：\n{query}"
+)
+
+INTENT_JSON_PATTERN = re.compile(r"\{[\s\S]*\}")
 
 
 @dataclass
@@ -57,6 +75,69 @@ class ChatRunResult:
     text: str
     sources: List[Dict[str, Any]] = field(default_factory=list)
     model: str = "default"
+
+
+@dataclass
+class QueryIntent:
+    """用户 query 的轻量意图路由结果。"""
+
+    needs_retrieval: bool
+    reason: str = "direct"
+    source: str = "rule"
+    confidence: Optional[float] = None
+
+
+KNOWLEDGE_INTENT_KEYWORDS = (
+    "知识库",
+    "文档",
+    "资料",
+    "上传",
+    "附件",
+    "引用",
+    "来源",
+    "检索",
+    "搜索",
+    "查一下",
+    "查询",
+    "根据",
+    "基于",
+    "结合",
+    "公司",
+    "企业",
+    "内部",
+    "制度",
+    "流程",
+    "规范",
+    "政策",
+    "手册",
+    "项目",
+    "合同",
+    "申请",
+    "权限",
+    "配置",
+    "环境",
+    "接口",
+    "操作",
+    "使用说明",
+    "报销",
+    "审批",
+    "员工",
+    "客户",
+)
+
+DIRECT_INTENT_KEYWORDS = (
+    "你好",
+    "在吗",
+    "谢谢",
+    "翻译",
+    "润色",
+    "改写",
+    "写一段",
+    "生成",
+    "创作",
+    "代码",
+    "解释一下这段",
+)
 
 
 def _extract_text(message: Any) -> str:
@@ -71,6 +152,163 @@ def _extract_text(message: Any) -> str:
                 parts.append(str(item))
         return "".join(parts)
     return str(content or "")
+
+
+def _build_intent_router_messages(query: str, history: Optional[Iterable[Any]] = None) -> List[Any]:
+    """构造用于意图路由的轻量提示消息。"""
+    history_hint = ""
+    if history:
+        try:
+            _, turns = _split_history_messages(history)
+            recent_turns = turns[-2:]
+            if recent_turns:
+                history_hint = _render_conversation_blocks(recent_turns)
+        except Exception:
+            history_hint = ""
+
+    human_prompt = INTENT_ROUTER_HUMAN_PROMPT.format(query=(query or "").strip())
+    if history_hint.strip():
+        human_prompt += f"\n\n最近对话上下文：\n{history_hint.strip()}"
+
+    return [
+        SystemMessage(content=INTENT_ROUTER_SYSTEM_PROMPT),
+        HumanMessage(content=human_prompt),
+    ]
+
+
+def _parse_intent_router_payload(text: str) -> Dict[str, Any]:
+    """从 LLM 输出中提取意图路由 JSON。"""
+    normalized = (text or "").strip()
+    if not normalized:
+        return {}
+
+    if normalized.startswith("```"):
+        normalized = re.sub(r"^```(?:json)?", "", normalized, flags=re.IGNORECASE).strip()
+        normalized = re.sub(r"```$", "", normalized).strip()
+
+    match = INTENT_JSON_PATTERN.search(normalized)
+    candidate = match.group(0) if match else normalized
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _intent_from_payload(payload: Dict[str, Any], source: str = "llm") -> Optional[QueryIntent]:
+    """把解析后的路由结果标准化成 QueryIntent。"""
+    route = str(
+        payload.get("route")
+        or payload.get("intent")
+        or payload.get("decision")
+        or payload.get("action")
+        or ""
+    ).strip().lower()
+    if route in {"rag", "retrieve", "retrieval", "knowledge", "kb"}:
+        needs_retrieval = True
+    elif route in {"direct", "chat", "answer", "none", "no_rag"}:
+        needs_retrieval = False
+    else:
+        return None
+
+    reason = str(payload.get("reason") or payload.get("explanation") or route).strip()
+    confidence_value = payload.get("confidence")
+    confidence: Optional[float] = None
+    try:
+        if confidence_value is not None and confidence_value != "":
+            confidence = max(0.0, min(1.0, float(confidence_value)))
+    except (TypeError, ValueError):
+        confidence = None
+
+    return QueryIntent(
+        needs_retrieval=needs_retrieval,
+        reason=f"{source}:{reason}" if reason else source,
+        source=source,
+        confidence=confidence,
+    )
+
+
+def _rule_route_query_intent(query: str, use_retrieval: bool = True) -> QueryIntent:
+    """用低延迟规则判断本轮是否需要进入知识库 RAG 工具。"""
+    normalized_query = (query or "").strip()
+    if not use_retrieval:
+        return QueryIntent(needs_retrieval=False, reason="retrieval_disabled", source="rule")
+    if not normalized_query:
+        return QueryIntent(needs_retrieval=False, reason="empty_query", source="rule")
+
+    lowered = normalized_query.lower()
+    has_knowledge_signal = any(keyword in lowered for keyword in KNOWLEDGE_INTENT_KEYWORDS)
+    has_direct_signal = any(keyword in lowered for keyword in DIRECT_INTENT_KEYWORDS)
+
+    if has_knowledge_signal:
+        return QueryIntent(needs_retrieval=True, reason="knowledge_keyword", source="rule")
+
+    if has_direct_signal:
+        return QueryIntent(needs_retrieval=False, reason="direct_keyword", source="rule")
+
+    return QueryIntent(needs_retrieval=False, reason="direct_default", source="rule")
+
+
+def route_query_intent(
+    query: str,
+    use_retrieval: bool = True,
+    llm: Optional[Any] = None,
+    history: Optional[Iterable[Any]] = None,
+) -> QueryIntent:
+    """用 LLM 先判断是否走 RAG，失败时回退到规则路由。"""
+    normalized_query = (query or "").strip()
+    if not use_retrieval:
+        return QueryIntent(needs_retrieval=False, reason="retrieval_disabled", source="rule")
+    if not normalized_query:
+        return QueryIntent(needs_retrieval=False, reason="empty_query", source="rule")
+
+    if llm is not None:
+        try:
+            response = llm.invoke(_build_intent_router_messages(normalized_query, history=history))
+            payload = _parse_intent_router_payload(_extract_text(response))
+            intent = _intent_from_payload(payload, source="llm")
+            if intent is not None:
+                logger.info(
+                    "意图路由结果: source=%s route=%s confidence=%s reason=%s",
+                    intent.source,
+                    "rag" if intent.needs_retrieval else "direct",
+                    intent.confidence,
+                    intent.reason,
+                )
+                return intent
+        except Exception as exc:
+            logger.warning("LLM 意图路由失败，已回退规则判断: %s", exc)
+
+    intent = _rule_route_query_intent(normalized_query, use_retrieval=use_retrieval)
+    logger.info(
+        "意图路由结果: source=%s route=%s reason=%s",
+        intent.source,
+        "rag" if intent.needs_retrieval else "direct",
+        intent.reason,
+    )
+    return intent
+
+
+def _build_rag_context_message(rag_context: str, rag_message: str = "") -> Optional[SystemMessage]:
+    """把 RAG 工具输出转换成回答阶段的系统上下文。"""
+    context = (rag_context or "").strip()
+    if context:
+        return SystemMessage(
+            content=(
+                "以下是本轮 RAG 工具从企业知识库检索、融合、重排和过滤后的资料：\n\n"
+                f"{context}\n\n"
+                "请基于这些资料作答。资料没有覆盖的信息不要编造。"
+            )
+        )
+
+    return SystemMessage(
+        content=(
+            "本轮已进入 RAG 工具，但知识库未检索到足够相关资料。"
+            f"{rag_message or '请直接说明资料不足，不要编造企业内部事实。'}"
+        )
+    )
 
 
 def _normalize_history_message(message: Any) -> Dict[str, str]:
@@ -362,6 +600,8 @@ def build_chat_messages(
     history: Optional[Iterable[Any]],
     query: str,
     allow_retrieval: bool = True,
+    rag_context: str = "",
+    rag_message: str = "",
     long_term_memory_messages: Optional[Iterable[Any]] = None,
     short_memory_strategy: str = SHORT_MEMORY_STRATEGY_WINDOW,
     short_memory_n: int = DEFAULT_SHORT_MEMORY_N,
@@ -373,6 +613,10 @@ def build_chat_messages(
     messages: List[Any] = [SystemMessage(content=system_prompt)]
     for message in long_term_memory_messages or []:
         messages.append(message)
+    if allow_retrieval:
+        context_message = _build_rag_context_message(rag_context, rag_message=rag_message)
+        if context_message is not None:
+            messages.append(context_message)
 
     if short_memory_strategy == SHORT_MEMORY_STRATEGY_WINDOW:
         history_messages, _ = _build_sliding_window_history(history, short_memory_n)
@@ -385,79 +629,6 @@ def build_chat_messages(
 
     messages.append(HumanMessage(content=(query or "").strip()))
     return messages
-
-
-def _normalize_tool_calls(message: Any) -> List[Dict[str, Any]]:
-    """兼容不同 LangChain provider 返回的 tool call 结构。"""
-    tool_calls = getattr(message, "tool_calls", None) or []
-    normalized: List[Dict[str, Any]] = []
-
-    for index, call in enumerate(tool_calls):
-        if isinstance(call, dict):
-            normalized.append(
-                {
-                    "id": call.get("id") or f"tool-call-{index}",
-                    "name": call.get("name") or call.get("function", {}).get("name"),
-                    "args": call.get("args") or call.get("function", {}).get("arguments", {}),
-                }
-            )
-
-    if normalized:
-        return normalized
-
-    raw_tool_call_chunks = getattr(message, "tool_call_chunks", None) or []
-    for index, call in enumerate(raw_tool_call_chunks):
-        if not isinstance(call, dict):
-            continue
-        args = call.get("args", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        normalized.append(
-            {
-                "id": call.get("id") or f"tool-call-{index}",
-                "name": call.get("name"),
-                "args": args,
-            }
-        )
-
-    if normalized:
-        return normalized
-
-    raw_calls = getattr(message, "additional_kwargs", {}).get("tool_calls", [])
-    for index, call in enumerate(raw_calls):
-        function = call.get("function", {}) if isinstance(call, dict) else {}
-        args = function.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        normalized.append(
-            {
-                "id": call.get("id") or f"tool-call-{index}",
-                "name": function.get("name"),
-                "args": args,
-            }
-        )
-
-    return normalized
-
-
-def _stream_model_response(model: Any, messages: List[Any]):
-    """逐块生成模型响应，同时聚合最终消息以解析工具调用。"""
-    response = None
-    for chunk in model.stream(messages):
-        response = chunk if response is None else response + chunk
-        text = _extract_text(chunk)
-        if text:
-            yield text, None
-
-    if response is None:
-        response = model.invoke(messages)
-    yield "", response
 
 
 def _deduplicate_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -477,31 +648,6 @@ def _deduplicate_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduplicated
 
 
-def _invoke_tools(
-    tool_calls: List[Dict[str, Any]],
-    tool_map: Dict[str, Any],
-    messages: List[Any],
-) -> None:
-    """执行当前轮次的工具调用，并把 ToolMessage 写回上下文。"""
-    for call in tool_calls:
-        tool_name = call.get("name")
-        tool = tool_map.get(tool_name)
-        if tool is None:
-            result = f"工具不存在: {tool_name}"
-        else:
-            try:
-                result = tool.invoke(call.get("args") or {})
-            except Exception as exc:
-                result = f"工具调用失败: {exc}"
-
-        messages.append(
-            ToolMessage(
-                content=str(result),
-                tool_call_id=call["id"],
-            )
-        )
-
-
 def run_chat(
     query: str,
     history: Optional[Iterable[Any]] = None,
@@ -518,7 +664,7 @@ def run_chat(
     temperature: Optional[float] = None,
     llm: Optional[Any] = None,
 ) -> ChatRunResult:
-    """运行一次支持自主 RAG 工具调用的聊天。"""
+    """运行一次先路由、再按需调用 RAG 工具的聊天。"""
     normalized_retrieval_method = _validate_retrieval_method(retrieval_method)
     if llm is None:
         from app.core.llm import get_llm
@@ -528,6 +674,19 @@ def run_chat(
             model=model,
             temperature=temperature,
         )
+    intent = route_query_intent(query, use_retrieval=use_retrieval, llm=llm, history=history)
+    sources: List[Dict[str, Any]] = []
+    rag_payload: Dict[str, Any] = {}
+    if intent.needs_retrieval:
+        rag_payload = run_rag_tool(
+            query=query,
+            default_top_k=top_k,
+            max_top_k=top_k,
+            retrieval_method=normalized_retrieval_method,
+            sources_sink=sources,
+            llm=llm,
+        )
+
     long_term_memory_messages = _build_long_term_memory_messages(
         query=query,
         conversation_id=conversation_id,
@@ -536,62 +695,30 @@ def run_chat(
     messages = build_chat_messages(
         history,
         query,
-        allow_retrieval=use_retrieval,
+        allow_retrieval=intent.needs_retrieval,
+        rag_context=str(rag_payload.get("context") or ""),
+        rag_message=str(rag_payload.get("message") or ""),
         long_term_memory_messages=long_term_memory_messages,
         short_memory_strategy=short_memory_strategy,
         short_memory_n=short_memory_n,
         short_memory_m=short_memory_m,
         llm=llm,
     )
-    if not use_retrieval:
-        text = _extract_text(llm.invoke(messages))
-        _persist_long_term_memory_async(
-            history=history,
-            query=query,
-            answer=text,
-            conversation_id=conversation_id,
-            session_id=session_id,
-            short_window_n=short_memory_n,
-            llm=llm,
-        )
-        return ChatRunResult(
-            text=text,
-            model=model or "default",
-        )
-
-    sources: List[Dict[str, Any]] = []
-    tools = create_rag_tools(
-        sources,
-        default_top_k=top_k,
-        max_top_k=top_k,
-        retrieval_method=normalized_retrieval_method,
+    text = _extract_text(llm.invoke(messages))
+    _persist_long_term_memory_async(
+        history=history,
+        query=query,
+        answer=text,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        short_window_n=short_memory_n,
+        llm=llm,
     )
-    tool_map = {tool.name: tool for tool in tools}
-    model_with_tools = llm.bind_tools(tools)
-
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = model_with_tools.invoke(messages)
-        messages.append(response)
-        tool_calls = _normalize_tool_calls(response)
-        if not tool_calls:
-            text = _extract_text(response)
-            _persist_long_term_memory_async(
-                history=history,
-                query=query,
-                answer=text,
-                conversation_id=conversation_id,
-                session_id=session_id,
-                short_window_n=short_memory_n,
-                llm=llm,
-            )
-            return ChatRunResult(
-                text=text,
-                sources=_deduplicate_sources(sources),
-                model=model or "default",
-            )
-        _invoke_tools(tool_calls, tool_map, messages)
-
-    raise RuntimeError("LLM 工具调用超过最大轮数")
+    return ChatRunResult(
+        text=text,
+        sources=_deduplicate_sources(sources) if intent.needs_retrieval else [],
+        model=model or "default",
+    )
 
 
 def stream_chat(
@@ -610,7 +737,7 @@ def stream_chat(
     temperature: Optional[float] = None,
     llm: Optional[Any] = None,
 ):
-    """运行流式聊天，工具决策和工具结果通过事件交给 API 层。"""
+    """运行流式聊天，先做意图路由，命中后再调用 RAG 工具。"""
     normalized_retrieval_method = _validate_retrieval_method(retrieval_method)
     if llm is None:
         from app.core.llm import get_llm
@@ -620,6 +747,31 @@ def stream_chat(
             model=model,
             temperature=temperature,
         )
+    intent = route_query_intent(query, use_retrieval=use_retrieval, llm=llm, history=history)
+    sources: List[Dict[str, Any]] = []
+    rag_payload: Dict[str, Any] = {}
+    if intent.needs_retrieval:
+        yield {
+            "event": "tool_call",
+            "data": {
+                "name": "search_knowledge_base",
+                "args": {
+                    "query": query,
+                    "top_k": top_k,
+                    "retrieval_method": normalized_retrieval_method,
+                    "reason": intent.reason,
+                },
+            },
+        }
+        rag_payload = run_rag_tool(
+            query=query,
+            default_top_k=top_k,
+            max_top_k=top_k,
+            retrieval_method=normalized_retrieval_method,
+            sources_sink=sources,
+            llm=llm,
+        )
+
     long_term_memory_messages = _build_long_term_memory_messages(
         query=query,
         conversation_id=conversation_id,
@@ -628,93 +780,48 @@ def stream_chat(
     messages = build_chat_messages(
         history,
         query,
-        allow_retrieval=use_retrieval,
+        allow_retrieval=intent.needs_retrieval,
+        rag_context=str(rag_payload.get("context") or ""),
+        rag_message=str(rag_payload.get("message") or ""),
         long_term_memory_messages=long_term_memory_messages,
         short_memory_strategy=short_memory_strategy,
         short_memory_n=short_memory_n,
         short_memory_m=short_memory_m,
         llm=llm,
     )
-    sources: List[Dict[str, Any]] = []
     final_text = ""
 
-    if not use_retrieval:
-        for chunk in llm.stream(messages):
-            text = _extract_text(chunk)
-            if text:
-                final_text += text
-                yield {"event": "message", "data": {"content": text}}
-        yield {"event": "done", "data": {"sources": []}}
-        _persist_long_term_memory_async(
-            history=history,
-            query=query,
-            answer=final_text,
-            conversation_id=conversation_id,
-            session_id=session_id,
-            short_window_n=short_memory_n,
-            llm=llm,
-        )
-        return
+    for chunk in llm.stream(messages):
+        text = _extract_text(chunk)
+        if text:
+            final_text += text
+            yield {"event": "message", "data": {"content": text}}
 
-    tools = create_rag_tools(
-        sources,
-        default_top_k=top_k,
-        max_top_k=top_k,
-        retrieval_method=normalized_retrieval_method,
-    )
-    tool_map = {tool.name: tool for tool in tools}
-    model_with_tools = llm.bind_tools(tools)
-
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = None
-        streamed_text = ""
-        for text, final_response in _stream_model_response(model_with_tools, messages):
-            if text:
-                streamed_text += text
-                yield {"event": "message", "data": {"content": text}}
-            if final_response is not None:
-                response = final_response
-
-        if response is None:
-            response = model_with_tools.invoke(messages)
-        messages.append(response)
-        tool_calls = _normalize_tool_calls(response)
-
-        if not tool_calls:
-            final_text = streamed_text or _extract_text(response)
-            if not streamed_text and final_text:
-                yield {"event": "message", "data": {"content": final_text}}
-            yield {
-                "event": "done",
-                "data": {"sources": _deduplicate_sources(sources)},
-            }
-            _persist_long_term_memory_async(
-                history=history,
-                query=query,
-                answer=final_text,
-                conversation_id=conversation_id,
-                session_id=session_id,
-                short_window_n=short_memory_n,
-                llm=llm,
-            )
-            return
-
-        for call in tool_calls:
-            yield {
-                "event": "tool_call",
-                "data": {
-                    "name": call.get("name"),
-                    "args": call.get("args") or {},
-                },
-            }
-
-        _invoke_tools(tool_calls, tool_map, messages)
+    deduplicated_sources = _deduplicate_sources(sources) if intent.needs_retrieval else []
+    if intent.needs_retrieval:
         yield {
             "event": "tool_result",
-            "data": {"sources": _deduplicate_sources(sources)},
+            "data": {
+                "sources": deduplicated_sources,
+                "expanded_queries": rag_payload.get("expanded_queries") or [],
+                "message": rag_payload.get("message") or "",
+            },
         }
 
-    raise RuntimeError("LLM 工具调用超过最大轮数")
+    yield {
+        "event": "done",
+        "data": {"sources": deduplicated_sources},
+    }
+    _persist_long_term_memory_async(
+        history=history,
+        query=query,
+        answer=final_text,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        short_window_n=short_memory_n,
+        llm=llm,
+    )
+    return
 
 
 def _validate_chat_options(query: str, top_k: int) -> None:

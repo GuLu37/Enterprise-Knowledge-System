@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from .base import BaseRetriever, RetrievalResult
 from app.config import settings
 from app.storage.milvus_store import get_milvus_client, is_collection_loaded
+from app.rag.retrieval.reranker import build_query_terms, rerank_results
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -53,23 +54,51 @@ def _escape_like_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _extract_filter_terms(query: str) -> List[str]:
-    parts = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", (query or "").lower())
-    terms: List[str] = []
-    for part in parts:
-        if re.fullmatch(r"[\u4e00-\u9fff]+", part):
-            if len(part) >= 2:
-                terms.append(part)
-        else:
-            terms.append(part)
-    return list(dict.fromkeys(terms)) or [(query or "").strip().lower()]
+def _build_filter_terms(query: str, max_terms: int = 12) -> List[str]:
+    """生成适合做候选召回的关键词。"""
+    query_terms = build_query_terms(query, max_terms=max_terms * 2)
+    if not query_terms:
+        return []
+
+    filter_terms: List[str] = []
+    seen = set()
+    for term in query_terms:
+        normalized_term = term.strip()
+        if len(normalized_term) < 2:
+            continue
+        if normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        filter_terms.append(normalized_term)
+        if len(filter_terms) >= max_terms:
+            break
+
+    if filter_terms:
+        return filter_terms
+
+    fallback_terms: List[str] = []
+    for term in query_terms:
+        normalized_term = term.strip()
+        if not normalized_term or normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        fallback_terms.append(normalized_term)
+        if len(fallback_terms) >= max_terms:
+            break
+    return fallback_terms
 
 
 def _tokenize(text: str) -> List[str]:
     tokens: List[str] = []
-    for part in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", (text or "").lower()):
-        if re.fullmatch(r"[\u4e00-\u9fff]+", part):
-            tokens.extend(list(part))
+    for part in re.findall(r"[A-Za-z0-9]+|[一-鿿]+", (text or "").lower()):
+        if re.fullmatch(r"[一-鿿]+", part):
+            if len(part) <= 2:
+                tokens.append(part)
+                continue
+            tokens.append(part)
+            tokens.extend(part[index:index + 2] for index in range(len(part) - 1))
+            if len(part) >= 4:
+                tokens.extend(part[index:index + 3] for index in range(len(part) - 2))
         else:
             tokens.append(part)
     return tokens
@@ -100,10 +129,13 @@ class SparseRetriever(BaseRetriever):
                 logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次稀疏检索")
                 return []
 
-            filter_terms = _extract_filter_terms(query)
+            filter_terms = _build_filter_terms(query)
+            if not filter_terms:
+                return []
+
             filter_expr = " or ".join(
                 f'chunk_text like "%{_escape_like_value(term)}%"'
-                for term in filter_terms[:8]
+                for term in filter_terms[:12]
                 if term
             )
             if not filter_expr:
@@ -121,8 +153,30 @@ class SparseRetriever(BaseRetriever):
                     "file_type",
                     "content_type",
                 ],
-                limit=max(top_k * 20, 50),
+                limit=max(top_k * 30, 80),
             )
+
+            if not rows and len(filter_terms) > 1:
+                fallback_filter = " or ".join(
+                    f'chunk_text like "%{_escape_like_value(term)}%"'
+                    for term in filter_terms[:4]
+                    if term
+                )
+                if fallback_filter and fallback_filter != filter_expr:
+                    rows = client.query(
+                        collection_name=collection_name,
+                        filter=fallback_filter,
+                        output_fields=[
+                            "text",
+                            "document_id",
+                            "chunk_index",
+                            "source_name",
+                            "chunk_text",
+                            "file_type",
+                            "content_type",
+                        ],
+                        limit=max(top_k * 30, 80),
+                    )
 
             if not rows:
                 return []
@@ -161,7 +215,10 @@ class SparseRetriever(BaseRetriever):
                     )
                 )
 
-            return results
+            if not results:
+                return []
+
+            return rerank_results(query=query, results=results, top_k=top_k)
         except Exception as e:
             logger.error(f"稀疏检索失败: {str(e)}")
             raise

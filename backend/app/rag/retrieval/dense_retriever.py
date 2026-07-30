@@ -7,6 +7,7 @@ from app.storage.milvus_store import (
     is_collection_loaded,
     get_milvus_client,
 )
+from app.rag.retrieval.reranker import rerank_results
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -75,12 +76,13 @@ class DenseRetriever(BaseRetriever):
                 logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次密集检索")
                 return []
 
+            candidate_k = max(top_k * 4, top_k + 8, 20)
             query_vector = self.embeddings.embed_query(query)
             search_result = client.search(
                 collection_name=collection_name,
                 data=[query_vector],
                 anns_field="vector",
-                limit=top_k,
+                limit=candidate_k,
                 output_fields=[
                     "text",
                     "document_id",
@@ -116,6 +118,8 @@ class DenseRetriever(BaseRetriever):
                     "content_type": _get_field(entity, "content_type", _get_field(hit, "content_type")),
                 }
                 score = float(_get_field(hit, "distance", _get_field(hit, "score", 0.0)) or 0.0)
+                if settings.SIMILARITY_THRESHOLD and score < settings.SIMILARITY_THRESHOLD:
+                    continue
                 results.append(
                     RetrievalResult(
                         content=content,
@@ -125,7 +129,10 @@ class DenseRetriever(BaseRetriever):
                     )
                 )
 
-            return results
+            if not results:
+                return []
+
+            return rerank_results(query=query, results=results, top_k=top_k)
 
         except Exception as e:
             logger.error(f"密集检索失败: {str(e)}")

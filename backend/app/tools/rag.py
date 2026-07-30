@@ -6,7 +6,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from app.services.retrieval_service import (
-    retrieve_documents,
+    run_rag_workflow,
     serialize_retrieval_results,
 )
 
@@ -27,11 +27,44 @@ class KnowledgeBaseSearchInput(BaseModel):
     )
 
 
+def run_rag_tool(
+    query: str,
+    top_k: Optional[int] = None,
+    default_top_k: int = 5,
+    max_top_k: int = 50,
+    retrieval_method: str = "hybrid",
+    sources_sink: Optional[MutableSequence[Dict[str, Any]]] = None,
+    llm: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """执行知识库 RAG 工具，并返回可用于 Prompt 组装的结构化结果。"""
+    resolved_top_k = max(1, min(top_k or default_top_k, max_top_k))
+    resolved_method = (retrieval_method or "hybrid").strip().lower()
+    workflow = run_rag_workflow(
+        query=query,
+        top_k=resolved_top_k,
+        retrieval_method=resolved_method,
+        llm=llm,
+    )
+    results = serialize_retrieval_results(workflow.results)
+
+    if sources_sink is not None:
+        sources_sink.extend(results)
+
+    return {
+        "query": workflow.query,
+        "expanded_queries": workflow.expanded_queries,
+        "results": results,
+        "context": workflow.context,
+        "message": workflow.message,
+    }
+
+
 def create_rag_tools(
     sources_sink: Optional[MutableSequence[Dict[str, Any]]] = None,
     default_top_k: int = 5,
     max_top_k: int = 50,
     retrieval_method: str = "hybrid",
+    llm: Optional[Any] = None,
 ) -> List[StructuredTool]:
     """创建带有本次请求来源收集器的 RAG 工具。"""
     default_retrieval_method = (retrieval_method or "hybrid").strip().lower()
@@ -42,27 +75,16 @@ def create_rag_tools(
         retrieval_method: Optional[str] = None,
     ) -> str:
         """检索企业知识库中的文档片段，用于回答企业内部知识问题。"""
-        resolved_top_k = max(1, min(top_k or default_top_k, max_top_k))
-        resolved_method = (retrieval_method or default_retrieval_method).strip().lower()
-        results = serialize_retrieval_results(
-            retrieve_documents(
-                query=query,
-                top_k=resolved_top_k,
-                retrieval_method=resolved_method,
-            )
+        result = run_rag_tool(
+            query=query,
+            top_k=top_k,
+            default_top_k=default_top_k,
+            max_top_k=max_top_k,
+            retrieval_method=retrieval_method or default_retrieval_method,
+            sources_sink=sources_sink,
+            llm=llm,
         )
-
-        if sources_sink is not None:
-            sources_sink.extend(results)
-
-        return json.dumps(
-            {
-                "query": query,
-                "results": results,
-                "message": "未检索到相关内容" if not results else "检索完成",
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps(result, ensure_ascii=False)
 
     return [
         StructuredTool.from_function(
