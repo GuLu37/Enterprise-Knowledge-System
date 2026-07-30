@@ -182,20 +182,36 @@ def warmup_collections(collection_names: Optional[Sequence[str]] = None) -> None
             continue
 
         logger.info(f"开始预热 collection: {collection_name}")
-        client.load_collection(
-            collection_name=collection_name,
-            replica_number=1,
-            timeout=60,
-        )
-        logger.info(f"✓ collection 预热完成: {collection_name}")
+        try:
+            client.load_collection(
+                collection_name=collection_name,
+                replica_number=1,
+                timeout=60,
+            )
+            logger.info(f"✓ collection 预热完成: {collection_name}")
+        except Exception as exc:
+            logger.warning(
+                "Milvus collection 预热失败，已跳过 (collection={}, error={})",
+                collection_name,
+                exc,
+            )
 
 
-def initialize_collections() -> None:
+def initialize_collections() -> bool:
     """确保业务 collection 存在、索引完整并已加载。"""
-    client = get_milvus_client()
-    _ensure_document_collection(client)
-    _ensure_memory_collection(client)
-    warmup_collections()
+    try:
+        client = get_milvus_client()
+        _ensure_document_collection(client)
+        _ensure_memory_collection(client)
+        warmup_collections()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Milvus 初始化失败，后端将继续启动，相关检索/入库功能在 Milvus 恢复前不可用: {}",
+            exc,
+        )
+        logger.debug("Milvus 初始化失败详情", exc_info=True)
+        return False
 
 
 def _create_document_collection(client: MilvusClient) -> None:

@@ -10,6 +10,7 @@ from app.api.schemas import (
     ChatResponse,
     ChatSettingsResponse,
     ConversationDeleteResponse,
+    ChatWarmupResponse,
 )
 from app.config import settings
 from app.utils.exceptions import VectorStoreException
@@ -28,11 +29,23 @@ async def get_chat_settings():
     return ChatSettingsResponse(max_conversations=settings.CHAT_MAX_CONVERSATIONS)
 
 
+@router.post("/warmup", response_model=ChatWarmupResponse)
+async def warmup_chat_runtime():
+    """预热聊天相关的 LLM 和 embedding 运行时。"""
+    try:
+        from app.services.chat_service import warmup_chat_runtime
+
+        result = await run_in_threadpool(warmup_chat_runtime)
+        return ChatWarmupResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
 async def delete_conversation(conversation_id: str):
     """删除一个 conversation_id 关联的长期记忆。"""
     try:
-        from app.memory.service import delete_long_term_memory
+        from app.services.memory_service import delete_long_term_memory
 
         memory_deleted = await run_in_threadpool(delete_long_term_memory, conversation_id)
         return ConversationDeleteResponse(

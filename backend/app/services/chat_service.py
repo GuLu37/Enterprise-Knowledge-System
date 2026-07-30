@@ -1,6 +1,7 @@
 """聊天业务编排：让 LLM 自主决定是否调用 RAG 工具。"""
 import logging
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -11,7 +12,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from app.memory.service import (
+from app.services.memory_service import (
     search_long_term_memory,
     store_semantic_long_term_memory,
 )
@@ -328,6 +329,35 @@ def _persist_long_term_memory(
         logger.warning("长期记忆写入失败，已跳过: %s", exc)
 
 
+def _persist_long_term_memory_async(
+    history: Optional[Iterable[Any]],
+    query: str,
+    answer: str,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    short_window_n: int = DEFAULT_SHORT_MEMORY_N,
+    llm: Optional[Any] = None,
+) -> None:
+    """后台写入长期记忆，不阻塞本次回答结束。"""
+    if not answer or not answer.strip():
+        return
+
+    worker = threading.Thread(
+        target=_persist_long_term_memory,
+        kwargs={
+            "history": history,
+            "query": query,
+            "answer": answer,
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "short_window_n": short_window_n,
+            "llm": llm,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+
 def build_chat_messages(
     history: Optional[Iterable[Any]],
     query: str,
@@ -515,7 +545,7 @@ def run_chat(
     )
     if not use_retrieval:
         text = _extract_text(llm.invoke(messages))
-        _persist_long_term_memory(
+        _persist_long_term_memory_async(
             history=history,
             query=query,
             answer=text,
@@ -545,7 +575,7 @@ def run_chat(
         tool_calls = _normalize_tool_calls(response)
         if not tool_calls:
             text = _extract_text(response)
-            _persist_long_term_memory(
+            _persist_long_term_memory_async(
                 history=history,
                 query=query,
                 answer=text,
@@ -614,7 +644,8 @@ def stream_chat(
             if text:
                 final_text += text
                 yield {"event": "message", "data": {"content": text}}
-        _persist_long_term_memory(
+        yield {"event": "done", "data": {"sources": []}}
+        _persist_long_term_memory_async(
             history=history,
             query=query,
             answer=final_text,
@@ -623,7 +654,6 @@ def stream_chat(
             short_window_n=short_memory_n,
             llm=llm,
         )
-        yield {"event": "done", "data": {"sources": []}}
         return
 
     tools = create_rag_tools(
@@ -654,7 +684,11 @@ def stream_chat(
             final_text = streamed_text or _extract_text(response)
             if not streamed_text and final_text:
                 yield {"event": "message", "data": {"content": final_text}}
-            _persist_long_term_memory(
+            yield {
+                "event": "done",
+                "data": {"sources": _deduplicate_sources(sources)},
+            }
+            _persist_long_term_memory_async(
                 history=history,
                 query=query,
                 answer=final_text,
@@ -663,10 +697,6 @@ def stream_chat(
                 short_window_n=short_memory_n,
                 llm=llm,
             )
-            yield {
-                "event": "done",
-                "data": {"sources": _deduplicate_sources(sources)},
-            }
             return
 
         for call in tool_calls:
@@ -791,3 +821,32 @@ def stream_chat_events(
         model=model,
         temperature=temperature,
     )
+
+
+def warmup_chat_runtime() -> Dict[str, Any]:
+    """预热聊天链路里最重的初始化步骤。"""
+    result: Dict[str, Any] = {
+        "llm_warmed": False,
+        "embedding_warmed": False,
+        "provider": None,
+    }
+
+    try:
+        from app.core.llm import get_default_llm
+
+        llm = get_default_llm()
+        result["llm_warmed"] = True
+        result["provider"] = getattr(llm, "active_provider", None)
+    except Exception as exc:
+        logger.warning("LLM 预热失败，已跳过: %s", exc)
+
+    try:
+        from app.core.embeddings import get_default_embeddings
+
+        embeddings = get_default_embeddings()
+        embeddings.embed_query("warmup")
+        result["embedding_warmed"] = True
+    except Exception as exc:
+        logger.warning("Embedding 预热失败，已跳过: %s", exc)
+
+    return result

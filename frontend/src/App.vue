@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   CircleAlert,
+  Copy,
   FileText,
   Loader2,
   LogIn,
@@ -15,6 +16,8 @@ import {
   Paperclip,
   Plus,
   RefreshCw,
+  PencilLine,
+  RotateCcw,
   Send,
   Trash2,
   Upload,
@@ -41,6 +44,9 @@ import {
 
 const CONVERSATION_STORAGE_KEY = 'enterprise-knowledge-system.conversations'
 const DEFAULT_MAX_CONVERSATIONS = 20
+const APP_NAME = '企业知识库问答系统'
+const APP_VERSION = '1.0.0'
+const COPYRIGHT_URL = 'https://github.com/GuLu37'
 
 function createAssistantGreeting(content = '你好，我在这里。可以先上传文档，再直接提问。') {
   return {
@@ -140,12 +146,16 @@ const selectedDocError = ref('')
 const scrollHost = ref(null)
 const fileInput = ref(null)
 const retrievalMenuRef = ref(null)
+const conversationFullNotice = ref(false)
 const autoScrollEnabled = ref(true)
 const expandedSources = ref({})
+const messageEditState = ref(null)
+const messageEditSubmitting = ref(false)
+const messageEditError = ref('')
 let previewRequestSeq = 0
 let sheetDragCleanup = null
 let conversationSaveTimer = null
-let profileMenuCloseTimer = null
+let conversationFullNoticeTimer = null
 
 const retrievalOptions = [
   { value: 'hybrid', label: '混合检索' },
@@ -194,6 +204,184 @@ function isConversationStreaming(id) {
   return Boolean(streamingConversationIds.value[id])
 }
 
+function closeMessageEditor() {
+  messageEditState.value = null
+  messageEditError.value = ''
+}
+
+function openMessageEditor(message) {
+  if (!message || message.role !== 'user' || chatBusy.value) return
+  messageEditError.value = ''
+  messageEditState.value = {
+    conversationId: activeConversationId.value,
+    messageId: message.id,
+    draft: message.content || '',
+  }
+}
+
+function isEditingMessage(messageId) {
+  return messageEditState.value?.messageId === messageId
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || '')
+  if (!value) return
+
+  try {
+    await navigator.clipboard.writeText(value)
+    return
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.setAttribute('readonly', 'readonly')
+    textarea.style.position = 'fixed'
+    textarea.style.top = '-9999px'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
+async function copyMessageContent(message) {
+  try {
+    await copyTextToClipboard(message?.content || '')
+  } catch (error) {
+    errorText.value = error?.message || '复制失败'
+  }
+}
+
+function getConversationMessageIndex(conversation, messageId) {
+  if (!conversation || !messageId) return -1
+  return conversation.messages.findIndex((message) => message.id === messageId)
+}
+
+function truncateConversationAfterIndex(conversation, messageIndex) {
+  if (!conversation || messageIndex < 0) return
+  conversation.messages.splice(messageIndex + 1)
+}
+
+async function generateAssistantReply({
+  runConversationId,
+  conversation,
+  query,
+  shouldStickToBottom = true,
+}) {
+  if (!conversation) return
+  const assistantMessage = {
+    id: crypto.randomUUID(),
+    role: 'assistant',
+    content: '',
+    sources: [],
+    pendingSources: [],
+    status: 'thinking',
+    thinkingTimeMs: null,
+  }
+  conversation.messages.push(assistantMessage)
+  touchConversation(runConversationId)
+  setConversationStreaming(runConversationId, true)
+  await nextTick()
+  if (activeConversationId.value === runConversationId) {
+    scrollToBottom(shouldStickToBottom)
+  }
+
+  const thinkingStartedAt = performance.now()
+  const payload = {
+    query,
+    history: buildHistoryPayload(conversation.messages),
+    conversation_id: conversation.conversation_id,
+    session_id: conversation.session_id,
+    use_retrieval: useRetrieval.value,
+    stream: streamMode.value,
+    retrieval_method: retrievalMethod.value,
+    short_memory_strategy: 'window',
+    short_memory_n: 5,
+    short_memory_m: 10,
+    top_k: 5,
+  }
+
+  let encounteredError = false
+  try {
+    if (payload.stream) {
+      await streamChat(payload, (event) => {
+        if (event.event === 'message') {
+          const content = readStreamContent(event.data)
+          if (content) {
+            updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+              message.content += content
+              message.status = 'thinking'
+            })
+          }
+          if (activeConversationId.value === runConversationId && autoScrollEnabled.value) {
+            scrollToBottom()
+          }
+          return
+        }
+        if (event.event === 'tool_call') {
+          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+            message.status = 'thinking'
+          })
+          return
+        }
+        if (event.event === 'tool_result') {
+          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+            message.pendingSources = event.data?.sources || message.pendingSources || []
+          })
+          return
+        }
+        if (event.event === 'done') {
+          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+            message.sources = event.data?.sources || message.pendingSources || message.sources
+            message.pendingSources = []
+            message.status = 'done'
+            message.thinkingTimeMs = Math.max(0, performance.now() - thinkingStartedAt)
+          }, true)
+          return
+        }
+        if (event.event === 'error') {
+          throw new Error(event.data?.message || '流式输出失败')
+        }
+      })
+    } else {
+      const result = await generateChat(payload)
+      updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+        message.content = result.response || ''
+        message.sources = result.sources || []
+        message.status = 'done'
+        message.thinkingTimeMs = Math.max(0, performance.now() - thinkingStartedAt)
+      }, true)
+    }
+  } catch (error) {
+    encounteredError = true
+    updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+      message.content = error.message || '请求失败'
+      message.status = 'error'
+    }, true)
+  } finally {
+    if (!encounteredError) {
+      updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+        if (message.status !== 'error') {
+          if (!message.sources?.length && message.pendingSources?.length) {
+            message.sources = message.pendingSources
+          }
+          message.pendingSources = []
+          message.status = 'done'
+          if (message.thinkingTimeMs == null) {
+            message.thinkingTimeMs = Math.max(0, performance.now() - thinkingStartedAt)
+          }
+        }
+      }, true)
+    }
+    setConversationStreaming(runConversationId, false)
+    touchConversation(runConversationId)
+    await nextTick()
+    if (activeConversationId.value === runConversationId && shouldStickToBottom) {
+      scrollToBottom(true)
+    }
+  }
+}
+
 function setConversationStreaming(id, isStreaming) {
   if (!id) return
   const next = { ...streamingConversationIds.value }
@@ -234,6 +422,7 @@ function activateConversation(id) {
   const target = findConversation(id)
   if (!target) return
 
+  closeMessageEditor()
   activeConversationId.value = target.conversation_id
   conversationId.value = target.conversation_id
   sessionId.value = target.session_id
@@ -323,34 +512,36 @@ async function handleLogin() {
 
 function handleLogout() {
   closeProfileMenu()
+  closeMessageEditor()
   clearAuthToken()
   window.location.reload()
 }
 
 function openProfileMenu() {
-  if (profileMenuCloseTimer) {
-    clearTimeout(profileMenuCloseTimer)
-    profileMenuCloseTimer = null
-  }
   profileMenuOpen.value = true
 }
 
 function closeProfileMenu() {
-  if (profileMenuCloseTimer) {
-    clearTimeout(profileMenuCloseTimer)
-    profileMenuCloseTimer = null
-  }
   profileMenuOpen.value = false
 }
 
-function scheduleCloseProfileMenu() {
-  if (profileMenuCloseTimer) {
-    clearTimeout(profileMenuCloseTimer)
+function showConversationFullNotice() {
+  conversationFullNotice.value = true
+  if (conversationFullNoticeTimer) {
+    clearTimeout(conversationFullNoticeTimer)
   }
-  profileMenuCloseTimer = window.setTimeout(() => {
-    profileMenuOpen.value = false
-    profileMenuCloseTimer = null
-  }, 180)
+  conversationFullNoticeTimer = window.setTimeout(() => {
+    conversationFullNotice.value = false
+    conversationFullNoticeTimer = null
+  }, 5000)
+}
+
+function dismissConversationFullNotice() {
+  if (conversationFullNoticeTimer) {
+    clearTimeout(conversationFullNoticeTimer)
+    conversationFullNoticeTimer = null
+  }
+  conversationFullNotice.value = false
 }
 
 function openPasswordModal() {
@@ -694,6 +885,21 @@ function formatBytes(size = 0) {
   return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
 }
 
+function formatThinkingTime(ms = 0) {
+  const value = Number(ms)
+  if (!Number.isFinite(value) || value < 0) return '-'
+  if (value < 1000) return `${Math.max(1, Math.round(value))} 毫秒`
+
+  const seconds = value / 1000
+  if (seconds < 60) {
+    return `${seconds.toFixed(seconds >= 10 ? 0 : 1).replace(/\.0$/, '')} 秒`
+  }
+
+  const minutes = Math.floor(seconds / 60)
+  const remain = (seconds % 60).toFixed(1).replace(/\.0$/, '')
+  return `${minutes} 分 ${remain} 秒`
+}
+
 function formatDate(value) {
   if (!value) return '-'
   const date = new Date(value)
@@ -843,6 +1049,78 @@ async function handleDelete(doc) {
   }
 }
 
+async function regenerateAssistantMessage(message) {
+  if (!message || message.role !== 'assistant' || chatBusy.value) return
+  const runConversationId = activeConversationId.value
+  const conversation = findConversation(runConversationId)
+  if (!conversation) return
+
+  const messageIndex = getConversationMessageIndex(conversation, message.id)
+  if (messageIndex <= 0) return
+
+  let userIndex = -1
+  for (let index = messageIndex - 1; index >= 0; index -= 1) {
+    if (conversation.messages[index]?.role === 'user') {
+      userIndex = index
+      break
+    }
+  }
+  if (userIndex < 0) return
+
+  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+  truncateConversationAfterIndex(conversation, userIndex)
+  expandedSources.value = {}
+  closeMessageEditor()
+  touchConversation(runConversationId)
+  await generateAssistantReply({
+    runConversationId,
+    conversation,
+    query: conversation.messages[userIndex]?.content || '',
+    shouldStickToBottom,
+  })
+}
+
+async function submitMessageEdit() {
+  if (messageEditSubmitting.value) return
+  const state = messageEditState.value
+  if (!state) return
+
+  const draft = (state.draft || '').trim()
+  if (!draft) {
+    messageEditError.value = '内容不能为空'
+    return
+  }
+
+  const runConversationId = state.conversationId || activeConversationId.value
+  const conversation = findConversation(runConversationId)
+  if (!conversation || isConversationStreaming(runConversationId)) return
+
+  const messageIndex = getConversationMessageIndex(conversation, state.messageId)
+  if (messageIndex < 0 || conversation.messages[messageIndex]?.role !== 'user') return
+
+  messageEditSubmitting.value = true
+  messageEditError.value = ''
+  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+
+  try {
+    conversation.messages[messageIndex].content = draft
+    truncateConversationAfterIndex(conversation, messageIndex)
+    expandedSources.value = {}
+    closeMessageEditor()
+    touchConversation(runConversationId)
+    await generateAssistantReply({
+      runConversationId,
+      conversation,
+      query: draft,
+      shouldStickToBottom,
+    })
+  } catch (error) {
+    messageEditError.value = error.message || '修改并重发失败'
+  } finally {
+    messageEditSubmitting.value = false
+  }
+}
+
 async function sendMessage() {
   const text = inputText.value.trim()
   if (!text || chatBusy.value) return
@@ -851,6 +1129,7 @@ async function sendMessage() {
   const runConversationId = activeConversationId.value
   const conversation = findConversation(runConversationId)
   if (!conversation) return
+  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
 
   const userMessage = {
     id: crypto.randomUUID(),
@@ -861,93 +1140,12 @@ async function sendMessage() {
   }
   conversation.messages.push(userMessage)
   inputText.value = ''
-
-  const assistantMessage = {
-    id: crypto.randomUUID(),
-    role: 'assistant',
-    content: '',
-    sources: [],
-    status: 'streaming',
-  }
-  conversation.messages.push(assistantMessage)
-  touchConversation(runConversationId)
-  setConversationStreaming(runConversationId, true)
-  await nextTick()
-  scrollToBottom(true)
-
-  const payload = {
+  await generateAssistantReply({
+    runConversationId,
+    conversation,
     query: text,
-    history: buildHistoryPayload(conversation.messages),
-    conversation_id: conversation.conversation_id,
-    session_id: conversation.session_id,
-    use_retrieval: useRetrieval.value,
-    stream: streamMode.value,
-    retrieval_method: retrievalMethod.value,
-    short_memory_strategy: 'window',
-    short_memory_n: 5,
-    short_memory_m: 10,
-    top_k: 5,
-  }
-
-  try {
-    if (payload.stream) {
-      updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-        message.status = 'streaming'
-      })
-      await streamChat(payload, (event) => {
-        if (event.event === 'message') {
-          const content = readStreamContent(event.data)
-          if (content) {
-            updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-              message.content += content
-            })
-          }
-          if (activeConversationId.value === runConversationId) {
-            scrollToBottom()
-          }
-          return
-        }
-        if (event.event === 'tool_call') {
-          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-            message.status = 'thinking'
-          })
-          return
-        }
-        if (event.event === 'tool_result') {
-          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-            message.sources = event.data?.sources || message.sources
-          })
-          return
-        }
-        if (event.event === 'done') {
-          updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-            message.sources = event.data?.sources || message.sources
-            message.status = 'done'
-          }, true)
-          return
-        }
-        if (event.event === 'error') {
-          throw new Error(event.data?.message || '流式输出失败')
-        }
-      })
-    } else {
-      const result = await generateChat(payload)
-      updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-        message.content = result.response || ''
-        message.sources = result.sources || []
-        message.status = 'done'
-      }, true)
-    }
-  } catch (error) {
-    updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-      message.content = error.message || '请求失败'
-      message.status = 'error'
-    }, true)
-  } finally {
-    setConversationStreaming(runConversationId, false)
-    touchConversation(runConversationId)
-    await nextTick()
-  }
+    shouldStickToBottom,
+  })
 }
 
 function isNearBottom(el) {
@@ -970,10 +1168,11 @@ function scrollToBottom(force = false) {
 
 function resetChat() {
   if (conversationLimitReached.value) {
-    errorText.value = `已达到后端配置的对话上限 ${maxConversations.value}，请先删除不需要的对话。`
+    showConversationFullNotice()
     return
   }
 
+  closeMessageEditor()
   touchActiveConversation(false)
   const nextConversation = createConversation()
   nextConversation.messages = [createAssistantGreeting('已开启新对话，可以继续提问。')]
@@ -1015,9 +1214,9 @@ onBeforeUnmount(() => {
     clearTimeout(conversationSaveTimer)
     conversationSaveTimer = null
   }
-  if (profileMenuCloseTimer) {
-    clearTimeout(profileMenuCloseTimer)
-    profileMenuCloseTimer = null
+  if (conversationFullNoticeTimer) {
+    clearTimeout(conversationFullNoticeTimer)
+    conversationFullNoticeTimer = null
   }
   persistConversations()
   document.removeEventListener('click', handleRetrievalMenuClick)
@@ -1036,10 +1235,7 @@ watch(conversations, () => {
   <div v-if="authLoading" class="auth-shell">
     <div class="auth-panel">
       <Loader2 :size="22" class="spin" />
-      <div>
-        <div class="eyebrow">Enterprise Knowledge System</div>
-        <div class="auth-panel__title">正在校验登录状态...</div>
-      </div>
+      <div class="auth-panel__title">正在校验登录状态...</div>
     </div>
   </div>
 
@@ -1049,10 +1245,7 @@ watch(conversations, () => {
         <div class="auth-panel__icon">
           <component :is="authMode === 'login' ? LogIn : User" :size="18" />
         </div>
-        <div>
-          <div class="eyebrow">Enterprise Knowledge System</div>
-          <h1>{{ authMode === 'login' ? '系统登录' : '创建账号' }}</h1>
-        </div>
+        <h1>{{ authMode === 'login' ? '系统登录' : '创建账号' }}</h1>
       </div>
 
       <div class="auth-tabs">
@@ -1090,6 +1283,7 @@ watch(conversations, () => {
       <label class="field">
         <span>密码</span>
         <div class="field__input">
+          <KeyRound :size="16" />
           <input
             v-model="loginForm.password"
             type="password"
@@ -1102,6 +1296,7 @@ watch(conversations, () => {
       <label v-if="authMode === 'register'" class="field">
         <span>重复密码</span>
         <div class="field__input">
+          <KeyRound :size="16" />
           <input
             v-model="loginForm.confirmPassword"
             type="password"
@@ -1121,16 +1316,31 @@ watch(conversations, () => {
         <LogIn v-else :size="16" />
         <span>{{ authSubmitting ? '提交中' : (authMode === 'login' ? '登录' : '注册') }}</span>
       </button>
+
+      <div class="app-branding app-branding--auth">
+        <div class="app-branding__title">{{ APP_NAME }} v{{ APP_VERSION }}</div>
+        <div class="app-branding__copyright">
+          版权归属
+          <a :href="COPYRIGHT_URL" target="_blank" rel="noreferrer">GuLu37</a>
+        </div>
+      </div>
     </form>
   </div>
 
   <div v-else class="shell">
+    <transition name="notice">
+      <div v-if="conversationFullNotice" class="toast toast--top">
+        <CircleAlert :size="16" />
+        <span>对话已满</span>
+        <button class="toast__close" type="button" title="关闭" @click="dismissConversationFullNotice">
+          <X :size="14" />
+        </button>
+      </div>
+    </transition>
+
     <aside class="sidebar">
       <div class="sidebar__header">
-        <div>
-          <div class="eyebrow">Enterprise Knowledge System</div>
-          <h1>文档与聊天</h1>
-        </div>
+        <h1>文档与聊天</h1>
         <button class="icon-button" type="button" @click="refreshDocs" :disabled="refreshingDocs">
           <RefreshCw :size="16" :class="{ spin: refreshingDocs }" />
         </button>
@@ -1181,12 +1391,12 @@ watch(conversations, () => {
               @click.stop="selectDocument(doc)"
             >
               <div class="doc-row__main">
-              <div class="doc-row__title">{{ doc.original_filename }}</div>
-              <div class="doc-row__meta">
-                <span>{{ doc.file_type?.toUpperCase() }}</span>
-                <span>{{ formatBytes(doc.file_size) }}</span>
-                <span :class="['status-pill', statusClass(doc.status)]">{{ statusLabel(doc.status) }}</span>
-              </div>
+                <div class="doc-row__title">{{ doc.original_filename }}</div>
+                <div class="doc-row__meta">
+                  <span>{{ doc.file_type?.toUpperCase() }}</span>
+                  <span>{{ formatBytes(doc.file_size) }}</span>
+                  <span :class="['status-pill', statusClass(doc.status)]">{{ statusLabel(doc.status) }}</span>
+                </div>
               </div>
             </button>
             <button
@@ -1213,7 +1423,16 @@ watch(conversations, () => {
             <span>{{ selectedDoc.error_message }}</span>
           </div>
         </div>
+
       </section>
+
+      <div class="app-branding app-branding--sidebar">
+        <div class="app-branding__title">{{ APP_NAME }} v{{ APP_VERSION }}</div>
+        <div class="app-branding__copyright">
+          版权归属
+          <a :href="COPYRIGHT_URL" target="_blank" rel="noreferrer">GuLu37</a>
+        </div>
+      </div>
     </aside>
 
     <main class="workspace">
@@ -1223,8 +1442,8 @@ watch(conversations, () => {
             <Bot :size="18" />
           </div>
           <div>
-            <div class="eyebrow">ChatGPT 风格对话</div>
             <h2>知识库问答台</h2>
+            <div class="eyebrow">上传文档即可进行智能检索问答</div>
           </div>
         </div>
 
@@ -1246,10 +1465,11 @@ watch(conversations, () => {
           </label>
 
           <button
-            class="ghost-button"
+            class="ghost-button topbar-action"
             type="button"
-            :disabled="conversationLimitReached"
-            :title="conversationLimitReached ? `已达到后端对话上限 ${maxConversations}` : '新建对话'"
+            :class="{ 'is-disabled': conversationLimitReached }"
+            :aria-disabled="conversationLimitReached"
+            :title="conversationLimitReached ? '对话已满' : '新建对话'"
             @click="resetChat"
           >
             <Plus :size="16" />
@@ -1260,12 +1480,10 @@ watch(conversations, () => {
             class="profile-menu"
             v-if="currentUser"
             @mouseenter="openProfileMenu"
-            @mouseleave="scheduleCloseProfileMenu"
-            @focusin="openProfileMenu"
-            @focusout="scheduleCloseProfileMenu"
+            @mouseleave="closeProfileMenu"
           >
             <button
-              class="ghost-button profile-menu__button"
+              class="ghost-button profile-menu__button topbar-action"
               type="button"
               aria-haspopup="menu"
               :aria-expanded="profileMenuOpen"
@@ -1274,7 +1492,7 @@ watch(conversations, () => {
               <span>个人信息</span>
               <ChevronDown :size="14" class="profile-menu__chevron" />
             </button>
-            <div v-show="profileMenuOpen" class="profile-menu__panel" role="menu" @mouseenter="openProfileMenu" @mouseleave="scheduleCloseProfileMenu">
+            <div v-show="profileMenuOpen" class="profile-menu__panel" role="menu">
               <div class="profile-menu__account">
                 <span class="profile-menu__account-label">账号</span>
                 <span class="profile-menu__account-value">{{ currentUser.username }}</span>
@@ -1359,31 +1577,114 @@ watch(conversations, () => {
               </div>
               <div class="message__body">
                 <div class="message__meta">
-                  <span>{{ message.role === 'user' ? '你' : '助手' }}</span>
-                  <span v-if="message.status === 'streaming'" class="typing-chip">
-                    <Loader2 :size="12" class="spin" />
-                    正在输出
-                  </span>
-                  <span v-else-if="message.status === 'thinking'" class="typing-chip">正在检索</span>
-                  <span v-else-if="message.status === 'error'" class="typing-chip error">出错</span>
+                  <span class="message__author">{{ message.role === 'user' ? '你' : '助手' }}</span>
+                  <div
+                    v-if="message.role === 'assistant' && (message.status === 'streaming' || message.status === 'thinking' || message.thinkingTimeMs != null)"
+                    class="thinking-status"
+                    :class="{
+                      'is-thinking': message.status === 'streaming' || message.status === 'thinking',
+                      'is-complete': message.thinkingTimeMs != null && message.status !== 'streaming' && message.status !== 'thinking',
+                    }"
+                    aria-live="polite"
+                  >
+                    <span class="thinking-status__label">
+                      {{ message.status === 'streaming' || message.status === 'thinking'
+                        ? '正在思考'
+                        : `已思考（用时 ${formatThinkingTime(message.thinkingTimeMs)}）` }}
+                    </span>
+                    <span
+                      v-if="message.status === 'streaming' || message.status === 'thinking'"
+                      class="thinking-status__dots"
+                      aria-hidden="true"
+                    >
+                      <span>.</span><span>.</span><span>.</span>
+                    </span>
+                  </div>
+                  <span v-if="message.status === 'error'" class="typing-chip error">出错</span>
                 </div>
-                <div class="message__content" :class="{ empty: !message.content }">
-                  <p v-if="message.content">{{ message.content }}</p>
+                <div class="message__content" :class="{ empty: !message.content, editing: isEditingMessage(message.id) }">
+                  <textarea
+                    v-if="isEditingMessage(message.id)"
+                    v-model="messageEditState.draft"
+                    class="message__edit-input"
+                    rows="4"
+                    placeholder="修改你的问题后重新提交"
+                  />
+                  <p v-else-if="message.content">{{ message.content }}</p>
                   <p v-else>...</p>
                 </div>
-                <div v-if="message.sources?.length" class="sources">
-                  <button class="source-toggle" type="button" @click="toggleSources(message.id)">
-                    <Wand2 :size="14" />
-                    <span>来源</span>
-                    <span class="source-toggle__count">{{ message.sources.length }}</span>
-                    <ChevronDown :size="14" :class="{ open: expandedSources[message.id] }" />
-                  </button>
-                  <div v-if="expandedSources[message.id]" class="source-list">
-                    <div v-for="(source, index) in message.sources" :key="index" class="source-item">
-                      <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
-                      <div class="source-item__content">{{ source.content }}</div>
+                <div
+                  class="message__footer"
+                  :class="{
+                    'has-sources': message.role === 'assistant' && message.status === 'done' && message.sources?.length,
+                    'assistant-no-sources': message.role === 'assistant' && (!message.sources || !message.sources.length),
+                  }"
+                >
+                  <div v-if="message.role === 'assistant' && message.status === 'done' && message.sources?.length" class="sources">
+                    <button class="source-toggle" type="button" @click="toggleSources(message.id)">
+                      <Wand2 :size="14" />
+                      <span>引用资料</span>
+                      <span class="source-toggle__count">{{ message.sources.length }}</span>
+                      <ChevronDown :size="14" :class="{ open: expandedSources[message.id] }" />
+                    </button>
+                    <div v-if="expandedSources[message.id]" class="source-list">
+                      <div v-for="(source, index) in message.sources" :key="index" class="source-item">
+                        <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
+                        <div class="source-item__content">{{ source.content }}</div>
+                      </div>
                     </div>
                   </div>
+                  <div class="message__actions" :class="{ 'is-editing': isEditingMessage(message.id) }">
+                    <template v-if="isEditingMessage(message.id)">
+                      <button class="message__action" type="button" title="取消修改" @click="closeMessageEditor">
+                        <X :size="14" />
+                      </button>
+                      <button
+                        class="message__action"
+                        type="button"
+                        title="提交修改"
+                        :disabled="messageEditSubmitting || !messageEditState.draft?.trim()"
+                        @click="submitMessageEdit"
+                      >
+                        <Loader2 v-if="messageEditSubmitting" :size="14" class="spin" />
+                        <Send v-else :size="14" />
+                      </button>
+                    </template>
+                    <template v-else>
+                      <button
+                        class="message__action"
+                        type="button"
+                        title="复制内容"
+                        @click="copyMessageContent(message)"
+                      >
+                        <Copy :size="14" />
+                      </button>
+                      <button
+                        v-if="message.role === 'assistant'"
+                        class="message__action"
+                        type="button"
+                        title="重新生成"
+                        :disabled="chatBusy"
+                        @click="regenerateAssistantMessage(message)"
+                      >
+                        <RotateCcw :size="14" />
+                      </button>
+                      <button
+                        v-else
+                        class="message__action"
+                        type="button"
+                        title="修改内容"
+                        :disabled="chatBusy"
+                        @click="openMessageEditor(message)"
+                      >
+                        <PencilLine :size="14" />
+                      </button>
+                    </template>
+                  </div>
+                  <p v-if="isEditingMessage(message.id) && messageEditError" class="inline-error message__edit-error">
+                    <CircleAlert :size="12" />
+                    <span>{{ messageEditError }}</span>
+                  </p>
                 </div>
               </div>
             </article>
@@ -1534,8 +1835,8 @@ watch(conversations, () => {
       <div v-if="errorText" class="toast">
         <CircleAlert :size="16" />
         <span>{{ errorText }}</span>
-        <button class="icon-button" type="button" @click="errorText = ''">
-          <ChevronDown :size="14" />
+        <button class="toast__close" type="button" @click="errorText = ''">
+          <X :size="14" />
         </button>
       </div>
 

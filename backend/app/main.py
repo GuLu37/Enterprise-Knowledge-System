@@ -55,12 +55,39 @@ def _include_routes(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # Startup
+    logger.info("==================================================")
     logger.info(f"🚀 启动 {settings.APP_NAME} (v{settings.APP_VERSION})")
     logger.info(f"环境: {settings.ENVIRONMENT}")
     logger.info(f"调试模式: {settings.DEBUG}")
+    logger.info("系统正在初始化各类设置...请稍等...")
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     init_metadata_db()
-    initialize_collections()
+
+    # 先热 LLM / Embedding，再做后续存储初始化，尽量把首聊冷启动挪到服务启动阶段。
+    try:
+        from app.services.chat_service import warmup_chat_runtime
+
+        warmup_started_at = time.perf_counter()
+        app.state.runtime_warmup = warmup_chat_runtime()
+        warmup_duration_ms = (time.perf_counter() - warmup_started_at) * 1000
+        logger.info(
+            "聊天运行时预热完成: llm=%s embedding=%s provider=%s duration=%.2fms",
+            app.state.runtime_warmup.get("llm_warmed"),
+            app.state.runtime_warmup.get("embedding_warmed"),
+            app.state.runtime_warmup.get("provider"),
+            warmup_duration_ms,
+        )
+    except Exception as exc:
+        logger.warning("聊天运行时预热阶段出错，后端继续启动: %s", exc)
+
+    app.state.milvus_ready = initialize_collections()
+    if app.state.milvus_ready:
+        logger.info("✓ Milvus 初始化完成")
+    else:
+        logger.warning("Milvus 未就绪，后端已继续启动")
+
+    logger.info("系统初始化完毕，功能正常。")
+    logger.info("==================================================")
 
     yield
 

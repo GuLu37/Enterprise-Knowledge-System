@@ -1,4 +1,5 @@
 """BGE 向量化模型配置"""
+import threading
 from typing import List, Optional
 
 import torch
@@ -112,6 +113,7 @@ class BGEEmbeddings(Embeddings):
 
 
 _embeddings_instance: Optional[BGEEmbeddings] = None
+_embeddings_init_lock = threading.Lock()
 
 
 def get_bge_embeddings(
@@ -161,5 +163,7 @@ def get_default_embeddings() -> BGEEmbeddings:
     """获取默认 Embedding 实例。"""
     global _embeddings_instance
     if _embeddings_instance is None:
-        _embeddings_instance = init_embeddings()
+        with _embeddings_init_lock:
+            if _embeddings_instance is None:
+                _embeddings_instance = init_embeddings()
     return _embeddings_instance

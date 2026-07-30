@@ -138,6 +138,12 @@ export async function getChatSettings() {
   return requestJson('/chat/settings')
 }
 
+export async function warmupChatRuntime() {
+  return requestJson('/chat/warmup', {
+    method: 'POST',
+  })
+}
+
 export async function deleteConversation(conversationId) {
   return requestJson(`/chat/conversations/${conversationId}`, {
     method: 'DELETE',
@@ -265,6 +271,7 @@ export async function streamChat(payload, onEvent) {
   const reader = response.body.getReader()
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
+  let sawDone = false
 
   while (true) {
     const { value, done } = await reader.read()
@@ -277,7 +284,10 @@ export async function streamChat(payload, onEvent) {
       buffer = buffer.slice(boundaryIndex + 2)
       if (block) {
         const parsed = parseSseEventBlock(block)
-        if (parsed) onEvent(parsed)
+        if (parsed) {
+          if (parsed.event === 'done') sawDone = true
+          onEvent(parsed)
+        }
       }
       boundaryIndex = buffer.indexOf('\n\n')
     }
@@ -286,6 +296,13 @@ export async function streamChat(payload, onEvent) {
   const tail = buffer.trim()
   if (tail) {
     const parsed = parseSseEventBlock(tail)
-    if (parsed) onEvent(parsed)
+    if (parsed) {
+      if (parsed.event === 'done') sawDone = true
+      onEvent(parsed)
+    }
+  }
+
+  if (!sawDone) {
+    onEvent({ event: 'done', data: {} })
   }
 }

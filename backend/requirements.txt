@@ -211,4 +211,3 @@ python-oxmsg==0.0.2
 olefile==0.47
 pypandoc-binary==1.17
 
-#TODO pip install -U pymilvus

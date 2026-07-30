@@ -1,4 +1,5 @@
 """LLM 配置和初始化"""
+import threading
 import time
 from typing import Any, Optional
 
@@ -400,6 +401,7 @@ def get_llm(
 
 # 全局 LLM 实例
 _llm_instance: Optional[object] = None
+_llm_init_lock = threading.Lock()
 
 
 def init_llm(
@@ -427,5 +429,7 @@ def get_default_llm():
     """获取默认 LLM 实例"""
     global _llm_instance
     if _llm_instance is None:
-        _llm_instance = init_llm()
+        with _llm_init_lock:
+            if _llm_instance is None:
+                _llm_instance = init_llm()
     return _llm_instance

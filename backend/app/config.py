@@ -28,6 +28,23 @@ def _resolve_backend_path(path_value: Optional[str], default: str) -> str:
     return str(path.resolve())
 
 
+def _resolve_backend_model_path(path_value: Optional[str], default: str) -> str:
+    """把本地模型路径优先解析到 backend 目录下；远程模型名则原样保留。"""
+    raw_value = (path_value or default).strip()
+    if not raw_value:
+        return raw_value
+
+    path = Path(raw_value)
+    if path.is_absolute():
+        return str(path.resolve())
+
+    candidate = (BACKEND_DIR / path).resolve()
+    if candidate.exists():
+        return str(candidate)
+
+    return raw_value
+
+
 def _resolve_sqlite_url(url_value: Optional[str], default: str) -> str:
     """把 SQLite 路径固定到 app/data 下，避免散落到其他目录。"""
     raw_url = (url_value or default).strip()
@@ -138,7 +155,10 @@ class Settings:
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "bge")
 
     # BGE 本地向量化配置
-    BGE_MODEL_NAME: str = os.getenv("BGE_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
+    BGE_MODEL_NAME: str = _resolve_backend_model_path(
+        os.getenv("BGE_MODEL_NAME"),
+        "./models/bge-base-zh-v1.5",
+    )
     BGE_DEVICE: str = os.getenv("BGE_DEVICE", "auto")
     BGE_MAX_LENGTH: int = int(os.getenv("BGE_MAX_LENGTH", "512"))
     BGE_BATCH_SIZE: int = int(os.getenv("BGE_BATCH_SIZE", "16"))
@@ -175,7 +195,7 @@ class Settings:
     )
 
     # ==================== 文件存储配置 ====================
-    UPLOAD_DIR: str = _resolve_backend_path(
+    UPLOAD_DIR: str = _resolve_app_path(
         os.getenv("UPLOAD_DIR"),
         "data/uploads",
     )

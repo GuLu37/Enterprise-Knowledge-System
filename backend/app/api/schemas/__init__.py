@@ -98,6 +98,12 @@ class ConversationDeleteResponse(BaseModel):
     memory_deleted: bool = False
 
 
+class ChatWarmupResponse(BaseModel):
+    llm_warmed: bool = False
+    embedding_warmed: bool = False
+    provider: Optional[str] = None
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=128)
@@ -143,6 +149,7 @@ __all__ = [
     "ChatResponse",
     "ChatSettingsResponse",
     "ConversationDeleteResponse",
+    "ChatWarmupResponse",
     "DocumentDeleteResponse",
     "DocumentContentResponse",
     "DocumentListResponse",
