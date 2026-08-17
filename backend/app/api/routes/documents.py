@@ -1,7 +1,7 @@
 """文档管理路由"""
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 import logging
 
@@ -94,17 +94,26 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/delete/{document_id}", response_model=DocumentDeleteResponse)
-async def delete_document(document_id: str):
+@router.delete(
+    "/delete/{document_id}",
+    response_model=DocumentDeleteResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def delete_document(document_id: str, background_tasks: BackgroundTasks):
     """
     删除文档
 
     - **document_id**: 文档ID
     """
     try:
-        from app.services.document_service import delete_document as delete_document_service
+        from app.services.document_service import (
+            delete_document as delete_document_service,
+            request_document_deletion,
+        )
 
-        return await run_in_threadpool(delete_document_service, document_id)
+        payload = await run_in_threadpool(request_document_deletion, document_id)
+        background_tasks.add_task(delete_document_service, document_id, True)
+        return payload
     except DocumentException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

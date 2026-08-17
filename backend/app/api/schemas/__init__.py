@@ -93,6 +93,14 @@ class ChatSettingsResponse(BaseModel):
     max_conversations: int
 
 
+class ChatRuntimeStatusResponse(BaseModel):
+    ready: bool = False
+    status: str = "initializing"
+    llm_warmed: bool = False
+    embedding_warmed: bool = False
+    provider: Optional[str] = None
+
+
 class ConversationDeleteResponse(BaseModel):
     conversation_id: str
     memory_deleted: bool = False

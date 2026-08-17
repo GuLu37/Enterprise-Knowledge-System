@@ -29,13 +29,14 @@ def _escape_filter_value(value: str) -> str:
 
 
 def _build_memory_filter(
+    user_id: str,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     chunk_type: Optional[str] = None,
     topic: Optional[str] = None,
 ) -> str:
     """构建记忆检索过滤条件。"""
-    clauses: List[str] = []
+    clauses: List[str] = [f'user_id == "{_escape_filter_value(user_id)}"']
     if conversation_id:
         clauses.append(f'conversation_id == "{_escape_filter_value(conversation_id)}"')
     if session_id:
@@ -45,6 +46,14 @@ def _build_memory_filter(
     if topic:
         clauses.append(f'topic == "{_escape_filter_value(topic)}"')
     return " and ".join(clauses)
+
+
+def _require_user_id(user_id: Optional[str]) -> str:
+    """确保长期记忆操作始终绑定到已认证用户。"""
+    normalized = (user_id or "").strip()
+    if not normalized:
+        raise VectorStoreException("user_id 不能为空，长期记忆必须绑定到用户")
+    return normalized
 
 
 def _coerce_float(value: Any) -> float:
@@ -192,6 +201,7 @@ def _build_chunk_summarizer(llm: Any):
 def _build_insert_rows(
     chunks: Sequence[Any],
     vectors: Sequence[Sequence[float]],
+    user_id: str,
     conversation_id: str,
     session_id: str,
     source_name: str,
@@ -207,10 +217,11 @@ def _build_insert_rows(
             {
                 "text": chunk.text,
                 "vector": list(vectors[chunk.chunk_index]),
-                "memory_id": f"{conversation_id}:{chunk.chunk_index}",
+                "memory_id": f"{user_id}:{conversation_id}:{chunk.chunk_index}",
                 "chunk_index": chunk.chunk_index,
                 "source_name": source_name,
                 "chunk_text": chunk.text,
+                "user_id": user_id,
                 "conversation_id": conversation_id,
                 "session_id": session_id,
                 "chunk_type": chunk_type,
@@ -225,6 +236,7 @@ def _build_insert_rows(
 
 def store_semantic_long_term_memory(
     messages: Sequence[Any] | str,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     source_name: str = "conversation",
@@ -239,6 +251,7 @@ def store_semantic_long_term_memory(
 ) -> List[str]:
     """把长期记忆写入 Milvus 的 `memory_chunks` collection。"""
     try:
+        user_key = _require_user_id(user_id)
         if isinstance(messages, str):
             chunk_texts = split_conversation_chunks(
                 messages,
@@ -300,6 +313,7 @@ def store_semantic_long_term_memory(
         rows = _build_insert_rows(
             chunks=chunks,
             vectors=vectors,
+            user_id=user_key,
             conversation_id=conversation_key,
             session_id=session_key,
             source_name=source_name,
@@ -313,7 +327,8 @@ def store_semantic_long_term_memory(
             rows=rows,
         )
         logger.info(
-            "✓ 长期记忆写入成功 (conversation_id=%s, chunks=%s)",
+            "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
+            user_key,
             conversation_key,
             len(inserted_ids),
         )
@@ -330,6 +345,7 @@ def store_long_term_memory(*args, **kwargs) -> List[str]:
 
 def store_conversation_memory(
     messages: Sequence[Any] | str,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     source_name: str = "conversation",
@@ -341,6 +357,7 @@ def store_conversation_memory(
 ) -> List[str]:
     """把对话写入长期记忆向量库。"""
     try:
+        user_key = _require_user_id(user_id)
         if isinstance(messages, str):
             chunk_texts = split_conversation_chunks(messages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             chunks = [
@@ -387,6 +404,7 @@ def store_conversation_memory(
         rows = _build_insert_rows(
             chunks=chunks,
             vectors=vectors,
+            user_id=user_key,
             conversation_id=conversation_key,
             session_id=session_key,
             source_name=source_name,
@@ -400,7 +418,8 @@ def store_conversation_memory(
             rows=rows,
         )
         logger.info(
-            "✓ 长期记忆写入成功 (conversation_id=%s, chunks=%s)",
+            "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
+            user_key,
             conversation_key,
             len(inserted_ids),
         )
@@ -413,6 +432,7 @@ def store_conversation_memory(
 def search_long_term_memory(
     query: str,
     top_k: int = 5,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     chunk_type: Optional[str] = None,
@@ -422,6 +442,7 @@ def search_long_term_memory(
     try:
         if not query or not query.strip():
             raise RetrievalException("查询文本不能为空")
+        user_key = _require_user_id(user_id)
 
         from app.core.embeddings import get_default_embeddings
         from app.storage.milvus_store import (
@@ -445,6 +466,7 @@ def search_long_term_memory(
         query_vector = embeddings.embed_query(query.strip())
 
         filter_expr = _build_memory_filter(
+            user_id=user_key,
             conversation_id=conversation_id,
             session_id=session_id,
             chunk_type=chunk_type,
@@ -461,6 +483,7 @@ def search_long_term_memory(
                 "chunk_index",
                 "source_name",
                 "chunk_text",
+                "user_id",
                 "conversation_id",
                 "session_id",
                 "chunk_type",
@@ -489,6 +512,7 @@ def search_long_term_memory(
                 "memory_id": _get_field(entity, "memory_id", _get_field(hit, "memory_id")),
                 "chunk_index": _get_field(entity, "chunk_index", _get_field(hit, "chunk_index")),
                 "source_name": _get_field(entity, "source_name", _get_field(hit, "source_name")),
+                "user_id": _get_field(entity, "user_id", _get_field(hit, "user_id")),
                 "chunk_type": _get_field(entity, "chunk_type", _get_field(hit, "chunk_type")),
                 "topic": _get_field(entity, "topic", _get_field(hit, "topic")),
                 "conversation_id": _get_field(entity, "conversation_id", _get_field(hit, "conversation_id")),
@@ -518,6 +542,7 @@ def search_long_term_memory(
 def search_conversation_memory(
     query: str,
     top_k: int = 5,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     chunk_type: Optional[str] = None,
@@ -527,6 +552,7 @@ def search_conversation_memory(
     return search_long_term_memory(
         query=query,
         top_k=top_k,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
         chunk_type=chunk_type,
@@ -534,11 +560,12 @@ def search_conversation_memory(
     )
 
 
-def delete_long_term_memory(conversation_id: str) -> bool:
-    """按 conversation_id 删除长期记忆。"""
+def delete_long_term_memory(conversation_id: str, user_id: Optional[str] = None) -> bool:
+    """按用户和 conversation_id 删除长期记忆。"""
     try:
         if not conversation_id or not conversation_id.strip():
             raise VectorStoreException("conversation_id 不能为空")
+        user_key = _require_user_id(user_id)
 
         from app.storage.milvus_store import _ensure_memory_collection, get_milvus_client
 
@@ -547,22 +574,25 @@ def delete_long_term_memory(conversation_id: str) -> bool:
             return False
 
         _ensure_memory_collection(client)
-        filter_expr = f'conversation_id == "{_escape_filter_value(conversation_id.strip())}"'
+        filter_expr = (
+            f'user_id == "{_escape_filter_value(user_key)}" and '
+            f'conversation_id == "{_escape_filter_value(conversation_id.strip())}"'
+        )
         client.delete(
             collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
             filter=filter_expr,
             timeout=30,
         )
-        logger.info("✓ 长期记忆删除成功 (conversation_id=%s)", conversation_id)
+        logger.info("✓ 长期记忆删除成功 (user_id=%s, conversation_id=%s)", user_key, conversation_id)
         return True
     except Exception as error:
         logger.error(f"长期记忆删除失败: {str(error)}")
         raise VectorStoreException(f"长期记忆删除失败: {str(error)}")
 
 
-def delete_conversation_memory(conversation_id: str) -> bool:
-    """按 conversation_id 删除长期记忆。"""
-    return delete_long_term_memory(conversation_id)
+def delete_conversation_memory(conversation_id: str, user_id: Optional[str] = None) -> bool:
+    """按用户和 conversation_id 删除长期记忆。"""
+    return delete_long_term_memory(conversation_id, user_id=user_id)
 __all__ = [
     "store_semantic_long_term_memory",
     "store_long_term_memory",

@@ -54,6 +54,26 @@ def _escape_like_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _build_searchable_row_text(row: Dict[str, Any]) -> str:
+    """组合文件名与切片正文，让文件名也参与 BM25 排序。"""
+    source_name = str(row.get("source_name") or "")
+    content = str(row.get("chunk_text") or row.get("text") or "")
+    return "\n".join(part for part in (source_name, content) if part)
+
+
+def _build_filter_expression(filter_terms: List[str]) -> str:
+    """同时在正文和来源文件名中筛选稀疏检索候选。"""
+    predicates = []
+    for term in filter_terms[:12]:
+        if not term:
+            continue
+        escaped_term = _escape_like_value(term)
+        predicates.append(
+            f'(chunk_text like "%{escaped_term}%" or source_name like "%{escaped_term}%")'
+        )
+    return " or ".join(predicates)
+
+
 def _build_filter_terms(query: str, max_terms: int = 12) -> List[str]:
     """生成适合做候选召回的关键词。"""
     query_terms = build_query_terms(query, max_terms=max_terms * 2)
@@ -133,11 +153,7 @@ class SparseRetriever(BaseRetriever):
             if not filter_terms:
                 return []
 
-            filter_expr = " or ".join(
-                f'chunk_text like "%{_escape_like_value(term)}%"'
-                for term in filter_terms[:12]
-                if term
-            )
+            filter_expr = _build_filter_expression(filter_terms)
             if not filter_expr:
                 return []
 
@@ -157,11 +173,7 @@ class SparseRetriever(BaseRetriever):
             )
 
             if not rows and len(filter_terms) > 1:
-                fallback_filter = " or ".join(
-                    f'chunk_text like "%{_escape_like_value(term)}%"'
-                    for term in filter_terms[:4]
-                    if term
-                )
+                fallback_filter = _build_filter_expression(filter_terms[:4])
                 if fallback_filter and fallback_filter != filter_expr:
                     rows = client.query(
                         collection_name=collection_name,
@@ -181,7 +193,7 @@ class SparseRetriever(BaseRetriever):
             if not rows:
                 return []
 
-            corpus = [_tokenize(str(row.get("chunk_text") or row.get("text") or "")) for row in rows]
+            corpus = [_tokenize(_build_searchable_row_text(row)) for row in rows]
             bm25 = BM25Okapi(corpus)
             query_tokens = _tokenize(query)
             scores = bm25.get_scores(query_tokens)

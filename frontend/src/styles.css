@@ -252,6 +252,35 @@ button {
   font-size: 18px;
 }
 
+.deletion-confirmation__message {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.deletion-confirmation__message span {
+  display: block;
+  margin-top: 6px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.danger-button {
+  background: var(--danger);
+  border-color: var(--danger);
+  box-shadow: none;
+}
+
+.danger-button:hover {
+  background: #d9363e;
+  border-color: #d9363e;
+}
+
 .user-chip {
   display: inline-flex;
   align-items: center;
@@ -1484,6 +1513,17 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.source-item__origin {
+  grid-column: 2;
+  justify-self: end;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 .composer {
   padding: 18px 20px 20px;
   border-top: 1px solid var(--line-soft);
@@ -2167,6 +2207,18 @@ body {
   color: var(--danger);
   background: rgba(245, 63, 63, 0.08);
   border-color: rgba(245, 63, 63, 0.18);
+}
+
+.primary-button.danger-button,
+.primary-button.danger-button:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  box-shadow: none;
+}
+
+.primary-button.danger-button:hover {
+  background: #d9363e;
+  border-color: #d9363e;
 }
 
 .conversation-panel__header h3,

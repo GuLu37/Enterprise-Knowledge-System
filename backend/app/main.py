@@ -1,4 +1,5 @@
 """FastAPI 主程序入口"""
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -51,6 +52,73 @@ def _include_routes(app: FastAPI) -> None:
     )
 
 
+def _warmup_chat_runtime_in_background(app: FastAPI) -> None:
+    """后台预热模型，避免本地模型加载阻塞服务启动。"""
+    try:
+        from app.services.chat_service import warmup_chat_runtime
+
+        warmup_started_at = time.perf_counter()
+        result = warmup_chat_runtime()
+        result["status"] = (
+            "ready"
+            if result.get("llm_warmed") and result.get("embedding_warmed")
+            else "failed"
+        )
+        app.state.runtime_warmup = result
+        logger.info(
+            "聊天运行时后台预热完成: llm=%s embedding=%s provider=%s duration=%.2fms",
+            result.get("llm_warmed"),
+            result.get("embedding_warmed"),
+            result.get("provider"),
+            (time.perf_counter() - warmup_started_at) * 1000,
+        )
+    except Exception as exc:
+        app.state.runtime_warmup = {
+            "llm_warmed": False,
+            "embedding_warmed": False,
+            "provider": None,
+            "error": str(exc),
+        }
+        logger.warning("聊天运行时后台预热出错，首次请求将按需初始化: %s", exc)
+
+
+def _initialize_milvus_in_background(app: FastAPI) -> None:
+    """后台初始化 Milvus，避免连接或 collection 预热拖慢服务可用时间。"""
+    try:
+        app.state.milvus_ready = initialize_collections()
+        if app.state.milvus_ready:
+            logger.info("✓ Milvus 后台初始化完成")
+        else:
+            logger.warning("Milvus 后台初始化未完成，检索与入库将在服务恢复后可用")
+    except Exception as exc:
+        app.state.milvus_ready = False
+        logger.warning("Milvus 后台初始化出错: %s", exc)
+
+
+def _start_background_initialization(app: FastAPI) -> None:
+    """启动不影响 HTTP 就绪状态的后台初始化任务。"""
+    app.state.runtime_warmup = {
+        "llm_warmed": False,
+        "embedding_warmed": False,
+        "provider": None,
+        "status": "initializing",
+    }
+    app.state.milvus_ready = False
+
+    threading.Thread(
+        target=_warmup_chat_runtime_in_background,
+        args=(app,),
+        name="chat-runtime-warmup",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_initialize_milvus_in_background,
+        args=(app,),
+        name="milvus-initialization",
+        daemon=True,
+    ).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -62,31 +130,9 @@ async def lifespan(app: FastAPI):
     logger.info("系统正在初始化各类设置...请稍等...")
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     init_metadata_db()
+    _start_background_initialization(app)
 
-    # 先热 LLM / Embedding，再做后续存储初始化，尽量把首聊冷启动挪到服务启动阶段。
-    try:
-        from app.services.chat_service import warmup_chat_runtime
-
-        warmup_started_at = time.perf_counter()
-        app.state.runtime_warmup = warmup_chat_runtime()
-        warmup_duration_ms = (time.perf_counter() - warmup_started_at) * 1000
-        logger.info(
-            "聊天运行时预热完成: llm=%s embedding=%s provider=%s duration=%.2fms",
-            app.state.runtime_warmup.get("llm_warmed"),
-            app.state.runtime_warmup.get("embedding_warmed"),
-            app.state.runtime_warmup.get("provider"),
-            warmup_duration_ms,
-        )
-    except Exception as exc:
-        logger.warning("聊天运行时预热阶段出错，后端继续启动: %s", exc)
-
-    app.state.milvus_ready = initialize_collections()
-    if app.state.milvus_ready:
-        logger.info("✓ Milvus 初始化完成")
-    else:
-        logger.warning("Milvus 未就绪，后端已继续启动")
-
-    logger.info("系统初始化完毕，功能正常。")
+    logger.info("核心服务已就绪，模型与 Milvus 正在后台初始化。")
     logger.info("==================================================")
 
     yield

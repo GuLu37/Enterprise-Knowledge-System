@@ -20,6 +20,30 @@ async function parseJsonResponse(response) {
   }
 }
 
+function formatErrorDetail(detail, fallback = '请求失败') {
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!item || typeof item !== 'object') return ''
+        const location = Array.isArray(item.loc) ? item.loc.slice(1).join('.') : ''
+        const message = typeof item.msg === 'string' ? item.msg : ''
+        return [location, message].filter(Boolean).join('：')
+      })
+      .filter(Boolean)
+    if (messages.length) return messages.join('；')
+  }
+
+  if (detail && typeof detail === 'object' && typeof detail.message === 'string') {
+    return detail.message
+  }
+
+  return fallback
+}
+
 export function getAuthToken() {
   return localStorage.getItem(AUTH_TOKEN_KEY) || ''
 }
@@ -92,7 +116,7 @@ async function requestJson(path, options = {}, allowRetry = true) {
   })
 
   if (!response.ok) {
-    const detail = (await parseJsonResponse(response))?.detail || '请求失败'
+    const detail = formatErrorDetail((await parseJsonResponse(response))?.detail)
     if (response.status === 401 && auth && allowRetry && getRefreshToken()) {
       try {
         await refreshAuthSession()
@@ -136,6 +160,10 @@ export async function getDocumentContent(documentId) {
 
 export async function getChatSettings() {
   return requestJson('/chat/settings')
+}
+
+export async function getChatRuntimeStatus() {
+  return requestJson('/chat/runtime-status')
 }
 
 export async function warmupChatRuntime() {
@@ -265,7 +293,10 @@ export async function streamChat(payload, onEvent) {
   }
 
   if (!response.ok || !response.body) {
-    throw new Error((await parseJsonResponse(response))?.detail || '流式请求失败')
+    throw new Error(formatErrorDetail(
+      (await parseJsonResponse(response))?.detail,
+      '流式请求失败',
+    ))
   }
 
   const reader = response.body.getReader()

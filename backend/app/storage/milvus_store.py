@@ -233,6 +233,7 @@ def _create_memory_collection(client: MilvusClient) -> None:
     """创建长期记忆向量 collection。"""
     schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
     _add_common_fields(schema, "memory_id")
+    schema.add_field(field_name="user_id", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
     schema.add_field(field_name="conversation_id", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
     schema.add_field(field_name="session_id", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
     schema.add_field(field_name="chunk_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
@@ -288,6 +289,7 @@ def _ensure_memory_collection(client: MilvusClient) -> None:
         "chunk_index",
         "source_name",
         "chunk_text",
+        "user_id",
         "conversation_id",
         "session_id",
         "chunk_type",

@@ -491,12 +491,12 @@ def list_documents(skip: int = 0, limit: int = 10) -> Dict:
         db.close()
 
 
-def delete_document(document_id: str) -> Dict:
-    """删除 SQLite 元数据、Milvus 向量块和本地原始文件。"""
+def request_document_deletion(document_id: str) -> Dict:
+    """先把文档标记为 deleting，供接口快速返回并提交后台清理。"""
     init_metadata_db()
     db: Session = SessionLocal()
     try:
-        _log_delete_step(document_id, "1/4", "开始删除文档")
+        _log_delete_step(document_id, "1/4", "收到删除请求")
         record, file_path = _validate_document_delete_prerequisites(db, document_id)
         _log_delete_step(
             document_id,
@@ -505,8 +505,40 @@ def delete_document(document_id: str) -> Dict:
         )
 
         record.status = "deleting"
+        record.error_message = None
         db.commit()
         _log_delete_step(document_id, "1/4", "SQLite 状态已更新为 deleting")
+        payload = _serialize_record(record)
+        payload["milvus_deleted"] = False
+        payload["file_deleted"] = False
+        return payload
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def delete_document(document_id: str, already_marked: bool = False) -> Dict:
+    """后台删除 SQLite 元数据、Milvus 向量块和本地原始文件。"""
+    init_metadata_db()
+    db: Session = SessionLocal()
+    try:
+        _log_delete_step(document_id, "1/4", "开始执行后台删除")
+        record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
+        if not record:
+            raise DocumentException("文档不存在")
+        if record.status == "deleted":
+            raise DocumentException("文档已经删除")
+        if record.status != "deleting":
+            if already_marked:
+                raise DocumentException(f"文档当前状态为 {record.status}，无法执行后台删除")
+            record.status = "deleting"
+            record.error_message = None
+            db.commit()
+            _log_delete_step(document_id, "1/4", "SQLite 状态已更新为 deleting")
+
+        file_path = Path(record.file_path)
 
         _log_delete_step(document_id, "2/4", "开始删除 Milvus 文档切块")
         try:
@@ -550,6 +582,15 @@ def delete_document(document_id: str) -> Dict:
         return payload
     except Exception as e:
         db.rollback()
+        try:
+            record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
+            if record:
+                record.status = "ready"
+                record.error_message = f"删除失败: {str(e)}"
+                db.commit()
+                _log_delete_step(document_id, "1/4", "后台删除失败，文档状态已恢复为 ready")
+        except Exception:
+            db.rollback()
         logger.exception(f"文档删除失败 (document_id={document_id}): {e}")
         raise
     finally:

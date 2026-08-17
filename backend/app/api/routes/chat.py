@@ -1,18 +1,20 @@
 """对话 HTTP 路由。"""
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.api.schemas import (
     ChatRequest,
     ChatResponse,
+    ChatRuntimeStatusResponse,
     ChatSettingsResponse,
     ConversationDeleteResponse,
     ChatWarmupResponse,
 )
 from app.config import settings
+from app.services.auth_service import require_current_user
 from app.utils.exceptions import VectorStoreException
 
 router = APIRouter()
@@ -29,6 +31,24 @@ async def get_chat_settings():
     return ChatSettingsResponse(max_conversations=settings.CHAT_MAX_CONVERSATIONS)
 
 
+@router.get("/runtime-status", response_model=ChatRuntimeStatusResponse)
+async def get_chat_runtime_status(request: Request):
+    """返回聊天模型和向量模型的后台初始化状态。"""
+    runtime_warmup = getattr(request.app.state, "runtime_warmup", {}) or {}
+    llm_warmed = bool(runtime_warmup.get("llm_warmed"))
+    embedding_warmed = bool(runtime_warmup.get("embedding_warmed"))
+    ready = llm_warmed and embedding_warmed
+    status = "ready" if ready else str(runtime_warmup.get("status") or "initializing")
+
+    return ChatRuntimeStatusResponse(
+        ready=ready,
+        status=status,
+        llm_warmed=llm_warmed,
+        embedding_warmed=embedding_warmed,
+        provider=runtime_warmup.get("provider"),
+    )
+
+
 @router.post("/warmup", response_model=ChatWarmupResponse)
 async def warmup_chat_runtime():
     """预热聊天相关的 LLM 和 embedding 运行时。"""
@@ -42,12 +62,16 @@ async def warmup_chat_runtime():
 
 
 @router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, current_user=Depends(require_current_user)):
     """删除一个 conversation_id 关联的长期记忆。"""
     try:
         from app.services.memory_service import delete_long_term_memory
 
-        memory_deleted = await run_in_threadpool(delete_long_term_memory, conversation_id)
+        memory_deleted = await run_in_threadpool(
+            delete_long_term_memory,
+            conversation_id,
+            current_user["user_id"],
+        )
         return ConversationDeleteResponse(
             conversation_id=conversation_id,
             memory_deleted=memory_deleted,
@@ -59,7 +83,7 @@ async def delete_conversation(conversation_id: str):
 
 
 @router.post("/generate", response_model=ChatResponse)
-async def generate_response(request: ChatRequest):
+async def generate_response(request: ChatRequest, current_user=Depends(require_current_user)):
     """生成一次先做意图路由、再按需调用 RAG 工具的回答。"""
     try:
         from app.services.chat_service import generate_chat
@@ -73,6 +97,7 @@ async def generate_response(request: ChatRequest):
             top_k=request.top_k,
             use_retrieval=request.use_retrieval,
             retrieval_method=request.retrieval_method,
+            user_id=current_user["user_id"],
             short_memory_strategy=request.short_memory_strategy,
             short_memory_n=request.short_memory_n,
             short_memory_m=request.short_memory_m,
@@ -93,7 +118,7 @@ async def generate_response(request: ChatRequest):
 
 
 @router.post("/stream")
-async def stream_response(request: ChatRequest):
+async def stream_response(request: ChatRequest, current_user=Depends(require_current_user)):
     """流式生成回答，并转发 RAG 工具调用及来源事件。"""
 
     def event_stream():
@@ -106,6 +131,7 @@ async def stream_response(request: ChatRequest):
                     "query": request.query,
                     "conversation_id": request.conversation_id,
                     "session_id": request.session_id,
+                    "user_id": current_user["user_id"],
                     "provider": request.provider,
                     "model": request.model,
                     "use_retrieval": request.use_retrieval,
@@ -124,6 +150,7 @@ async def stream_response(request: ChatRequest):
                 top_k=request.top_k,
                 use_retrieval=request.use_retrieval,
                 retrieval_method=request.retrieval_method,
+                user_id=current_user["user_id"],
                 short_memory_strategy=request.short_memory_strategy,
                 short_memory_n=request.short_memory_n,
                 short_memory_m=request.short_memory_m,

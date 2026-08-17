@@ -29,7 +29,7 @@ _PROVIDER_FACTORIES = {
     ),
 }
 
-_FALLBACK_ORDER = ("deepseek", "openai", "anthropic", "openrouter", "ollama")
+_FALLBACK_ORDER = ("deepseek", "openrouter", "openai", "anthropic", "ollama")
 _FAILURE_TTL_SECONDS = 60
 
 
@@ -104,16 +104,15 @@ class FallbackLLM:
         providers = _build_provider_order(self.preferred_provider)
         now = time.monotonic()
 
-        # 先过滤掉近期刚失败过的 provider，避免每次请求都重复踩同一个坑。
-        # 但如果是显式指定的 preferred provider，仍然优先尝试一次。
+        # 过滤未配置和近期刚失败过的 provider，避免无效初始化与重复等待。
         candidates = []
         for provider in providers:
-            if provider == self.preferred_provider:
-                candidates.append(provider)
-                continue
-
             failed_at = self._failure_at.get(provider)
-            if failed_at is not None and (now - failed_at) < _FAILURE_TTL_SECONDS:
+            if (
+                provider != self.preferred_provider
+                and failed_at is not None
+                and (now - failed_at) < _FAILURE_TTL_SECONDS
+            ):
                 continue
             if _provider_is_configured(provider, self.model):
                 candidates.append(provider)
@@ -130,10 +129,14 @@ class FallbackLLM:
             timeout=self.timeout,
         )
 
+    def _attempt_providers(self) -> list[str]:
+        """限制单次调用的候选数量，避免故障时轮询全部 provider。"""
+        return self._candidate_providers()[:settings.LLM_MAX_FALLBACK_ATTEMPTS]
+
     def prime(self) -> str:
         """预先挑选一个当前可用的 provider。"""
         errors: list[str] = []
-        for provider in self._candidate_providers():
+        for provider in self._attempt_providers():
             try:
                 self._active_llm = self._instantiate_provider(provider)
                 self.active_provider = provider
@@ -153,7 +156,7 @@ class FallbackLLM:
 
     def _fallback_call(self, method_name: str, *args, **kwargs):
         errors: list[str] = []
-        providers = self._candidate_providers()
+        providers = self._attempt_providers()
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
@@ -185,7 +188,7 @@ class FallbackLLM:
 
     def stream(self, *args, **kwargs):
         errors: list[str] = []
-        providers = self._candidate_providers()
+        providers = self._attempt_providers()
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
@@ -212,7 +215,7 @@ class FallbackLLM:
 
     async def astream(self, *args, **kwargs):
         errors: list[str] = []
-        providers = self._candidate_providers()
+        providers = self._attempt_providers()
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
@@ -386,13 +389,13 @@ def get_llm(
     获取 LLM 实例
 
     Args:
-        provider: LLM 提供商。若不传，则按 deepseek -> openai -> anthropic -> openrouter -> ollama 兜底。
+        provider: LLM 提供商。若不传，优先使用 LLM_PROVIDER 配置，再按兜底顺序尝试。
         model: 可选，覆盖默认模型名称
         temperature: 可选，覆盖默认温度
         timeout: 可选，覆盖默认超时
     """
     return FallbackLLM(
-        preferred_provider=provider,
+        preferred_provider=_normalize_provider(provider) or _normalize_provider(settings.LLM_PROVIDER),
         model=model,
         temperature=temperature,
         timeout=timeout,

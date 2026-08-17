@@ -209,6 +209,58 @@ flowchart TD
 
 完整的配置项及示例请查看 [backend/.env.example](backend/.env.example)。
 
+## 向量数据库 Schema
+
+项目使用 Milvus 存储文档切块向量和长期记忆向量。默认向量维度为 `EMBEDDING_DIMENSION=768`，如更换 Embedding 模型，需要同步调整 Milvus collection 的 `vector` 维度。
+
+### 文档向量 Collection
+
+默认 collection 名称：`doc_chunks`，对应配置项 `MILVUS_DOC_COLLECTION_NAME`。
+
+| 字段名 | Milvus 类型 | 约束 / 说明 |
+| --- | --- | --- |
+| `pk` | `INT64` | 主键，`auto_id=True` |
+| `text` | `VARCHAR(65535)` | 原始文本字段 |
+| `vector` | `FLOAT_VECTOR(768)` | 文档切块向量，维度由 `EMBEDDING_DIMENSION` 控制 |
+| `document_id` | `VARCHAR(65535)` | 文档 ID |
+| `chunk_index` | `INT64` | 文档内切块序号 |
+| `source_name` | `VARCHAR(65535)` | 来源文件名 |
+| `chunk_text` | `VARCHAR(65535)` | 切块正文 |
+| `file_type` | `VARCHAR(65535)` | 文件类型，如 `pdf`、`docx`、`xlsx` |
+| `content_type` | `VARCHAR(65535)` | 上传文件 MIME 类型 |
+
+### 长期记忆 Collection
+
+默认 collection 名称：`memory_chunks`，对应配置项 `MILVUS_MEMORY_COLLECTION_NAME`。
+
+| 字段名 | Milvus 类型 | 约束 / 说明 |
+| --- | --- | --- |
+| `pk` | `INT64` | 主键，`auto_id=True` |
+| `text` | `VARCHAR(65535)` | 记忆文本字段 |
+| `vector` | `FLOAT_VECTOR(768)` | 长期记忆向量，维度由 `EMBEDDING_DIMENSION` 控制 |
+| `memory_id` | `VARCHAR(65535)` | 记忆 ID，格式为 `user_id:conversation_id:chunk_index` |
+| `chunk_index` | `INT64` | 记忆切块序号 |
+| `source_name` | `VARCHAR(65535)` | 来源名称，默认为 `conversation` |
+| `chunk_text` | `VARCHAR(65535)` | 记忆切块正文 |
+| `user_id` | `VARCHAR(65535)` | 用户隔离字段，检索和删除长期记忆时必须匹配当前登录用户 |
+| `conversation_id` | `VARCHAR(65535)` | 对话 ID |
+| `session_id` | `VARCHAR(65535)` | 会话 ID |
+| `chunk_type` | `VARCHAR(65535)` | 记忆类型，如 `semantic_memory`、`dialogue` |
+| `topic` | `VARCHAR(65535)` | 主题 |
+| `turn_start` | `INT64` | 起始对话轮次 |
+| `turn_end` | `INT64` | 结束对话轮次 |
+| `created_at` | `VARCHAR(65535)` | 创建时间，ISO 字符串 |
+
+### 向量索引
+
+两个 collection 都使用同一套向量索引配置：
+
+| 配置 | 值 |
+| --- | --- |
+| 索引字段 | `vector` |
+| 索引类型 | `AUTOINDEX` |
+| 距离度量 | `COSINE` |
+
 ## API
 
 除登录、注册、刷新令牌与健康检查外，接口都需要携带：

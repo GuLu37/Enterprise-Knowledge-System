@@ -31,6 +31,7 @@ import {
   changePassword as apiChangePassword,
   generateChat,
   getChatSettings,
+  getChatRuntimeStatus,
   getCurrentUser,
   getDocumentContent,
   listDocuments,
@@ -42,12 +43,13 @@ import {
   getAuthToken,
 } from './lib/api'
 
-const CONVERSATION_STORAGE_KEY = 'enterprise-knowledge-system.conversations'
+const CONVERSATION_STORAGE_KEY_PREFIX = 'enterprise-knowledge-system.conversations'
 const DEFAULT_MAX_CONVERSATIONS = 20
 const APP_NAME = '企业知识库问答系统'
 const APP_VERSION = '1.0.0'
 const COPYRIGHT_URL = 'https://github.com/GuLu37'
 const SOURCE_DISPLAY_LIMIT = 3
+const CHAT_RUNTIME_STATUS_INTERVAL_MS = 1000
 
 function createAssistantGreeting(content = '你好，我在这里。可以先上传文档，再直接提问。') {
   return {
@@ -73,22 +75,36 @@ function createConversation() {
 
 function normalizeStoredConversation(item) {
   const fallback = createConversation()
-  const messages = Array.isArray(item?.messages) && item.messages.length
+  const messages = Array.isArray(item?.messages)
     ? item.messages
-    : fallback.messages
+      .filter((message) => message && typeof message === 'object')
+      .map((message) => ({
+        ...message,
+        content: typeof message.content === 'string' ? message.content : '',
+      }))
+    : []
 
   return {
     conversation_id: item?.conversation_id || fallback.conversation_id,
     session_id: item?.session_id || fallback.session_id,
     created_at: item?.created_at || fallback.created_at,
     updated_at: item?.updated_at || item?.created_at || fallback.updated_at,
-    messages,
+    messages: messages.length ? messages : fallback.messages,
   }
 }
 
-function loadConversations() {
+function getConversationStorageKey(user) {
+  const userKey = typeof user === 'string'
+    ? user
+    : user?.user_id || user?.username || ''
+  return userKey ? `${CONVERSATION_STORAGE_KEY_PREFIX}.${userKey}` : ''
+}
+
+function loadConversationsForUser(user) {
+  const storageKey = getConversationStorageKey(user)
+  if (!storageKey) return [createConversation()]
   try {
-    const stored = JSON.parse(localStorage.getItem(CONVERSATION_STORAGE_KEY) || '[]')
+    const stored = JSON.parse(localStorage.getItem(storageKey) || '[]')
     if (Array.isArray(stored) && stored.length) {
       return stored.map(normalizeStoredConversation)
     }
@@ -117,6 +133,7 @@ const passwordForm = ref({
   newPassword: '',
   confirmPassword: '',
 })
+const pendingDeletion = ref(null)
 const profileMenuOpen = ref(false)
 
 const docs = ref([])
@@ -125,16 +142,28 @@ const selectedDocId = ref('')
 const uploadError = ref('')
 const uploadBusy = ref(false)
 const refreshingDocs = ref(false)
-const conversations = ref(loadConversations())
+const deletingDocumentIds = ref({})
+const conversations = ref([createConversation()])
 const activeConversationId = ref(conversations.value[0].conversation_id)
 const chatMessages = ref(conversations.value[0].messages)
 const chatSettings = ref({ max_conversations: DEFAULT_MAX_CONVERSATIONS })
+const chatRuntime = ref({
+  ready: false,
+  status: 'initializing',
+  llm_warmed: false,
+  embedding_warmed: false,
+})
 const deletingConversationIds = ref({})
 const streamingConversationIds = ref({})
 const inputText = ref('')
 const chatBusy = computed(() => Boolean(streamingConversationIds.value[activeConversationId.value]))
+const chatRuntimeReady = computed(() => Boolean(chatRuntime.value.ready))
+const chatInputDisabled = computed(() => chatBusy.value || !chatRuntimeReady.value)
+const chatRuntimeMessage = computed(() => {
+  if (chatRuntimeReady.value) return chatBusy.value ? '正在生成回答' : '等待输入'
+  return chatRuntime.value.status === 'failed' ? '系统初始化失败' : '系统正在初始化...'
+})
 const streamMode = ref(true)
-const useRetrieval = ref(true)
 const retrievalMethod = ref('hybrid')
 const retrievalMenuOpen = ref(false)
 const errorText = ref('')
@@ -157,6 +186,7 @@ let previewRequestSeq = 0
 let sheetDragCleanup = null
 let conversationSaveTimer = null
 let conversationFullNoticeTimer = null
+let chatRuntimeStatusTimer = null
 
 const retrievalOptions = [
   { value: 'hybrid', label: '混合检索' },
@@ -201,8 +231,38 @@ function getDisplaySources(message) {
   return (message?.sources || []).slice(0, SOURCE_DISPLAY_LIMIT)
 }
 
+function getSourceFilename(source) {
+  const metadata = source?.metadata && typeof source.metadata === 'object'
+    ? source.metadata
+    : {}
+  const sourceName = (
+    source?.source_name
+    || metadata.source_name
+    || source?.original_filename
+    || metadata.original_filename
+    || metadata.stored_filename
+    || metadata.document_id
+    || '未知文件'
+  )
+  return String(sourceName).trim() || '未知文件'
+}
+
 function findConversation(id = activeConversationId.value) {
   return conversations.value.find((conversation) => conversation.conversation_id === id)
+}
+
+function replaceConversations(nextConversations) {
+  const normalized = Array.isArray(nextConversations) && nextConversations.length
+    ? nextConversations.map(normalizeStoredConversation)
+    : [createConversation()]
+  conversations.value = normalized
+  const nextActive = conversationList.value[0] || conversations.value[0]
+  activeConversationId.value = nextActive.conversation_id
+  conversationId.value = nextActive.conversation_id
+  sessionId.value = nextActive.session_id
+  chatMessages.value = nextActive.messages
+  expandedSources.value = {}
+  autoScrollEnabled.value = true
 }
 
 function isConversationStreaming(id) {
@@ -297,7 +357,7 @@ async function generateAssistantReply({
     history: buildHistoryPayload(conversation.messages),
     conversation_id: conversation.conversation_id,
     session_id: conversation.session_id,
-    use_retrieval: useRetrieval.value,
+    use_retrieval: true,
     stream: streamMode.value,
     retrieval_method: retrievalMethod.value,
     short_memory_strategy: 'window',
@@ -337,6 +397,9 @@ async function generateAssistantReply({
         }
         if (event.event === 'done') {
           updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
+            if (typeof event.data?.content === 'string') {
+              message.content = event.data.content
+            }
             message.sources = event.data?.sources || message.pendingSources || message.sources
             message.pendingSources = []
             message.status = 'done'
@@ -450,6 +513,40 @@ async function loadChatSettings() {
   }
 }
 
+function stopChatRuntimeStatusPolling() {
+  if (chatRuntimeStatusTimer) {
+    clearInterval(chatRuntimeStatusTimer)
+    chatRuntimeStatusTimer = null
+  }
+}
+
+async function refreshChatRuntimeStatus() {
+  try {
+    const status = await getChatRuntimeStatus()
+    chatRuntime.value = {
+      ready: Boolean(status.ready),
+      status: status.status || 'initializing',
+      llm_warmed: Boolean(status.llm_warmed),
+      embedding_warmed: Boolean(status.embedding_warmed),
+      provider: status.provider || null,
+    }
+    if (chatRuntime.value.ready || chatRuntime.value.status === 'failed') {
+      stopChatRuntimeStatusPolling()
+    }
+  } catch {
+    // 后端重启期间保持禁用，下一轮轮询恢复后会自动解除。
+  }
+}
+
+function startChatRuntimeStatusPolling() {
+  stopChatRuntimeStatusPolling()
+  refreshChatRuntimeStatus()
+  chatRuntimeStatusTimer = window.setInterval(
+    refreshChatRuntimeStatus,
+    CHAT_RUNTIME_STATUS_INTERVAL_MS,
+  )
+}
+
 async function bootstrapAuth() {
   authLoading.value = true
   authError.value = ''
@@ -463,6 +560,7 @@ async function bootstrapAuth() {
 
   try {
     currentUser.value = await getCurrentUser()
+    replaceConversations(loadConversationsForUser(currentUser.value))
     isAuthenticated.value = true
     return true
   } catch (error) {
@@ -595,7 +693,7 @@ async function handleChangePassword() {
   }
 }
 
-async function removeConversation(conversation) {
+function requestConversationDeletion(conversation) {
   if (!conversation?.conversation_id) return
   const id = conversation.conversation_id
   if (isConversationStreaming(id)) {
@@ -603,35 +701,45 @@ async function removeConversation(conversation) {
     return
   }
 
-  if (!window.confirm(`删除对话「${getConversationTitle(conversation)}」并同步清除长期记忆？`)) return
+  pendingDeletion.value = {
+    type: 'conversation',
+    target: conversation,
+    title: getConversationTitle(conversation),
+  }
+}
+
+async function removeConversation(conversation) {
+  if (!conversation?.conversation_id) return
+  const id = conversation.conversation_id
 
   deletingConversationIds.value = {
     ...deletingConversationIds.value,
     [id]: true,
   }
 
+  conversations.value = conversations.value.filter((item) => item.conversation_id !== id)
+
+  if (!conversations.value.length) {
+    const nextConversation = createConversation()
+    conversations.value.push(nextConversation)
+  }
+
+  if (activeConversationId.value === id) {
+    const nextActive = conversationList.value[0] || conversations.value[0]
+    activeConversationId.value = nextActive.conversation_id
+    conversationId.value = nextActive.conversation_id
+    sessionId.value = nextActive.session_id
+    chatMessages.value = nextActive.messages
+    expandedSources.value = {}
+    autoScrollEnabled.value = true
+    await nextTick()
+    scrollToBottom(true)
+  }
+
   try {
     await deleteConversation(id)
-    conversations.value = conversations.value.filter((item) => item.conversation_id !== id)
-
-    if (!conversations.value.length) {
-      const nextConversation = createConversation()
-      conversations.value.push(nextConversation)
-    }
-
-    if (activeConversationId.value === id) {
-      const nextActive = conversationList.value[0] || conversations.value[0]
-      activeConversationId.value = nextActive.conversation_id
-      conversationId.value = nextActive.conversation_id
-      sessionId.value = nextActive.session_id
-      chatMessages.value = nextActive.messages
-      expandedSources.value = {}
-      autoScrollEnabled.value = true
-      await nextTick()
-      scrollToBottom(true)
-    }
   } catch (error) {
-    errorText.value = error.message || '删除对话失败'
+    errorText.value = `对话已删除，但长期记忆清理失败：${error.message || '请稍后重试'}`
   } finally {
     const nextDeleting = { ...deletingConversationIds.value }
     delete nextDeleting[id]
@@ -640,7 +748,9 @@ async function removeConversation(conversation) {
 }
 
 function persistConversations() {
-  localStorage.setItem(CONVERSATION_STORAGE_KEY, JSON.stringify(conversations.value))
+  const storageKey = getConversationStorageKey(currentUser.value)
+  if (!storageKey) return
+  localStorage.setItem(storageKey, JSON.stringify(conversations.value))
 }
 
 function scheduleConversationPersist() {
@@ -934,10 +1044,15 @@ function statusClass(status) {
 function buildHistoryPayload(messages = chatMessages.value) {
   return messages
     .slice(0, -2)
-    .filter((message) => (message.role === 'user' || message.role === 'assistant') && !message.ephemeral)
+    .filter((message) => (
+      (message.role === 'user' || message.role === 'assistant')
+      && !message.ephemeral
+      && typeof message.content === 'string'
+      && message.content.trim()
+    ))
     .map((message) => ({
       role: message.role,
-      content: message.content,
+      content: message.content.trim(),
     }))
 }
 
@@ -1036,26 +1151,62 @@ async function handleUpload(event) {
   }
 }
 
-async function handleDelete(doc) {
+function requestDocumentDeletion(doc) {
   if (!doc?.document_id) return
   if (doc.status !== 'ready') {
-    errorText.value = '文档还在处理中，状态切换为可用后才可以删除。'
+    errorText.value = doc.status === 'deleting'
+      ? '该文档正在删除中，请稍候。'
+      : doc.status === 'failed'
+        ? '该文档入库失败，请先重新上传后再删除。'
+        : '文档还在处理中，状态切换为可用后才可以删除。'
     return
   }
-  if (!window.confirm(`删除文档「${doc.original_filename}」？`)) return
-  try {
-    await deleteDocument(doc.document_id)
-    if (selectedDocId.value === doc.document_id) {
-      closeDocumentPreview()
-    }
-    await loadDocs()
-  } catch (error) {
-    errorText.value = error.message || '删除失败'
+
+  pendingDeletion.value = {
+    type: 'document',
+    target: doc,
+    title: doc.original_filename,
   }
 }
 
+async function handleDelete(doc) {
+  if (!doc?.document_id) return
+
+  const documentId = doc.document_id
+  deletingDocumentIds.value = {
+    ...deletingDocumentIds.value,
+    [documentId]: true,
+  }
+
+  try {
+    await deleteDocument(documentId)
+    docs.value = docs.value.filter((item) => item.document_id !== documentId)
+    if (selectedDocId.value === documentId) {
+      closeDocumentPreview()
+    }
+  } catch (error) {
+    errorText.value = error.message || '删除失败'
+  } finally {
+    const nextDeleting = { ...deletingDocumentIds.value }
+    delete nextDeleting[documentId]
+    deletingDocumentIds.value = nextDeleting
+  }
+}
+
+async function confirmPendingDeletion() {
+  const pending = pendingDeletion.value
+  pendingDeletion.value = null
+  if (!pending?.target) return
+
+  if (pending.type === 'conversation') {
+    await removeConversation(pending.target)
+    return
+  }
+  await handleDelete(pending.target)
+}
+
 async function regenerateAssistantMessage(message) {
-  if (!message || message.role !== 'assistant' || chatBusy.value) return
+  if (!message || message.role !== 'assistant' || chatInputDisabled.value) return
   const runConversationId = activeConversationId.value
   const conversation = findConversation(runConversationId)
   if (!conversation) return
@@ -1086,7 +1237,7 @@ async function regenerateAssistantMessage(message) {
 }
 
 async function submitMessageEdit() {
-  if (messageEditSubmitting.value) return
+  if (messageEditSubmitting.value || !chatRuntimeReady.value) return
   const state = messageEditState.value
   if (!state) return
 
@@ -1128,7 +1279,7 @@ async function submitMessageEdit() {
 
 async function sendMessage() {
   const text = inputText.value.trim()
-  if (!text || chatBusy.value) return
+  if (!text || chatInputDisabled.value) return
 
   errorText.value = ''
   const runConversationId = activeConversationId.value
@@ -1196,6 +1347,7 @@ function resetChat() {
 function handleComposerKeydown(event) {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault()
+    if (!chatRuntimeReady.value) return
     sendMessage()
   }
 }
@@ -1208,6 +1360,7 @@ onMounted(async () => {
     loadDocs(),
     loadChatSettings(),
   ])
+  startChatRuntimeStatusPolling()
   await nextTick()
   scrollToBottom(true)
   document.addEventListener('click', handleRetrievalMenuClick)
@@ -1223,6 +1376,7 @@ onBeforeUnmount(() => {
     clearTimeout(conversationFullNoticeTimer)
     conversationFullNoticeTimer = null
   }
+  stopChatRuntimeStatusPolling()
   persistConversations()
   document.removeEventListener('click', handleRetrievalMenuClick)
 })
@@ -1407,11 +1561,12 @@ watch(conversations, () => {
             <button
               class="icon-button danger"
               type="button"
-              :title="doc.status === 'ready' ? '删除文档' : '文档处理中，暂不能删除'"
-              :disabled="doc.status !== 'ready'"
-              @click.stop="handleDelete(doc)"
+              :title="deletingDocumentIds[doc.document_id] ? '正在删除文档' : '删除文档'"
+              :disabled="Boolean(deletingDocumentIds[doc.document_id])"
+              @click.stop="requestDocumentDeletion(doc)"
             >
-              <Trash2 :size="14" />
+              <Loader2 v-if="deletingDocumentIds[doc.document_id]" :size="14" class="spin" />
+              <Trash2 v-else :size="14" />
             </button>
           </div>
         </div>
@@ -1459,14 +1614,6 @@ watch(conversations, () => {
               <span class="switch__thumb"></span>
             </span>
             <span class="switch__label">{{ streamMode ? '流式输出' : '非流式输出' }}</span>
-          </label>
-
-          <label class="switch">
-            <input v-model="useRetrieval" type="checkbox" />
-            <span class="switch__track">
-              <span class="switch__thumb"></span>
-            </span>
-            <span class="switch__label">知识检索</span>
           </label>
 
           <button
@@ -1636,6 +1783,7 @@ watch(conversations, () => {
                       <div v-for="(source, index) in getDisplaySources(message)" :key="index" class="source-item">
                         <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
                         <div class="source-item__content">{{ source.content }}</div>
+                        <div class="source-item__origin">来源于 {{ getSourceFilename(source) }}</div>
                       </div>
                     </div>
                   </div>
@@ -1699,18 +1847,25 @@ watch(conversations, () => {
             <textarea
               v-model="inputText"
               class="composer__input"
-              placeholder="输入你的问题，Shift + Enter 换行，Enter 发送"
+              :placeholder="chatRuntimeReady ? '输入你的问题，Shift + Enter 换行，Enter 发送' : chatRuntimeMessage"
               rows="3"
+              :disabled="!chatRuntimeReady"
               @keydown="handleComposerKeydown"
             />
             <div class="composer__footer">
               <div class="status-line">
-                <span :class="['status-dot', chatBusy ? 'busy' : 'idle']"></span>
-                <span>{{ chatBusy ? '正在生成回答' : '等待输入' }}</span>
+                <Loader2 v-if="!chatRuntimeReady" :size="14" class="spin" />
+                <span v-else :class="['status-dot', chatBusy ? 'busy' : 'idle']"></span>
+                <span>{{ chatRuntimeMessage }}</span>
               </div>
               <div class="composer-actions">
                 <div ref="retrievalMenuRef" class="retrieval-menu composer-retrieval">
-                  <button class="ghost-button retrieval-menu__button" type="button" @click.stop="toggleRetrievalMenu">
+                  <button
+                    class="ghost-button retrieval-menu__button"
+                    type="button"
+                    :disabled="!chatRuntimeReady"
+                    @click.stop="toggleRetrievalMenu"
+                  >
                     <span>{{ currentRetrievalLabel }}</span>
                     <ChevronDown :size="16" :class="{ open: retrievalMenuOpen }" />
                   </button>
@@ -1732,7 +1887,12 @@ watch(conversations, () => {
                   </transition>
                 </div>
 
-                <button class="primary-button send-button" type="button" @click="sendMessage" :disabled="chatBusy || !inputText.trim()">
+                <button
+                  class="primary-button send-button"
+                  type="button"
+                  @click="sendMessage"
+                  :disabled="chatInputDisabled || !inputText.trim()"
+                >
                   <Send :size="16" />
                   <span>发送</span>
                   <ArrowRight :size="16" />
@@ -1783,9 +1943,9 @@ watch(conversations, () => {
                 <button
                   class="icon-button danger"
                   type="button"
-                  :title="isConversationStreaming(conversation.conversation_id) ? '输出中，暂不能删除' : '删除对话并清除长期记忆'"
-                  :disabled="Boolean(deletingConversationIds[conversation.conversation_id]) || isConversationStreaming(conversation.conversation_id)"
-                  @click.stop="removeConversation(conversation)"
+                  :title="deletingConversationIds[conversation.conversation_id] ? '正在删除对话' : '删除对话并清除长期记忆'"
+                  :disabled="Boolean(deletingConversationIds[conversation.conversation_id])"
+                  @click.stop="requestConversationDeletion(conversation)"
                 >
                   <Loader2 v-if="deletingConversationIds[conversation.conversation_id]" :size="14" class="spin" />
                   <Trash2 v-else :size="14" />
@@ -1844,6 +2004,35 @@ watch(conversations, () => {
           <X :size="14" />
         </button>
       </div>
+
+      <transition name="modal">
+        <div v-if="pendingDeletion" class="modal-overlay" @click.self="pendingDeletion = null">
+          <section class="modal-panel deletion-confirmation" role="dialog" aria-modal="true" aria-labelledby="deletion-confirmation-title">
+            <div class="modal-panel__header">
+              <div>
+                <div class="eyebrow">确认操作</div>
+                <h3 id="deletion-confirmation-title">
+                  {{ pendingDeletion.type === 'conversation' ? '删除对话' : '删除文档' }}
+                </h3>
+              </div>
+              <button class="icon-button" type="button" title="取消" @click="pendingDeletion = null">
+                <X :size="16" />
+              </button>
+            </div>
+
+            <p class="deletion-confirmation__message">
+              确定删除「{{ pendingDeletion.title }}」吗？
+              <span v-if="pendingDeletion.type === 'conversation'">关联的长期记忆也会一并清除。</span>
+              <span v-else>删除请求会立即生效，后台将继续清理向量数据和本地文件。</span>
+            </p>
+
+            <div class="modal-actions">
+              <button class="ghost-button" type="button" @click="pendingDeletion = null">取消</button>
+              <button class="primary-button danger-button" type="button" @click="confirmPendingDeletion">确认删除</button>
+            </div>
+          </section>
+        </div>
+      </transition>
 
       <transition name="modal">
         <div v-if="passwordModalOpen" class="modal-overlay" @click.self="closePasswordModal">

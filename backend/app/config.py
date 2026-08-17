@@ -135,6 +135,11 @@ class Settings:
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS"))
     # LLM请求超时时间（秒）
     LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT"))
+    # 单次请求最多尝试的 LLM 提供商数量，包含首次调用。
+    LLM_MAX_FALLBACK_ATTEMPTS: int = max(
+        1,
+        int(os.getenv("LLM_MAX_FALLBACK_ATTEMPTS", "2")),
+    )
 
     # ==================== 聊天配置 ====================
     # 前端可保留的最大对话线程数，防止本地历史过多导致页面和请求阻塞。

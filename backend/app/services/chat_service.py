@@ -40,11 +40,13 @@ RAG_SYSTEM_PROMPT = (
     "你是企业知识库助手。当前问题已识别为需要知识库检索。"
     "请优先依据已检索到的资料回答，不能把没有检索到的内容当成企业内部事实。"
     "如果资料不足，请明确说明缺少哪些依据，并给出可继续补充资料的方向。"
+    "请使用简洁的纯文本段落回答，不要使用 Markdown 标题、加粗、代码围栏、引用或列表符号。"
 )
 
 DIRECT_CHAT_SYSTEM_PROMPT = (
-    "你是企业知识库助手。当前对话未启用知识库检索，请直接回答用户问题。"
+    "你是企业知识库助手。当前问题不需要知识库检索，请直接回答用户问题。"
     "不要假装查阅过企业内部文档；涉及内部事实且无法确认时，请明确说明。"
+    "请使用简洁的纯文本段落回答，不要使用 Markdown 标题、加粗、代码围栏、引用或列表符号。"
 )
 
 INTENT_ROUTER_SYSTEM_PROMPT = (
@@ -66,6 +68,11 @@ INTENT_ROUTER_HUMAN_PROMPT = (
 )
 
 INTENT_JSON_PATTERN = re.compile(r"\{[\s\S]*\}")
+MARKDOWN_EMPHASIS_PATTERN = re.compile(r"(\*\*|__)(.*?)\1", re.DOTALL)
+MARKDOWN_CODE_PATTERN = re.compile(r"(`{1,3})(.*?)\1", re.DOTALL)
+MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
+MARKDOWN_QUOTE_PATTERN = re.compile(r"(?m)^\s*>\s?")
+MARKDOWN_LIST_PATTERN = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 
 
 @dataclass
@@ -152,6 +159,21 @@ def _extract_text(message: Any) -> str:
                 parts.append(str(item))
         return "".join(parts)
     return str(content or "")
+
+
+def clean_rag_response_text(text: str) -> str:
+    """清理 RAG 回答中的 Markdown 展示符号，保留段落和语义文本。"""
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"```[^\n`]*\n?", "", normalized)
+    normalized = normalized.replace("```", "")
+    normalized = MARKDOWN_EMPHASIS_PATTERN.sub(r"\2", normalized)
+    normalized = MARKDOWN_CODE_PATTERN.sub(r"\2", normalized)
+    normalized = MARKDOWN_HEADING_PATTERN.sub("", normalized)
+    normalized = MARKDOWN_QUOTE_PATTERN.sub("", normalized)
+    normalized = MARKDOWN_LIST_PATTERN.sub("", normalized)
+    normalized = "\n".join(line.strip() for line in normalized.split("\n"))
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
 
 
 def _build_intent_router_messages(query: str, history: Optional[Iterable[Any]] = None) -> List[Any]:
@@ -257,12 +279,21 @@ def route_query_intent(
     llm: Optional[Any] = None,
     history: Optional[Iterable[Any]] = None,
 ) -> QueryIntent:
-    """用 LLM 先判断是否走 RAG，失败时回退到规则路由。"""
+    """规则优先判断是否走 RAG，仅对知识库相关问题使用 LLM 消歧。"""
     normalized_query = (query or "").strip()
     if not use_retrieval:
         return QueryIntent(needs_retrieval=False, reason="retrieval_disabled", source="rule")
     if not normalized_query:
         return QueryIntent(needs_retrieval=False, reason="empty_query", source="rule")
+
+    rule_intent = _rule_route_query_intent(normalized_query, use_retrieval=use_retrieval)
+    if not rule_intent.needs_retrieval:
+        logger.info(
+            "意图路由结果: source=%s route=direct reason=%s",
+            rule_intent.source,
+            rule_intent.reason,
+        )
+        return rule_intent
 
     if llm is not None:
         try:
@@ -281,14 +312,13 @@ def route_query_intent(
         except Exception as exc:
             logger.warning("LLM 意图路由失败，已回退规则判断: %s", exc)
 
-    intent = _rule_route_query_intent(normalized_query, use_retrieval=use_retrieval)
     logger.info(
         "意图路由结果: source=%s route=%s reason=%s",
-        intent.source,
-        "rag" if intent.needs_retrieval else "direct",
-        intent.reason,
+        rule_intent.source,
+        "rag" if rule_intent.needs_retrieval else "direct",
+        rule_intent.reason,
     )
-    return intent
+    return rule_intent
 
 
 def _build_rag_context_message(rag_context: str, rag_message: str = "") -> Optional[SystemMessage]:
@@ -508,6 +538,7 @@ def _compact_long_term_memory_content(content: str) -> str:
 
 def _build_long_term_memory_messages(
     query: str,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     top_k: int = LONG_TERM_MEMORY_TOP_K,
@@ -517,6 +548,7 @@ def _build_long_term_memory_messages(
         memories = search_long_term_memory(
             query=query,
             top_k=top_k,
+            user_id=user_id,
             conversation_id=conversation_id,
             session_id=session_id,
         )
@@ -542,6 +574,7 @@ def _persist_long_term_memory(
     history: Optional[Iterable[Any]],
     query: str,
     answer: str,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_window_n: int = DEFAULT_SHORT_MEMORY_N,
@@ -558,6 +591,7 @@ def _persist_long_term_memory(
     try:
         store_semantic_long_term_memory(
             messages=conversation_messages,
+            user_id=user_id,
             conversation_id=conversation_id,
             session_id=session_id,
             short_window_n=short_window_n,
@@ -571,6 +605,7 @@ def _persist_long_term_memory_async(
     history: Optional[Iterable[Any]],
     query: str,
     answer: str,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_window_n: int = DEFAULT_SHORT_MEMORY_N,
@@ -586,6 +621,7 @@ def _persist_long_term_memory_async(
             "history": history,
             "query": query,
             "answer": answer,
+            "user_id": user_id,
             "conversation_id": conversation_id,
             "session_id": session_id,
             "short_window_n": short_window_n,
@@ -654,6 +690,7 @@ def run_chat(
     use_retrieval: bool = True,
     top_k: int = 5,
     retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_memory_strategy: str = SHORT_MEMORY_STRATEGY_WINDOW,
@@ -667,13 +704,18 @@ def run_chat(
     """运行一次先路由、再按需调用 RAG 工具的聊天。"""
     normalized_retrieval_method = _validate_retrieval_method(retrieval_method)
     if llm is None:
-        from app.core.llm import get_llm
+        if provider is None and model is None and temperature is None:
+            from app.core.llm import get_default_llm
 
-        llm = get_llm(
-            provider=provider,
-            model=model,
-            temperature=temperature,
-        )
+            llm = get_default_llm()
+        else:
+            from app.core.llm import get_llm
+
+            llm = get_llm(
+                provider=provider,
+                model=model,
+                temperature=temperature,
+            )
     intent = route_query_intent(query, use_retrieval=use_retrieval, llm=llm, history=history)
     sources: List[Dict[str, Any]] = []
     rag_payload: Dict[str, Any] = {}
@@ -689,6 +731,7 @@ def run_chat(
 
     long_term_memory_messages = _build_long_term_memory_messages(
         query=query,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
     )
@@ -704,11 +747,12 @@ def run_chat(
         short_memory_m=short_memory_m,
         llm=llm,
     )
-    text = _extract_text(llm.invoke(messages))
+    text = clean_rag_response_text(_extract_text(llm.invoke(messages)))
     _persist_long_term_memory_async(
         history=history,
         query=query,
         answer=text,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
         short_window_n=short_memory_n,
@@ -727,6 +771,7 @@ def stream_chat(
     use_retrieval: bool = True,
     top_k: int = 5,
     retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_memory_strategy: str = SHORT_MEMORY_STRATEGY_WINDOW,
@@ -740,13 +785,18 @@ def stream_chat(
     """运行流式聊天，先做意图路由，命中后再调用 RAG 工具。"""
     normalized_retrieval_method = _validate_retrieval_method(retrieval_method)
     if llm is None:
-        from app.core.llm import get_llm
+        if provider is None and model is None and temperature is None:
+            from app.core.llm import get_default_llm
 
-        llm = get_llm(
-            provider=provider,
-            model=model,
-            temperature=temperature,
-        )
+            llm = get_default_llm()
+        else:
+            from app.core.llm import get_llm
+
+            llm = get_llm(
+                provider=provider,
+                model=model,
+                temperature=temperature,
+            )
     intent = route_query_intent(query, use_retrieval=use_retrieval, llm=llm, history=history)
     sources: List[Dict[str, Any]] = []
     rag_payload: Dict[str, Any] = {}
@@ -774,6 +824,7 @@ def stream_chat(
 
     long_term_memory_messages = _build_long_term_memory_messages(
         query=query,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
     )
@@ -808,14 +859,19 @@ def stream_chat(
             },
         }
 
+    cleaned_final_text = clean_rag_response_text(final_text)
     yield {
         "event": "done",
-        "data": {"sources": deduplicated_sources},
+        "data": {
+            "sources": deduplicated_sources,
+            "content": cleaned_final_text,
+        },
     }
     _persist_long_term_memory_async(
         history=history,
         query=query,
-        answer=final_text,
+        answer=cleaned_final_text,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
         short_window_n=short_memory_n,
@@ -864,6 +920,7 @@ def generate_chat(
     top_k: int = 5,
     use_retrieval: bool = True,
     retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_memory_strategy: str = SHORT_MEMORY_STRATEGY_WINDOW,
@@ -883,6 +940,7 @@ def generate_chat(
         use_retrieval=use_retrieval,
         top_k=top_k,
         retrieval_method=normalized_retrieval_method,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
         short_memory_strategy=short_memory_strategy,
@@ -900,6 +958,7 @@ def stream_chat_events(
     top_k: int = 5,
     use_retrieval: bool = True,
     retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
+    user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     short_memory_strategy: str = SHORT_MEMORY_STRATEGY_WINDOW,
@@ -919,6 +978,7 @@ def stream_chat_events(
         use_retrieval=use_retrieval,
         top_k=top_k,
         retrieval_method=normalized_retrieval_method,
+        user_id=user_id,
         conversation_id=conversation_id,
         session_id=session_id,
         short_memory_strategy=short_memory_strategy,

@@ -96,6 +96,14 @@ def _match_coverage_score(query_terms: Sequence[str], content: str) -> float:
     return min(1.0, hit_score / max_score)
 
 
+def _build_result_search_text(result: RetrievalResult) -> str:
+    """组合切片正文与来源文件名，供关键词覆盖度和精确匹配使用。"""
+    metadata = result.metadata or {}
+    source_name = str(metadata.get("source_name") or "")
+    content = result.content or ""
+    return "\n".join(part for part in (source_name, content) if part)
+
+
 def _score_result(
     query_terms: Sequence[str],
     normalized_query: str,
@@ -103,9 +111,9 @@ def _score_result(
     raw_norm: float,
 ) -> float:
     """对单条检索结果计算综合分。"""
-    content = result.content or ""
-    coverage = _match_coverage_score(query_terms, content)
-    normalized_content = normalize_text(content)
+    searchable_text = _build_result_search_text(result)
+    coverage = _match_coverage_score(query_terms, searchable_text)
+    normalized_content = normalize_text(searchable_text)
     exact_bonus = 1.0 if normalized_query and normalized_query in normalized_content else 0.0
     source_bonus = 0.0
     if result.source == "hybrid":
