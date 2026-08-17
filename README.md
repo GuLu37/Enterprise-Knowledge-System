@@ -1,224 +1,248 @@
-# Enterprise Knowledge System
+# 企业知识库问答系统
 
-一个支持文档上传、检索问答、流式聊天、账号注册登录、刷新令牌和修改密码的企业知识库系统。
+![企业知识库问答系统演示界面](docs/images/demo.png)
 
-## 项目概览
+一个面向企业内部资料的 RAG（检索增强生成）问答系统。用户上传文档后，系统会完成解析、切分和向量化；在对话中按需检索知识库，以流式方式生成可追溯至引用资料的回答。
+
+## 功能概览
+
+- 文档入库：支持 PDF、TXT、Markdown、Word、PowerPoint 和 Excel 等常见办公文档，提供上传、状态跟踪、内容预览与删除。
+- 智能问答：根据问题自动选择直接回答或知识库问答，支持流式 SSE 输出与引用资料展示。
+- 混合检索：支持稠密向量检索、BM25 稀疏检索和混合检索，并结合 Multi-Query、RRF 融合、重排和相关性过滤提升召回质量。
+- 会话与记忆：支持多会话管理、历史会话切换与删除；长期语义记忆可写入 Milvus 并在后续对话中召回。
+- 账号与安全：提供注册、登录、JWT Access/Refresh Token 续签、修改密码和会话失效控制。
+- 工程化部署：前后端分离，支持本地开发与 Docker Compose 部署；默认使用 SQLite，也可通过 Compose profile 启用 MySQL。
+
+## 技术栈
+
+| 模块 | 技术 |
+| --- | --- |
+| 前端 | Vue 3、Vite、Lucide、Nginx |
+| 后端 | Python、FastAPI、Uvicorn、SQLAlchemy、Loguru |
+| RAG | LangChain、BGE Embedding、BM25、RRF、Reranker |
+| 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |
+| 数据存储 | Milvus、SQLite（默认）/ MySQL（可选） |
+| 部署 | Docker、Docker Compose |
+
+## 架构
 
 ```mermaid
 flowchart LR
-  Browser[浏览器 / Vue 3] --> Nginx[前端 Nginx]
-  Nginx -->|/| Static[静态页面]
-  Nginx -->|/api/v1| API[FastAPI]
-  Nginx -->|/health| Health[健康检查]
-  API --> Auth[认证 / 令牌]
-  API --> Docs[文档管理]
-  API --> Chat[对话 / 流式输出]
-  API --> Retrieval[检索接口]
-  API --> SQL[(SQLite / MySQL)]
-  API --> Milvus[(Milvus)]
-  API --> LLM[LLM Provider]
+    U[用户] --> F[Vue 3 前端]
+    F -->|HTTP / SSE| N[Nginx]
+    N -->|/api/v1| A[FastAPI]
+
+    A --> AU[认证与会话]
+    A --> D[文档管理]
+    A --> C[聊天服务]
+    D --> P[解析、切分与向量化]
+    P --> M[(Milvus)]
+    C --> R[检索服务]
+    R --> M
+    R --> L[LLM Provider]
+    A --> S[(SQLite / MySQL)]
 ```
 
-## 目录结构
+## 快速开始
 
-```text
-backend/
-  app/
-    api/        # 路由与请求/响应模型
-    core/       # LLM、Embedding 等核心能力
-    services/    # 认证、文档、聊天、记忆、检索
-    storage/     # SQLite / Milvus 存储
-    data/       # SQLite 数据文件固定目录
-    logs/       # 日志目录
-frontend/
-  src/         # Vue 3 前端
-  Dockerfile   # 前端镜像
-  nginx.conf   # Nginx 反向代理配置
-docker-compose.yml
-DEPLOYMENT.md
-```
+### 前置条件
 
-## 运行流程
+- Python 3.10 或更高版本
+- Node.js 18 或更高版本
+- 可访问的 Milvus 2.x 实例
+- 一个可用的模型服务：Ollama，或已配置 API Key 的 OpenAI、DeepSeek、OpenRouter、Anthropic
+- Docker 与 Docker Compose（仅容器化部署需要）
 
-1. 前端发起登录、注册、刷新令牌、改密请求。
-2. FastAPI 返回 `access_token` 和 `refresh_token`。
-3. 前端自动在 401 时使用 refresh token 续签。
-4. 文档上传后进入处理流程，写入元数据数据库并同步到向量库。
-5. 聊天请求先做意图路由，命中知识库意图后再进入完整 RAG 流程，支持流式和非流式输出。
-6. SQLite 元数据固定落在 `backend/app/data/rag_metadata.db`，不会散到其他目录。
-
-```mermaid
-sequenceDiagram
-  participant U as 用户
-  participant F as 前端
-  participant A as FastAPI
-  U->>F: 登录 / 注册
-  F->>A: POST /api/v1/auth/login
-  A-->>F: access_token + refresh_token
-  F->>A: 业务请求
-  A-->>F: 401
-  F->>A: POST /api/v1/auth/refresh
-  A-->>F: 新 token
-```
-
-## 完整 RAG 流程
-
-```mermaid
-flowchart TD
-  Q[用户 query] --> I[LLM 意图路由]
-  I -->|direct| D[直接回答]
-  I -->|rag| M[Multi-Query 扩展\n生成 3~5 条同义/多角度变体]
-  M --> S1[密集检索\n每条 query 独立召回]
-  M --> S2[稀疏检索\n每条 query 独立召回]
-  S1 --> F[RRF 融合 + 初步去重]
-  S2 --> F
-  F --> R[Reranker 细粒度重排序]
-  R --> C[检索后过滤\n保留高相关引用资料]
-  C --> P[上下文组装 + Prompt 注入]
-  P --> L[LLM 生成最终答案]
-  L --> O[返回答案 + 引用资料]
-```
-
-流程说明：
-
-1. 先由 LLM 判断当前 query 是直接回答还是需要进入 RAG。
-2. 如果需要 RAG，先生成 3 到 5 条同义、多角度的查询变体。
-3. 每条查询变体分别进入密集检索和稀疏检索。
-4. 检索结果先做 RRF 融合和初步去重。
-5. 再经过 reranker 细粒度重排和过滤，只保留更精确的引用资料。
-6. 最后把资料组装进 Prompt，由 LLM 基于资料生成最终答案。
-
-## 环境变量
-
-### 后端
-
-复制 `backend/.env.example` 为 `backend/.env`。
-
-重点变量：
-
-- `DATABASE_URL=sqlite:///./app/data/rag_metadata.db`
-- `JWT_SECRET_KEY`
-- `BOOTSTRAP_ADMIN_USERNAME=admin`
-- `BOOTSTRAP_ADMIN_PASSWORD=123456`
-- `LLM_PROVIDER`
-- `OLLAMA_BASE_URL` / `OLLAMA_MODEL`
-- `MILVUS_HOST` / `MILVUS_PORT` / `MILVUS_DB_NAME`
-- `UPLOAD_DIR` 固定到 `backend/app/data/uploads`
-
-说明：
-
-- SQLite 数据只保留在 `backend/app/data`。
-- 上传文件只保留在 `backend/app/data/uploads`。
-- 如果切换到 MySQL，把 `DATABASE_URL` 改成 `mysql+pymysql://...`。
-- 如果 LLM、Milvus 不在本机，要把地址改成服务器可达的地址。
-
-### 前端
-
-复制 `frontend/.env.example` 为 `frontend/.env`。
-
-- `VITE_API_BASE_URL=/api/v1` 适合同域或 Nginx 反代部署。
-- 前后端分域时，把它改成完整的后端地址。
-
-## 本地启动
-
-### 后端
+### 1. 配置后端
 
 ```bash
 cd backend
 python -m venv .venv
-.venv\\Scripts\\Activate.ps1
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# Linux / macOS
+source .venv/bin/activate
+
 pip install -r requirements.txt
-copy .env.example .env
-uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 前端
+复制环境变量模板：
+
+```bash
+# Windows PowerShell
+Copy-Item .env.example .env
+
+# Linux / macOS
+cp .env.example .env
+```
+
+编辑 `backend/.env`，至少完成以下配置：
+
+```dotenv
+# 选择模型供应商，并填写该供应商所需的模型与鉴权配置
+LLM_PROVIDER=ollama
+
+# 连接可访问的 Milvus 实例
+MILVUS_HOST=127.0.0.1
+MILVUS_PORT=19530
+
+# 生产环境必须替换为随机强密钥
+JWT_SECRET_KEY=replace-with-a-random-secret
+```
+
+使用本地 BGE 模型时，确保 `BGE_MODEL_NAME` 指向正确的模型目录。离线环境可设置 `BGE_LOCAL_FILES_ONLY=true`，避免运行时从 Hugging Face 下载模型。
+
+### 2. 启动后端
+
+```bash
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+后端启动后可访问：
+
+- API 文档：`http://127.0.0.1:8000/docs`
+- 健康检查：`http://127.0.0.1:8000/health`
+
+服务启动时会初始化元数据数据库，并尝试连接和初始化 Milvus collection。Milvus 暂不可用时后端仍会启动，但文档入库与检索功能不可用。
+
+### 3. 启动前端
 
 ```bash
 cd frontend
 npm install
-copy .env.example .env
 npm run dev
 ```
 
-Vite 默认会把 `/api/v1` 代理到后端 `http://127.0.0.1:8000`。
+开发服务器默认运行于 `http://127.0.0.1:5173`，并将 `/api/v1` 请求代理到后端 `http://127.0.0.1:8000`。
 
-## Docker 部署
+### 4. Docker Compose 部署
+
+先准备后端配置文件：
+
+```bash
+# Windows PowerShell
+Copy-Item backend\.env.example backend\.env
+
+# Linux / macOS
+cp backend/.env.example backend/.env
+```
+
+启动前后端：
 
 ```bash
 docker compose up -d --build
 ```
 
-如果要启用 MySQL profile：
+如需使用 MySQL：
 
 ```bash
 docker compose --profile mysql up -d --build
 ```
 
-说明：
+前端容器监听宿主机 `80` 端口。当前 Compose 文件不包含 Milvus 服务，请在 `backend/.env` 中将 `MILVUS_HOST` 配置为容器可访问的 Milvus 地址。
 
-- 前端容器使用 Nginx 提供静态页面，并反代 `/api/v1`。
-- 后端容器启动 FastAPI。
-- SQLite 持久化要确保 `backend/app/data` 被挂载保存。
-- 如果还要持久化上传文件和缓存，建议再把容器里的 `/app/data` 额外挂载出来。
-- MySQL profile 里的 `MYSQL_ROOT_PASSWORD`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD` 可按需覆盖。
+## 使用流程
 
-## 反向代理
+1. 使用初始管理员账号登录。默认账号由 `BOOTSTRAP_ADMIN_USERNAME` 和 `BOOTSTRAP_ADMIN_PASSWORD` 配置，部署前请修改默认密码。
+2. 在左侧上传企业资料，等待文档状态变为“可用”。
+3. 提出问题，并选择是否启用知识检索、流式输出以及检索策略。
+4. 在回答中查看引用资料，继续追问或创建新的会话。
 
-前端 Nginx 会把：
+## 检索流程
 
-- `/api/v1/` 转发到后端服务
-- `/health` 转发到后端健康检查
+```mermaid
+flowchart TD
+    Q[用户问题] --> I{是否需要知识检索}
+    I -->|否| D[LLM 直接回答]
+    I -->|是| MQ[Multi-Query 查询扩展]
+    MQ --> DE[稠密向量检索]
+    MQ --> SP[BM25 稀疏检索]
+    DE --> RR[RRF 融合与去重]
+    SP --> RR
+    RR --> RE[重排与相关性过滤]
+    RE --> CTX[上下文组装]
+    CTX --> G[LLM 生成带引用的回答]
+```
 
-## 接口概览
+## 项目结构
 
-### 认证
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── api/routes/       # 认证、文档、检索、聊天接口
+│   │   ├── core/             # LLM 与 Embedding 初始化
+│   │   ├── rag/              # 检索相关实现
+│   │   ├── services/         # 认证、文档、聊天、记忆服务
+│   │   ├── storage/          # SQLite 元数据与 Milvus 存储
+│   │   ├── data/             # 运行时生成的数据目录
+│   │   └── main.py
+│   ├── models/               # 可选的本地 Embedding 模型
+│   ├── tests/
+│   ├── Dockerfile
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   └── package.json
+├── docs/images/demo.png
+├── docker-compose.yml
+└── README.md
+```
 
-- `POST /api/v1/auth/login`
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/refresh`
-- `POST /api/v1/auth/password`
-- `GET /api/v1/auth/me`
+## 关键配置
 
-### 文档
+| 配置项 | 说明 |
+| --- | --- |
+| `LLM_PROVIDER` | 默认模型供应商，可选 `ollama`、`openai`、`deepseek`、`openrouter`、`anthropic` |
+| `MILVUS_HOST` / `MILVUS_PORT` | Milvus 服务地址 |
+| `DATABASE_URL` | 元数据数据库连接；默认使用 SQLite |
+| `EMBEDDING_PROVIDER` / `BGE_MODEL_NAME` | 向量化模型与本地模型路径 |
+| `BGE_LOCAL_FILES_ONLY` | 离线模式下仅从本地加载 BGE 模型 |
+| `USE_DENSE_RETRIEVER` / `USE_SPARSE_RETRIEVER` / `USE_HYBRID_RETRIEVER` | 检索策略开关 |
+| `DENSE_WEIGHT` / `SPARSE_WEIGHT` | 混合检索权重 |
+| `CORS_ORIGINS` | 允许访问 API 的前端域名列表 |
 
-- `GET /api/v1/documents/list`
-- `POST /api/v1/documents/upload`
-- `GET /api/v1/documents/content/{document_id}`
-- `DELETE /api/v1/documents/delete/{document_id}`
+完整的配置项及示例请查看 [backend/.env.example](backend/.env.example)。
 
-### 检索
+## API
 
-- `POST /api/v1/retrieval/search/hybrid`
-- `POST /api/v1/retrieval/search/dense`
-- `POST /api/v1/retrieval/search/sparse`
+除登录、注册、刷新令牌与健康检查外，接口都需要携带：
 
-### 聊天
+```http
+Authorization: Bearer <access_token>
+```
 
-- `GET /api/v1/chat/settings`
-- `POST /api/v1/chat/generate`
-- `POST /api/v1/chat/stream`
-- `DELETE /api/v1/chat/conversations/{conversation_id}`
+| 分类 | 示例接口 |
+| --- | --- |
+| 认证 | `POST /api/v1/auth/login`、`POST /api/v1/auth/refresh`、`GET /api/v1/auth/me` |
+| 文档 | `POST /api/v1/documents/upload`、`GET /api/v1/documents/list`、`DELETE /api/v1/documents/delete/{document_id}` |
+| 检索 | `POST /api/v1/retrieval/search/hybrid`、`/dense`、`/sparse` |
+| 聊天 | `POST /api/v1/chat/generate`、`POST /api/v1/chat/stream`、`POST /api/v1/chat/warmup` |
 
-### 健康检查
+接口参数与响应结构以运行中的 Swagger 文档 `/docs` 为准。
 
-- `GET /health`
+## 测试
 
-## 默认账号
+```bash
+cd backend
+pytest
+```
 
-系统启动后会自动创建默认管理员：
+大部分测试可独立执行。`test_milvus_real.py` 需要本地或远程 Milvus 可访问，并具备相应 collection。
 
-- 用户名：`admin`
-- 密码：`123456`
+## 生产部署建议
 
-## 生产注意事项
-
-- 把 `DEBUG` 改成 `false`
-- 把 `JWT_SECRET_KEY` 换成强随机值
-- 把 `CORS_ORIGINS` 改成真实域名
-- 不要提交真实 `.env`
-- 不要提交 `node_modules`、`.vite`、`dist`
+- 使用随机且高强度的 `JWT_SECRET_KEY`，不要保留示例密码或真实 API Key。
+- 设置 `DEBUG=false`，将 `CORS_ORIGINS` 限制为实际前端域名。
+- 为 Milvus、数据库、上传文件与日志配置持久化和备份策略。
+- 通过 Nginx、Caddy 或负载均衡器终止 TLS，使用 HTTPS 对外提供服务。
+- 不要提交 `.env`、`node_modules`、运行时数据、日志或本地模型文件。
 
 ## 许可证
 
-未声明。
+当前仓库未声明许可证。使用、分发或二次开发前请先获得项目维护者授权。
