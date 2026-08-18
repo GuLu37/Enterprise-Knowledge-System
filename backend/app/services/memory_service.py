@@ -36,10 +36,11 @@ PROFILE_MEMORY_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{1,127}$")
 
 PROFILE_MEMORY_SYSTEM_PROMPT = (
     "你是用户个性化记忆抽取器。"
-    "只提取用户明确表达、长期稳定且未来对话有帮助的信息。"
-    "不要提取一次性任务、临时安排、普通知识、企业文档内容、密码、令牌、身份证号或其他敏感凭据。"
-    "如果用户明确要求忘记或修改某项记忆，返回 action=delete 或 action=upsert。"
-    "只输出严格 JSON，不要输出解释。格式："
+    "只提取用户明确表达、长期稳定、未来对话确实有帮助的个人偏好或事实。"
+    "不要提取一次性任务、临时安排、普通问题、企业文档内容、模型回答内容、密码、令牌、身份证号或其他敏感凭据。"
+    "只有用户明确要求记住、忘记或修改某项信息时，才返回 action=upsert 或 action=delete。"
+    "没有可记忆内容时输出 {\"memories\":[]}。"
+    "只输出严格 JSON，不要解释。格式："
     "{\"memories\":[{\"memory_key\":\"profile.xxx\",\"value\":\"...\","
     "\"confidence\":0到1之间的小数,\"importance\":0到100之间的数字,"
     "\"action\":\"upsert\"或\"delete\"}]}"

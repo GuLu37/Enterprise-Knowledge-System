@@ -96,6 +96,13 @@ _IDENTIFIER_HINT_TERMS = (
     "型号",
     "id",
 )
+_REFERENCE_INDEX_MARKERS = (
+    "查询速查",
+    "优先命中表",
+    "检索提示",
+    "回答参考",
+    "常见问题",
+)
 
 
 def extract_identifier_terms(query: str) -> List[str]:
@@ -265,6 +272,31 @@ def build_query_focus_terms(query: str, max_terms: int = 8) -> List[str]:
     focus_terms: List[str] = []
     seen = set()
 
+    matched_domain_terms = sorted(
+        (
+            (normalized_query.find(term), term)
+            for term in _DOMAIN_TERMS
+            if term in normalized_query
+        ),
+        key=lambda item: (item[0], -len(item[1])),
+    )
+    # 连续业务词组成的短语比单个宽泛词更能区分主题，例如：
+    # “差旅 + 报销 + 标准”应形成“差旅报销标准”。
+    for start_index, (start_position, _) in enumerate(matched_domain_terms):
+        end_position = start_position
+        for next_position, next_term in matched_domain_terms[start_index:]:
+            if next_position > end_position + 1:
+                break
+            end_position = max(
+                end_position,
+                next_position + len(next_term),
+            )
+        phrase = normalized_query[start_position:end_position]
+        if len(phrase) >= 4:
+            _append_unique(focus_terms, seen, phrase, max_terms)
+            if len(focus_terms) >= max_terms:
+                return focus_terms
+
     for term in _DOMAIN_TERMS:
         if term in _GENERIC_FOCUS_TERMS or term not in normalized_query:
             continue
@@ -365,6 +397,17 @@ def _build_result_heading_text(result: RetrievalResult) -> str:
     return "\n".join(heading_lines)
 
 
+def is_reference_index_result(result: RetrievalResult) -> bool:
+    """识别用于导航的索引/速查片段，避免它压过事实数据片段。
+
+    这是按内容角色判断，而不是按文件名或具体业务字段判断。索引片段
+    仍然可以作为兜底证据，但在存在原始记录时不应主导最终答案。
+    """
+    content = str(result.content or "")
+    marker_count = sum(1 for marker in _REFERENCE_INDEX_MARKERS if marker in content)
+    return marker_count >= 2
+
+
 def _build_keyword_specificity_scores(
     keywords: Sequence[str],
     candidates: Sequence[RetrievalResult],
@@ -410,10 +453,19 @@ def _build_keyword_specificity_scores(
     return scores
 
 
-def build_relevance_signals(query: str, result: RetrievalResult) -> Dict[str, Any]:
+def build_relevance_signals(
+    query: str,
+    result: RetrievalResult,
+    query_keywords: Sequence[str] | None = None,
+    query_focus_terms: Sequence[str] | None = None,
+) -> Dict[str, Any]:
     """生成最终过滤可复用的相关性信号。"""
-    keywords = build_query_keywords(query)
-    focus_terms = build_query_focus_terms(query)
+    keywords = list(query_keywords) if query_keywords is not None else build_query_keywords(query)
+    focus_terms = (
+        list(query_focus_terms)
+        if query_focus_terms is not None
+        else build_query_focus_terms(query)
+    )
     searchable_text = _build_result_search_text(result)
     normalized_content = normalize_text(searchable_text)
     normalized_query = normalize_text(query)
@@ -432,6 +484,7 @@ def build_relevance_signals(query: str, result: RetrievalResult) -> Dict[str, An
     long_hit_count = sum(1 for term in unique_hits if len(term) >= 3)
     exact_match = bool(normalized_query and normalized_query in normalized_content)
     return {
+        "_query_key": normalize_text(query),
         "query_keywords": keywords,
         "query_focus_terms": focus_terms,
         "keyword_hits": unique_hits,
@@ -444,12 +497,23 @@ def build_relevance_signals(query: str, result: RetrievalResult) -> Dict[str, An
         "heading_coverage": _match_coverage_score(keywords, _build_result_heading_text(result)),
         "heading_focus_coverage": _match_coverage_score(focus_terms, _build_result_heading_text(result)),
         "exact_match": exact_match,
+        "is_reference_index": is_reference_index_result(result),
     }
 
 
-def passes_keyword_relevance_gate(query: str, result: RetrievalResult) -> bool:
+def _passes_keyword_relevance_gate(
+    query: str,
+    result: RetrievalResult,
+    signals: Dict[str, Any],
+) -> bool:
     """判断结果是否满足最终引用所需的关键词相关性。"""
-    signals = build_relevance_signals(query, result)
+    identifier_terms = extract_identifier_terms(query)
+    if identifier_terms:
+        normalized_content = normalize_text(_build_result_search_text(result))
+        # 编号查询的完整性优先于普通主题阈值，命中的每个编号都必须
+        # 有机会进入后续的逐编号保护逻辑。
+        return any(normalize_text(term) in normalized_content for term in identifier_terms)
+
     keywords = signals["query_keywords"]
     focus_terms = signals["query_focus_terms"]
     if not keywords:
@@ -462,30 +526,46 @@ def passes_keyword_relevance_gate(query: str, result: RetrievalResult) -> bool:
     long_hit_count = int(signals["long_keyword_hit_count"])
     coverage = float(signals["keyword_coverage"] or 0.0)
     focus_coverage = float(signals["focus_coverage"] or 0.0)
+    heading_coverage = float(signals["heading_coverage"] or 0.0)
 
-    if focus_terms and focus_hit_count < 1 and focus_coverage < 0.18:
-        return False
+    if focus_terms and len(focus_terms) >= 2 and focus_hit_count < 2 and focus_coverage < 0.18:
+        # 复合主题不能只凭一个宽泛词通过；如果标题本身明确命中主题，
+        # 则允许正文 chunk 只覆盖其中一部分（例如制度首页）。
+        if heading_coverage < 0.30:
+            return False
 
     if len(keywords) <= 2:
         return hit_count >= 1 or coverage >= 0.28
     return long_hit_count >= 1 or hit_count >= 2 or coverage >= 0.22
 
 
+def passes_keyword_relevance_gate(query: str, result: RetrievalResult) -> bool:
+    """判断结果是否满足最终引用所需的关键词相关性。"""
+    cached_signals = (result.metadata or {}).get("_relevance_signals")
+    if (
+        isinstance(cached_signals, dict)
+        and cached_signals.get("_query_key") == normalize_text(query)
+    ):
+        signals = cached_signals
+    else:
+        signals = build_relevance_signals(query, result)
+    return _passes_keyword_relevance_gate(query, result, signals)
+
+
 def _score_result(
-    query_terms: Sequence[str],
-    normalized_query: str,
     result: RetrievalResult,
     raw_norm: float,
-    specificity: float = 0.0,
+    specificity: float,
+    signals: Dict[str, Any],
+    keyword_gate_passed: bool,
 ) -> float:
     """对单条检索结果计算综合分。"""
-    signals = build_relevance_signals(normalized_query, result)
     coverage = float(signals["keyword_coverage"] or 0.0)
     focus_coverage = float(signals["focus_coverage"] or 0.0)
     heading_coverage = float(signals["heading_coverage"] or 0.0)
     heading_focus_coverage = float(signals["heading_focus_coverage"] or 0.0)
     exact_bonus = 1.0 if signals["exact_match"] else 0.0
-    keyword_gate_bonus = 0.22 if passes_keyword_relevance_gate(normalized_query, result) else -0.22
+    keyword_gate_bonus = 0.22 if keyword_gate_passed else -0.22
     source_bonus = 0.0
     if result.source == "hybrid":
         source_bonus = 0.02
@@ -493,6 +573,7 @@ def _score_result(
         source_bonus = 0.03
     elif result.source == "sparse":
         source_bonus = 0.03
+    reference_index_penalty = -0.10 if signals["is_reference_index"] else 0.0
 
     return (
         (0.20 * raw_norm)
@@ -504,6 +585,7 @@ def _score_result(
         + (0.25 * exact_bonus)
         + keyword_gate_bonus
         + source_bonus
+        + reference_index_penalty
     )
 
 
@@ -513,13 +595,21 @@ def rerank_results(
     top_k: int | None = None,
 ) -> List[RetrievalResult]:
     """根据查询词覆盖和原始分数重排结果。"""
-    query_terms = build_query_terms(query)
-    normalized_query = normalize_text(query)
     candidates = [item for item in results if item and (item.content or "").strip()]
     if not candidates:
         return []
 
     query_keywords = build_query_keywords(query)
+    query_focus_terms = build_query_focus_terms(query)
+    relevance_signals = [
+        build_relevance_signals(
+            query,
+            item,
+            query_keywords=query_keywords,
+            query_focus_terms=query_focus_terms,
+        )
+        for item in candidates
+    ]
     specificity_scores = _build_keyword_specificity_scores(query_keywords, candidates)
     raw_scores = [_normalize_source_score(item.score, item.source) for item in candidates]
     min_score = min(raw_scores)
@@ -535,7 +625,17 @@ def rerank_results(
         scored_items.append((
             index,
             item,
-            _score_result(query_terms, query, item, raw_norm, specificity_scores[index]),
+            _score_result(
+                item,
+                raw_norm,
+                specificity_scores[index],
+                relevance_signals[index],
+                _passes_keyword_relevance_gate(
+                    query,
+                    item,
+                    relevance_signals[index],
+                ),
+            ),
         ))
 
     scored_items.sort(
@@ -554,9 +654,10 @@ def rerank_results(
                 **(item.metadata or {}),
                 **{
                     key: value
-                    for key, value in build_relevance_signals(query, item).items()
+                    for key, value in relevance_signals[index].items()
                     if key not in {"query_keywords", "query_focus_terms"}
                 },
+                "_relevance_signals": relevance_signals[index],
                 "keyword_specificity": float(specificity_scores[index]),
             },
             score=float(score),

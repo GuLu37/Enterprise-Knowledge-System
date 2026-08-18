@@ -31,7 +31,13 @@ class DenseRetriever(BaseRetriever):
     基于向量相似度的语义检索，使用 Embedding 模型
     """
 
-    def __init__(self, embeddings, top_k: int = 5, vector_store: Optional[Any] = None):
+    def __init__(
+        self,
+        embeddings,
+        top_k: int = 5,
+        vector_store: Optional[Any] = None,
+        enforce_similarity_threshold: bool = True,
+    ):
         """
         初始化密集检索器
 
@@ -39,10 +45,13 @@ class DenseRetriever(BaseRetriever):
             embeddings: Embedding 模型实例
             top_k: 默认返回结果数
             vector_store: 可选的 MilvusClient 实例，便于测试或外部注入
+            enforce_similarity_threshold: 是否在本次召回阶段执行相似度阈值
         """
         super().__init__(top_k)
         self.embeddings = embeddings
         self.vector_store = vector_store
+        self.enforce_similarity_threshold = enforce_similarity_threshold
+        self._collection_ready: Optional[bool] = None
 
     def retrieve(self, query: str, top_k: int = None) -> List[RetrievalResult]:
         """
@@ -68,11 +77,14 @@ class DenseRetriever(BaseRetriever):
 
             client = self.vector_store or get_milvus_client()
             collection_name = settings.MILVUS_DOC_COLLECTION_NAME
-            if not client.has_collection(collection_name):
-                return []
-
-            if not is_collection_loaded(client, collection_name):
-                logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次密集检索")
+            if self._collection_ready is None:
+                self._collection_ready = (
+                    client.has_collection(collection_name)
+                    and is_collection_loaded(client, collection_name)
+                )
+                if not self._collection_ready:
+                    logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次密集检索")
+            if not self._collection_ready:
                 return []
 
             query_vector = self.embeddings.embed_query(query)
@@ -116,7 +128,11 @@ class DenseRetriever(BaseRetriever):
                     "content_type": _get_field(entity, "content_type", _get_field(hit, "content_type")),
                 }
                 score = float(_get_field(hit, "distance", _get_field(hit, "score", 0.0)) or 0.0)
-                if settings.SIMILARITY_THRESHOLD and score < settings.SIMILARITY_THRESHOLD:
+                if (
+                    self.enforce_similarity_threshold
+                    and settings.SIMILARITY_THRESHOLD
+                    and score < settings.SIMILARITY_THRESHOLD
+                ):
                     continue
                 results.append(
                     RetrievalResult(

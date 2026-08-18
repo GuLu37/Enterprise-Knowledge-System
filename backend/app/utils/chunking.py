@@ -13,15 +13,8 @@ ARTICLE_TEXT_SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", "：", "，
 LONG_TERM_MEMORY_TOKEN_LIMIT = 700
 
 ARTICLE_FILE_TYPES = {"pdf", "doc", "docx", "md", "txt", "html", "htm", "rtf", "markdown"}
-SECTION_HEADING_PATTERN = re.compile(
-    r"^(?:"
-    r"#{1,6}\s+\S.{0,80}|"
-    r"第[一二三四五六七八九十百千万0-9]+[章节条部分][、.．\s:：-]*\S.{0,70}|"
-    r"[一二三四五六七八九十]+[、.．]\s*\S.{0,70}|"
-    r"\d+(?:\.\d+)*[、.．]\s*\S.{0,70}|"
-    r"[（(][一二三四五六七八九十0-9]+[）)]\s*\S.{0,70}"
-    r")$"
-)
+STRUCTURED_FILE_TYPES = {"csv", "tsv", "xls", "xlsx"}
+STRUCTURED_SECTION_PATTERN = re.compile(r"^\[Sheet\]\s*(?P<name>.+?)\s*$", re.IGNORECASE)
 
 _ROLE_LABELS = {
     "system": "系统",
@@ -123,14 +116,46 @@ def split_text_chunks(
     return [chunk.strip() for chunk in splitter.split_text(normalized_text) if chunk.strip()]
 
 
+def _parse_section_heading(line: str) -> tuple[int, str] | None:
+    """识别标题并返回标题层级与规范化文本。"""
+    normalized_line = re.sub(r"\s+", " ", (line or "").strip())
+    # 标题行本身可能较长，尤其是 FAQ / 制度类问句标题；这里放宽上限，
+    # 避免长标题退化成普通正文后被通用切分器拆成孤立片段。
+    if not normalized_line or len(normalized_line) > 140:
+        return None
+    if normalized_line.count("。") + normalized_line.count("；") + normalized_line.count(";") > 0:
+        return None
+
+    markdown_match = re.match(r"^(#{1,6})\s+(\S.{0,80})$", normalized_line)
+    if markdown_match:
+        return len(markdown_match.group(1)), markdown_match.group(2).strip()
+
+    numbered_match = re.match(
+        r"^(?P<number>\d+(?:\.\d+)*)(?:、|[.．])\s*(?P<title>\S.{0,70})$",
+        normalized_line,
+    )
+    if numbered_match:
+        level = numbered_match.group("number").count(".") + 1
+        return level, normalized_line
+
+    if re.match(
+        r"^第[一二三四五六七八九十百千万0-9]+[章节条部分][、.．\s:：-]*\S.{0,70}$",
+        normalized_line,
+    ):
+        return 1, normalized_line
+
+    if re.match(r"^[一二三四五六七八九十]+[、.．]\s*\S.{0,70}$", normalized_line):
+        return 1, normalized_line
+
+    if re.match(r"^[（(][一二三四五六七八九十0-9]+[）)]\s*\S.{0,70}$", normalized_line):
+        return 2, normalized_line
+
+    return None
+
+
 def _is_section_heading(line: str) -> bool:
     """识别常见文档标题行。"""
-    normalized_line = re.sub(r"\s+", " ", (line or "").strip())
-    if not normalized_line or len(normalized_line) > 90:
-        return False
-    if normalized_line.count("。") + normalized_line.count("；") + normalized_line.count(";") > 0:
-        return False
-    return bool(SECTION_HEADING_PATTERN.match(normalized_line))
+    return _parse_section_heading(line) is not None
 
 
 def _clean_section_heading(line: str) -> str:
@@ -144,15 +169,16 @@ def _split_text_into_sections(text: str) -> List[tuple[str, str]]:
     """按标题行切成章节，保留标题与正文关系。"""
     lines = (text or "").splitlines()
     sections: List[tuple[str, str]] = []
-    current_heading = ""
+    heading_stack: List[tuple[int, str]] = []
     current_lines: List[str] = []
     heading_count = 0
 
-    def flush() -> None:
+    def flush(force: bool = False) -> None:
         nonlocal current_lines
         body = "\n".join(current_lines).strip()
-        if current_heading or body:
-            sections.append((current_heading, body))
+        if body or (force and heading_stack):
+            heading = " / ".join(item[1] for item in heading_stack)
+            sections.append((heading, body))
         current_lines = []
 
     for raw_line in lines:
@@ -161,14 +187,20 @@ def _split_text_into_sections(text: str) -> List[tuple[str, str]]:
             if current_lines and current_lines[-1] != "":
                 current_lines.append("")
             continue
-        if _is_section_heading(line):
-            flush()
-            current_heading = _clean_section_heading(line)
+        heading_info = _parse_section_heading(line)
+        if heading_info is not None:
+            if current_lines:
+                flush()
+            level, heading = heading_info
+            heading_stack = [
+                item for item in heading_stack if item[0] < level
+            ]
+            heading_stack.append((level, _clean_section_heading(heading)))
             heading_count += 1
             continue
         current_lines.append(line)
 
-    flush()
+    flush(force=True)
     if heading_count <= 0:
         return []
     return sections
@@ -186,7 +218,9 @@ def _split_section_chunks(
     normalized_body = (body or "").strip()
 
     if prefix and not normalized_body:
-        return [prefix]
+        # 纯标题没有正文时，单独入库价值很低，还会让检索更容易先命中
+        # 这一片却丢掉后文上下文；直接跳过，交给后续有正文的章节承载。
+        return []
     if not prefix:
         return split_text_chunks(
             text=normalized_body,
@@ -210,11 +244,11 @@ def split_document_text_by_sections(
     chunk_size: int,
     chunk_overlap: int,
     separators: Sequence[str],
-) -> List[str]:
+) -> List[str] | None:
     """先按章节标题切分，再在章节内递归切块。"""
     sections = _split_text_into_sections(text)
     if not sections:
-        return []
+        return None
 
     chunks: List[str] = []
     for heading, body in sections:
@@ -227,6 +261,91 @@ def split_document_text_by_sections(
                 separators=separators,
             )
         )
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _split_structured_text_chunks(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    """按工作表和完整行切分结构化文本，并为每个分片保留表头。
+
+    表格的字段名通常只出现在第一行；如果直接按字符切分，后续分片会
+    失去字段语义，导致“地点/负责人/状态”等列查询只能命中第一片。
+    这里把工作表标记和表头复制到同一工作表的每个分片中，同时只在
+    完整数据行之间切分，避免破坏一行内的字段关系。
+    """
+    lines = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return []
+
+    sections: List[tuple[str, List[str]]] = []
+    current_name = ""
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        if current_name or current_lines:
+            sections.append((current_name, current_lines))
+        current_lines = []
+
+    for line in lines:
+        match = STRUCTURED_SECTION_PATTERN.match(line)
+        if match:
+            flush()
+            current_name = match.group("name").strip()
+            continue
+        current_lines.append(line)
+    flush()
+
+    # 没有工作表标记时回退到原有通用切分逻辑，兼容 CSV/TSV 等纯文本输入。
+    if not any(name for name, _ in sections):
+        return split_text_chunks(
+            text=text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=DEFAULT_TEXT_SEPARATORS,
+        )
+
+    chunks: List[str] = []
+    for sheet_name, sheet_lines in sections:
+        if not sheet_lines:
+            continue
+
+        sheet_prefix = f"[Sheet] {sheet_name}".strip() if sheet_name else ""
+        header = sheet_lines[0]
+        rows = sheet_lines[1:]
+        prefix_parts = [part for part in (sheet_prefix, header) if part]
+        prefix = "\n".join(prefix_parts)
+        available_size = max(120, chunk_size - len(prefix) - 1)
+
+        if not rows:
+            if prefix:
+                chunks.append(prefix)
+            continue
+
+        current_rows: List[str] = []
+        current_length = 0
+        for row in rows:
+            row_length = len(row) + (1 if current_rows else 0)
+            if current_rows and current_length + row_length > available_size:
+                chunks.append("\n".join(prefix_parts + current_rows).strip())
+                # 保留一行上下文，避免边界数据在相邻检索中完全断开。
+                overlap_row = current_rows[-1]
+                current_rows = [overlap_row] if chunk_overlap > 0 else []
+                current_length = len(overlap_row) if current_rows else 0
+
+            current_rows.append(row)
+            current_length += row_length
+
+        if current_rows:
+            chunks.append("\n".join(prefix_parts + current_rows).strip())
+
     return [chunk for chunk in chunks if chunk.strip()]
 
 
@@ -248,7 +367,7 @@ def split_document_text(
             chunk_overlap=DOCUMENT_ARTICLE_CHUNK_OVERLAP,
             separators=ARTICLE_TEXT_SEPARATORS,
         )
-        if section_chunks:
+        if section_chunks is not None:
             return section_chunks
 
         return split_text_chunks(
@@ -257,6 +376,15 @@ def split_document_text(
             chunk_overlap=DOCUMENT_ARTICLE_CHUNK_OVERLAP,
             separators=ARTICLE_TEXT_SEPARATORS,
         )
+
+    if normalized_file_type in STRUCTURED_FILE_TYPES:
+        structured_chunks = _split_structured_text_chunks(
+            text=text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        if structured_chunks:
+            return structured_chunks
 
     return split_text_chunks(
         text=text,

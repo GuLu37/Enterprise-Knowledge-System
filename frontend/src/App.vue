@@ -1239,12 +1239,15 @@ async function handleUpload(event) {
 
 function requestDocumentDeletion(doc) {
   if (!doc?.document_id) return
-  if (doc.status !== 'ready') {
+  if (doc.status === 'deleting') {
     errorText.value = doc.status === 'deleting'
       ? '该文档正在删除中，请稍候。'
-      : doc.status === 'failed'
-        ? '该文档入库失败，请先重新上传后再删除。'
-        : '文档还在处理中，状态切换为可用后才可以删除。'
+      : '该文档当前不可删除。'
+    return
+  }
+  if (doc.status === 'deleted') return
+  if (doc.status !== 'ready' && doc.status !== 'failed') {
+    errorText.value = '文档还在处理中，状态切换为可用或失败后才可以删除。'
     return
   }
 

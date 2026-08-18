@@ -1,4 +1,5 @@
 """混合检索器 (密集 + 稀疏)"""
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 from .base import BaseRetriever, RetrievalResult
@@ -41,8 +42,23 @@ class HybridRetriever(BaseRetriever):
             if not query:
                 return []
 
-            dense_results = self._safe_retrieve(self.dense_retriever, query, top_k, "密集")
-            sparse_results = self._safe_retrieve(self.sparse_retriever, query, top_k, "稀疏")
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag-retrieval") as executor:
+                dense_future = executor.submit(
+                    self._safe_retrieve,
+                    self.dense_retriever,
+                    query,
+                    top_k,
+                    "密集",
+                )
+                sparse_future = executor.submit(
+                    self._safe_retrieve,
+                    self.sparse_retriever,
+                    query,
+                    top_k,
+                    "稀疏",
+                )
+                dense_results = dense_future.result()
+                sparse_results = sparse_future.result()
 
             if not dense_results and not sparse_results:
                 return []

@@ -1,17 +1,103 @@
 """BGE 向量化模型配置"""
+import importlib
+import sys
 import threading
+from pathlib import Path
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 from langchain_core.embeddings import Embeddings
-from transformers import AutoModel, AutoTokenizer
 
 from app.config import settings
 from app.utils.exceptions import EmbeddingException
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+def _load_transformers_classes():
+    """加载当前解释器环境中的 Transformers，绕过错误的用户级包遮蔽。"""
+    def import_classes():
+        module = importlib.import_module("transformers")
+        auto_model = getattr(module, "AutoModel", None)
+        auto_tokenizer = getattr(module, "AutoTokenizer", None)
+        if auto_model is None or auto_tokenizer is None:
+            raise ImportError(
+                f"当前 transformers 缺少 AutoModel/AutoTokenizer: "
+                f"{getattr(module, '__file__', 'unknown')}"
+            )
+        return auto_model, auto_tokenizer, getattr(module, "__version__", "unknown")
+
+    try:
+        return import_classes()
+    except (ImportError, AttributeError) as first_error:
+        loaded_module = sys.modules.get("transformers")
+        loaded_origin = str(getattr(loaded_module, "__file__", "") or "")
+        environment_roots = [
+            Path(sys.prefix) / "Lib" / "site-packages",
+            Path(sys.prefix) / "lib" / "python" / "site-packages",
+            *(
+                Path(item)
+                for item in sys.path
+                if item and "site-packages" in item.lower()
+            ),
+        ]
+        candidate_roots = []
+        seen_roots = set()
+        loaded_root = (
+            Path(loaded_origin).resolve().parent
+            if loaded_origin
+            else None
+        )
+        for root in environment_roots:
+            try:
+                resolved_root = root.resolve()
+            except OSError:
+                continue
+            root_key = str(resolved_root).lower()
+            if root_key in seen_roots:
+                continue
+            seen_roots.add(root_key)
+            if (
+                resolved_root != loaded_root
+                and (resolved_root / "transformers").exists()
+            ):
+                candidate_roots.append(resolved_root)
+        if not candidate_roots:
+            raise ImportError(
+                "Transformers 导入失败。当前 Python 环境中没有可用的 "
+                "AutoModel/AutoTokenizer，请检查 transformers 安装和启动解释器。"
+            ) from first_error
+
+        original_path = list(sys.path)
+        try:
+            for module_name in list(sys.modules):
+                if module_name == "transformers" or module_name.startswith("transformers."):
+                    del sys.modules[module_name]
+            sys.path[:] = [
+                str(root)
+                for root in candidate_roots
+            ] + [
+                item
+                for item in original_path
+                if item not in {str(root) for root in candidate_roots}
+            ]
+            auto_model, auto_tokenizer, version = import_classes()
+            logger.warning(
+                "检测到错误的 Transformers 导入路径，已切换到当前环境包: "
+                "bad_path=%s version=%s",
+                loaded_origin or "unknown",
+                version,
+            )
+            return auto_model, auto_tokenizer, version
+        except Exception as second_error:
+            raise ImportError(
+                "Transformers 导入失败，且无法切换到当前 Python 环境中的可用版本。"
+                f"当前解释器: {sys.executable}; 原始错误: {first_error}"
+            ) from second_error
+        finally:
+            sys.path[:] = original_path
 
 
 class BGEEmbeddings(Embeddings):
@@ -39,6 +125,8 @@ class BGEEmbeddings(Embeddings):
 
         logger.info(f"初始化 BGE Embedding: {self.model_name} ({self.device})")
         try:
+            AutoModel, AutoTokenizer, transformers_version = _load_transformers_classes()
+            logger.info("Transformers 就绪: version=%s", transformers_version)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 cache_dir=self.cache_dir,

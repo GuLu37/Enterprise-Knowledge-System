@@ -7,7 +7,6 @@ from .base import BaseRetriever, RetrievalResult
 from app.config import settings
 from app.storage.milvus_store import get_milvus_client, is_collection_loaded
 from app.rag.retrieval.reranker import (
-    build_query_terms,
     extract_identifier_terms,
     normalize_text,
 )
@@ -79,8 +78,28 @@ def _build_filter_expression(filter_terms: List[str]) -> str:
 
 
 def _build_filter_terms(query: str, max_terms: int = 12) -> List[str]:
-    """生成适合做候选召回的关键词。"""
-    query_terms = extract_identifier_terms(query) + build_query_terms(query, max_terms=max_terms * 2)
+    """生成低噪声候选过滤词，保留编号、语义片段和必要短 ngram。"""
+    query_terms = extract_identifier_terms(query)
+    normalized_query = (query or "").strip().lower()
+    normalized_query = re.sub(
+        r"(根据|基于|结合|请问|麻烦|帮我|帮忙|查询|检索|搜索|查一下|查找|"
+        r"公司|企业|每个|各个|所有|全部|分别|哪些|哪几|是谁|是什么|在哪里|在哪|"
+        r"多少|如何|怎么|为什么|是否|有没有|可以吗|能否|吗|呢|吧|啊)",
+        " ",
+        normalized_query,
+    )
+    normalized_query = re.sub(r"[的之与和及在是有为从到对把将]", " ", normalized_query)
+    semantic_parts = re.findall(r"[A-Za-z0-9]+|[一-鿿]{2,}", normalized_query)
+    for part in semantic_parts:
+        if part:
+            query_terms.append(part)
+        if re.fullmatch(r"[一-鿿]{4,}", part):
+            query_terms.extend(
+                part[index:index + 3]
+                for index in range(len(part) - 2)
+                if not any(char in "的之与和及在是有为从到对把将" for char in part[index:index + 3])
+            )
+
     if not query_terms:
         return []
 
@@ -162,6 +181,7 @@ class SparseRetriever(BaseRetriever):
     def __init__(self, top_k: int = 5, vector_store: Optional[Any] = None):
         super().__init__(top_k)
         self.vector_store = vector_store
+        self._collection_ready: Optional[bool] = None
 
     def retrieve(self, query: str, top_k: int = None) -> List[RetrievalResult]:
         try:
@@ -174,11 +194,14 @@ class SparseRetriever(BaseRetriever):
 
             client = self.vector_store or get_milvus_client()
             collection_name = settings.MILVUS_DOC_COLLECTION_NAME
-            if not client.has_collection(collection_name):
-                return []
-
-            if not is_collection_loaded(client, collection_name):
-                logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次稀疏检索")
+            if self._collection_ready is None:
+                self._collection_ready = (
+                    client.has_collection(collection_name)
+                    and is_collection_loaded(client, collection_name)
+                )
+                if not self._collection_ready:
+                    logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次稀疏检索")
+            if not self._collection_ready:
                 return []
 
             filter_terms = _build_filter_terms(query)

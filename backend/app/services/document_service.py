@@ -1,4 +1,7 @@
 """文档入库与管理服务"""
+import csv
+import io
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -8,7 +11,12 @@ from fastapi import BackgroundTasks, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.storage.sqlite_metadata import DocumentRecord, SessionLocal, init_metadata_db
+from app.storage.sqlite_metadata import (
+    DocumentChunkRecord,
+    DocumentRecord,
+    SessionLocal,
+    init_metadata_db,
+)
 from app.storage.milvus_store import get_milvus_client
 from app.utils.chunking import split_document_text
 from app.utils.exceptions import DocumentException
@@ -57,6 +65,30 @@ def _get_file_size(file_path: Path) -> int:
     return file_path.stat().st_size
 
 
+def _delete_local_uploaded_file(file_path: Path, document_id: str, reason: str) -> bool:
+    """删除上传后的临时原始文件，避免服务端长期保存用户文档。"""
+    try:
+        existed = file_path.exists()
+        file_path.unlink(missing_ok=True)
+        logger.info(
+            "本地上传原始文件清理完成: deleted={} reason={} path={} (document_id={})",
+            existed,
+            reason,
+            file_path,
+            document_id,
+        )
+        return existed
+    except Exception as exc:
+        logger.warning(
+            "本地上传原始文件清理失败: reason={} path={} error={} (document_id={})",
+            reason,
+            file_path,
+            exc,
+            document_id,
+        )
+        return False
+
+
 def _extract_text_from_txt(file_path: Path) -> str:
     """从 TXT/MD 文件中提取文本，按常见编码做容错读取。"""
     for encoding in ("utf-8", "utf-8-sig", "gbk", "gb18030"):
@@ -98,22 +130,185 @@ def _extract_text_from_pdf(file_path: Path) -> str:
 
 
 def _extract_text_from_docx(file_path: Path) -> str:
-    """从 DOCX 文件中抽取段落文本。"""
+    """按原始顺序抽取 DOCX 段落和表格文本。"""
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
     from docx import Document as DocxDocument
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
 
     doc = DocxDocument(str(file_path))
-    return "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip())
+    blocks: List[str] = []
+
+    for child in doc.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, doc)
+            text = " ".join(paragraph.text.split()).strip()
+            if text:
+                blocks.append(text)
+            continue
+
+        if not isinstance(child, CT_Tbl):
+            continue
+
+        table = Table(child, doc)
+        rows: List[str] = []
+        for row in table.rows:
+            cells = [" ".join(cell.text.split()).strip() for cell in row.cells]
+            if any(cells):
+                rows.append(" | ".join(cells))
+        if rows:
+            blocks.append("[表格]\n" + "\n".join(rows))
+
+    return "\n\n".join(blocks)
+
+
+def _normalize_excel_cell(value, pandas_module) -> str:
+    """把 Excel 单元格转换成稳定的单行文本。"""
+    if value is None or pandas_module.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+
+
+def _serialize_excel_row(values: List[str]) -> str:
+    """按 CSV 规则序列化一行，避免单元格中的逗号破坏列结构。"""
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="").writerow(values)
+    return buffer.getvalue()
+
+
+def _looks_numeric_excel_value(value: str) -> bool:
+    """判断单元格是否更像数据值而不是字段名。"""
+    normalized = (value or "").strip().replace(",", "")
+    if not normalized:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:%|元|万元|万)?",
+            normalized,
+        )
+    )
+
+
+def _infer_excel_header_index(rows: List[List[str]]) -> int:
+    """从工作表行中推断真实表头位置，不依赖固定行号或业务字段名。"""
+    nonempty_rows = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if any(cell.strip() for cell in row)
+    ]
+    if not nonempty_rows:
+        return 0
+    if len(nonempty_rows) == 1:
+        return nonempty_rows[0][0]
+
+    max_width = max(sum(bool(cell.strip()) for cell in row) for _, row in nonempty_rows)
+    candidates = []
+    for index, row in nonempty_rows:
+        values = [cell.strip() for cell in row if cell.strip()]
+        width = len(values)
+        if width < 2:
+            continue
+
+        unique_ratio = len({value.casefold() for value in values}) / width
+        text_ratio = sum(
+            not _looks_numeric_excel_value(value) for value in values
+        ) / width
+        following = rows[index + 1 : index + 4]
+        similar_rows = sum(
+            sum(bool(cell.strip()) for cell in candidate)
+            >= max(2, int(width * 0.5))
+            for candidate in following
+            if any(cell.strip() for cell in candidate)
+        )
+
+        score = (
+            width * 2.0
+            + unique_ratio * 3.0
+            + text_ratio * 3.0
+            + similar_rows * 2.0
+        )
+        if width >= max(2, int(max_width * 0.5)):
+            score += 4.0
+        candidates.append((score, width, -index, index))
+
+    if candidates:
+        return max(candidates)[3]
+    return nonempty_rows[0][0]
+
+
+def _normalize_excel_headers(headers: List[str]) -> List[str]:
+    """清理空表头、Unnamed 表头并保证字段名唯一。"""
+    normalized_headers: List[str] = []
+    used_counts: Dict[str, int] = {}
+
+    for index, header in enumerate(headers):
+        value = " ".join((header or "").split()).strip()
+        if not value or value.casefold().startswith("unnamed"):
+            value = f"列{index + 1}"
+
+        used_counts[value] = used_counts.get(value, 0) + 1
+        count = used_counts[value]
+        normalized_headers.append(value if count == 1 else f"{value}_{count}")
+
+    return normalized_headers
 
 
 def _extract_text_from_xlsx(file_path: Path) -> str:
-    """从 Excel 文件中抽取工作表内容，转成可切块的纯文本。"""
+    """抽取 Excel 工作表并自动识别真实表头，输出可稳定切块的结构化文本。"""
     import pandas as pd
 
-    sheets = pd.read_excel(str(file_path), sheet_name=None)
+    sheets = pd.read_excel(
+        str(file_path),
+        sheet_name=None,
+        header=None,
+        dtype=object,
+        keep_default_na=False,
+    )
     blocks = []
-    for sheet_name, df in sheets.items():
+
+    for sheet_name, dataframe in sheets.items():
+        raw_rows = [
+            [
+                _normalize_excel_cell(value, pd)
+                for value in row
+            ]
+            for row in dataframe.itertuples(index=False, name=None)
+        ]
+        raw_rows = [
+            row
+            for row in raw_rows
+            if any(cell.strip() for cell in row)
+        ]
+        if not raw_rows:
+            continue
+
+        max_width = max(len(row) for row in raw_rows)
+        rows = [row + [""] * (max_width - len(row)) for row in raw_rows]
+        while rows and all(not row[-1].strip() for row in rows):
+            for row in rows:
+                row.pop()
+
+        header_index = _infer_excel_header_index(rows)
+        headers = _normalize_excel_headers(rows[header_index])
+        width = len(headers)
+
         blocks.append(f"[Sheet] {sheet_name}")
-        blocks.append(df.fillna("").to_csv(index=False))
+        blocks.append(_serialize_excel_row(headers))
+
+        # 标题、说明和空行仍保留，但放在规范表头之后，避免被误识别成表头。
+        for row in rows[:header_index]:
+            values = [cell for cell in row[:width] if cell.strip()]
+            if values:
+                blocks.append(f"[说明] {' | '.join(values)}")
+
+        for row in rows[header_index + 1 :]:
+            normalized_row = row[:width] + [""] * max(0, width - len(row))
+            if any(cell.strip() for cell in normalized_row):
+                blocks.append(_serialize_excel_row(normalized_row))
+
     return "\n".join(blocks)
 
 
@@ -196,6 +391,86 @@ def _update_document_record(document_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(record, key, value)
         db.commit()
+    finally:
+        db.close()
+
+
+def _replace_document_chunk_records(db: Session, document_id: str, chunks: List[str]) -> None:
+    """用当前解析结果覆盖 SQLite 中的文档正文切片。"""
+    db.query(DocumentChunkRecord).filter(DocumentChunkRecord.document_id == document_id).delete()
+    db.add_all(
+        DocumentChunkRecord(
+            document_id=document_id,
+            chunk_index=index,
+            chunk_text=chunk,
+        )
+        for index, chunk in enumerate(chunks)
+    )
+
+
+def _get_document_content_from_sqlite(db: Session, document_id: str) -> str:
+    """从 SQLite 切片表重组文档正文。"""
+    chunks = (
+        db.query(DocumentChunkRecord)
+        .filter(DocumentChunkRecord.document_id == document_id)
+        .order_by(DocumentChunkRecord.chunk_index.asc())
+        .all()
+    )
+    return "\n\n".join(chunk.chunk_text for chunk in chunks if chunk.chunk_text.strip())
+
+
+def _get_document_content_from_milvus(document_id: str) -> str:
+    """兼容旧数据：从 Milvus chunk_text 重组正文。"""
+    try:
+        client = get_milvus_client()
+        rows = client.query(
+            collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
+            filter=f'document_id == "{document_id}"',
+            output_fields=["chunk_index", "chunk_text"],
+            limit=10000,
+        )
+    except Exception as exc:
+        logger.warning("从 Milvus 读取文档正文切片失败，已跳过: {} (document_id={})", exc, document_id)
+        return ""
+
+    sorted_rows = sorted(rows or [], key=lambda item: int(item.get("chunk_index") or 0))
+    return "\n\n".join(
+        str(row.get("chunk_text") or "").strip()
+        for row in sorted_rows
+        if str(row.get("chunk_text") or "").strip()
+    )
+
+
+def get_document_content(document_id: str) -> Dict:
+    """获取文档正文预览，优先使用 SQLite 切片，避免依赖本地原始文件。"""
+    init_metadata_db()
+    db: Session = SessionLocal()
+    try:
+        record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
+        if not record:
+            raise DocumentException("文档不存在")
+
+        content = _get_document_content_from_sqlite(db, document_id)
+        if not content:
+            content = _get_document_content_from_milvus(document_id)
+
+        if not content:
+            file_path = Path(record.file_path)
+            if file_path.exists():
+                content = extract_text_from_file(file_path)
+
+        if not content:
+            raise DocumentException("文档正文不存在或尚未处理完成")
+
+        return {
+            "document_id": record.document_id,
+            "original_filename": record.original_filename,
+            "file_type": record.file_type,
+            "status": record.status,
+            "content": content,
+            "content_type": record.content_type,
+            "updated_at": record.updated_at,
+        }
     finally:
         db.close()
 
@@ -344,6 +619,7 @@ def _process_document_upload(
         logger.info(f"开始更新文档状态为 ready (document_id={document_id})")
         record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
         if record:
+            _replace_document_chunk_records(db, document_id, chunks)
             record.status = "ready"
             record.chunk_count = len(chunks)
             record.error_message = None
@@ -365,6 +641,7 @@ def _process_document_upload(
         logger.exception(f"文档后台处理失败 (document_id={document_id}): {e}")
     finally:
         db.close()
+        _delete_local_uploaded_file(stored_path, document_id, "background_processed")
 
 
 def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks] = None) -> Dict:
@@ -447,6 +724,7 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
         record.status = "ready"
         record.chunk_count = len(chunks)
         record.error_message = None
+        _replace_document_chunk_records(db, document_id, chunks)
         db.commit()
         db.refresh(record)
         _log_upload_step(
@@ -469,6 +747,8 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
         raise
     finally:
         db.close()
+        if "stored_path" in locals() and background_tasks is None:
+            _delete_local_uploaded_file(stored_path, document_id, "sync_processed")
 
 
 def list_documents(skip: int = 0, limit: int = 10) -> Dict:
@@ -569,6 +849,7 @@ def delete_document(document_id: str, already_marked: bool = False) -> Dict:
         try:
             payload = _serialize_record(record)
             payload["status"] = "deleted"
+            db.query(DocumentChunkRecord).filter(DocumentChunkRecord.document_id == document_id).delete()
             db.delete(record)
             db.commit()
             _log_delete_step(document_id, "4/4", "SQLite 文档记录删除完成")
