@@ -144,11 +144,35 @@ class Settings:
     # ==================== 聊天配置 ====================
     # 前端可保留的最大对话线程数，防止本地历史过多导致页面和请求阻塞。
     CHAT_MAX_CONVERSATIONS: int = int(os.getenv("CHAT_MAX_CONVERSATIONS"))
+    MEMORY_CLEANUP_INTERVAL_SECONDS: int = max(
+        60,
+        int(os.getenv("MEMORY_CLEANUP_INTERVAL_SECONDS", "3600")),
+    )
+    MEMORY_EVENT_EXPIRY_DAYS: int = max(
+        1,
+        int(os.getenv("MEMORY_EVENT_EXPIRY_DAYS", "90")),
+    )
+    MEMORY_PROFILE_STALE_DAYS: int = max(
+        1,
+        int(os.getenv("MEMORY_PROFILE_STALE_DAYS", "180")),
+    )
+    MEMORY_SCORE_THRESHOLD: float = max(
+        0.0,
+        min(100.0, float(os.getenv("MEMORY_SCORE_THRESHOLD", "20"))),
+    )
+    MEMORY_PURGE_RETENTION_DAYS: int = max(
+        1,
+        int(os.getenv("MEMORY_PURGE_RETENTION_DAYS", "30")),
+    )
 
     # ==================== 认证配置 ====================
     JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
-    REFRESH_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "30"))
+    # 登录态默认 1 小时；每次有效交互都会把数据库会话的空闲过期时间重新延长。
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+    REFRESH_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "60"))
+    SESSION_IDLE_TIMEOUT_MINUTES: int = int(
+        os.getenv("SESSION_IDLE_TIMEOUT_MINUTES", "60")
+    )
     BOOTSTRAP_ADMIN_USERNAME: Optional[str] = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "admin")
     BOOTSTRAP_ADMIN_PASSWORD: Optional[str] = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "123456")
     BOOTSTRAP_ADMIN_ROLE: str = os.getenv("BOOTSTRAP_ADMIN_ROLE", "admin")

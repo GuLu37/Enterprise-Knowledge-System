@@ -52,6 +52,7 @@ def run_rag_tool(
 
     return {
         "query": workflow.query,
+        "retrieval_method": workflow.retrieval_method,
         "expanded_queries": workflow.expanded_queries,
         "results": results,
         "context": workflow.context,

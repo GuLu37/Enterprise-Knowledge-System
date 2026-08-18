@@ -6,12 +6,26 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from app.config import settings
 from app.rag.retrieval.base import RetrievalResult
-from app.rag.retrieval.reranker import build_query_terms, fuse_ranked_results, rerank_results
+from app.rag.retrieval.reranker import (
+    build_query_terms,
+    extract_identifier_terms,
+    fuse_ranked_results,
+    is_identifier_query,
+    passes_keyword_relevance_gate,
+    rerank_results,
+)
+from app.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 MIN_MULTI_QUERY_COUNT = 3
 MAX_MULTI_QUERY_COUNT = 5
 MAX_CITATION_RESULTS = 3
+STRUCTURED_QUERY_CITATION_RESULTS = 5
 RAG_CONTEXT_MAX_CHARS = 6500
+MIN_FINAL_RELEVANCE_SCORE = 0.28
+MIN_RAG_CANDIDATE_POOL = 60
+NO_RESULTS_MESSAGE = "当前知识库未检索到足够相关资料"
 MULTI_QUERY_SYSTEM_PROMPT = (
     "你是企业知识库检索的多查询扩展器。"
     "你的任务是根据用户问题，生成 3 到 5 条同义、不同角度的检索查询变体。"
@@ -20,12 +34,35 @@ MULTI_QUERY_SYSTEM_PROMPT = (
     "只输出严格 JSON，格式必须是：{\"queries\":[\"查询1\",\"查询2\",\"查询3\"]}"
 )
 
+STRUCTURED_QUERY_HINT_TERMS = (
+    "员工",
+    "部门",
+    "岗位",
+    "职位",
+    "工号",
+    "姓名",
+    "婚姻",
+    "状态",
+    "入职",
+    "离职",
+    "手机号",
+    "电话",
+    "邮箱",
+    "地址",
+    "身份证",
+    "证件",
+    "账号",
+    "编码",
+    "编号",
+)
+
 
 @dataclass
 class RagWorkflowResult:
     """一次 RAG 工具执行后的结构化结果。"""
 
     query: str
+    retrieval_method: str = "hybrid"
     expanded_queries: List[str] = field(default_factory=list)
     results: List[RetrievalResult] = field(default_factory=list)
     context: str = ""
@@ -89,6 +126,14 @@ def _build_retriever(top_k: int, retrieval_method: str = "hybrid"):
     return dense_retriever or sparse_retriever
 
 
+def _resolve_retrieval_method_for_query(query: str, retrieval_method: str) -> str:
+    """编号型查询自动避免纯向量检索，优先保留关键词/精确匹配机会。"""
+    normalized_method = (retrieval_method or "hybrid").strip().lower()
+    if normalized_method == "dense" and is_identifier_query(query):
+        return "hybrid"
+    return normalized_method
+
+
 def retrieve_documents(
     query: str,
     top_k: Optional[int] = None,
@@ -100,11 +145,14 @@ def retrieve_documents(
         return []
 
     resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, 50))
-    retriever = _build_retriever(resolved_top_k, retrieval_method=retrieval_method)
+    candidate_k = max(resolved_top_k * 8, resolved_top_k + 20, MIN_RAG_CANDIDATE_POOL)
+    resolved_method = _resolve_retrieval_method_for_query(normalized_query, retrieval_method)
+    retriever = _build_retriever(candidate_k, retrieval_method=resolved_method)
     if retriever is None:
         return []
 
-    return retriever.retrieve(normalized_query, top_k=resolved_top_k)
+    candidates = retriever.retrieve(normalized_query, top_k=candidate_k)
+    return rerank_results(query=normalized_query, results=candidates, top_k=resolved_top_k)
 
 
 def _normalize_query_variants(
@@ -174,6 +222,14 @@ def _heuristic_multi_query_variants(query: str, max_queries: int = MAX_MULTI_QUE
     return _normalize_query_variants(candidates, normalized_query, max_queries=max_queries)
 
 
+def _identifier_query_variants(query: str) -> List[str]:
+    """编号型查询不要交给 LLM 改写，优先保留原始编号和大小写变体。"""
+    normalized_query = re.sub(r"\s+", " ", (query or "").strip())
+    candidates = [normalized_query]
+    candidates.extend(extract_identifier_terms(normalized_query))
+    return _normalize_query_variants(candidates, normalized_query, max_queries=MAX_MULTI_QUERY_COUNT)
+
+
 def _parse_multi_query_payload(text: str) -> Dict[str, Any]:
     """解析 LLM 输出的多查询 JSON。"""
     normalized = (text or "").strip()
@@ -202,6 +258,8 @@ def generate_multi_query_variants(
     normalized_query = re.sub(r"\s+", " ", (query or "").strip())
     if not normalized_query:
         return []
+    if is_identifier_query(normalized_query):
+        return _identifier_query_variants(normalized_query)
 
     if llm is None:
         return _heuristic_multi_query_variants(normalized_query, max_queries=max_queries)
@@ -248,8 +306,9 @@ def retrieve_documents_multi_query(
         return []
 
     resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, 50))
-    candidate_k = max(resolved_top_k * 4, resolved_top_k + 8, 20)
-    retriever = _build_retriever(candidate_k, retrieval_method=retrieval_method)
+    candidate_k = max(resolved_top_k * 8, resolved_top_k + 20, MIN_RAG_CANDIDATE_POOL)
+    resolved_method = _resolve_retrieval_method_for_query(query, retrieval_method)
+    retriever = _build_retriever(candidate_k, retrieval_method=resolved_method)
     if retriever is None:
         return []
 
@@ -268,7 +327,34 @@ def retrieve_documents_multi_query(
         source_labels=[f"query_{index + 1}" for index in range(len(result_sets))],
         rrf_k=60,
     )
-    return rerank_results(query=query, results=fused_results, top_k=max(resolved_top_k * 2, resolved_top_k + 4))
+    return fused_results[: max(resolved_top_k * 8, resolved_top_k + 20, MIN_RAG_CANDIDATE_POOL)]
+
+
+def _citation_document_key(result: RetrievalResult) -> str:
+    """引用资料优先按文档去重，避免同一文件多个片段挤占展示位。"""
+    metadata = result.metadata or {}
+    return str(metadata.get("document_id") or metadata.get("source_name") or result.content or "")
+
+
+def _citation_chunk_key(result: RetrievalResult) -> tuple[str, str, Any]:
+    metadata = result.metadata or {}
+    return (
+        str(metadata.get("document_id") or ""),
+        str(metadata.get("source_name") or ""),
+        metadata.get("chunk_index"),
+    )
+
+
+def _is_structured_lookup_query(query: str) -> bool:
+    """判断是否是员工、部门、状态这类结构化字段查询。"""
+    normalized = re.sub(r"\s+", "", (query or "").strip())
+    if not normalized:
+        return False
+    if is_identifier_query(normalized):
+        return True
+    if len(normalized) > 32:
+        return False
+    return any(term in normalized for term in STRUCTURED_QUERY_HINT_TERMS)
 
 
 def filter_retrieval_results(
@@ -277,34 +363,47 @@ def filter_retrieval_results(
     top_k: Optional[int] = None,
 ) -> List[RetrievalResult]:
     """检索后过滤：保留高相关、去重后的候选引用资料。"""
-    resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, MAX_CITATION_RESULTS))
+    structured_lookup = _is_structured_lookup_query(query)
+    max_citation_results = STRUCTURED_QUERY_CITATION_RESULTS if structured_lookup else MAX_CITATION_RESULTS
+    resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, max_citation_results))
     candidates = [item for item in results if item and (item.content or "").strip()]
     if not candidates:
         return []
 
-    reranked = rerank_results(query=query, results=candidates, top_k=max(resolved_top_k * 2, resolved_top_k))
+    reranked = rerank_results(query=query, results=candidates, top_k=len(candidates))
     if not reranked:
         return []
 
-    best_score = max(float(item.score or 0.0) for item in reranked)
-    score_floor = max(0.12, best_score * 0.55)
-    filtered = [item for item in reranked if float(item.score or 0.0) >= score_floor]
+    keyword_matched = [item for item in reranked if passes_keyword_relevance_gate(query, item)]
+    if not keyword_matched:
+        return []
 
-    if not filtered and best_score >= 0.18:
-        filtered = reranked[:1]
+    best_score = max(float(item.score or 0.0) for item in keyword_matched)
+    score_floor = max(MIN_FINAL_RELEVANCE_SCORE, best_score * 0.62)
+    filtered = [item for item in keyword_matched if float(item.score or 0.0) >= score_floor]
+
+    if not filtered and best_score >= MIN_FINAL_RELEVANCE_SCORE:
+        filtered = keyword_matched[:1]
 
     deduplicated: List[RetrievalResult] = []
-    seen_keys = set()
-    for item in filtered or reranked:
-        metadata = item.metadata or {}
-        document_id = str(metadata.get("document_id") or "")
-        chunk_index = metadata.get("chunk_index")
-        source_name = str(metadata.get("source_name") or "")
-        key = (document_id, source_name, chunk_index)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
+    seen_documents = set()
+    seen_chunks = set()
+
+    def append_candidate(item: RetrievalResult, enforce_document_diversity: bool) -> None:
+        if len(deduplicated) >= resolved_top_k:
+            return
+        chunk_key = _citation_chunk_key(item)
+        document_key = _citation_document_key(item)
+        if chunk_key in seen_chunks:
+            return
+        if enforce_document_diversity and document_key in seen_documents:
+            return
+        seen_chunks.add(chunk_key)
+        seen_documents.add(document_key)
         deduplicated.append(item)
+
+    for item in filtered:
+        append_candidate(item, enforce_document_diversity=not structured_lookup)
         if len(deduplicated) >= resolved_top_k:
             break
 
@@ -349,11 +448,12 @@ def run_rag_workflow(
     if not normalized_query:
         return RagWorkflowResult(query="")
 
+    resolved_method = _resolve_retrieval_method_for_query(normalized_query, retrieval_method)
     expanded_queries = expand_multi_query(normalized_query, llm=llm)
     recalled_results = retrieve_documents_multi_query(
         normalized_query,
         top_k=top_k,
-        retrieval_method=retrieval_method,
+        retrieval_method=resolved_method,
         expanded_queries=expanded_queries,
     )
     filtered_results = filter_retrieval_results(
@@ -362,12 +462,22 @@ def run_rag_workflow(
         top_k=top_k,
     )
     context = assemble_rag_context(filtered_results)
+    logger_data = {
+        "query": normalized_query,
+        "identifier_query": is_identifier_query(normalized_query),
+        "expanded_queries": expanded_queries,
+        "recalled_count": len(recalled_results),
+        "filtered_count": len(filtered_results),
+        "best_score": max((float(item.score or 0.0) for item in filtered_results), default=0.0),
+    }
+    logger.info(f"RAG 检索诊断: {json.dumps(logger_data, ensure_ascii=False)}")
     return RagWorkflowResult(
         query=normalized_query,
+        retrieval_method=resolved_method,
         expanded_queries=expanded_queries,
         results=filtered_results,
         context=context,
-        message="检索完成" if filtered_results else "未检索到相关内容",
+        message="检索完成" if filtered_results else NO_RESULTS_MESSAGE,
     )
 
 

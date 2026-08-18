@@ -1,13 +1,133 @@
 """检索结果打分、重排与融合。"""
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .base import RetrievalResult
 
 _QUERY_TERM_PATTERN = re.compile(r"[A-Za-z0-9]+|[一-鿿]{2,}")
+_IDENTIFIER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,12}[-_ ]?\d{2,}[A-Za-z0-9_-]*|\d{4,}[A-Za-z0-9_-]*)(?![A-Za-z0-9])"
+)
 _CLEANUP_PATTERN = re.compile(r"[\s\-_.,;:!?，。！？；：、“”‘’\"'`~…·/\\|()[\]{}<>《》]+")
+_QUESTION_FILLER_CHARS = set("的吗呢吧么嘛是否有没有请帮想要了解查询检索一下")
+_QUERY_STOP_TERMS = {
+    "公司",
+    "企业",
+    "知识库",
+    "文档",
+    "资料",
+    "里面",
+    "相关",
+    "标准吗",
+    "有没有",
+    "是否有",
+}
+_DOMAIN_TERMS = (
+    "城市交通",
+    "市内出行",
+    "出租车",
+    "网约车",
+    "火车站",
+    "行程单",
+    "高铁",
+    "飞机",
+    "住宿",
+    "餐补",
+    "报销",
+    "审批",
+    "流程",
+    "标准",
+    "费用",
+    "凭证",
+    "发票",
+    "材料",
+    "差旅",
+    "采购",
+    "合同",
+    "付款",
+    "验收",
+    "上线",
+    "发布",
+    "灰度",
+    "回滚",
+    "账号",
+    "登录",
+    "密码",
+    "权限",
+    "项目",
+    "文档",
+)
+_GENERIC_FOCUS_TERMS = {
+    "公司",
+    "企业",
+    "城市",
+    "知识库",
+    "文档",
+    "资料",
+    "报销",
+    "审批",
+    "流程",
+    "标准",
+    "费用",
+    "制度",
+    "规范",
+    "政策",
+    "手册",
+    "相关",
+}
+_IDENTIFIER_HINT_TERMS = (
+    "员工编号",
+    "员工号",
+    "工号",
+    "人员编号",
+    "用户编号",
+    "产品编号",
+    "产品号",
+    "商品编号",
+    "物料编号",
+    "订单编号",
+    "合同编号",
+    "项目编号",
+    "编号",
+    "编码",
+    "型号",
+    "id",
+)
+
+
+def extract_identifier_terms(query: str) -> List[str]:
+    """提取用户问题中的编号、工号、产品号等精确检索词。"""
+    raw_query = (query or "").strip()
+    if not raw_query:
+        return []
+
+    identifiers: List[str] = []
+    seen = set()
+    for match in _IDENTIFIER_PATTERN.findall(raw_query):
+        compact = re.sub(r"\s+", "", match).strip()
+        plain = re.sub(r"[\s_-]+", "", match).strip()
+        for base_value in (compact, plain):
+            for value in (base_value, base_value.upper(), base_value.lower()):
+                if value and value not in seen:
+                    seen.add(value)
+                    identifiers.append(value)
+    return identifiers
+
+
+def is_identifier_query(query: str) -> bool:
+    """判断是否像员工号、产品号、订单号这类应优先精确检索的查询。"""
+    normalized = (query or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if extract_identifier_terms(normalized):
+        return True
+    if any(term in lowered for term in _IDENTIFIER_HINT_TERMS if term != "id"):
+        return True
+    return bool(re.search(r"(?<![A-Za-z0-9])id(?![A-Za-z0-9])", lowered))
 
 
 def normalize_text(text: str) -> str:
@@ -24,7 +144,7 @@ def build_query_terms(query: str, max_terms: int = 16) -> List[str]:
     if not normalized_query:
         return []
 
-    terms: List[str] = []
+    terms: List[str] = extract_identifier_terms(query)
     for part in _QUERY_TERM_PATTERN.findall(normalized_query):
         if re.fullmatch(r"[一-鿿]{2,}", part):
             if len(part) >= 4:
@@ -48,6 +168,131 @@ def build_query_terms(query: str, max_terms: int = 16) -> List[str]:
         if len(deduplicated) >= max_terms:
             break
     return deduplicated
+
+
+def _normalize_query_for_keywords(query: str) -> str:
+    """清理问句噪声，避免生成跨越虚词的中文 ngram。"""
+    normalized = normalize_text(query)
+    if not normalized:
+        return ""
+
+    replacements = (
+        ("根据知识库", ""),
+        ("基于知识库", ""),
+        ("结合知识库", ""),
+        ("企业知识库", ""),
+        ("公司资料", ""),
+        ("上传文档", ""),
+        ("查一下", ""),
+        ("查询", ""),
+        ("检索", ""),
+        ("搜索", ""),
+        ("请问", ""),
+        ("帮我", ""),
+        ("有没有", ""),
+        ("是否有", ""),
+        ("是否", ""),
+        ("有什么", "什么"),
+        ("有标准", "标准"),
+    )
+    for old, new in replacements:
+        normalized = normalized.replace(old, new)
+
+    normalized = re.sub(r"(是什么|有哪些|如何|怎么|为什么|可以吗|能否|请说明|请解释)$", "", normalized)
+    for stop_term in sorted(_QUERY_STOP_TERMS, key=len, reverse=True):
+        normalized = normalized.replace(stop_term, "")
+    normalized = normalized.replace("有标准", "标准")
+    normalized = normalized.strip("的吗呢吧么嘛请帮想要了解一下")
+    return normalized
+
+
+def _append_unique(items: List[str], seen: set[str], value: str, max_terms: int) -> bool:
+    normalized_value = normalize_text(value)
+    if len(normalized_value) < 2 or normalized_value in seen:
+        return len(items) >= max_terms
+    seen.add(normalized_value)
+    items.append(normalized_value)
+    return len(items) >= max_terms
+
+
+def build_query_keywords(query: str, max_terms: int = 24) -> List[str]:
+    """提取用于最终相关性过滤的有效关键词。"""
+    normalized_query = _normalize_query_for_keywords(query)
+    keywords: List[str] = []
+    seen = set()
+
+    for term in _DOMAIN_TERMS:
+        if term in normalized_query and _append_unique(keywords, seen, term, max_terms):
+            return keywords
+
+    if 2 <= len(normalized_query) <= 16:
+        _append_unique(keywords, seen, normalized_query, max_terms)
+
+    for size in (4, 3, 2):
+        if len(normalized_query) < size:
+            continue
+        for index in range(len(normalized_query) - size + 1):
+            term = normalized_query[index:index + size]
+            if any(char in _QUESTION_FILLER_CHARS for char in term):
+                continue
+            if _append_unique(keywords, seen, term, max_terms):
+                return keywords
+
+    raw_terms = build_query_terms(normalized_query, max_terms=max_terms * 4)
+    for term in raw_terms:
+        normalized_term = normalize_text(term)
+        if len(normalized_term) < 2:
+            continue
+        if normalized_term in _QUERY_STOP_TERMS:
+            continue
+        if re.fullmatch(r"[一-鿿]+", normalized_term):
+            if all(char in _QUESTION_FILLER_CHARS for char in normalized_term):
+                continue
+            if len(normalized_term) >= 3 and any(char in _QUESTION_FILLER_CHARS for char in normalized_term):
+                continue
+        if normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        keywords.append(normalized_term)
+        if len(keywords) >= max_terms:
+            break
+    return keywords
+
+
+def build_query_focus_terms(query: str, max_terms: int = 8) -> List[str]:
+    """提取能代表用户真正主题的核心焦点词。"""
+    normalized_query = _normalize_query_for_keywords(query)
+    focus_terms: List[str] = []
+    seen = set()
+
+    for term in _DOMAIN_TERMS:
+        if term in _GENERIC_FOCUS_TERMS or term not in normalized_query:
+            continue
+        if _append_unique(focus_terms, seen, term, max_terms):
+            return focus_terms
+        if term == "城市交通" and _append_unique(focus_terms, seen, "交通", max_terms):
+            return focus_terms
+        if term == "市内出行" and _append_unique(focus_terms, seen, "出行", max_terms):
+            return focus_terms
+
+    if focus_terms:
+        return focus_terms
+
+    keywords = build_query_keywords(query, max_terms=32)
+    for term in keywords:
+        if term in _GENERIC_FOCUS_TERMS:
+            continue
+        if len(term) > 2 and term not in _DOMAIN_TERMS and term != normalized_query:
+            continue
+        if len(term) < 2:
+            continue
+        if term in seen:
+            continue
+        seen.add(term)
+        focus_terms.append(term)
+        if len(focus_terms) >= max_terms:
+            break
+    return focus_terms
 
 
 def _normalize_source_score(score: float, source: str = "") -> float:
@@ -104,17 +349,143 @@ def _build_result_search_text(result: RetrievalResult) -> str:
     return "\n".join(part for part in (source_name, content) if part)
 
 
+def _build_result_heading_text(result: RetrievalResult) -> str:
+    """提取 chunk 的结构标题，供章节/表格标题命中加权。"""
+    lines = [
+        line.strip()
+        for line in (result.content or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+
+    heading_lines = [lines[0]]
+    if lines[0].startswith("[Sheet]") and len(lines) > 1:
+        heading_lines.append(lines[1])
+    return "\n".join(heading_lines)
+
+
+def _build_keyword_specificity_scores(
+    keywords: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+) -> List[float]:
+    """按候选集合内的关键词稀有度计算区分度分数。"""
+    if not keywords or not candidates:
+        return [0.0 for _ in candidates]
+
+    normalized_texts = [
+        normalize_text(_build_result_search_text(item))
+        for item in candidates
+    ]
+    document_frequency: Dict[str, int] = {}
+    for keyword in keywords:
+        document_frequency[keyword] = sum(
+            1
+            for text in normalized_texts
+            if keyword and keyword in text
+        )
+
+    total = len(candidates)
+    max_weight = 0.0
+    keyword_weights: Dict[str, float] = {}
+    for keyword in keywords:
+        if not keyword:
+            continue
+        idf = math.log((total + 1) / (document_frequency.get(keyword, 0) + 1)) + 1.0
+        weight = idf * (min(max(len(keyword), 1), 8) / 8.0)
+        keyword_weights[keyword] = weight
+        max_weight += weight
+
+    if max_weight <= 0.0:
+        return [0.0 for _ in candidates]
+
+    scores: List[float] = []
+    for text in normalized_texts:
+        hit_weight = sum(
+            weight
+            for keyword, weight in keyword_weights.items()
+            if keyword in text
+        )
+        scores.append(min(1.0, hit_weight / max_weight))
+    return scores
+
+
+def build_relevance_signals(query: str, result: RetrievalResult) -> Dict[str, Any]:
+    """生成最终过滤可复用的相关性信号。"""
+    keywords = build_query_keywords(query)
+    focus_terms = build_query_focus_terms(query)
+    searchable_text = _build_result_search_text(result)
+    normalized_content = normalize_text(searchable_text)
+    normalized_query = normalize_text(query)
+    keyword_hits = [
+        term
+        for term in keywords
+        if term and term in normalized_content
+    ]
+    focus_hits = [
+        term
+        for term in focus_terms
+        if term and term in normalized_content
+    ]
+    unique_hits = list(dict.fromkeys(keyword_hits))
+    unique_focus_hits = list(dict.fromkeys(focus_hits))
+    long_hit_count = sum(1 for term in unique_hits if len(term) >= 3)
+    exact_match = bool(normalized_query and normalized_query in normalized_content)
+    return {
+        "query_keywords": keywords,
+        "query_focus_terms": focus_terms,
+        "keyword_hits": unique_hits,
+        "focus_hits": unique_focus_hits,
+        "keyword_hit_count": len(unique_hits),
+        "focus_hit_count": len(unique_focus_hits),
+        "long_keyword_hit_count": long_hit_count,
+        "keyword_coverage": _match_coverage_score(keywords, searchable_text),
+        "focus_coverage": _match_coverage_score(focus_terms, searchable_text),
+        "heading_coverage": _match_coverage_score(keywords, _build_result_heading_text(result)),
+        "heading_focus_coverage": _match_coverage_score(focus_terms, _build_result_heading_text(result)),
+        "exact_match": exact_match,
+    }
+
+
+def passes_keyword_relevance_gate(query: str, result: RetrievalResult) -> bool:
+    """判断结果是否满足最终引用所需的关键词相关性。"""
+    signals = build_relevance_signals(query, result)
+    keywords = signals["query_keywords"]
+    focus_terms = signals["query_focus_terms"]
+    if not keywords:
+        return True
+    if signals["exact_match"]:
+        return True
+
+    hit_count = int(signals["keyword_hit_count"])
+    focus_hit_count = int(signals["focus_hit_count"])
+    long_hit_count = int(signals["long_keyword_hit_count"])
+    coverage = float(signals["keyword_coverage"] or 0.0)
+    focus_coverage = float(signals["focus_coverage"] or 0.0)
+
+    if focus_terms and focus_hit_count < 1 and focus_coverage < 0.18:
+        return False
+
+    if len(keywords) <= 2:
+        return hit_count >= 1 or coverage >= 0.28
+    return long_hit_count >= 1 or hit_count >= 2 or coverage >= 0.22
+
+
 def _score_result(
     query_terms: Sequence[str],
     normalized_query: str,
     result: RetrievalResult,
     raw_norm: float,
+    specificity: float = 0.0,
 ) -> float:
     """对单条检索结果计算综合分。"""
-    searchable_text = _build_result_search_text(result)
-    coverage = _match_coverage_score(query_terms, searchable_text)
-    normalized_content = normalize_text(searchable_text)
-    exact_bonus = 1.0 if normalized_query and normalized_query in normalized_content else 0.0
+    signals = build_relevance_signals(normalized_query, result)
+    coverage = float(signals["keyword_coverage"] or 0.0)
+    focus_coverage = float(signals["focus_coverage"] or 0.0)
+    heading_coverage = float(signals["heading_coverage"] or 0.0)
+    heading_focus_coverage = float(signals["heading_focus_coverage"] or 0.0)
+    exact_bonus = 1.0 if signals["exact_match"] else 0.0
+    keyword_gate_bonus = 0.22 if passes_keyword_relevance_gate(normalized_query, result) else -0.22
     source_bonus = 0.0
     if result.source == "hybrid":
         source_bonus = 0.02
@@ -123,7 +494,17 @@ def _score_result(
     elif result.source == "sparse":
         source_bonus = 0.03
 
-    return (0.35 * raw_norm) + (0.35 * coverage) + (0.30 * exact_bonus) + source_bonus
+    return (
+        (0.20 * raw_norm)
+        + (0.20 * coverage)
+        + (0.24 * specificity)
+        + (0.16 * focus_coverage)
+        + (0.08 * heading_coverage)
+        + (0.12 * heading_focus_coverage)
+        + (0.25 * exact_bonus)
+        + keyword_gate_bonus
+        + source_bonus
+    )
 
 
 def rerank_results(
@@ -138,6 +519,8 @@ def rerank_results(
     if not candidates:
         return []
 
+    query_keywords = build_query_keywords(query)
+    specificity_scores = _build_keyword_specificity_scores(query_keywords, candidates)
     raw_scores = [_normalize_source_score(item.score, item.source) for item in candidates]
     min_score = min(raw_scores)
     max_score = max(raw_scores)
@@ -149,7 +532,11 @@ def rerank_results(
             raw_norm = (raw_scores[index] - min_score) / score_span
         else:
             raw_norm = 1.0 if raw_scores[index] > 0 else 0.0
-        scored_items.append((index, item, _score_result(query_terms, normalized_query, item, raw_norm)))
+        scored_items.append((
+            index,
+            item,
+            _score_result(query_terms, query, item, raw_norm, specificity_scores[index]),
+        ))
 
     scored_items.sort(
         key=lambda item: (
@@ -163,11 +550,19 @@ def rerank_results(
     return [
         RetrievalResult(
             content=item.content,
-            metadata=item.metadata,
+            metadata={
+                **(item.metadata or {}),
+                **{
+                    key: value
+                    for key, value in build_relevance_signals(query, item).items()
+                    if key not in {"query_keywords", "query_focus_terms"}
+                },
+                "keyword_specificity": float(specificity_scores[index]),
+            },
             score=float(score),
             source=item.source,
         )
-        for _, item, score in limited
+        for index, item, score in limited
     ]
 
 

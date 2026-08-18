@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -17,7 +17,12 @@ engine = create_engine(
     if settings.DATABASE_URL.startswith("sqlite")
     else {},
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    bind=engine,
+)
 
 
 class Base(DeclarativeBase):
@@ -80,8 +85,40 @@ class AuthSession(Base):
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class MemoryRecord(Base):
+    """长期记忆生命周期元数据。"""
+
+    __tablename__ = "memory_records"
+    __table_args__ = (
+        Index("ix_memory_records_user_type_status", "user_id", "memory_type", "status"),
+        Index("ix_memory_records_user_key_status", "user_id", "memory_key", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    memory_id: Mapped[str] = mapped_column(String(256), unique=True, index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    memory_type: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    memory_key: Mapped[Optional[str]] = mapped_column(String(256), index=True, nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    conversation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    session_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    base_importance_score: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
+    importance_score: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
+    confidence_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    access_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_accessed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="active")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    supersedes_memory_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+
 def init_metadata_db():
-    """创建或校验 SQLite 中的文档元数据表结构。"""
+    """创建或校验关系型元数据表结构。"""
     if settings.DATABASE_URL.startswith("sqlite:///"):
         database_path = settings.DATABASE_URL.removeprefix("sqlite:///")
         if database_path and database_path != ":memory:" and not database_path.startswith("file:"):

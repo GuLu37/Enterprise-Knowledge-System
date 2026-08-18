@@ -50,3 +50,4 @@ def test_sparse_retriever_ranks_by_keyword_overlap(monkeypatch):
     assert results[0].metadata["document_id"] == "doc-1"
     assert client.calls
     assert 'chunk_text like "%高考%"' in client.calls[0]["filter"]
+    assert 'source_name like "%高考%"' in client.calls[0]["filter"]

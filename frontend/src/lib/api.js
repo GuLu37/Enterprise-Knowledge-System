@@ -1,6 +1,7 @@
 const defaultBaseUrl = '/api/v1'
 const AUTH_TOKEN_KEY = 'enterprise-knowledge-system.auth-token'
 const REFRESH_TOKEN_KEY = 'enterprise-knowledge-system.refresh-token'
+const RENEWED_ACCESS_TOKEN_HEADER = 'X-Access-Token'
 
 function getBaseUrl() {
   return (import.meta.env.VITE_API_BASE_URL || defaultBaseUrl).replace(/\/$/, '')
@@ -67,7 +68,11 @@ export function setAuthTokens({ accessToken = '', refreshToken = '' } = {}) {
 }
 
 export function setAuthToken(token) {
-  setAuthTokens({ accessToken: token })
+  if (token) {
+    localStorage.setItem(AUTH_TOKEN_KEY, token)
+  } else {
+    localStorage.removeItem(AUTH_TOKEN_KEY)
+  }
 }
 
 export function clearAuthToken() {
@@ -84,6 +89,13 @@ function buildHeaders(headers = {}, withAuth = true) {
     }
   }
   return nextHeaders
+}
+
+function captureRenewedAccessToken(response) {
+  const renewedAccessToken = response.headers.get(RENEWED_ACCESS_TOKEN_HEADER)
+  if (renewedAccessToken) {
+    setAuthToken(renewedAccessToken)
+  }
 }
 
 async function refreshAuthSession() {
@@ -114,6 +126,7 @@ async function requestJson(path, options = {}, allowRetry = true) {
     ...fetchOptions,
     headers: buildHeaders(headers, auth),
   })
+  captureRenewedAccessToken(response)
 
   if (!response.ok) {
     const detail = formatErrorDetail((await parseJsonResponse(response))?.detail)
@@ -277,6 +290,7 @@ export async function streamChat(payload, onEvent) {
   }
 
   let response = await fetch(buildUrl('/chat/stream'), requestInit)
+  captureRenewedAccessToken(response)
   if (response.status === 401 && getRefreshToken()) {
     try {
       await refreshAuthSession()
@@ -287,6 +301,7 @@ export async function streamChat(payload, onEvent) {
           ...(getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}),
         },
       })
+      captureRenewedAccessToken(response)
     } catch {
       clearAuthToken()
     }

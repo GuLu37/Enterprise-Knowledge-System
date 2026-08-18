@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import uuid
 
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
@@ -199,6 +199,20 @@ def _build_access_token(user: Dict[str, Any], session_id: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=_JWT_ALGORITHM)
 
 
+def _renew_session_access_token(
+    db,
+    user: UserAccount,
+    session: AuthSession,
+    now: datetime,
+) -> str:
+    """续期当前会话，并生成新的访问令牌供客户端替换。"""
+    session.last_used_at = now
+    session.updated_at = now
+    session.expires_at = now + timedelta(minutes=settings.SESSION_IDLE_TIMEOUT_MINUTES)
+    access_token = _build_access_token(_serialize_user(user), session.session_id)
+    return access_token
+
+
 def _build_refresh_token(user: Dict[str, Any], session_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
     payload = {
@@ -371,9 +385,10 @@ def decode_access_token(token: str) -> Dict[str, Any]:
 
 
 def require_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> Dict[str, Any]:
-    """FastAPI 依赖：要求当前请求携带有效登录态。"""
+    """FastAPI 依赖：校验登录态并按交互滑动续期。"""
     if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="未登录或登录已失效")
 
@@ -392,9 +407,15 @@ def require_current_user(
         ):
             raise HTTPException(status_code=401, detail="未登录或登录已失效")
 
-        session.last_used_at = _utcnow()
-        session.updated_at = _utcnow()
+        now = _utcnow()
+        renewed_access_token = _renew_session_access_token(
+            db,
+            user,
+            session,
+            now,
+        )
         db.commit()
+        request.state.renewed_access_token = renewed_access_token
         return _serialize_user(user)
     finally:
         db.close()

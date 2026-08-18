@@ -13,6 +13,15 @@ ARTICLE_TEXT_SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", "：", "，
 LONG_TERM_MEMORY_TOKEN_LIMIT = 700
 
 ARTICLE_FILE_TYPES = {"pdf", "doc", "docx", "md", "txt", "html", "htm", "rtf", "markdown"}
+SECTION_HEADING_PATTERN = re.compile(
+    r"^(?:"
+    r"#{1,6}\s+\S.{0,80}|"
+    r"第[一二三四五六七八九十百千万0-9]+[章节条部分][、.．\s:：-]*\S.{0,70}|"
+    r"[一二三四五六七八九十]+[、.．]\s*\S.{0,70}|"
+    r"\d+(?:\.\d+)*[、.．]\s*\S.{0,70}|"
+    r"[（(][一二三四五六七八九十0-9]+[）)]\s*\S.{0,70}"
+    r")$"
+)
 
 _ROLE_LABELS = {
     "system": "系统",
@@ -114,6 +123,113 @@ def split_text_chunks(
     return [chunk.strip() for chunk in splitter.split_text(normalized_text) if chunk.strip()]
 
 
+def _is_section_heading(line: str) -> bool:
+    """识别常见文档标题行。"""
+    normalized_line = re.sub(r"\s+", " ", (line or "").strip())
+    if not normalized_line or len(normalized_line) > 90:
+        return False
+    if normalized_line.count("。") + normalized_line.count("；") + normalized_line.count(";") > 0:
+        return False
+    return bool(SECTION_HEADING_PATTERN.match(normalized_line))
+
+
+def _clean_section_heading(line: str) -> str:
+    """把标题行清洗成稳定的 chunk 前缀。"""
+    heading = re.sub(r"\s+", " ", (line or "").strip())
+    heading = re.sub(r"^#{1,6}\s*", "", heading).strip()
+    return heading
+
+
+def _split_text_into_sections(text: str) -> List[tuple[str, str]]:
+    """按标题行切成章节，保留标题与正文关系。"""
+    lines = (text or "").splitlines()
+    sections: List[tuple[str, str]] = []
+    current_heading = ""
+    current_lines: List[str] = []
+    heading_count = 0
+
+    def flush() -> None:
+        nonlocal current_lines
+        body = "\n".join(current_lines).strip()
+        if current_heading or body:
+            sections.append((current_heading, body))
+        current_lines = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current_lines and current_lines[-1] != "":
+                current_lines.append("")
+            continue
+        if _is_section_heading(line):
+            flush()
+            current_heading = _clean_section_heading(line)
+            heading_count += 1
+            continue
+        current_lines.append(line)
+
+    flush()
+    if heading_count <= 0:
+        return []
+    return sections
+
+
+def _split_section_chunks(
+    heading: str,
+    body: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    separators: Sequence[str],
+) -> List[str]:
+    """在单个章节内部切块，避免跨章节拼接。"""
+    prefix = f"[章节] {heading.strip()}" if heading.strip() else ""
+    normalized_body = (body or "").strip()
+
+    if prefix and not normalized_body:
+        return [prefix]
+    if not prefix:
+        return split_text_chunks(
+            text=normalized_body,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators,
+        )
+
+    available_size = max(120, chunk_size - len(prefix) - 1)
+    body_chunks = split_text_chunks(
+        text=normalized_body,
+        chunk_size=available_size,
+        chunk_overlap=min(chunk_overlap, max(0, available_size // 3)),
+        separators=separators,
+    )
+    return [f"{prefix}\n{chunk}".strip() for chunk in body_chunks]
+
+
+def split_document_text_by_sections(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    separators: Sequence[str],
+) -> List[str]:
+    """先按章节标题切分，再在章节内递归切块。"""
+    sections = _split_text_into_sections(text)
+    if not sections:
+        return []
+
+    chunks: List[str] = []
+    for heading, body in sections:
+        chunks.extend(
+            _split_section_chunks(
+                heading=heading,
+                body=body,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                separators=separators,
+            )
+        )
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
 def split_document_text(
     text: str,
     chunk_size: int = DOCUMENT_CHUNK_SIZE,
@@ -126,6 +242,15 @@ def split_document_text(
     """
     normalized_file_type = (file_type or "").strip().lower().lstrip(".")
     if normalized_file_type in ARTICLE_FILE_TYPES:
+        section_chunks = split_document_text_by_sections(
+            text=text,
+            chunk_size=DOCUMENT_ARTICLE_CHUNK_SIZE,
+            chunk_overlap=DOCUMENT_ARTICLE_CHUNK_OVERLAP,
+            separators=ARTICLE_TEXT_SEPARATORS,
+        )
+        if section_chunks:
+            return section_chunks
+
         return split_text_chunks(
             text=text,
             chunk_size=DOCUMENT_ARTICLE_CHUNK_SIZE,

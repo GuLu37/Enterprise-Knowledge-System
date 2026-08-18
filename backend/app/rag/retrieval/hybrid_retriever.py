@@ -2,7 +2,7 @@
 from typing import List
 
 from .base import BaseRetriever, RetrievalResult
-from .reranker import fuse_retrieval_results, rerank_results
+from .reranker import fuse_retrieval_results
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -41,9 +41,8 @@ class HybridRetriever(BaseRetriever):
             if not query:
                 return []
 
-            candidate_k = max(top_k * 4, top_k + 8, 20)
-            dense_results = self._safe_retrieve(self.dense_retriever, query, candidate_k, "密集")
-            sparse_results = self._safe_retrieve(self.sparse_retriever, query, candidate_k, "稀疏")
+            dense_results = self._safe_retrieve(self.dense_retriever, query, top_k, "密集")
+            sparse_results = self._safe_retrieve(self.sparse_retriever, query, top_k, "稀疏")
 
             if not dense_results and not sparse_results:
                 return []
@@ -54,7 +53,7 @@ class HybridRetriever(BaseRetriever):
                 dense_weight=self.dense_weight,
                 sparse_weight=self.sparse_weight,
             )
-            return rerank_results(query=query, results=fused_results, top_k=top_k)
+            return fused_results[:top_k]
         except Exception as e:
             logger.error(f"混合检索失败: {str(e)}")
             raise

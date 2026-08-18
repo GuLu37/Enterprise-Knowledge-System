@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
+  ArrowDown,
   ArrowRight,
   Bot,
   Check,
@@ -78,10 +79,16 @@ function normalizeStoredConversation(item) {
   const messages = Array.isArray(item?.messages)
     ? item.messages
       .filter((message) => message && typeof message === 'object')
-      .map((message) => ({
-        ...message,
-        content: typeof message.content === 'string' ? message.content : '',
-      }))
+      .map((message) => {
+        const normalizedMessage = {
+          ...message,
+          content: typeof message.content === 'string' ? message.content : '',
+        }
+        if (!normalizedMessage.retrievalMethod && typeof message.retrieval_method === 'string') {
+          normalizedMessage.retrievalMethod = message.retrieval_method
+        }
+        return normalizedMessage
+      })
     : []
 
   return {
@@ -179,6 +186,7 @@ const retrievalMenuRef = ref(null)
 const conversationFullNotice = ref(false)
 const autoScrollEnabled = ref(true)
 const expandedSources = ref({})
+const showJumpToBottomButton = computed(() => !autoScrollEnabled.value && chatMessages.value.length > 1)
 const messageEditState = ref(null)
 const messageEditSubmitting = ref(false)
 const messageEditError = ref('')
@@ -187,12 +195,19 @@ let sheetDragCleanup = null
 let conversationSaveTimer = null
 let conversationFullNoticeTimer = null
 let chatRuntimeStatusTimer = null
+let chatScrollResizeObserver = null
+let chatBottomSyncFrame = null
 
 const retrievalOptions = [
   { value: 'hybrid', label: '混合检索' },
   { value: 'dense', label: '密集检索' },
   { value: 'sparse', label: '稀疏检索' },
 ]
+const retrievalMethodLabels = {
+  hybrid: '混合检索',
+  dense: '密集检索',
+  sparse: '稀疏检索',
+}
 
 const currentRetrievalLabel = computed(
   () => retrievalOptions.find((option) => option.value === retrievalMethod.value)?.label || '混合检索',
@@ -229,6 +244,37 @@ function getConversationTurnCount(conversation) {
 
 function getDisplaySources(message) {
   return (message?.sources || []).slice(0, SOURCE_DISPLAY_LIMIT)
+}
+
+function normalizeRetrievalMethod(value) {
+  const method = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return retrievalMethodLabels[method] ? method : ''
+}
+
+function getRetrievalMethodLabel(method) {
+  const normalized = normalizeRetrievalMethod(method)
+  return normalized ? retrievalMethodLabels[normalized] : ''
+}
+
+function scheduleChatBottomSync(force = false) {
+  if (chatBottomSyncFrame) {
+    cancelAnimationFrame(chatBottomSyncFrame)
+  }
+  chatBottomSyncFrame = window.requestAnimationFrame(() => {
+    chatBottomSyncFrame = null
+    if (force || autoScrollEnabled.value) {
+      scrollToBottom(true)
+    }
+  })
+}
+
+function normalizeMessageSources(payload) {
+  const candidates = Array.isArray(payload)
+    ? payload
+    : payload?.sources || payload?.results || []
+  return Array.isArray(candidates)
+    ? candidates.filter((source) => source && typeof source === 'object')
+    : []
 }
 
 function getSourceFilename(source) {
@@ -340,6 +386,7 @@ async function generateAssistantReply({
     content: '',
     sources: [],
     pendingSources: [],
+    retrievalMethod: '',
     status: 'thinking',
     thinkingTimeMs: null,
   }
@@ -391,7 +438,16 @@ async function generateAssistantReply({
         }
         if (event.event === 'tool_result') {
           updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-            message.pendingSources = event.data?.sources || message.pendingSources || []
+            const sources = normalizeMessageSources(event.data)
+            if (sources.length) {
+              message.pendingSources = sources
+            }
+            const retrievalMethod = normalizeRetrievalMethod(
+              event.data?.retrieval_method || event.data?.retrievalMethod,
+            )
+            if (retrievalMethod) {
+              message.retrievalMethod = retrievalMethod
+            }
           })
           return
         }
@@ -400,7 +456,18 @@ async function generateAssistantReply({
             if (typeof event.data?.content === 'string') {
               message.content = event.data.content
             }
-            message.sources = event.data?.sources || message.pendingSources || message.sources
+            const sources = normalizeMessageSources(event.data)
+            if (sources.length) {
+              message.sources = sources
+            } else if (message.pendingSources?.length) {
+              message.sources = message.pendingSources
+            }
+            const retrievalMethod = normalizeRetrievalMethod(
+              event.data?.retrieval_method || event.data?.retrievalMethod || message.retrievalMethod,
+            )
+            if (retrievalMethod) {
+              message.retrievalMethod = retrievalMethod
+            }
             message.pendingSources = []
             message.status = 'done'
             message.thinkingTimeMs = Math.max(0, performance.now() - thinkingStartedAt)
@@ -415,7 +482,11 @@ async function generateAssistantReply({
       const result = await generateChat(payload)
       updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
         message.content = result.response || ''
-        message.sources = result.sources || []
+        message.sources = normalizeMessageSources(result)
+        const retrievalMethod = normalizeRetrievalMethod(result.retrieval_method || result.retrievalMethod)
+        if (retrievalMethod) {
+          message.retrievalMethod = retrievalMethod
+        }
         message.status = 'done'
         message.thinkingTimeMs = Math.max(0, performance.now() - thinkingStartedAt)
       }, true)
@@ -433,6 +504,10 @@ async function generateAssistantReply({
           if (!message.sources?.length && message.pendingSources?.length) {
             message.sources = message.pendingSources
           }
+          const retrievalMethod = normalizeRetrievalMethod(message.retrievalMethod)
+          if (retrievalMethod) {
+            message.retrievalMethod = retrievalMethod
+          }
           message.pendingSources = []
           message.status = 'done'
           if (message.thinkingTimeMs == null) {
@@ -444,7 +519,7 @@ async function generateAssistantReply({
     setConversationStreaming(runConversationId, false)
     touchConversation(runConversationId)
     await nextTick()
-    if (activeConversationId.value === runConversationId && shouldStickToBottom) {
+    if (activeConversationId.value === runConversationId && autoScrollEnabled.value) {
       scrollToBottom(true)
     }
   }
@@ -1111,23 +1186,34 @@ async function loadSelectedDocumentContent(documentId) {
 
 function selectDocument(doc) {
   if (!doc?.document_id) return
+  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
   if (selectedDocId.value === doc.document_id) {
     selectedDocId.value = ''
     selectedDocContent.value = ''
     selectedDocError.value = ''
     selectedDocLoading.value = false
     previewRequestSeq += 1
+    if (shouldStickToBottom) {
+      scheduleChatBottomSync(true)
+    }
     return
   }
   selectedDocId.value = doc.document_id
+  if (shouldStickToBottom) {
+    scheduleChatBottomSync(true)
+  }
 }
 
 function closeDocumentPreview() {
+  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
   selectedDocId.value = ''
   selectedDocContent.value = ''
   selectedDocError.value = ''
   selectedDocLoading.value = false
   previewRequestSeq += 1
+  if (shouldStickToBottom) {
+    scheduleChatBottomSync(true)
+  }
 }
 
 function openPicker() {
@@ -1319,7 +1405,24 @@ function scrollToBottom(force = false) {
   const el = scrollHost.value
   if (!el) return
   if (!force && !autoScrollEnabled.value) return
-  el.scrollTop = el.scrollHeight
+  el.scrollTo({
+    top: el.scrollHeight,
+    behavior: 'auto',
+  })
+}
+
+function scrollToBottomSmooth() {
+  const el = scrollHost.value
+  if (!el) return
+  el.scrollTo({
+    top: el.scrollHeight,
+    behavior: 'smooth',
+  })
+}
+
+function jumpToBottom() {
+  autoScrollEnabled.value = true
+  scrollToBottomSmooth()
 }
 
 function resetChat() {
@@ -1363,10 +1466,24 @@ onMounted(async () => {
   startChatRuntimeStatusPolling()
   await nextTick()
   scrollToBottom(true)
+  if (scrollHost.value && typeof ResizeObserver !== 'undefined') {
+    chatScrollResizeObserver = new ResizeObserver(() => {
+      scheduleChatBottomSync()
+    })
+    chatScrollResizeObserver.observe(scrollHost.value)
+  }
   document.addEventListener('click', handleRetrievalMenuClick)
 })
 
 onBeforeUnmount(() => {
+  if (chatScrollResizeObserver) {
+    chatScrollResizeObserver.disconnect()
+    chatScrollResizeObserver = null
+  }
+  if (chatBottomSyncFrame) {
+    cancelAnimationFrame(chatBottomSyncFrame)
+    chatBottomSyncFrame = null
+  }
   stopSheetDrag()
   if (conversationSaveTimer) {
     clearTimeout(conversationSaveTimer)
@@ -1722,8 +1839,9 @@ watch(conversations, () => {
         </transition>
 
         <section class="chat-panel">
-          <div ref="scrollHost" class="messages" @scroll="handleChatScroll">
-            <article v-for="message in chatMessages" :key="message.id" class="message" :class="message.role">
+          <div class="messages-shell">
+            <div ref="scrollHost" class="messages" @scroll="handleChatScroll">
+              <article v-for="message in chatMessages" :key="message.id" class="message" :class="message.role">
               <div class="avatar">
                 <component :is="message.role === 'user' ? User : Bot" :size="16" />
               </div>
@@ -1779,6 +1897,12 @@ watch(conversations, () => {
                       <span class="source-toggle__count">{{ getDisplaySources(message).length }}</span>
                       <ChevronDown :size="14" :class="{ open: expandedSources[message.id] }" />
                     </button>
+                    <span
+                      v-if="getRetrievalMethodLabel(message.retrievalMethod)"
+                      class="source-toggle source-toggle--retrieval"
+                    >
+                      <span class="source-toggle__value">{{ getRetrievalMethodLabel(message.retrievalMethod) }}</span>
+                    </span>
                     <div v-if="expandedSources[message.id]" class="source-list">
                       <div v-for="(source, index) in getDisplaySources(message)" :key="index" class="source-item">
                         <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
@@ -1840,7 +1964,23 @@ watch(conversations, () => {
                   </p>
                 </div>
               </div>
-            </article>
+              </article>
+            </div>
+            <transition name="jump-to-bottom">
+              <div v-if="showJumpToBottomButton" class="chat-panel__jump">
+                <button
+                  class="chat-panel__jump-button"
+                  :class="{ 'is-loading': chatBusy }"
+                  type="button"
+                  title="快速回到底部"
+                  aria-label="快速回到底部"
+                  @click="jumpToBottom"
+                >
+                  <Loader2 v-if="chatBusy" :size="22" class="spin" />
+                  <ArrowDown v-else :size="24" />
+                </button>
+              </div>
+            </transition>
           </div>
 
           <div class="composer">

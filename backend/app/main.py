@@ -95,6 +95,26 @@ def _initialize_milvus_in_background(app: FastAPI) -> None:
         logger.warning("Milvus 后台初始化出错: %s", exc)
 
 
+def _memory_maintenance_loop(app: FastAPI) -> None:
+    """定期刷新记忆重要性并清理过期数据。"""
+    from app.services.memory_service import cleanup_memory_records
+
+    stop_event = app.state.memory_maintenance_stop_event
+    while not stop_event.is_set():
+        try:
+            result = cleanup_memory_records()
+            if any(result.values()):
+                logger.info(
+                    "长期记忆维护完成: rescored=%s expired=%s purged=%s",
+                    result["rescored"],
+                    result["expired"],
+                    result["purged"],
+                )
+        except Exception as exc:
+            logger.warning("长期记忆维护失败: %s", exc)
+        stop_event.wait(settings.MEMORY_CLEANUP_INTERVAL_SECONDS)
+
+
 def _start_background_initialization(app: FastAPI) -> None:
     """启动不影响 HTTP 就绪状态的后台初始化任务。"""
     app.state.runtime_warmup = {
@@ -104,6 +124,7 @@ def _start_background_initialization(app: FastAPI) -> None:
         "status": "initializing",
     }
     app.state.milvus_ready = False
+    app.state.memory_maintenance_stop_event = threading.Event()
 
     threading.Thread(
         target=_warmup_chat_runtime_in_background,
@@ -115,6 +136,12 @@ def _start_background_initialization(app: FastAPI) -> None:
         target=_initialize_milvus_in_background,
         args=(app,),
         name="milvus-initialization",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_memory_maintenance_loop,
+        args=(app,),
+        name="memory-maintenance",
         daemon=True,
     ).start()
 
@@ -138,6 +165,9 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    stop_event = getattr(app.state, "memory_maintenance_stop_event", None)
+    if stop_event is not None:
+        stop_event.set()
     logger.info("🛑 关闭应用...")
 
 
@@ -157,6 +187,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Access-Token"],
 )
 
 # 记录每次 HTTP 调用，未捕获异常会带 traceback 写入日志文件。
@@ -178,6 +209,13 @@ async def log_requests(request: Request, call_next):
         raise
 
     duration_ms = (time.perf_counter() - start_time) * 1000
+    renewed_access_token = getattr(
+        getattr(request, "state", None),
+        "renewed_access_token",
+        None,
+    )
+    if renewed_access_token:
+        response.headers["X-Access-Token"] = renewed_access_token
     logger.info(
         f"请求完成: {request_line} status={response.status_code} duration={duration_ms:.2f}ms"
     )

@@ -87,6 +87,7 @@ class ChatResponse(BaseModel):
     response: str
     sources: List[RetrievalResultResponse] = Field(default_factory=list)
     model: str
+    retrieval_method: Optional[Literal["hybrid", "dense", "sparse"]] = None
 
 
 class ChatSettingsResponse(BaseModel):

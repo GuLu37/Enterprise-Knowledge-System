@@ -110,6 +110,7 @@ async def generate_response(request: ChatRequest, current_user=Depends(require_c
             response=result.text,
             sources=result.sources,
             model=result.model,
+            retrieval_method=result.retrieval_method,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

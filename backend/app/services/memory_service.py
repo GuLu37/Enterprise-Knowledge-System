@@ -1,15 +1,19 @@
 """对话长期记忆服务。"""
 import json
 import logging
+import math
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from sqlalchemy import or_
 
 from app.config import settings
 from app.core.constants import CHAT_CHUNK_OVERLAP, CHAT_CHUNK_SIZE
 from app.rag.retrieval.base import RetrievalResult
+from app.storage.sqlite_metadata import MemoryRecord, SessionLocal, init_metadata_db
 from app.utils.chunking import (
     ConversationChunk,
     LongTermMemoryChunk,
@@ -21,6 +25,25 @@ from app.utils.chunking import (
 from app.utils.exceptions import RetrievalException, VectorStoreException
 
 logger = logging.getLogger(__name__)
+
+MEMORY_TYPE_PROFILE = "profile"
+MEMORY_TYPE_EVENT = "event"
+MEMORY_STATUS_ACTIVE = "active"
+MEMORY_STATUS_SUPERSEDED = "superseded"
+MEMORY_STATUS_EXPIRED = "expired"
+MEMORY_STATUS_DELETED = "deleted"
+PROFILE_MEMORY_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{1,127}$")
+
+PROFILE_MEMORY_SYSTEM_PROMPT = (
+    "你是用户个性化记忆抽取器。"
+    "只提取用户明确表达、长期稳定且未来对话有帮助的信息。"
+    "不要提取一次性任务、临时安排、普通知识、企业文档内容、密码、令牌、身份证号或其他敏感凭据。"
+    "如果用户明确要求忘记或修改某项记忆，返回 action=delete 或 action=upsert。"
+    "只输出严格 JSON，不要输出解释。格式："
+    "{\"memories\":[{\"memory_key\":\"profile.xxx\",\"value\":\"...\","
+    "\"confidence\":0到1之间的小数,\"importance\":0到100之间的数字,"
+    "\"action\":\"upsert\"或\"delete\"}]}"
+)
 
 
 def _escape_filter_value(value: str) -> str:
@@ -122,6 +145,450 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _utcnow_naive() -> datetime:
+    """返回与 SQLAlchemy DateTime 字段兼容的 UTC 时间。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _clamp_score(value: Any, default: float = 50.0) -> float:
+    """把重要性或置信度限制在安全范围。"""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(0.0, min(100.0, numeric))
+
+
+def _clamp_confidence(value: Any, default: float = 0.5) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(0.0, min(1.0, numeric))
+
+
+def _normalize_memory_content(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _calculate_event_importance(content: str) -> tuple[float, float]:
+    """为事件记忆生成可解释的初始重要性和置信度。"""
+    normalized = _normalize_memory_content(content)
+    importance = 45.0
+    confidence = 0.65
+    strong_markers = ("必须", "明确", "决定", "结论", "长期", "偏好", "目标", "完成")
+    temporary_markers = ("今天", "明天", "刚才", "临时", "这次", "当前")
+    importance += min(25.0, sum(normalized.count(marker) * 5 for marker in strong_markers))
+    importance -= min(20.0, sum(normalized.count(marker) * 4 for marker in temporary_markers))
+    if len(normalized) < 20:
+        confidence -= 0.1
+    return _clamp_score(importance), _clamp_confidence(confidence)
+
+
+def _extract_profile_memory_candidates(
+    messages: Sequence[Any],
+    llm: Optional[Any],
+) -> List[Dict[str, Any]]:
+    """从最近对话中抽取稳定的用户个性化记忆候选。"""
+    if llm is None:
+        return []
+
+    transcript_lines = []
+    for message in list(messages)[-20:]:
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", "")
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        content = _normalize_memory_content(content)
+        if role in {"user", "assistant"} and content:
+            transcript_lines.append(f"{role}: {content}")
+    if not transcript_lines:
+        return []
+
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=PROFILE_MEMORY_SYSTEM_PROMPT),
+                HumanMessage(content="\n".join(transcript_lines)),
+            ]
+        )
+        payload = _safe_json_loads(_extract_text(response))
+    except Exception as exc:
+        logger.warning("个性化记忆抽取失败，已跳过: %s", exc)
+        return []
+
+    candidates = payload.get("memories")
+    if not isinstance(candidates, list):
+        return []
+
+    normalized_candidates: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        key = str(candidate.get("memory_key") or "").strip().lower()
+        value = _normalize_memory_content(candidate.get("value"))
+        action = str(candidate.get("action") or "upsert").strip().lower()
+        if not PROFILE_MEMORY_KEY_PATTERN.match(key):
+            continue
+        if action == "delete":
+            normalized_candidates.append({"memory_key": key, "action": "delete"})
+            continue
+        if not value:
+            continue
+        normalized_candidates.append(
+            {
+                "memory_key": key,
+                "value": value[:4000],
+                "confidence": _clamp_confidence(candidate.get("confidence"), 0.7),
+                "importance": _clamp_score(candidate.get("importance"), 75.0),
+                "action": "upsert",
+            }
+        )
+    return normalized_candidates
+
+
+def get_active_profile_memories(user_id: Optional[str], limit: int = 20) -> List[MemoryRecord]:
+    """读取当前用户跨对话共享的有效个性化记忆。"""
+    user_key = _require_user_id(user_id)
+    init_metadata_db()
+    db = SessionLocal()
+    try:
+        now = _utcnow_naive()
+        records = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_key,
+                MemoryRecord.memory_type == MEMORY_TYPE_PROFILE,
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                or_(MemoryRecord.expires_at.is_(None), MemoryRecord.expires_at > now),
+            )
+            .order_by(MemoryRecord.importance_score.desc(), MemoryRecord.updated_at.desc())
+            .limit(max(1, min(limit, 100)))
+            .all()
+        )
+        for record in records:
+            record.access_count += 1
+            record.last_accessed_at = now
+        db.commit()
+        return records
+    finally:
+        db.close()
+
+
+def upsert_profile_memory_candidates(
+    user_id: Optional[str],
+    candidates: Sequence[Dict[str, Any]],
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> int:
+    """按 memory_key 更新个性化记忆，保留被替代版本。"""
+    user_key = _require_user_id(user_id)
+    if not candidates:
+        return 0
+    init_metadata_db()
+    db = SessionLocal()
+    changed = 0
+    now = _utcnow_naive()
+    try:
+        for candidate in candidates:
+            key = str(candidate.get("memory_key") or "").strip().lower()
+            action = str(candidate.get("action") or "upsert").strip().lower()
+            if not PROFILE_MEMORY_KEY_PATTERN.match(key):
+                continue
+            current = (
+                db.query(MemoryRecord)
+                .filter(
+                    MemoryRecord.user_id == user_key,
+                    MemoryRecord.memory_type == MEMORY_TYPE_PROFILE,
+                    MemoryRecord.memory_key == key,
+                    MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                )
+                .order_by(MemoryRecord.version.desc(), MemoryRecord.updated_at.desc())
+                .first()
+            )
+            if action == "delete":
+                if current:
+                    current.status = MEMORY_STATUS_DELETED
+                    current.updated_at = now
+                    changed += 1
+                continue
+
+            value = _normalize_memory_content(candidate.get("value"))
+            if not value:
+                continue
+            confidence = _clamp_confidence(candidate.get("confidence"), 0.7)
+            importance = _clamp_score(candidate.get("importance"), 75.0)
+            if current and _normalize_memory_content(current.content) == value:
+                current.base_importance_score = importance
+                current.importance_score = importance
+                current.confidence_score = confidence
+                current.last_accessed_at = now
+                current.updated_at = now
+                changed += 1
+                continue
+
+            if current:
+                current.status = MEMORY_STATUS_SUPERSEDED
+                current.updated_at = now
+                version = current.version + 1
+                supersedes_memory_id = current.memory_id
+            else:
+                version = 1
+                supersedes_memory_id = None
+
+            record = MemoryRecord(
+                memory_id=f"profile:{user_key}:{key}:{uuid.uuid4().hex}",
+                user_id=user_key,
+                memory_type=MEMORY_TYPE_PROFILE,
+                memory_key=key,
+                content=value,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                base_importance_score=importance,
+                importance_score=importance,
+                confidence_score=confidence,
+                access_count=0,
+                last_accessed_at=None,
+                expires_at=None,
+                status=MEMORY_STATUS_ACTIVE,
+                version=version,
+                supersedes_memory_id=supersedes_memory_id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(record)
+            changed += 1
+        db.commit()
+        return changed
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def register_event_memory_records(
+    user_id: Optional[str],
+    rows: Sequence[Dict[str, Any]],
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> int:
+    """为已写入 Milvus 的事件记忆建立 SQL 生命周期记录。"""
+    user_key = _require_user_id(user_id)
+    if not rows:
+        return 0
+    init_metadata_db()
+    db = SessionLocal()
+    now = _utcnow_naive()
+    expiry = now + timedelta(days=settings.MEMORY_EVENT_EXPIRY_DAYS)
+    changed = 0
+    retired_memory_ids: List[str] = []
+    try:
+        for row in rows:
+            memory_id = str(row.get("memory_id") or "").strip()
+            content = _normalize_memory_content(row.get("chunk_text") or row.get("text"))
+            if not memory_id or not content:
+                continue
+            base_score, confidence = _calculate_event_importance(content)
+            row_conversation_id = str(
+                conversation_id or row.get("conversation_id") or ""
+            ).strip() or None
+            row_session_id = str(session_id or row.get("session_id") or "").strip() or None
+            chunk_index = row.get("chunk_index")
+            logical_key = (
+                f"event:{user_key}:{row_conversation_id or 'unknown'}:"
+                f"{chunk_index if chunk_index is not None else memory_id}"
+            )
+            current = (
+                db.query(MemoryRecord)
+                .filter(
+                    MemoryRecord.user_id == user_key,
+                    MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                    MemoryRecord.memory_key == logical_key,
+                    MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                )
+                .order_by(MemoryRecord.version.desc(), MemoryRecord.updated_at.desc())
+                .first()
+            )
+            version = 1
+            supersedes_memory_id = None
+            if current:
+                current.status = MEMORY_STATUS_SUPERSEDED
+                current.updated_at = now
+                version = current.version + 1
+                supersedes_memory_id = current.memory_id
+                retired_memory_ids.append(current.memory_id)
+
+            db.add(
+                MemoryRecord(
+                    memory_id=memory_id,
+                    user_id=user_key,
+                    memory_type=MEMORY_TYPE_EVENT,
+                    memory_key=logical_key,
+                    content=content,
+                    conversation_id=row_conversation_id,
+                    session_id=row_session_id,
+                    base_importance_score=base_score,
+                    importance_score=base_score,
+                    confidence_score=confidence,
+                    access_count=0,
+                    last_accessed_at=None,
+                    expires_at=expiry,
+                    status=MEMORY_STATUS_ACTIVE,
+                    version=version,
+                    supersedes_memory_id=supersedes_memory_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            changed += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    if retired_memory_ids:
+        _delete_event_vectors(retired_memory_ids)
+    return changed
+
+
+def _get_active_event_records(
+    user_id: str,
+    memory_ids: Sequence[str],
+) -> Dict[str, MemoryRecord]:
+    """只返回 SQL 中仍然有效的事件记忆。"""
+    normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
+    if not normalized_ids:
+        return {}
+    db = SessionLocal()
+    try:
+        now = _utcnow_naive()
+        records = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                MemoryRecord.memory_id.in_(normalized_ids),
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                or_(MemoryRecord.expires_at.is_(None), MemoryRecord.expires_at > now),
+            )
+            .all()
+        )
+        return {record.memory_id: record for record in records}
+    finally:
+        db.close()
+
+
+def _mark_memory_accessed(user_id: str, memory_ids: Sequence[str]) -> None:
+    """更新被召回记忆的访问统计。"""
+    normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
+    if not normalized_ids:
+        return
+    db = SessionLocal()
+    try:
+        now = _utcnow_naive()
+        records = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.memory_id.in_(normalized_ids),
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+            )
+            .all()
+        )
+        for record in records:
+            record.access_count += 1
+            record.last_accessed_at = now
+            record.updated_at = now
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("更新长期记忆访问统计失败", exc_info=True)
+    finally:
+        db.close()
+
+
+def _delete_event_vectors(memory_ids: Sequence[str]) -> None:
+    """删除已过期事件记忆对应的 Milvus 向量。"""
+    normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
+    if not normalized_ids:
+        return
+    try:
+        from app.storage.milvus_store import get_milvus_client
+
+        client = get_milvus_client()
+        if not client.has_collection(settings.MILVUS_MEMORY_COLLECTION_NAME):
+            return
+        escaped = ", ".join(f'"{_escape_filter_value(item)}"' for item in normalized_ids)
+        client.delete(
+            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
+            filter=f"memory_id in [{escaped}]",
+            timeout=30,
+        )
+    except Exception:
+        logger.warning("清理过期长期记忆向量失败", exc_info=True)
+
+
+def cleanup_memory_records() -> Dict[str, int]:
+    """刷新记忆重要性，标记过期记录并清理旧元数据。"""
+    init_metadata_db()
+    db = SessionLocal()
+    now = _utcnow_naive()
+    expired_event_ids: List[str] = []
+    result = {"rescored": 0, "expired": 0, "purged": 0}
+    try:
+        records = db.query(MemoryRecord).filter(MemoryRecord.status == MEMORY_STATUS_ACTIVE).all()
+        for record in records:
+            reference_time = record.last_accessed_at or record.created_at or now
+            age_days = max(0.0, (now - reference_time).total_seconds() / 86400)
+            recency_days = 90.0 if record.memory_type == MEMORY_TYPE_EVENT else 365.0
+            decayed_score = (
+                record.base_importance_score
+                * record.confidence_score
+                * math.exp(-age_days / recency_days)
+            )
+            access_bonus = min(15.0, math.log1p(max(0, record.access_count)) * 2.5)
+            record.importance_score = round(_clamp_score(decayed_score + access_bonus), 2)
+            record.updated_at = now
+            result["rescored"] += 1
+
+            should_expire = (
+                record.expires_at is not None and record.expires_at <= now
+            ) or (
+                record.importance_score < settings.MEMORY_SCORE_THRESHOLD
+                and (
+                    record.memory_type == MEMORY_TYPE_EVENT
+                    or age_days >= settings.MEMORY_PROFILE_STALE_DAYS
+                )
+            )
+            if should_expire:
+                record.status = MEMORY_STATUS_EXPIRED
+                record.updated_at = now
+                result["expired"] += 1
+                if record.memory_type == MEMORY_TYPE_EVENT:
+                    expired_event_ids.append(record.memory_id)
+
+        purge_before = now - timedelta(days=settings.MEMORY_PURGE_RETENTION_DAYS)
+        result["purged"] = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.status.in_(
+                    [MEMORY_STATUS_EXPIRED, MEMORY_STATUS_SUPERSEDED, MEMORY_STATUS_DELETED]
+                ),
+                MemoryRecord.updated_at < purge_before,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("长期记忆生命周期清理失败", exc_info=True)
+    finally:
+        db.close()
+
+    _delete_event_vectors(expired_event_ids)
+    return result
+
+
 def _flatten_turn_messages(turns: Sequence[Sequence[Any]]) -> List[Any]:
     """把轮次结构拍平，方便交给 chunk builder。"""
     flattened: List[Any] = []
@@ -213,11 +680,16 @@ def _build_insert_rows(
     rows: List[Dict[str, Any]] = []
     for chunk in chunks:
         chunk_topic = str(getattr(chunk, "topic", "") or topic).strip()
+        # Milvus 使用自增主键，memory_id 也必须按版本唯一，否则重复写入同一对话
+        # 会留下无法由业务 ID 区分的旧向量。
+        versioned_memory_id = (
+            f"{user_id}:{conversation_id}:{chunk.chunk_index}:{uuid.uuid4().hex}"
+        )
         rows.append(
             {
                 "text": chunk.text,
                 "vector": list(vectors[chunk.chunk_index]),
-                "memory_id": f"{user_id}:{conversation_id}:{chunk.chunk_index}",
+                "memory_id": versioned_memory_id,
                 "chunk_index": chunk.chunk_index,
                 "source_name": source_name,
                 "chunk_text": chunk.text,
@@ -326,6 +798,12 @@ def store_semantic_long_term_memory(
             collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
             rows=rows,
         )
+        register_event_memory_records(
+            user_id=user_key,
+            rows=rows,
+            conversation_id=conversation_key,
+            session_id=session_key,
+        )
         logger.info(
             "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
             user_key,
@@ -417,6 +895,12 @@ def store_conversation_memory(
             collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
             rows=rows,
         )
+        register_event_memory_records(
+            user_id=user_key,
+            rows=rows,
+            conversation_id=conversation_key,
+            session_id=session_key,
+        )
         logger.info(
             "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
             user_key,
@@ -476,7 +960,7 @@ def search_long_term_memory(
         search_kwargs: Dict[str, Any] = {
             "collection_name": settings.MILVUS_MEMORY_COLLECTION_NAME,
             "data": [query_vector],
-            "limit": top_k,
+            "limit": max(top_k * 3, top_k),
             "output_fields": [
                 "text",
                 "memory_id",
@@ -498,9 +982,24 @@ def search_long_term_memory(
 
         search_result = client.search(**search_kwargs)
         hits = _flatten_search_hits(search_result)
+        hit_memory_ids = [
+            str(
+                _get_field(_get_hit_entity(hit), "memory_id", _get_field(hit, "memory_id"))
+                or ""
+            ).strip()
+            for hit in hits
+        ]
+        active_records = _get_active_event_records(user_key, hit_memory_ids)
         results: List[RetrievalResult] = []
         for hit in hits:
             entity = _get_hit_entity(hit)
+            memory_id = str(
+                _get_field(entity, "memory_id", _get_field(hit, "memory_id"))
+                or ""
+            ).strip()
+            record = active_records.get(memory_id)
+            if record is None:
+                continue
             content = str(
                 _get_field(entity, "chunk_text")
                 or _get_field(entity, "text")
@@ -509,7 +1008,7 @@ def search_long_term_memory(
                 or ""
             )
             metadata = {
-                "memory_id": _get_field(entity, "memory_id", _get_field(hit, "memory_id")),
+                "memory_id": memory_id,
                 "chunk_index": _get_field(entity, "chunk_index", _get_field(hit, "chunk_index")),
                 "source_name": _get_field(entity, "source_name", _get_field(hit, "source_name")),
                 "user_id": _get_field(entity, "user_id", _get_field(hit, "user_id")),
@@ -520,6 +1019,10 @@ def search_long_term_memory(
                 "turn_start": _get_field(entity, "turn_start", _get_field(hit, "turn_start")),
                 "turn_end": _get_field(entity, "turn_end", _get_field(hit, "turn_end")),
                 "created_at": _get_field(entity, "created_at", _get_field(hit, "created_at")),
+                "importance_score": record.importance_score,
+                "confidence_score": record.confidence_score,
+                "status": record.status,
+                "access_count": record.access_count,
             }
             score = _coerce_float(_get_field(hit, "distance", _get_field(hit, "score", 0.0)))
             results.append(
@@ -531,7 +1034,12 @@ def search_long_term_memory(
                 )
             )
 
-        return results
+        final_results = results[:top_k]
+        _mark_memory_accessed(
+            user_key,
+            [str(item.metadata.get("memory_id") or "") for item in final_results],
+        )
+        return final_results
     except RetrievalException:
         raise
     except Exception as error:
@@ -583,6 +1091,29 @@ def delete_long_term_memory(conversation_id: str, user_id: Optional[str] = None)
             filter=filter_expr,
             timeout=30,
         )
+        init_metadata_db()
+        db = SessionLocal()
+        try:
+            now = _utcnow_naive()
+            (
+                db.query(MemoryRecord)
+                .filter(
+                    MemoryRecord.user_id == user_key,
+                    MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                    MemoryRecord.conversation_id == conversation_id.strip(),
+                    MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                )
+                .update(
+                    {
+                        MemoryRecord.status: MEMORY_STATUS_DELETED,
+                        MemoryRecord.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
         logger.info("✓ 长期记忆删除成功 (user_id=%s, conversation_id=%s)", user_key, conversation_id)
         return True
     except Exception as error:
@@ -601,4 +1132,8 @@ __all__ = [
     "store_conversation_memory",
     "search_conversation_memory",
     "delete_conversation_memory",
+    "get_active_profile_memories",
+    "upsert_profile_memory_candidates",
+    "register_event_memory_records",
+    "cleanup_memory_records",
 ]
