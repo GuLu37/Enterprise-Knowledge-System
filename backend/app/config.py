@@ -12,6 +12,17 @@ _env_path = BACKEND_DIR / ".env"
 load_dotenv(_env_path, override=True)
 
 
+def _configure_langsmith_tracing() -> None:
+    """默认关闭 LangSmith/LangChain 追踪，避免本地开发反复上报。"""
+    tracing = (os.getenv("LANGSMITH_TRACING") or "false").strip().lower()
+    if tracing not in {"true", "1", "yes", "on"}:
+        os.environ["LANGSMITH_TRACING"] = "false"
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+
+_configure_langsmith_tracing()
+
+
 def _resolve_app_path(path_value: Optional[str], default: str) -> str:
     """把应用内部路径固定解析到 backend/app 下，避免受启动目录影响。"""
     path = Path(path_value or default)
@@ -206,6 +217,14 @@ class Settings:
     MILVUS_DOC_COLLECTION_NAME: str = os.getenv(
         "MILVUS_DOC_COLLECTION_NAME",
         "doc_chunks",
+    )
+    MILVUS_PARENT_COLLECTION_NAME: str = os.getenv(
+        "MILVUS_PARENT_COLLECTION_NAME",
+        "doc_parent_chunks",
+    )
+    MILVUS_CHILD_COLLECTION_NAME: str = os.getenv(
+        "MILVUS_CHILD_COLLECTION_NAME",
+        "doc_child_chunks",
     )
     MILVUS_MEMORY_COLLECTION_NAME: str = os.getenv(
         "MILVUS_MEMORY_COLLECTION_NAME",

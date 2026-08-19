@@ -394,10 +394,14 @@ def register_event_memory_records(
             ).strip() or None
             row_session_id = str(session_id or row.get("session_id") or "").strip() or None
             chunk_index = row.get("chunk_index")
-            logical_key = (
-                f"event:{user_key}:{row_conversation_id or 'unknown'}:"
-                f"{chunk_index if chunk_index is not None else memory_id}"
-            )
+            row_chunk_type = str(row.get("chunk_type") or "").strip()
+            if row_chunk_type == "dialogue":
+                logical_key = f"event:{user_key}:{row_conversation_id or 'unknown'}:{memory_id}"
+            else:
+                logical_key = (
+                    f"event:{user_key}:{row_conversation_id or 'unknown'}:"
+                    f"{chunk_index if chunk_index is not None else memory_id}"
+                )
             current = (
                 db.query(MemoryRecord)
                 .filter(

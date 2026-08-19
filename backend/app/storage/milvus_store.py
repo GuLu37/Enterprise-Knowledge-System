@@ -74,6 +74,19 @@ def _create_index_params():
     return index_params
 
 
+def _create_parent_index_params():
+    """Parent collection 只需要按 parent_id/document_id 精确查询。"""
+    index_params = MilvusClient.prepare_index_params()
+    index_params.add_index(
+        field_name="vector",
+        index_type="AUTOINDEX",
+        metric_type="COSINE",
+    )
+    index_params.add_index(field_name="parent_id", index_type="INVERTED")
+    index_params.add_index(field_name="document_id", index_type="INVERTED")
+    return index_params
+
+
 def _is_rate_limited_error(error: Exception) -> bool:
     """判断异常是否属于 Milvus 写入限流。"""
     message = str(error).lower()
@@ -133,15 +146,29 @@ def insert_rows_with_retry(
 
 
 def _ensure_index(client: MilvusClient, collection_name: str) -> None:
-    """若 collection 缺少向量索引则补建，避免 load_collection 报 index not found。"""
-    indexes = client.list_indexes(collection_name)
-    if not indexes:
-        logger.warning(f"⚠ collection {collection_name} 缺少索引，正在补建...")
-        client.create_index(
-            collection_name=collection_name,
-            index_params=_create_index_params(),
+    """确保 vector 字段有索引，避免 load_collection 报 index not found。"""
+    for index_name in client.list_indexes(collection_name) or []:
+        try:
+            description = client.describe_index(
+                collection_name=collection_name,
+                index_name=index_name,
+            )
+        except Exception:
+            continue
+        field_name = (
+            description.get("field_name")
+            or description.get("fieldName")
+            or description.get("field")
         )
-        logger.info(f"✓ collection {collection_name} 索引补建完成")
+        if field_name == "vector":
+            return
+
+    logger.warning(f"⚠ collection {collection_name} 缺少 vector 索引，正在补建...")
+    client.create_index(
+        collection_name=collection_name,
+        index_params=_create_index_params(),
+    )
+    logger.info(f"✓ collection {collection_name} vector 索引补建完成")
 
 
 def _collection_field_names(client: MilvusClient, collection_name: str) -> set[str]:
@@ -168,7 +195,8 @@ def warmup_collections(collection_names: Optional[Sequence[str]] = None) -> None
     """在启动阶段一次性预热 Milvus collection。"""
     client = get_milvus_client()
     names = list(collection_names or (
-        settings.MILVUS_DOC_COLLECTION_NAME,
+        settings.MILVUS_CHILD_COLLECTION_NAME,
+        settings.MILVUS_PARENT_COLLECTION_NAME,
         settings.MILVUS_MEMORY_COLLECTION_NAME,
     ))
 
@@ -201,7 +229,8 @@ def initialize_collections() -> bool:
     """确保业务 collection 存在、索引完整并已加载。"""
     try:
         client = get_milvus_client()
-        _ensure_document_collection(client)
+        _ensure_child_collection(client)
+        _ensure_parent_collection(client)
         _ensure_memory_collection(client)
         warmup_collections()
         return True
@@ -214,19 +243,44 @@ def initialize_collections() -> bool:
         return False
 
 
-def _create_document_collection(client: MilvusClient) -> None:
-    """创建文档向量 collection。"""
+def _create_child_collection(client: MilvusClient) -> None:
+    """创建 Child collection：只有 Child 参与向量检索。"""
     schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
     _add_common_fields(schema, "document_id")
+    schema.add_field(field_name="child_id", datatype=DataType.VARCHAR, max_length=128)
+    schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=128)
+    schema.add_field(field_name="parent_index", datatype=DataType.INT64)
+    schema.add_field(field_name="child_text", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
     schema.add_field(field_name="file_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
     schema.add_field(field_name="content_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
 
     client.create_collection(
-        collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
+        collection_name=settings.MILVUS_CHILD_COLLECTION_NAME,
         schema=schema,
         index_params=_create_index_params(),
     )
-    logger.info(f"✓ Milvus 文档 collection 创建完成 ({settings.MILVUS_DOC_COLLECTION_NAME})")
+    logger.info(f"✓ Milvus Child collection 创建完成 ({settings.MILVUS_CHILD_COLLECTION_NAME})")
+
+
+def _create_parent_collection(client: MilvusClient) -> None:
+    """创建 Parent collection：只按 parent_id 精确读取。"""
+    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
+    schema.add_field(field_name="pk", datatype=DataType.INT64, is_primary=True, auto_id=True)
+    schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=settings.EMBEDDING_DIMENSION)
+    schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=128)
+    schema.add_field(field_name="document_id", datatype=DataType.VARCHAR, max_length=128)
+    schema.add_field(field_name="parent_index", datatype=DataType.INT64)
+    schema.add_field(field_name="parent_text", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
+    schema.add_field(field_name="source_name", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
+    schema.add_field(field_name="file_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
+    schema.add_field(field_name="content_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
+
+    client.create_collection(
+        collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
+        schema=schema,
+        index_params=_create_parent_index_params(),
+    )
+    logger.info(f"✓ Milvus Parent collection 创建完成 ({settings.MILVUS_PARENT_COLLECTION_NAME})")
 
 
 def _create_memory_collection(client: MilvusClient) -> None:
@@ -250,17 +304,21 @@ def _create_memory_collection(client: MilvusClient) -> None:
     logger.info(f"✓ Milvus 长期记忆 collection 创建完成 ({settings.MILVUS_MEMORY_COLLECTION_NAME})")
 
 
-def _ensure_document_collection(client: MilvusClient) -> None:
-    """确保文档向量 collection 存在，不存在时按当前 schema 创建；存在时确保索引完整。"""
-    collection_name = settings.MILVUS_DOC_COLLECTION_NAME
+def _ensure_child_collection(client: MilvusClient) -> None:
+    """确保 Child collection 存在，不存在时按当前 schema 创建。"""
+    collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
     expected_fields = {
         "pk",
         "text",
         "vector",
         "document_id",
+        "child_id",
+        "parent_id",
+        "parent_index",
         "chunk_index",
         "source_name",
         "chunk_text",
+        "child_text",
         "file_type",
         "content_type",
     }
@@ -269,13 +327,41 @@ def _ensure_document_collection(client: MilvusClient) -> None:
         if not expected_fields.issubset(existing_fields):
             missing_fields = sorted(expected_fields - existing_fields)
             raise VectorStoreException(
-                f"Milvus collection schema 不匹配: {collection_name} "
+                f"Milvus Child collection schema 不匹配: {collection_name} "
                 f"缺少字段 {missing_fields}，请执行迁移或清理后重新初始化"
             )
         _ensure_index(client, collection_name)
         return
 
-    _create_document_collection(client)
+    _create_child_collection(client)
+
+
+def _ensure_parent_collection(client: MilvusClient) -> None:
+    """确保 Parent collection 存在，不存在时按当前 schema 创建。"""
+    collection_name = settings.MILVUS_PARENT_COLLECTION_NAME
+    expected_fields = {
+        "pk",
+        "vector",
+        "parent_id",
+        "document_id",
+        "parent_index",
+        "parent_text",
+        "source_name",
+        "file_type",
+        "content_type",
+    }
+    if client.has_collection(collection_name):
+        existing_fields = _collection_field_names(client, collection_name)
+        if not expected_fields.issubset(existing_fields):
+            missing_fields = sorted(expected_fields - existing_fields)
+            raise VectorStoreException(
+                f"Milvus Parent collection schema 不匹配: {collection_name} "
+                f"缺少字段 {missing_fields}，请执行迁移或清理后重新初始化"
+            )
+        _ensure_index(client, collection_name)
+        return
+
+    _create_parent_collection(client)
 
 
 def _ensure_memory_collection(client: MilvusClient) -> None:

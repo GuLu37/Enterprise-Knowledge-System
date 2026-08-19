@@ -1,6 +1,7 @@
 """稀疏检索器 (BM25)"""
 import math
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from .base import BaseRetriever, RetrievalResult
@@ -13,6 +14,7 @@ from app.rag.retrieval.reranker import (
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+_COLLECTION_RECHECK_SECONDS = 5.0
 
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
@@ -60,7 +62,7 @@ def _escape_like_value(value: str) -> str:
 def _build_searchable_row_text(row: Dict[str, Any]) -> str:
     """组合文件名与切片正文，让文件名也参与 BM25 排序。"""
     source_name = str(row.get("source_name") or "")
-    content = str(row.get("chunk_text") or row.get("text") or "")
+    content = str(row.get("child_text") or row.get("chunk_text") or row.get("text") or "")
     return "\n".join(part for part in (source_name, content) if part)
 
 
@@ -72,7 +74,7 @@ def _build_filter_expression(filter_terms: List[str]) -> str:
             continue
         escaped_term = _escape_like_value(term)
         predicates.append(
-            f'(chunk_text like "%{escaped_term}%" or source_name like "%{escaped_term}%")'
+            f'(child_text like "%{escaped_term}%" or source_name like "%{escaped_term}%")'
         )
     return " or ".join(predicates)
 
@@ -182,6 +184,28 @@ class SparseRetriever(BaseRetriever):
         super().__init__(top_k)
         self.vector_store = vector_store
         self._collection_ready: Optional[bool] = None
+        self._last_collection_check_at = 0.0
+
+    def _is_collection_ready(self, client: Any) -> bool:
+        """缓存已加载状态；未就绪时定期复检以兼容后台初始化完成。"""
+        now = time.monotonic()
+        if self._collection_ready is True:
+            return True
+        if (
+            self._collection_ready is False
+            and now - self._last_collection_check_at < _COLLECTION_RECHECK_SECONDS
+        ):
+            return False
+
+        collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
+        self._last_collection_check_at = now
+        self._collection_ready = (
+            client.has_collection(collection_name)
+            and is_collection_loaded(client, collection_name)
+        )
+        if not self._collection_ready:
+            logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次稀疏检索")
+        return self._collection_ready
 
     def retrieve(self, query: str, top_k: int = None) -> List[RetrievalResult]:
         try:
@@ -193,15 +217,8 @@ class SparseRetriever(BaseRetriever):
                 return []
 
             client = self.vector_store or get_milvus_client()
-            collection_name = settings.MILVUS_DOC_COLLECTION_NAME
-            if self._collection_ready is None:
-                self._collection_ready = (
-                    client.has_collection(collection_name)
-                    and is_collection_loaded(client, collection_name)
-                )
-                if not self._collection_ready:
-                    logger.warning(f"collection {collection_name} 尚未加载完成，跳过本次稀疏检索")
-            if not self._collection_ready:
+            collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
+            if not self._is_collection_ready(client):
                 return []
 
             filter_terms = _build_filter_terms(query)
@@ -217,10 +234,14 @@ class SparseRetriever(BaseRetriever):
                 filter=filter_expr,
                 output_fields=[
                     "text",
+                    "child_id",
                     "document_id",
+                    "parent_id",
+                    "parent_index",
                     "chunk_index",
                     "source_name",
                     "chunk_text",
+                    "child_text",
                     "file_type",
                     "content_type",
                 ],
@@ -235,10 +256,14 @@ class SparseRetriever(BaseRetriever):
                         filter=fallback_filter,
                         output_fields=[
                             "text",
+                            "child_id",
                             "document_id",
+                            "parent_id",
+                            "parent_index",
                             "chunk_index",
                             "source_name",
                             "chunk_text",
+                            "child_text",
                             "file_type",
                             "content_type",
                         ],
@@ -272,9 +297,12 @@ class SparseRetriever(BaseRetriever):
             for score, row in ranked_rows[:top_k]:
                 results.append(
                     RetrievalResult(
-                        content=str(row.get("chunk_text") or row.get("text") or ""),
+                        content=str(row.get("child_text") or row.get("chunk_text") or row.get("text") or ""),
                         metadata={
+                            "child_id": row.get("child_id"),
                             "document_id": row.get("document_id"),
+                            "parent_id": row.get("parent_id"),
+                            "parent_index": row.get("parent_index"),
                             "chunk_index": row.get("chunk_index"),
                             "source_name": row.get("source_name"),
                             "file_type": row.get("file_type"),

@@ -25,7 +25,47 @@ _QUERY_STOP_TERMS = {
     "有没有",
     "是否有",
 }
+_QUERY_INTENT_TERMS = (
+    "完整名单",
+    "全体名单",
+    "名单列表",
+    "清单列表",
+    "分别是什么",
+    "有哪些",
+    "有谁",
+    "是谁",
+    "多少个",
+    "多少名",
+    "一共有多少",
+    "共有多少",
+    "总人数",
+    "总数",
+    "数量",
+    "名单",
+    "列表",
+    "清单",
+    "明细",
+    "构成",
+    "分别",
+    "全部",
+    "所有",
+    "全体",
+    "各个",
+    "各",
+)
 _DOMAIN_TERMS = (
+    "办公地点",
+    "直属主管",
+    "负责人",
+    "员工",
+    "部门",
+    "岗位",
+    "职位",
+    "工号",
+    "姓名",
+    "状态",
+    "学历",
+    "邮箱",
     "城市交通",
     "市内出行",
     "出租车",
@@ -208,6 +248,8 @@ def _normalize_query_for_keywords(query: str) -> str:
     normalized = re.sub(r"(是什么|有哪些|如何|怎么|为什么|可以吗|能否|请说明|请解释)$", "", normalized)
     for stop_term in sorted(_QUERY_STOP_TERMS, key=len, reverse=True):
         normalized = normalized.replace(stop_term, "")
+    for intent_term in sorted(_QUERY_INTENT_TERMS, key=len, reverse=True):
+        normalized = normalized.replace(intent_term, "")
     normalized = normalized.replace("有标准", "标准")
     normalized = normalized.strip("的吗呢吧么嘛请帮想要了解一下")
     return normalized

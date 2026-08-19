@@ -6,6 +6,8 @@ from typing import Any, Callable, Iterable, List, Mapping, Sequence
 
 from app.core.constants import DOCUMENT_ARTICLE_CHUNK_OVERLAP, DOCUMENT_ARTICLE_CHUNK_SIZE
 from app.core.constants import DOCUMENT_CHUNK_OVERLAP, DOCUMENT_CHUNK_SIZE
+from app.core.constants import DOCUMENT_CHILD_CHUNK_OVERLAP, DOCUMENT_CHILD_CHUNK_SIZE
+from app.core.constants import DOCUMENT_PARENT_CHUNK_OVERLAP, DOCUMENT_PARENT_CHUNK_SIZE
 from app.core.constants import CHAT_CHUNK_OVERLAP, CHAT_CHUNK_SIZE
 
 DEFAULT_TEXT_SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", "，", " ", "")
@@ -276,32 +278,7 @@ def _split_structured_text_chunks(
     这里把工作表标记和表头复制到同一工作表的每个分片中，同时只在
     完整数据行之间切分，避免破坏一行内的字段关系。
     """
-    lines = [
-        line.strip()
-        for line in (text or "").splitlines()
-        if line.strip()
-    ]
-    if not lines:
-        return []
-
-    sections: List[tuple[str, List[str]]] = []
-    current_name = ""
-    current_lines: List[str] = []
-
-    def flush() -> None:
-        nonlocal current_lines
-        if current_name or current_lines:
-            sections.append((current_name, current_lines))
-        current_lines = []
-
-    for line in lines:
-        match = STRUCTURED_SECTION_PATTERN.match(line)
-        if match:
-            flush()
-            current_name = match.group("name").strip()
-            continue
-        current_lines.append(line)
-    flush()
+    sections = _parse_structured_sections(text)
 
     # 没有工作表标记时回退到原有通用切分逻辑，兼容 CSV/TSV 等纯文本输入。
     if not any(name for name, _ in sections):
@@ -335,16 +312,83 @@ def _split_structured_text_chunks(
             row_length = len(row) + (1 if current_rows else 0)
             if current_rows and current_length + row_length > available_size:
                 chunks.append("\n".join(prefix_parts + current_rows).strip())
-                # 保留一行上下文，避免边界数据在相邻检索中完全断开。
-                overlap_row = current_rows[-1]
-                current_rows = [overlap_row] if chunk_overlap > 0 else []
-                current_length = len(overlap_row) if current_rows else 0
+                # 结构化表格更看重完整行，不做重叠复制，避免父块重复过多。
+                current_rows = []
+                current_length = 0
 
             current_rows.append(row)
             current_length += row_length
 
         if current_rows:
             chunks.append("\n".join(prefix_parts + current_rows).strip())
+
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _parse_structured_sections(text: str) -> List[tuple[str, List[str]]]:
+    """把结构化文本按工作表标记拆成 section。"""
+    lines = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return []
+
+    sections: List[tuple[str, List[str]]] = []
+    current_name = ""
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        if current_name or current_lines:
+            sections.append((current_name, current_lines))
+        current_lines = []
+
+    for line in lines:
+        match = STRUCTURED_SECTION_PATTERN.match(line)
+        if match:
+            flush()
+            current_name = match.group("name").strip()
+            continue
+        current_lines.append(line)
+    flush()
+    return sections
+
+
+def _split_structured_row_chunks(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    """把结构化文本切成单行级 child chunk。"""
+    sections = _parse_structured_sections(text)
+    if not any(name for name, _ in sections):
+        return split_text_chunks(
+            text=text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=DEFAULT_TEXT_SEPARATORS,
+        )
+
+    chunks: List[str] = []
+    for sheet_name, sheet_lines in sections:
+        if len(sheet_lines) < 2:
+            continue
+
+        sheet_prefix = f"[Sheet] {sheet_name}".strip() if sheet_name else ""
+        header = sheet_lines[0]
+        prefix_parts = [part for part in (sheet_prefix, header) if part]
+
+        for row in sheet_lines[1:]:
+            row_text = row.strip()
+            if not row_text or row_text.startswith("["):
+                continue
+
+            # 表格行是最小事实单元，不能因为 child_chunk_size 较小再切半；
+            # 否则后半段会失去表头对应关系，姓名、部门、金额等字段会断开。
+            chunk = "\n".join(prefix_parts + [row_text]).strip()
+            chunks.append(chunk)
 
     return [chunk for chunk in chunks if chunk.strip()]
 
@@ -361,10 +405,20 @@ def split_document_text(
     """
     normalized_file_type = (file_type or "").strip().lower().lstrip(".")
     if normalized_file_type in ARTICLE_FILE_TYPES:
+        resolved_chunk_size = (
+            DOCUMENT_ARTICLE_CHUNK_SIZE
+            if chunk_size == DOCUMENT_CHUNK_SIZE
+            else chunk_size
+        )
+        resolved_chunk_overlap = (
+            DOCUMENT_ARTICLE_CHUNK_OVERLAP
+            if chunk_overlap == DOCUMENT_CHUNK_OVERLAP
+            else chunk_overlap
+        )
         section_chunks = split_document_text_by_sections(
             text=text,
-            chunk_size=DOCUMENT_ARTICLE_CHUNK_SIZE,
-            chunk_overlap=DOCUMENT_ARTICLE_CHUNK_OVERLAP,
+            chunk_size=resolved_chunk_size,
+            chunk_overlap=resolved_chunk_overlap,
             separators=ARTICLE_TEXT_SEPARATORS,
         )
         if section_chunks is not None:
@@ -372,8 +426,8 @@ def split_document_text(
 
         return split_text_chunks(
             text=text,
-            chunk_size=DOCUMENT_ARTICLE_CHUNK_SIZE,
-            chunk_overlap=DOCUMENT_ARTICLE_CHUNK_OVERLAP,
+            chunk_size=resolved_chunk_size,
+            chunk_overlap=resolved_chunk_overlap,
             separators=ARTICLE_TEXT_SEPARATORS,
         )
 
@@ -392,6 +446,66 @@ def split_document_text(
         chunk_overlap=chunk_overlap,
         separators=DEFAULT_TEXT_SEPARATORS,
     )
+
+
+def build_parent_child_chunks(
+    document_id: str,
+    text: str,
+    file_type: str | None = None,
+    parent_chunk_size: int = DOCUMENT_PARENT_CHUNK_SIZE,
+    parent_chunk_overlap: int = DOCUMENT_PARENT_CHUNK_OVERLAP,
+    child_chunk_size: int = DOCUMENT_CHILD_CHUNK_SIZE,
+    child_chunk_overlap: int = DOCUMENT_CHILD_CHUNK_OVERLAP,
+) -> tuple[List[dict[str, Any]], List[dict[str, Any]]]:
+    """生成标准 Parent-Child 切块：Parent 存上下文，Child 建向量索引。"""
+    parents = split_document_text(
+        text=text,
+        chunk_size=parent_chunk_size,
+        chunk_overlap=parent_chunk_overlap,
+        file_type=file_type,
+    )
+    parent_rows: List[dict[str, Any]] = []
+    child_rows: List[dict[str, Any]] = []
+
+    for parent_index, parent_text in enumerate(parents):
+        parent_id = f"{document_id}:p{parent_index:06d}"
+        parent_rows.append(
+            {
+                "parent_id": parent_id,
+                "document_id": document_id,
+                "parent_index": parent_index,
+                "parent_text": parent_text,
+            }
+        )
+
+        normalized_file_type = (file_type or "").strip().lower().lstrip(".")
+        if normalized_file_type in STRUCTURED_FILE_TYPES:
+            children = _split_structured_row_chunks(
+                text=parent_text,
+                chunk_size=child_chunk_size,
+                chunk_overlap=min(child_chunk_overlap, max(0, child_chunk_size // 3)),
+            ) or [parent_text]
+        else:
+            children = split_document_text(
+                text=parent_text,
+                chunk_size=child_chunk_size,
+                chunk_overlap=min(child_chunk_overlap, max(0, child_chunk_size // 3)),
+                file_type=file_type,
+            ) or [parent_text]
+        for child_text in children:
+            child_index = len(child_rows)
+            child_rows.append(
+                {
+                    "child_id": f"{document_id}:c{child_index:06d}",
+                    "parent_id": parent_id,
+                    "document_id": document_id,
+                    "parent_index": parent_index,
+                    "child_index": child_index,
+                    "child_text": child_text,
+                }
+            )
+
+    return parent_rows, child_rows
 
 
 def _normalize_message(message: Any, include_system: bool = False) -> ConversationMessage | None:

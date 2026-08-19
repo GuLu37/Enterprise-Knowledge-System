@@ -194,10 +194,14 @@ class BGEEmbeddings(Embeddings):
 
     def embed_query(self, text: str) -> List[float]:
         """向量化查询文本。"""
-        query = text or ""
+        return self.embed_queries([text])[0]
+
+    def embed_queries(self, texts: List[str]) -> List[List[float]]:
+        """批量向量化检索查询，复用一次模型前向计算。"""
+        queries = [text or "" for text in texts]
         if self.query_instruction:
-            query = f"{self.query_instruction}{query}"
-        return self._embed_batch([query])[0]
+            queries = [f"{self.query_instruction}{query}" for query in queries]
+        return self._embed_batch(queries)
 
 
 _embeddings_instance: Optional[BGEEmbeddings] = None

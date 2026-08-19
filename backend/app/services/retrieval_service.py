@@ -1,16 +1,16 @@
 """统一的文档检索业务服务。"""
-import csv
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.config import settings
 from app.rag.retrieval.base import RetrievalResult
 from app.rag.retrieval.reranker import (
+    build_query_keywords,
     extract_identifier_terms,
     fuse_ranked_results,
-    build_query_keywords,
     is_reference_index_result,
     is_identifier_query,
     normalize_text,
@@ -20,15 +20,19 @@ from app.rag.retrieval.reranker import (
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+_RETRIEVER_CACHE: Dict[str, Any] = {}
+_RETRIEVER_CACHE_LOCK = threading.Lock()
 
 MIN_MULTI_QUERY_COUNT = 3
 MAX_MULTI_QUERY_COUNT = 4
 MAX_CITATION_RESULTS = 3
-STRUCTURED_QUERY_CITATION_RESULTS = 5
+STRUCTURED_QUERY_CITATION_RESULTS = 12
 RAG_CONTEXT_MAX_CHARS = 6500
-MAX_STRUCTURED_CONTEXT_CHARS = 24000
+STRUCTURED_CONTEXT_MAX_CHARS = 30000
 MIN_FINAL_RELEVANCE_SCORE = 0.28
 MIN_RAG_CANDIDATE_POOL = 60
+STRUCTURED_SECTION_PARENT_LIMIT = 200
+STRUCTURED_SECTION_ROW_CHAR_LIMIT = 24000
 NO_RESULTS_MESSAGE = "当前知识库未检索到足够相关资料"
 MULTI_QUERY_SYSTEM_PROMPT = (
     "你是企业知识库检索查询扩展器。"
@@ -58,6 +62,57 @@ STRUCTURED_QUERY_HINT_TERMS = (
     "账号",
     "编码",
     "编号",
+)
+STRUCTURED_SUMMARY_TERMS = (
+    "统计",
+    "总数",
+    "总人数",
+    "数量",
+    "多少",
+    "共有",
+    "一共",
+    "名单",
+    "列表",
+    "清单",
+    "明细",
+    "构成",
+    "分别",
+    "哪些",
+    "有谁",
+)
+STRUCTURED_META_SCHEMA_TERMS = (
+    "说明",
+    "填表说明",
+    "字段说明",
+    "版本",
+    "变更",
+    "速查",
+    "索引",
+    "目录",
+    "FAQ",
+    "常见问题",
+    "检索提示",
+    "回答参考",
+)
+STRUCTURED_META_HEADER_TERMS = (
+    "字段",
+    "用途",
+    "填写规则",
+    "问题",
+    "答案",
+    "关键词",
+    "优先命中表",
+    "检索提示",
+)
+STRUCTURED_DATA_SHEET_TERMS = (
+    "明细",
+    "名单",
+    "名册",
+    "花名册",
+    "通讯录",
+    "清单",
+    "台账",
+    "总表",
 )
 
 
@@ -121,6 +176,20 @@ def _extract_text_content(message: Any) -> str:
 def _build_retriever(top_k: int, retrieval_method: str = "hybrid"):
     """根据配置和请求的检索方式构造检索器。"""
     normalized_method = (retrieval_method or "hybrid").strip().lower()
+    cache_key = normalized_method
+    with _RETRIEVER_CACHE_LOCK:
+        cached_retriever = _RETRIEVER_CACHE.get(cache_key)
+        if cached_retriever is not None:
+            return cached_retriever
+
+        retriever = _create_retriever(top_k, normalized_method)
+        if retriever is not None:
+            _RETRIEVER_CACHE[cache_key] = retriever
+        return retriever
+
+
+def _create_retriever(top_k: int, normalized_method: str):
+    """创建可复用的检索器实例，运行时 top_k 仍由 retrieve 参数控制。"""
     dense_retriever = None
     sparse_retriever = None
 
@@ -181,15 +250,20 @@ def retrieve_documents(
     if not normalized_query:
         return []
 
-    resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, 50))
-    candidate_k = max(resolved_top_k * 8, resolved_top_k + 20, MIN_RAG_CANDIDATE_POOL)
     resolved_method = _resolve_retrieval_method_for_query(normalized_query, retrieval_method)
-    retriever = _build_retriever(candidate_k, retrieval_method=resolved_method)
-    if retriever is None:
-        return []
-
-    candidates = retriever.retrieve(normalized_query, top_k=candidate_k)
-    return rerank_results(query=normalized_query, results=candidates, top_k=resolved_top_k)
+    resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, 50))
+    reranked = retrieve_documents_multi_query(
+        normalized_query,
+        top_k=resolved_top_k,
+        retrieval_method=resolved_method,
+    )
+    filtered = filter_retrieval_results(
+        normalized_query,
+        reranked,
+        top_k=resolved_top_k,
+    )
+    filtered = _expand_structured_section_evidence(filtered, query=normalized_query)
+    return _expand_parent_evidence(filtered, query=normalized_query, top_k=resolved_top_k)
 
 
 def _normalize_query_variants(
@@ -252,6 +326,10 @@ def _heuristic_multi_query_variants(query: str, max_queries: int = MAX_MULTI_QUE
     if focus:
         candidates.append(focus)
 
+    structured_aliases = _structured_query_aliases(normalized_query)
+    if structured_aliases:
+        candidates.extend(structured_aliases)
+
     # 中文没有空格分词时，直接拼接 build_query_terms 会产生“公司办、
     # 司办公、办公地”这类重叠 ngram，容易让扩展查询把无关分片带进 RRF。
     # 兜底扩展只保留去掉疑问词、语气词后的连续语义片段。
@@ -271,6 +349,66 @@ def _heuristic_multi_query_variants(query: str, max_queries: int = MAX_MULTI_QUE
     return _normalize_query_variants(candidates, normalized_query, max_queries=max_queries)
 
 
+def _structured_query_aliases(query: str) -> List[str]:
+    """把员工、部门这类结构化问法展开成通用口径别名。"""
+    normalized = re.sub(r"\s+", "", (query or "").strip())
+    if not normalized:
+        return []
+
+    aliases: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = re.sub(r"\s+", "", (value or "").strip())
+        if not value or value == normalized or value in seen:
+            return
+        seen.add(value)
+        aliases.append(value)
+
+    has_employee = any(term in normalized for term in ("员工", "人员", "人事", "花名册", "名册"))
+    has_department = any(term in normalized for term in ("部门", "组织", "通讯录", "架构"))
+    has_salary = any(term in normalized for term in ("工资", "薪资", "薪酬", "月薪", "应发", "实发", "奖金", "扣款"))
+    has_count = any(term in normalized for term in ("统计", "总数", "总人数", "数量", "多少", "共有", "一共"))
+    has_list = any(term in normalized for term in ("名单", "列表", "清单", "明细", "分别", "有哪些", "有谁", "是谁"))
+    has_role = any(term in normalized for term in ("负责人", "主管", "上级"))
+
+    if has_salary:
+        add("工资明细")
+        add("薪资明细")
+        add("实发工资")
+        add("应发工资")
+        add("员工工资")
+    if has_employee:
+        add("员工名单")
+        add("员工花名册")
+        add("员工明细")
+        if has_count:
+            add("员工人数")
+            add("员工总数")
+            add("员工统计")
+    if has_department:
+        add("部门通讯录")
+        add("部门负责人")
+        add("部门名单")
+        add("部门数量")
+        add("部门统计")
+    if has_role:
+        add("负责人名单")
+        add("各部门负责人")
+    if has_count:
+        if has_employee:
+            add("在职员工人数")
+        if has_department:
+            add("部门数量统计")
+    if has_list:
+        if has_employee:
+            add("员工明细")
+        if has_department:
+            add("部门清单")
+
+    return aliases
+
+
 def _identifier_query_variants(query: str) -> List[str]:
     """编号型查询保留原句，并为每个编号生成独立查询。"""
     normalized_query = re.sub(r"\s+", " ", (query or "").strip())
@@ -283,237 +421,60 @@ def _identifier_query_variants(query: str) -> List[str]:
     )
 
 
-def _load_structured_section_chunks(
+def _load_parent_context(
     anchor: RetrievalResult,
-) -> List[RetrievalResult]:
-    """从向量库读取同一结构化区域的全部分片。
-
-    旧索引可能没有在每个表格分片重复表头，单靠关键词过滤无法判断
-    后续数据行属于哪个字段。这里仅在已经命中结构化锚点时读取同一文档
-    的完整工作表区域，并按工作表标记确认边界，避免跨表拼接无关内容。
-    """
-    if not _is_structured_result(anchor):
-        return []
-
+) -> Optional[RetrievalResult]:
+    """通过 parent_id 从 Milvus 读取对应 Parent 文本。"""
     metadata = anchor.metadata or {}
-    document_id = str(metadata.get("document_id") or "").strip()
-    anchor_index = metadata.get("chunk_index")
-    anchor_section = _structured_section_marker(anchor)
-    if not document_id or anchor_index is None or not anchor_section:
-        return []
-
-    try:
-        anchor_index = int(anchor_index)
-    except (TypeError, ValueError):
-        return []
+    parent_id = str(metadata.get("parent_id") or "").strip()
+    if not parent_id:
+        return None
 
     try:
         from app.storage.milvus_store import get_milvus_client
 
         client = get_milvus_client()
-        escaped_document_id = document_id.replace("\\", "\\\\").replace('"', '\\"')
-        query_kwargs = {
-            "collection_name": settings.MILVUS_DOC_COLLECTION_NAME,
-            "filter": f'document_id == "{escaped_document_id}"',
-            "output_fields": [
-                "chunk_text",
-                "text",
+        escaped_parent_id = parent_id.replace("\\", "\\\\").replace('"', '\\"')
+        parent_rows = client.query(
+            collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
+            filter=f'parent_id == "{escaped_parent_id}"',
+            output_fields=[
+                "parent_id",
                 "document_id",
-                "chunk_index",
+                "parent_index",
+                "parent_text",
                 "source_name",
                 "file_type",
                 "content_type",
             ],
-        }
-        if hasattr(client, "query_iterator"):
-            iterator = client.query_iterator(
-                **query_kwargs,
-                batch_size=1000,
-                limit=-1,
-            )
-            rows = []
-            try:
-                while True:
-                    batch = iterator.next()
-                    if not batch:
-                        break
-                    rows.extend(batch)
-            finally:
-                close = getattr(iterator, "close", None)
-                if close:
-                    close()
-        else:
-            # 兼容旧版客户端和测试替身；生产客户端使用上面的迭代器，
-            # 因此不会受单次 query 的返回数量上限影响。
-            rows = client.query(**query_kwargs, limit=10000)
+            limit=1,
+        )
+        if not parent_rows:
+            return None
+
+        parent = parent_rows[0]
+        parent_text = str(parent.get("parent_text") or "").strip()
+        if not parent_text:
+            return None
+
+        return RetrievalResult(
+            content=parent_text,
+            metadata={
+                **metadata,
+                "document_id": parent.get("document_id") or metadata.get("document_id"),
+                "parent_id": parent.get("parent_id") or parent_id,
+                "parent_index": parent.get("parent_index") or metadata.get("parent_index"),
+                "source_name": parent.get("source_name") or metadata.get("source_name"),
+                "file_type": parent.get("file_type") or metadata.get("file_type"),
+                "content_type": parent.get("content_type") or metadata.get("content_type"),
+                "context_expansion": True,
+            },
+            score=float(anchor.score or 0.0),
+            source=anchor.source,
+        )
     except Exception as exc:
-        logger.debug("结构化分片邻域补取失败，继续使用已有召回结果: %s", exc)
-        return []
-
-    ordered_rows = sorted(
-        rows or [],
-        key=lambda row: int(row.get("chunk_index") or 0),
-    )
-    current_section = ""
-    section_by_index: Dict[int, str] = {}
-    for row in ordered_rows:
-        try:
-            chunk_index = int(row.get("chunk_index"))
-        except (TypeError, ValueError):
-            continue
-        content = str(row.get("chunk_text") or row.get("text") or "")
-        marker = _structured_section_marker(
-            RetrievalResult(
-                content=content,
-                metadata={},
-                score=0.0,
-                source="structured",
-            )
-        )
-        if marker:
-            current_section = marker
-        section_by_index[chunk_index] = current_section
-
-    section_chunks: List[RetrievalResult] = []
-    for row in ordered_rows:
-        try:
-            chunk_index = int(row.get("chunk_index"))
-        except (TypeError, ValueError):
-            continue
-        if chunk_index == anchor_index:
-            continue
-        same_section = section_by_index.get(chunk_index) == anchor_section
-        if not same_section:
-            continue
-
-        content = str(row.get("chunk_text") or row.get("text") or "").strip()
-        if not content:
-            continue
-        section_chunks.append(
-            RetrievalResult(
-                content=content,
-                metadata={
-                    "document_id": row.get("document_id") or document_id,
-                    "chunk_index": chunk_index,
-                    "source_name": row.get("source_name") or metadata.get("source_name"),
-                    "file_type": row.get("file_type") or metadata.get("file_type"),
-                    "content_type": row.get("content_type") or metadata.get("content_type"),
-                    "context_expansion": True,
-                    "section_name": section_by_index.get(chunk_index),
-                },
-                score=max(float(anchor.score or 0.0) * 0.92, 0.0),
-                source=anchor.source,
-            )
-        )
-
-    return sorted(
-        section_chunks,
-        key=lambda item: int(item.metadata.get("chunk_index") or 0),
-    )
-
-
-def _compact_structured_section(
-    anchor: RetrievalResult,
-    section_chunks: Sequence[RetrievalResult],
-    query: str,
-) -> Optional[RetrievalResult]:
-    """把较大的结构化区域压缩为相关字段和完整记录集合。
-
-    结构化覆盖问题不能只取锚点附近的 chunk，也不能把整张大表原样
-    塞入 Prompt。这里根据表头与查询词选择字段，跨全部分片收集记录，
-    并去除切块重叠产生的重复行。
-    """
-    ordered_chunks = sorted(
-        [anchor, *section_chunks],
-        key=lambda item: int((item.metadata or {}).get("chunk_index") or 0),
-    )
-    header: Optional[List[str]] = None
-    rows: List[List[str]] = []
-
-    for result in ordered_chunks:
-        for raw_line in str(result.content or "").splitlines():
-            line = raw_line.strip()
-            if not line or line.lower().startswith("[sheet]"):
-                continue
-            try:
-                parsed = [str(cell).strip() for cell in next(csv.reader([line]))]
-            except (csv.Error, StopIteration):
-                continue
-            if len(parsed) < 2:
-                continue
-            if header is None:
-                header = parsed
-                continue
-            if [normalize_text(cell) for cell in parsed] == [
-                normalize_text(cell) for cell in header
-            ]:
-                continue
-            rows.append(parsed)
-
-    if not header or not rows:
+        logger.debug("Parent 上下文读取失败，继续使用原始命中: %s", exc)
         return None
-
-    query_keywords = build_query_keywords(query, max_terms=32)
-    normalized_headers = [normalize_text(cell) for cell in header]
-    selected_indexes = [0]
-    for index, normalized_header in enumerate(normalized_headers):
-        if index == 0:
-            continue
-        if any(
-            keyword
-            and (
-                keyword in normalized_header
-                or normalized_header in keyword
-            )
-            for keyword in query_keywords
-        ):
-            selected_indexes.append(index)
-
-    if len(selected_indexes) == 1:
-        selected_indexes.extend(range(1, min(len(header), 4)))
-    selected_indexes = list(dict.fromkeys(selected_indexes))
-
-    rendered_rows: List[str] = []
-    seen_rows = set()
-    for row in rows:
-        row_key = tuple(normalize_text(cell) for cell in row)
-        if not any(row_key) or row_key in seen_rows:
-            continue
-        seen_rows.add(row_key)
-        values = [
-            f"{header[index]}={row[index] if index < len(row) else ''}"
-            for index in selected_indexes
-            if index < len(header) and index < len(row) and row[index]
-        ]
-        if values:
-            rendered_rows.append("；".join(values))
-
-    if not rendered_rows:
-        return None
-
-    metadata = dict(anchor.metadata or {})
-    metadata.update(
-        {
-            "structured_aggregation": True,
-            "chunk_indices": [
-                (item.metadata or {}).get("chunk_index")
-                for item in ordered_chunks
-            ],
-            "section_name": _structured_section_marker(anchor),
-        }
-    )
-    section_name = _structured_section_marker(anchor)
-    content = (
-        f"[Sheet] {section_name}\n"
-        f"字段: {'、'.join(header[index] for index in selected_indexes)}\n"
-        + "\n".join(rendered_rows)
-    )
-    return RetrievalResult(
-        content=content,
-        metadata=metadata,
-        score=max(float(item.score or 0.0) for item in ordered_chunks),
-        source="structured_evidence",
-    )
 
 
 def _parse_multi_query_payload(text: str) -> Dict[str, Any]:
@@ -605,21 +566,40 @@ def retrieve_documents_multi_query(
     if retriever is None:
         return []
 
-    result_sets: List[List[RetrievalResult]] = []
-    for item in queries:
-        results = retriever.retrieve(item, top_k=candidate_k)
-        if results:
-            result_sets.append(results)
+    retrieve_many = getattr(retriever, "retrieve_many", None)
+    if callable(retrieve_many):
+        result_sets = retrieve_many(queries, top_k=candidate_k)
+    else:
+        result_sets = [
+            retriever.retrieve(item, top_k=candidate_k)
+            for item in queries
+        ]
 
-    if not result_sets:
+    if not any(result_sets):
         return []
 
+    nonempty_result_sets = [
+        results
+        for results in result_sets
+        if results
+    ]
+    nonempty_indexes = [
+        index
+        for index, results in enumerate(result_sets)
+        if results
+    ]
     fused_results = fuse_ranked_results(
-        result_sets=result_sets,
+        result_sets=nonempty_result_sets,
         # 原始问题是最可靠的召回基线，扩展问题只负责补充表达，不能
         # 因为多个较弱变体的 RRF 累积而把原始命中挤出候选池。
-        weights=[1.4] + [0.75 for _ in result_sets[1:]],
-        source_labels=[f"query_{index + 1}" for index in range(len(result_sets))],
+        weights=[
+            1.4 if index == 0 else 0.75
+            for index in nonempty_indexes
+        ],
+        source_labels=[
+            f"query_{index + 1}"
+            for index in nonempty_indexes
+        ],
         rrf_k=60,
     )
     candidate_limit = max(
@@ -630,9 +610,20 @@ def retrieve_documents_multi_query(
     selected_results = list(fused_results[:candidate_limit])
     seen_keys = {_citation_chunk_key(item) for item in selected_results}
 
+    def keep_candidate(item: RetrievalResult) -> None:
+        """把必须保留的候选塞回融合池尾部。"""
+        key = _citation_chunk_key(item)
+        if key in seen_keys:
+            return
+        if len(selected_results) >= candidate_limit:
+            removed = selected_results.pop()
+            seen_keys.discard(_citation_chunk_key(removed))
+        selected_results.append(item)
+        seen_keys.add(key)
+
     # Multi-Query 的职责是扩召回，不应破坏原始问题已经召回的有效证据。
     # 如果原始查询结果因融合排序落到候选池之外，替换候选池尾部保留它。
-    direct_results = result_sets[0]
+    direct_results = result_sets[0] if result_sets else []
     protected_direct_results = [
         item
         for item in direct_results[: max(resolved_top_k * 2, 12)]
@@ -641,22 +632,40 @@ def retrieve_documents_multi_query(
         and passes_keyword_relevance_gate(query, item)
     ]
     for item in protected_direct_results:
-        key = _citation_chunk_key(item)
-        if key in seen_keys:
-            continue
-        if len(selected_results) >= candidate_limit:
-            removed = selected_results.pop()
-            seen_keys.discard(_citation_chunk_key(removed))
-        selected_results.append(item)
-        seen_keys.add(key)
+        keep_candidate(item)
+
+    if _is_structured_lookup_query(query):
+        # 统计/名单类表格问题里，真正的数据表可能只被“员工花名册/
+        # 部门通讯录/工资明细”某个变体强命中；RRF 会偏向多路擦边命中
+        # 的说明页。每个变体保留少量 schema 明确匹配的数据行，保证后续
+        # 同 Sheet 聚合有机会展开完整证据。
+        for results in result_sets:
+            kept_for_route = 0
+            for item in results:
+                if not _is_structured_result(item):
+                    continue
+                if is_reference_index_result(item):
+                    continue
+                if _structured_schema_score(item, query) <= 0.12:
+                    continue
+                keep_candidate(item)
+                kept_for_route += 1
+                if kept_for_route >= 3:
+                    break
 
     return selected_results
 
 
 def _citation_document_key(result: RetrievalResult) -> str:
-    """引用资料优先按文档去重，避免同一文件多个片段挤占展示位。"""
+    """引用资料按 Parent 优先去重，旧数据再退回文档去重。"""
     metadata = result.metadata or {}
-    return str(metadata.get("document_id") or metadata.get("source_name") or result.content or "")
+    return str(
+        metadata.get("parent_id")
+        or metadata.get("document_id")
+        or metadata.get("source_name")
+        or result.content
+        or ""
+    )
 
 
 def _citation_chunk_key(result: RetrievalResult) -> tuple[str, str, Any]:
@@ -664,7 +673,7 @@ def _citation_chunk_key(result: RetrievalResult) -> tuple[str, str, Any]:
     return (
         str(metadata.get("document_id") or ""),
         str(metadata.get("source_name") or ""),
-        metadata.get("chunk_index"),
+        metadata.get("child_id") or metadata.get("chunk_index"),
     )
 
 
@@ -686,119 +695,375 @@ def _is_structured_result(result: RetrievalResult) -> bool:
     return file_type in {"csv", "tsv", "xls", "xlsx"} or str(result.content or "").lstrip().startswith("[Sheet]")
 
 
-def _structured_section_marker(result: RetrievalResult) -> str:
-    first_line = next(
-        (
-            line.strip()
-            for line in str(result.content or "").splitlines()
-            if line.strip()
-        ),
-        "",
+def _is_structured_summary_query(query: str) -> bool:
+    """判断是否需要跨多行表格证据来回答。"""
+    normalized = re.sub(r"\s+", "", (query or "").strip())
+    return _is_structured_lookup_query(normalized) and any(
+        term in normalized
+        for term in STRUCTURED_SUMMARY_TERMS
     )
-    match = re.match(r"^\[Sheet\]\s*(.+?)\s*$", first_line, flags=re.IGNORECASE)
-    return str(match.group(1) or "").strip().lower() if match else ""
 
 
-def _structured_header_score(result: RetrievalResult) -> float:
-    """按表头与查询的匹配度衡量结构化分片是否属于主证据区域。"""
-    metadata = result.metadata or {}
+def _structured_section_marker_from_text(text: str) -> str:
+    """从结构化 chunk/parent 中提取 sheet 名。"""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^\[Sheet\]\s*(.+?)\s*$", line, flags=re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+    return ""
+
+
+def _structured_section_marker(result: RetrievalResult) -> str:
+    return _structured_section_marker_from_text(result.content)
+
+
+def _structured_schema_text(result: RetrievalResult) -> str:
+    """取结构化结果的 sheet 名和表头，用于判断表格是否对题。"""
+    lines = [
+        line.strip()
+        for line in str(result.content or "").splitlines()
+        if line.strip()
+    ]
+    return "\n".join(lines[:2])
+
+
+def _structured_schema_parts(result: RetrievalResult) -> tuple[str, str]:
+    """拆出 sheet 名和表头，后续只用结构信息判断表格是否对题。"""
+    lines = [
+        line.strip()
+        for line in str(result.content or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return "", ""
+
+    sheet_name = ""
+    header = lines[0]
+    if lines[0].startswith("[Sheet]"):
+        sheet_name = re.sub(r"^\[Sheet\]\s*", "", lines[0], flags=re.IGNORECASE).strip()
+        header = lines[1] if len(lines) > 1 else ""
+    return sheet_name, header
+
+
+def _structured_query_schema_terms(query: str) -> List[str]:
+    """按查询主题生成可迁移的表头/Sheet 匹配词。"""
+    normalized = re.sub(r"\s+", "", (query or "").strip())
+    terms: List[str] = []
+
+    def extend(values: Sequence[str]) -> None:
+        for value in values:
+            if value and value not in terms:
+                terms.append(value)
+
+    has_employee = any(term in normalized for term in ("员工", "人员", "人事", "花名册", "名册", "姓名", "工号"))
+    has_department = any(term in normalized for term in ("部门", "组织", "通讯录", "架构", "负责人", "主管"))
+    has_salary = any(term in normalized for term in ("工资", "薪资", "薪酬", "月薪", "应发", "实发", "奖金", "扣款"))
+
+    if has_salary:
+        extend(("工资", "薪资", "薪酬", "基本工资", "应发工资", "实发工资", "奖金", "扣款", "个税", "社保", "公积金"))
+    if has_employee:
+        extend(("员工", "人员", "员工号", "工号", "姓名", "员工姓名", "部门", "岗位", "职位", "状态", "入职", "邮箱", "电话"))
+    if has_department:
+        extend(("部门", "负责人", "主管", "直属主管", "办公地点", "办公", "地点", "联系人", "电话", "邮箱"))
+
+    extend(build_query_keywords(query, max_terms=32))
+    return [term for term in terms if len(normalize_text(term)) >= 2]
+
+
+def _structured_schema_score(result: RetrievalResult, query: str) -> float:
+    """按 sheet/表头字段匹配度给结构化候选打分。"""
+    sheet_name, header = _structured_schema_parts(result)
+    schema_text = normalize_text("\n".join(part for part in (sheet_name, header) if part))
+    if not schema_text:
+        return 0.0
+
+    sheet_text = normalize_text(sheet_name)
+    header_text = normalize_text(header)
+    useful_terms = [
+        normalize_text(term)
+        for term in _structured_query_schema_terms(query)
+        if normalize_text(term)
+        and normalize_text(term) not in {"名单", "列表", "清单", "统计", "总数", "总人数", "数量", "多少", "共有", "一共"}
+    ]
+    if not useful_terms:
+        return 0.0
+
+    hit_weight = 0.0
+    max_weight = 0.0
+    for term in list(dict.fromkeys(useful_terms)):
+        weight = min(len(term), 8) / 8.0
+        max_weight += weight
+        if term in header_text:
+            hit_weight += weight
+        elif term in sheet_text:
+            hit_weight += weight * 0.65
+
+    score = hit_weight / max_weight if max_weight > 0.0 else 0.0
+    meta_hits = sum(
+        1
+        for term in STRUCTURED_META_SCHEMA_TERMS
+        if normalize_text(term) and normalize_text(term) in schema_text
+    )
+    meta_header_hits = sum(
+        1
+        for term in STRUCTURED_META_HEADER_TERMS
+        if normalize_text(term) and normalize_text(term) in header_text
+    )
+    data_sheet_hit = any(
+        normalize_text(term) in sheet_text
+        for term in STRUCTURED_DATA_SHEET_TERMS
+        if normalize_text(term)
+    )
+    data_field_hits = sum(1 for term in useful_terms if term in header_text)
+
+    if data_sheet_hit and data_field_hits >= 2:
+        score += 0.15
+    if meta_hits + meta_header_hits >= 2 and data_field_hits < 2:
+        score *= 0.25
+    return min(1.0, score)
+
+
+def _escape_milvus_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _query_parent_rows_by_document(document_id: str) -> List[Dict[str, Any]]:
+    """按 document_id 读取 parent，避免运行时扫全库。"""
+    if not document_id:
+        return []
     try:
-        heading_coverage = float(metadata.get("heading_coverage") or 0.0)
-    except (TypeError, ValueError):
-        heading_coverage = 0.0
-    try:
-        heading_focus_coverage = float(metadata.get("heading_focus_coverage") or 0.0)
-    except (TypeError, ValueError):
-        heading_focus_coverage = 0.0
-    return heading_coverage + heading_focus_coverage
+        from app.storage.milvus_store import get_milvus_client
 
-
-def _select_primary_structured_anchors(
-    anchors: Sequence[RetrievalResult],
-) -> List[RetrievalResult]:
-    """保留与查询表头最匹配的一个或多个结构化证据区域。"""
-    if not anchors:
+        client = get_milvus_client()
+        if not client.has_collection(settings.MILVUS_PARENT_COLLECTION_NAME):
+            return []
+        rows = client.query(
+            collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
+            filter=f'document_id == "{_escape_milvus_value(document_id)}"',
+            output_fields=[
+                "parent_id",
+                "document_id",
+                "parent_index",
+                "parent_text",
+                "source_name",
+                "file_type",
+                "content_type",
+            ],
+            limit=10000,
+        )
+        return list(rows or [])
+    except Exception as exc:
+        logger.debug("结构化 parent 扩展读取失败，继续使用原始命中: %s", exc)
         return []
 
-    scored = [(item, _structured_header_score(item)) for item in anchors]
-    best_score = max(score for _, score in scored)
-    if best_score <= 0.0:
-        # 旧索引可能没有保存重排信号，至少保留最高原始相关结果所在区域。
-        return [scored[0][0]]
 
-    minimum_score = max(best_score * 0.5, 0.05)
-    return [item for item, score in scored if score >= minimum_score]
+def _parse_structured_table(parent_texts: Sequence[str]) -> tuple[str, List[str], List[str], List[int]]:
+    """从多个 parent 中还原同一张 sheet 的表头与去重数据行。"""
+    sheet_name = ""
+    header = ""
+    rows: List[str] = []
+    seen_rows = set()
+    parent_indexes: List[int] = []
+
+    for parent_text in parent_texts:
+        current_sheet = ""
+        lines = [
+            line.strip()
+            for line in str(parent_text or "").splitlines()
+            if line.strip()
+        ]
+        for line in lines:
+            match = re.match(r"^\[Sheet\]\s*(.+?)\s*$", line, flags=re.IGNORECASE)
+            if match:
+                current_sheet = match.group(1).strip()
+                if not sheet_name:
+                    sheet_name = current_sheet
+                continue
+            if not header:
+                header = line
+                continue
+            if normalize_text(line) == normalize_text(header):
+                continue
+            row_key = normalize_text(line)
+            if not row_key or row_key in seen_rows:
+                continue
+            seen_rows.add(row_key)
+            rows.append(line)
+        if current_sheet and current_sheet == sheet_name:
+            parent_indexes.append(len(parent_indexes))
+
+    return sheet_name, [item.strip() for item in header.split(",") if item.strip()], rows, parent_indexes
 
 
-def _same_structured_section(anchor: RetrievalResult, candidate: RetrievalResult) -> bool:
-    """判断两个结构化分片是否仍属于同一连续表格区域。"""
-    if not _is_structured_result(anchor) or not _is_structured_result(candidate):
+def _row_matches_query(row: str, query: str) -> bool:
+    """粗粒度判断某行是否包含用户限定条件，命中行优先展示。"""
+    keywords = build_query_keywords(query, max_terms=32)
+    normalized_row = normalize_text(row)
+    useful_keywords = [
+        keyword
+        for keyword in keywords
+        if keyword
+        and keyword not in {"员工", "人员", "部门", "名单", "列表", "清单", "统计", "总数", "数量"}
+        and len(keyword) >= 2
+    ]
+    if not useful_keywords:
         return False
-
-    anchor_metadata = anchor.metadata or {}
-    candidate_metadata = candidate.metadata or {}
-    if str(anchor_metadata.get("document_id") or "") != str(candidate_metadata.get("document_id") or ""):
-        return False
-
-    anchor_marker = _structured_section_marker(anchor)
-    candidate_marker = _structured_section_marker(candidate)
-    if anchor_marker and candidate_marker:
-        return anchor_marker == candidate_marker
-    if candidate_marker and not anchor_marker:
-        return False
-    return True
+    return any(keyword in normalized_row for keyword in useful_keywords)
 
 
-def _expand_structured_evidence(
+def _build_structured_section_summary(
+    anchor: RetrievalResult,
+    parent_rows: Sequence[Dict[str, Any]],
+    query: str,
+) -> Optional[RetrievalResult]:
+    """把同一 sheet 的 parent 压缩成统计/名单类问题可读的证据。"""
+    section_name = _structured_section_marker(anchor)
+    metadata = anchor.metadata or {}
+    if not section_name:
+        return None
+
+    same_section_rows = sorted(
+        [
+            row
+            for row in parent_rows
+            if _structured_section_marker_from_text(str(row.get("parent_text") or "")) == section_name
+        ],
+        key=lambda row: int(row.get("parent_index") or 0),
+    )[:STRUCTURED_SECTION_PARENT_LIMIT]
+    if not same_section_rows:
+        return None
+
+    sheet_name, headers, rows, _ = _parse_structured_table(
+        [str(row.get("parent_text") or "") for row in same_section_rows]
+    )
+    if not rows:
+        return None
+
+    matched_rows = [row for row in rows if _row_matches_query(row, query)]
+    ordered_rows = matched_rows + [row for row in rows if row not in set(matched_rows)]
+    rendered_rows: List[str] = []
+    used_chars = 0
+    for row in ordered_rows:
+        next_len = len(row) + 1
+        if used_chars + next_len > STRUCTURED_SECTION_ROW_CHAR_LIMIT:
+            break
+        rendered_rows.append(row)
+        used_chars += next_len
+
+    if not rendered_rows:
+        return None
+
+    content = (
+        f"[Sheet] {sheet_name or section_name}\n"
+        f"字段: {'、'.join(headers) if headers else '未知'}\n"
+        f"去重记录数: {len(rows)}\n"
+        f"优先匹配行数: {len(matched_rows)}\n"
+        "数据行:\n"
+        + "\n".join(rendered_rows)
+    )
+    return RetrievalResult(
+        content=content,
+        metadata={
+            **metadata,
+            "structured_aggregation": True,
+            "section_name": sheet_name or section_name,
+            "chunk_indices": [
+                row.get("parent_index")
+                for row in same_section_rows
+            ],
+        },
+        score=max(float(anchor.score or 0.0), 0.0) + 0.08,
+        source="structured_evidence",
+    )
+
+
+def _expand_parent_evidence(
     results: Sequence[RetrievalResult],
     query: str,
     top_k: Optional[int] = None,
 ) -> List[RetrievalResult]:
-    """把已命中的结构化锚点扩展成同一工作表的完整证据。"""
-    structured_anchors = _select_primary_structured_anchors(
-        [
-            item
-            for item in results
-            if _is_structured_result(item) and _structured_section_marker(item)
-        ]
-    )
-    if not structured_anchors:
+    """保留 Child 命中，并把 Parent 上下文挂到元数据里供 Prompt 使用。"""
+    if not results:
         return list(results)
 
-    citation_limit = max(1, min(top_k or settings.SEARCH_TOP_K, STRUCTURED_QUERY_CITATION_RESULTS))
     expanded_results: List[RetrievalResult] = []
-    expanded_keys = set()
-    expanded_sections = set()
+    seen_children = set()
 
-    for result in structured_anchors:
-        metadata = result.metadata or {}
-        section_key = (
-            str(metadata.get("document_id") or ""),
-            _structured_section_marker(result),
-        )
-        if section_key in expanded_sections:
+    for result in results:
+        if (result.metadata or {}).get("structured_aggregation"):
+            expanded_results.append(result)
             continue
-        expanded_sections.add(section_key)
 
-        section_chunks = [result, *_load_structured_section_chunks(result)]
-        if len(section_chunks) > max(citation_limit, 8):
-            compacted = _compact_structured_section(
-                anchor=result,
-                section_chunks=section_chunks[1:],
-                query=query,
+        metadata = result.metadata or {}
+        child_key = (
+            str(metadata.get("document_id") or ""),
+            str(metadata.get("child_id") or metadata.get("chunk_index") or ""),
+            str((result.content or "").strip()),
+        )
+        if child_key in seen_children:
+            continue
+        seen_children.add(child_key)
+
+        parent_result = _load_parent_context(result)
+        metadata_with_parent = dict(metadata)
+        if parent_result and (parent_result.content or "").strip():
+            metadata_with_parent["parent_context_text"] = parent_result.content
+            metadata_with_parent["context_expansion"] = True
+
+        expanded_results.append(
+            RetrievalResult(
+                content=result.content,
+                metadata=metadata_with_parent,
+                score=result.score,
+                source=result.source,
             )
-            if compacted is not None:
-                expanded_results.append(compacted)
-                continue
-
-        for item in section_chunks:
-            item_key = _citation_chunk_key(item)
-            if item_key in expanded_keys:
-                continue
-            expanded_results.append(item)
-            expanded_keys.add(item_key)
+        )
 
     return expanded_results
+
+
+def _expand_structured_section_evidence(
+    results: Sequence[RetrievalResult],
+    query: str,
+) -> List[RetrievalResult]:
+    """结构化文档命中 sheet 后，补齐同一 sheet 的多行 parent 证据。
+
+    xlsx/csv 的一行通常只是最小事实单元。用户问统计、筛选、名单、
+    范围比较时，单个 child 命中不足以让 LLM 得到完整答案，所以只要
+    已经召回到结构化 sheet，就把同 sheet 的 parent 行聚合成可读证据。
+    """
+    if not any(_is_structured_result(result) for result in results):
+        return list(results)
+
+    expanded: List[RetrievalResult] = []
+    seen_sections = set()
+    parent_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+    for result in results:
+        if not _is_structured_result(result) or is_reference_index_result(result):
+            expanded.append(result)
+            continue
+        metadata = result.metadata or {}
+        document_id = str(metadata.get("document_id") or "").strip()
+        section_name = _structured_section_marker(result)
+        section_key = (document_id, section_name)
+        if not document_id or not section_name or section_key in seen_sections:
+            expanded.append(result)
+            continue
+
+        seen_sections.add(section_key)
+        if document_id not in parent_cache:
+            parent_cache[document_id] = _query_parent_rows_by_document(document_id)
+        summary = _build_structured_section_summary(
+            anchor=result,
+            parent_rows=parent_cache[document_id],
+            query=query,
+        )
+        expanded.append(summary or result)
+
+    return expanded
 
 
 def filter_retrieval_results(
@@ -826,53 +1091,83 @@ def filter_retrieval_results(
         return []
 
     keyword_matched = [item for item in reranked if passes_keyword_relevance_gate(query, item)]
-    if not keyword_matched:
-        return []
+    # 关键词相关性只做优先级信号，不做硬拒绝。否则同义词、数值范围、
+    # 表格字段表达不一致时，会把 Dense/RRF 已经召回的候选直接清零。
+    ranking_pool = list(reranked) if structured_lookup else (keyword_matched or list(reranked))
 
-    best_score = max(float(item.score or 0.0) for item in keyword_matched)
-    structured_matched = [item for item in keyword_matched if _is_structured_result(item)]
+    best_score = max(float(item.score or 0.0) for item in ranking_pool)
+    structured_matched = [item for item in ranking_pool if _is_structured_result(item)]
     if structured_lookup and structured_matched:
-        filtered = structured_matched
+        non_reference_structured = [
+            item
+            for item in structured_matched
+            if not is_reference_index_result(item)
+        ]
+        structured_pool = non_reference_structured or structured_matched
+        schema_scores = [
+            _structured_schema_score(item, query)
+            for item in structured_pool
+        ]
+        best_schema_score = max(schema_scores, default=0.0)
+        if best_schema_score > 0.0:
+            minimum_schema_score = max(0.25, best_schema_score * 0.5)
+            filtered = [
+                item
+                for item, schema_score in zip(structured_pool, schema_scores)
+                if schema_score >= minimum_schema_score
+            ]
+            filtered.sort(
+                key=lambda item: (
+                    -_structured_schema_score(item, query),
+                    -float(item.score or 0.0),
+                )
+            )
+        else:
+            filtered = structured_pool
+    elif not keyword_matched:
+        filtered = ranking_pool[:resolved_top_k]
     else:
         score_floor = max(MIN_FINAL_RELEVANCE_SCORE, best_score * 0.62)
-        filtered = [item for item in keyword_matched if float(item.score or 0.0) >= score_floor]
+        filtered = [item for item in ranking_pool if float(item.score or 0.0) >= score_floor]
 
         if not filtered and best_score >= MIN_FINAL_RELEVANCE_SCORE:
-            filtered = keyword_matched[:1]
+            filtered = ranking_pool[:1]
 
     # 多编号查询必须保留每个已命中的编号，避免一个高分片段挤掉其他编号。
     protected_identifier_results: List[RetrievalResult] = []
     for identifier in identifiers:
         matching = [
             item
-            for item in keyword_matched
+            for item in ranking_pool
             if _result_contains_identifier(item, identifier)
         ]
         if matching:
             protected_identifier_results.append(matching[0])
 
     deduplicated: List[RetrievalResult] = []
-    seen_documents = set()
     seen_chunks = set()
 
-    def append_candidate(item: RetrievalResult, enforce_document_diversity: bool) -> None:
+    def append_candidate(item: RetrievalResult) -> None:
         if len(deduplicated) >= resolved_top_k:
             return
         chunk_key = _citation_chunk_key(item)
-        document_key = _citation_document_key(item)
+        if structured_lookup:
+            metadata = item.metadata or {}
+            chunk_key = (
+                str(metadata.get("document_id") or ""),
+                str(metadata.get("parent_id") or ""),
+                str(metadata.get("child_id") or metadata.get("chunk_index") or ""),
+            )
         if chunk_key in seen_chunks:
             return
-        if enforce_document_diversity and document_key in seen_documents:
-            return
         seen_chunks.add(chunk_key)
-        seen_documents.add(document_key)
         deduplicated.append(item)
 
     for item in protected_identifier_results:
-        append_candidate(item, enforce_document_diversity=False)
+        append_candidate(item)
 
     for item in filtered:
-        append_candidate(item, enforce_document_diversity=not structured_lookup)
+        append_candidate(item)
         if len(deduplicated) >= resolved_top_k:
             break
 
@@ -892,6 +1187,13 @@ def assemble_rag_context(results: Sequence[RetrievalResult], max_chars: int = RA
         if chunk_index is not None:
             header += f" / chunk: {chunk_index}"
         content = re.sub(r"\s+", " ", (result.content or "").strip())
+        parent_context = re.sub(
+            r"\s+",
+            " ",
+            str(metadata.get("parent_context_text") or "").strip(),
+        )
+        if parent_context and parent_context != content:
+            content = f"[命中行] {content}\n[父块上下文] {parent_context}"
         block = f"{header}\n{content}"
         if used_chars + len(block) > max_chars:
             remaining = max_chars - used_chars
@@ -912,7 +1214,7 @@ def run_rag_workflow(
     retrieval_method: str = "hybrid",
     llm: Optional[Any] = None,
 ) -> RagWorkflowResult:
-    """执行完整 RAG 工具流程：Multi-Query、混合召回、RRF、重排、过滤、结构化补全、上下文组装。"""
+    """执行完整 RAG 工具流程：Multi-Query、混合召回、RRF、重排、Parent 回收、上下文组装。"""
     normalized_query = (query or "").strip()
     if not normalized_query:
         return RagWorkflowResult(query="")
@@ -930,18 +1232,21 @@ def run_rag_workflow(
         recalled_results,
         top_k=top_k,
     )
-    filtered_results = _expand_structured_evidence(
+    filtered_results = _expand_structured_section_evidence(
+        filtered_results,
+        query=normalized_query,
+    )
+    filtered_results = _expand_parent_evidence(
         filtered_results,
         query=normalized_query,
         top_k=top_k,
     )
 
-    context_max_chars = RAG_CONTEXT_MAX_CHARS
-    if any(
-        bool((item.metadata or {}).get("structured_aggregation"))
-        for item in filtered_results
-    ):
-        context_max_chars = MAX_STRUCTURED_CONTEXT_CHARS
+    context_max_chars = (
+        STRUCTURED_CONTEXT_MAX_CHARS
+        if any((item.metadata or {}).get("structured_aggregation") for item in filtered_results)
+        else RAG_CONTEXT_MAX_CHARS
+    )
     context = assemble_rag_context(
         filtered_results,
         max_chars=context_max_chars,
@@ -959,9 +1264,7 @@ def run_rag_workflow(
                 "chunk_index": (item.metadata or {}).get("chunk_index"),
                 "chunk_count": len((item.metadata or {}).get("chunk_indices") or [])
                 or 1,
-                "structured_aggregation": bool(
-                    (item.metadata or {}).get("structured_aggregation")
-                ),
+                "parent_id": (item.metadata or {}).get("parent_id"),
             }
             for item in filtered_results
         ],

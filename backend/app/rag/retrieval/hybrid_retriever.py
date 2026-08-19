@@ -1,6 +1,6 @@
 """混合检索器 (密集 + 稀疏)"""
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Sequence
 
 from .base import BaseRetriever, RetrievalResult
 from .reranker import fuse_retrieval_results
@@ -33,43 +33,90 @@ class HybridRetriever(BaseRetriever):
             logger.warning(f"{label} 检索失败，跳过该路结果: {str(e)}")
             return []
 
-    def retrieve(self, query: str, top_k: int = None) -> List[RetrievalResult]:
+    def _safe_retrieve_many(
+        self,
+        queries: Sequence[str],
+        top_k: int,
+    ) -> List[List[RetrievalResult]]:
+        retrieve_many = getattr(self.dense_retriever, "retrieve_many", None)
+        if not callable(retrieve_many):
+            return [
+                self._safe_retrieve(self.dense_retriever, query, top_k, "密集")
+                for query in queries
+            ]
         try:
-            if top_k is None:
-                top_k = self.top_k
+            return retrieve_many(list(queries), top_k=top_k) or [
+                [] for _ in queries
+            ]
+        except Exception as e:
+            logger.warning(f"批量密集检索失败，跳过该路结果: {str(e)}")
+            return [[] for _ in queries]
 
-            query = (query or "").strip()
-            if not query:
-                return []
+    def retrieve_many(
+        self,
+        queries: Sequence[str],
+        top_k: int = None,
+        sparse_max_workers: int = 3,
+    ) -> List[List[RetrievalResult]]:
+        """统一调度多查询：Dense 批量检索，Sparse 有界并行检索。"""
+        resolved_top_k = top_k or self.top_k
+        normalized_queries = [(query or "").strip() for query in queries]
+        if not normalized_queries:
+            return []
 
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag-retrieval") as executor:
-                dense_future = executor.submit(
-                    self._safe_retrieve,
-                    self.dense_retriever,
-                    query,
-                    top_k,
-                    "密集",
-                )
-                sparse_future = executor.submit(
+        worker_count = max(1, min(sparse_max_workers, len(normalized_queries)))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="rag-sparse",
+        ) as executor:
+            sparse_futures = [
+                executor.submit(
                     self._safe_retrieve,
                     self.sparse_retriever,
                     query,
-                    top_k,
+                    resolved_top_k,
                     "稀疏",
                 )
-                dense_results = dense_future.result()
-                sparse_results = sparse_future.result()
-
-            if not dense_results and not sparse_results:
-                return []
-
-            fused_results = fuse_retrieval_results(
-                dense_results=dense_results,
-                sparse_results=sparse_results,
-                dense_weight=self.dense_weight,
-                sparse_weight=self.sparse_weight,
+                if query
+                else None
+                for query in normalized_queries
+            ]
+            dense_result_sets = self._safe_retrieve_many(
+                normalized_queries,
+                resolved_top_k,
             )
-            return fused_results[:top_k]
-        except Exception as e:
-            logger.error(f"混合检索失败: {str(e)}")
-            raise
+            sparse_result_sets = [
+                future.result() if future is not None else []
+                for future in sparse_futures
+            ]
+
+        merged_result_sets: List[List[RetrievalResult]] = []
+        for index in range(len(normalized_queries)):
+            dense_results = (
+                dense_result_sets[index]
+                if index < len(dense_result_sets)
+                else []
+            )
+            sparse_results = (
+                sparse_result_sets[index]
+                if index < len(sparse_result_sets)
+                else []
+            )
+            if not dense_results and not sparse_results:
+                merged_result_sets.append([])
+                continue
+            merged_result_sets.append(
+                fuse_retrieval_results(
+                    dense_results=dense_results,
+                    sparse_results=sparse_results,
+                    dense_weight=self.dense_weight,
+                    sparse_weight=self.sparse_weight,
+                )[:resolved_top_k]
+            )
+        return merged_result_sets
+
+    def retrieve(self, query: str, top_k: int = None) -> List[RetrievalResult]:
+        normalized_query = (query or "").strip()
+        if not normalized_query:
+            return []
+        return self.retrieve_many([normalized_query], top_k=top_k)[0]

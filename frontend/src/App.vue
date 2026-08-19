@@ -48,7 +48,7 @@ const CONVERSATION_STORAGE_KEY_PREFIX = 'enterprise-knowledge-system.conversatio
 const DEFAULT_MAX_CONVERSATIONS = 20
 const APP_NAME = '企业知识库问答系统'
 const APP_VERSION = '1.0.0'
-const COPYRIGHT_URL = 'https://github.com/GuLu37'
+const COPYRIGHT_URL = 'https://github.com/GuLu37/Enterprise-Knowledge-System.git'
 const SOURCE_DISPLAY_LIMIT = 3
 const CHAT_RUNTIME_STATUS_INTERVAL_MS = 1000
 
@@ -203,6 +203,26 @@ const retrievalOptions = [
   { value: 'dense', label: '密集检索' },
   { value: 'sparse', label: '稀疏检索' },
 ]
+const welcomeQuickQuestions = [
+  {
+    icon: Wand2,
+    title: '差旅报销需要哪些材料？',
+    hint: '适合报销、凭证、时限',
+    question: '差旅报销需要哪些材料？',
+  },
+  {
+    icon: FileText,
+    title: '采购审批通过后还能直接签合同吗？',
+    hint: '适合采购、合同、法务审核',
+    question: '采购审批通过后还能直接签合同吗？',
+  },
+  {
+    icon: MessageSquare,
+    title: '如何申请项目 Alpha 的访问权限？',
+    hint: '适合账号、权限、项目访问',
+    question: '如何申请项目 Alpha 的访问权限？',
+  },
+]
 const retrievalMethodLabels = {
   hybrid: '混合检索',
   dense: '密集检索',
@@ -226,6 +246,9 @@ const conversationList = computed(() => (
   ))
 ))
 
+const visibleChatMessages = computed(() => chatMessages.value.filter((message) => !message.ephemeral))
+const showWelcomeScreen = computed(() => visibleChatMessages.value.length === 0)
+
 function getConversationTitle(conversation) {
   const firstQuestion = conversation.messages?.find((message) => message.role === 'user' && message.content?.trim())
   return trimText(firstQuestion?.content || '新对话', 34)
@@ -243,7 +266,202 @@ function getConversationTurnCount(conversation) {
 }
 
 function getDisplaySources(message) {
-  return (message?.sources || []).slice(0, SOURCE_DISPLAY_LIMIT)
+  const grouped = []
+  const groups = new Map()
+
+  for (const source of message?.sources || []) {
+    const metadata = source?.metadata && typeof source.metadata === 'object'
+      ? source.metadata
+      : {}
+    const sourceName = (
+      source?.source_name
+      || metadata.source_name
+      || source?.original_filename
+      || metadata.original_filename
+      || metadata.stored_filename
+      || metadata.document_id
+      || '未知来源'
+    )
+    const parentId = String(
+      source?.parent_id
+      || metadata.parent_id
+      || '',
+    ).trim()
+    const documentId = String(
+      source?.document_id
+      || metadata.document_id
+      || '',
+    ).trim()
+    const chunkIndex = metadata.chunk_index ?? source?.chunk_index ?? null
+    const groupKey = parentId
+      ? `${sourceName}::${parentId}`
+      : `${sourceName}::${documentId}::${chunkIndex ?? grouped.length}`
+    const existing = groups.get(groupKey)
+
+    if (existing) {
+      existing.count += 1
+      existing.maxScore = Math.max(existing.maxScore, Number(source?.score || 0))
+      if (!existing.content && source?.content) {
+        existing.content = source.content
+      }
+      if (chunkIndex != null) {
+        existing.chunkIndices.add(Number(chunkIndex))
+      }
+      continue
+    }
+
+    const next = {
+      key: groupKey,
+      sourceName,
+      parentId,
+      documentId,
+      content: source?.content || '',
+      score: Number(source?.score || 0),
+      maxScore: Number(source?.score || 0),
+      count: 1,
+      chunkIndices: new Set(chunkIndex != null ? [Number(chunkIndex)] : []),
+    }
+    groups.set(groupKey, next)
+    grouped.push(next)
+  }
+
+  return grouped.slice(0, SOURCE_DISPLAY_LIMIT).map((source) => {
+    const chunkIndices = [...source.chunkIndices].filter((value) => Number.isFinite(value)).sort((left, right) => left - right)
+    const rangeLabel = source.count > 1
+      ? `1-${source.count} 条`
+      : '1 条'
+    const chunkRangeLabel = chunkIndices.length > 1
+      ? `${chunkIndices[0]}-${chunkIndices[chunkIndices.length - 1]}`
+      : chunkIndices[0] != null
+        ? `${chunkIndices[0]}`
+        : ''
+
+    return {
+      ...source,
+      chunkRangeLabel,
+      rangeLabel,
+      score: source.maxScore ?? source.score,
+    }
+  })
+}
+
+async function handleQuickQuestion(question) {
+  if (!question || chatInputDisabled.value) return
+  inputText.value = question
+  await sendMessage()
+}
+
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderInlineMarkdown(value = '') {
+  const codeSnippets = []
+  let html = escapeHtml(value)
+  html = html.replace(/`([^`]+)`/g, (_, code) => {
+    const token = `@@CODE_${codeSnippets.length}@@`
+    codeSnippets.push(`<code>${code}</code>`)
+    return token
+  })
+  html = html.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>')
+  html = html.replace(/(^|[\s([{])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+  html = html.replace(/(^|[\s([{])_([^_\n]+)_/g, '$1<em>$2</em>')
+  return html.replace(/@@CODE_(\d+)@@/g, (_, index) => codeSnippets[Number(index)] || '')
+}
+
+function renderMessageContent(content = '') {
+  const lines = String(content || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
+  const html = []
+  const codeLines = []
+  let listType = ''
+  let inCodeBlock = false
+
+  const closeList = () => {
+    if (listType) {
+      html.push(`</${listType}>`)
+      listType = ''
+    }
+  }
+
+  const openList = (type) => {
+    if (listType !== type) {
+      closeList()
+      html.push(`<${type}>`)
+      listType = type
+    }
+  }
+
+  lines.forEach((rawLine) => {
+    const line = rawLine.trimEnd()
+    const trimmed = line.trim()
+
+    if (trimmed.startsWith('```')) {
+      closeList()
+      if (inCodeBlock) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+        codeLines.length = 0
+        inCodeBlock = false
+      } else {
+        inCodeBlock = true
+      }
+      return
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(rawLine)
+      return
+    }
+
+    if (!trimmed) {
+      closeList()
+      return
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/)
+    if (heading) {
+      closeList()
+      const level = Math.min(heading[1].length + 2, 6)
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`)
+      return
+    }
+
+    const ordered = trimmed.match(/^\d+[.)、]\s+(.+)$/)
+    if (ordered) {
+      openList('ol')
+      html.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`)
+      return
+    }
+
+    const unordered = trimmed.match(/^[-*+]\s+(.+)$/)
+    if (unordered) {
+      openList('ul')
+      html.push(`<li>${renderInlineMarkdown(unordered[1])}</li>`)
+      return
+    }
+
+    const quote = trimmed.match(/^>\s?(.+)$/)
+    if (quote) {
+      closeList()
+      html.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`)
+      return
+    }
+
+    closeList()
+    html.push(`<p>${renderInlineMarkdown(trimmed)}</p>`)
+  })
+
+  closeList()
+  if (inCodeBlock && codeLines.length) {
+    html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+  }
+  return html.join('')
 }
 
 function normalizeRetrievalMethod(value) {
@@ -378,6 +596,8 @@ async function generateAssistantReply({
   conversation,
   query,
   shouldStickToBottom = true,
+  assistantIndex = null,
+  historyMessages = null,
 }) {
   if (!conversation) return
   const assistantMessage = {
@@ -390,7 +610,15 @@ async function generateAssistantReply({
     status: 'thinking',
     thinkingTimeMs: null,
   }
-  conversation.messages.push(assistantMessage)
+  if (
+    Number.isInteger(assistantIndex)
+    && assistantIndex >= 0
+    && assistantIndex <= conversation.messages.length
+  ) {
+    conversation.messages.splice(assistantIndex, 0, assistantMessage)
+  } else {
+    conversation.messages.push(assistantMessage)
+  }
   touchConversation(runConversationId)
   setConversationStreaming(runConversationId, true)
   await nextTick()
@@ -401,7 +629,9 @@ async function generateAssistantReply({
   const thinkingStartedAt = performance.now()
   const payload = {
     query,
-    history: buildHistoryPayload(conversation.messages),
+    history: historyMessages
+      ? buildHistoryPayload(historyMessages, 0)
+      : buildHistoryPayload(conversation.messages),
     conversation_id: conversation.conversation_id,
     session_id: conversation.session_id,
     use_retrieval: true,
@@ -1116,9 +1346,9 @@ function statusClass(status) {
   }[status] || ''
 }
 
-function buildHistoryPayload(messages = chatMessages.value) {
+function buildHistoryPayload(messages = chatMessages.value, excludeTail = 2) {
   return messages
-    .slice(0, -2)
+    .slice(0, excludeTail > 0 ? -excludeTail : undefined)
     .filter((message) => (
       (message.role === 'user' || message.role === 'assistant')
       && !message.ephemeral
@@ -1348,8 +1578,17 @@ async function submitMessageEdit() {
   const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
 
   try {
-    conversation.messages[messageIndex].content = draft
-    truncateConversationAfterIndex(conversation, messageIndex)
+    const historyMessages = conversation.messages.slice(0, messageIndex)
+    const editedMessage = {
+      ...conversation.messages[messageIndex],
+      id: crypto.randomUUID(),
+      content: draft,
+      sources: [],
+      status: 'done',
+    }
+    const removeCount = conversation.messages[messageIndex + 1]?.role === 'assistant' ? 2 : 1
+    conversation.messages.splice(messageIndex, removeCount)
+    conversation.messages.push(editedMessage)
     expandedSources.value = {}
     closeMessageEditor()
     touchConversation(runConversationId)
@@ -1358,6 +1597,7 @@ async function submitMessageEdit() {
       conversation,
       query: draft,
       shouldStickToBottom,
+      historyMessages,
     })
   } catch (error) {
     messageEditError.value = error.message || '修改并重发失败'
@@ -1437,7 +1677,6 @@ function resetChat() {
   closeMessageEditor()
   touchActiveConversation(false)
   const nextConversation = createConversation()
-  nextConversation.messages = [createAssistantGreeting('已开启新对话，可以继续提问。')]
   conversations.value.push(nextConversation)
   activeConversationId.value = nextConversation.conversation_id
   conversationId.value = nextConversation.conversation_id
@@ -1843,8 +2082,42 @@ watch(conversations, () => {
 
         <section class="chat-panel">
           <div class="messages-shell">
-            <div ref="scrollHost" class="messages" @scroll="handleChatScroll">
-              <article v-for="message in chatMessages" :key="message.id" class="message" :class="message.role">
+            <div ref="scrollHost" class="messages" :class="{ 'is-empty': showWelcomeScreen }" @scroll="handleChatScroll">
+              <section v-if="showWelcomeScreen" class="chat-welcome">
+                <div class="chat-welcome__lead">
+                  <div class="chat-welcome__mark">
+                    <Bot :size="22" />
+                  </div>
+                  <div class="chat-welcome__copy">
+                    <div class="chat-welcome__eyebrow">企业知识库问答助手</div>
+                    <h3>你好，直接告诉我你想查什么</h3>
+                    <p>我会先帮你检索文档、制度和流程，再把结果整理成清晰答案。适合问退款、报销、审批、权限和文档内容。</p>
+                  </div>
+                </div>
+
+                <div class="chat-welcome__quick">
+                  <div class="chat-welcome__quick-title">试试这 3 个问题</div>
+                  <div class="chat-welcome__quick-list">
+                    <button
+                      v-for="item in welcomeQuickQuestions"
+                      :key="item.question"
+                      class="chat-welcome__quick-item"
+                      type="button"
+                      :disabled="chatInputDisabled"
+                      @click="handleQuickQuestion(item.question)"
+                    >
+                      <component :is="item.icon" :size="16" class="chat-welcome__quick-icon" />
+                      <div class="chat-welcome__quick-body">
+                        <strong>{{ item.title }}</strong>
+                        <span>{{ item.hint }}</span>
+                      </div>
+                      <ArrowRight :size="16" class="chat-welcome__quick-arrow" />
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <article v-for="message in visibleChatMessages" :key="message.id" class="message" :class="message.role">
               <div class="avatar">
                 <component :is="message.role === 'user' ? User : Bot" :size="16" />
               </div>
@@ -1883,7 +2156,11 @@ watch(conversations, () => {
                     rows="4"
                     placeholder="修改你的问题后重新提交"
                   />
-                  <p v-else-if="message.content">{{ message.content }}</p>
+                  <div
+                    v-else-if="message.content"
+                    class="message-markdown"
+                    v-html="renderMessageContent(message.content)"
+                  />
                   <p v-else>...</p>
                 </div>
                 <div
@@ -1907,10 +2184,17 @@ watch(conversations, () => {
                       <span class="source-toggle__value">{{ getRetrievalMethodLabel(message.retrievalMethod) }}</span>
                     </span>
                     <div v-if="expandedSources[message.id]" class="source-list">
-                      <div v-for="(source, index) in getDisplaySources(message)" :key="index" class="source-item">
+                      <div
+                        v-for="source in getDisplaySources(message)"
+                        :key="source.key"
+                        class="source-item"
+                      >
                         <div class="source-item__score">{{ Number(source.score || 0).toFixed(3) }}</div>
                         <div class="source-item__content">{{ source.content }}</div>
-                        <div class="source-item__origin">来源于 {{ getSourceFilename(source) }}</div>
+                        <div class="source-item__origin">
+                          <span>来源于 {{ source.sourceName || getSourceFilename(source) }}</span>
+                          <span class="source-item__range">来源范围 {{ source.rangeLabel }}</span>
+                        </div>
                       </div>
                     </div>
                   </div>

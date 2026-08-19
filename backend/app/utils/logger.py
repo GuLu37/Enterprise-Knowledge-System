@@ -227,6 +227,11 @@ def _init_loguru() -> None:
         log.handlers = [intercept]
         log.propagate = False
 
+    # httpx/httpcore 在 INFO 级别会把每一次模型 HTTP 请求都打出来；
+    # 业务日志保留即可，第三方成功请求降到 WARNING，避免控制台刷屏。
+    for noisy_logger_name in ("httpx", "httpcore"):
+        logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)
+
     # 接管 root logger，捕获未来动态创建的 logger
     logging.root.handlers = [intercept]
     logging.root.setLevel(0)
@@ -244,6 +249,12 @@ def _init_loguru() -> None:
         uv_log = logging.getLogger(uvicorn_logger_name)
         uv_log.handlers = [intercept]
         uv_log.propagate = False
+
+    for noisy_logger_name in ("httpx", "httpcore"):
+        noisy_log = logging.getLogger(noisy_logger_name)
+        noisy_log.handlers = [intercept]
+        noisy_log.propagate = False
+        noisy_log.setLevel(logging.WARNING)
 
     sys.stdout = _StreamToLogger("INFO")
     sys.stderr = _StreamToLogger("ERROR")

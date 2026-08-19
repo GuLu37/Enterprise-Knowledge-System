@@ -3,6 +3,7 @@ import csv
 import io
 import re
 import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -18,7 +19,7 @@ from app.storage.sqlite_metadata import (
     init_metadata_db,
 )
 from app.storage.milvus_store import get_milvus_client
-from app.utils.chunking import split_document_text
+from app.utils.chunking import build_parent_child_chunks
 from app.utils.exceptions import DocumentException
 from app.utils.logger import setup_logger
 
@@ -192,6 +193,107 @@ def _looks_numeric_excel_value(value: str) -> bool:
     )
 
 
+_EXCEL_FILL_COLUMN_HINTS = (
+    "部门",
+    "团队",
+    "小组",
+    "班组",
+    "科室",
+    "事业部",
+    "中心",
+    "区域",
+    "地区",
+    "办公地点",
+    "岗位",
+    "职级",
+    "级别",
+    "序列",
+    "分类",
+    "类别",
+    "状态",
+    "负责人",
+    "主管",
+    "上级",
+    "项目",
+    "产品",
+)
+_EXCEL_NO_FILL_HINTS = (
+    "金额",
+    "工资",
+    "薪资",
+    "绩效",
+    "应发",
+    "实发",
+    "数量",
+    "单价",
+    "税",
+    "社保",
+    "公积金",
+    "合计",
+    "总计",
+    "余额",
+    "成本",
+    "收入",
+    "支出",
+)
+
+
+def _looks_like_excel_fill_column(header: str, column_values: List[str]) -> bool:
+    """判断某列是否适合把上方分组值向下填充。"""
+    normalized_header = re.sub(r"\s+", "", (header or "")).strip().lower()
+    if not normalized_header:
+        return False
+    if any(hint in normalized_header for hint in _EXCEL_NO_FILL_HINTS):
+        return False
+    if any(hint in normalized_header for hint in _EXCEL_FILL_COLUMN_HINTS):
+        return True
+
+    values = [str(value or "").strip() for value in column_values]
+    nonempty_values = [value for value in values if value]
+    if len(nonempty_values) < 2:
+        return False
+
+    text_ratio = sum(not _looks_numeric_excel_value(value) for value in nonempty_values) / len(nonempty_values)
+    blank_ratio = (len(values) - len(nonempty_values)) / len(values) if values else 0.0
+    repeated_ratio = 0.0
+    if nonempty_values:
+        repeated_ratio = max(Counter(nonempty_values).values()) / len(nonempty_values)
+
+    return text_ratio >= 0.7 and blank_ratio >= 0.25 and repeated_ratio >= 0.25
+
+
+def _forward_fill_excel_rows(headers: List[str], rows: List[List[str]]) -> List[List[str]]:
+    """把结构化表格里显然被合并单元格吞掉的分组值向下补齐。"""
+    if not rows:
+        return rows
+
+    width = len(headers)
+    column_candidates = []
+    for column_index in range(width):
+        column_values = [
+            row[column_index] if column_index < len(row) else ""
+            for row in rows
+        ]
+        column_candidates.append(
+            _looks_like_excel_fill_column(headers[column_index], column_values)
+        )
+
+    previous_values = [""] * width
+    filled_rows: List[List[str]] = []
+    for row in rows:
+        normalized_row = row[:width] + [""] * max(0, width - len(row))
+        for column_index in range(width):
+            cell_value = normalized_row[column_index].strip()
+            if cell_value:
+                previous_values[column_index] = cell_value
+                continue
+            if column_candidates[column_index] and previous_values[column_index]:
+                normalized_row[column_index] = previous_values[column_index]
+        filled_rows.append(normalized_row)
+
+    return filled_rows
+
+
 def _infer_excel_header_index(rows: List[List[str]]) -> int:
     """从工作表行中推断真实表头位置，不依赖固定行号或业务字段名。"""
     nonempty_rows = [
@@ -294,6 +396,7 @@ def _extract_text_from_xlsx(file_path: Path) -> str:
         header_index = _infer_excel_header_index(rows)
         headers = _normalize_excel_headers(rows[header_index])
         width = len(headers)
+        data_rows = _forward_fill_excel_rows(headers, rows[header_index + 1 :])
 
         blocks.append(f"[Sheet] {sheet_name}")
         blocks.append(_serialize_excel_row(headers))
@@ -304,10 +407,9 @@ def _extract_text_from_xlsx(file_path: Path) -> str:
             if values:
                 blocks.append(f"[说明] {' | '.join(values)}")
 
-        for row in rows[header_index + 1 :]:
-            normalized_row = row[:width] + [""] * max(0, width - len(row))
-            if any(cell.strip() for cell in normalized_row):
-                blocks.append(_serialize_excel_row(normalized_row))
+        for row in data_rows:
+            if any(cell.strip() for cell in row):
+                blocks.append(_serialize_excel_row(row))
 
     return "\n".join(blocks)
 
@@ -395,7 +497,11 @@ def _update_document_record(document_id: str, **fields) -> None:
         db.close()
 
 
-def _replace_document_chunk_records(db: Session, document_id: str, chunks: List[str]) -> None:
+def _replace_document_chunk_records(
+    db: Session,
+    document_id: str,
+    chunks: List[str],
+) -> None:
     """用当前解析结果覆盖 SQLite 中的文档正文切片。"""
     db.query(DocumentChunkRecord).filter(DocumentChunkRecord.document_id == document_id).delete()
     db.add_all(
@@ -420,9 +526,28 @@ def _get_document_content_from_sqlite(db: Session, document_id: str) -> str:
 
 
 def _get_document_content_from_milvus(document_id: str) -> str:
-    """兼容旧数据：从 Milvus chunk_text 重组正文。"""
+    """从 Milvus Parent collection 重组正文，兼容旧 doc_chunks。"""
     try:
         client = get_milvus_client()
+        if client.has_collection(settings.MILVUS_PARENT_COLLECTION_NAME):
+            rows = client.query(
+                collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
+                filter=f'document_id == "{document_id}"',
+                output_fields=["parent_index", "parent_text"],
+                limit=10000,
+            )
+            sorted_rows = sorted(rows or [], key=lambda item: int(item.get("parent_index") or 0))
+            content = "\n\n".join(
+                str(row.get("parent_text") or "").strip()
+                for row in sorted_rows
+                if str(row.get("parent_text") or "").strip()
+            )
+            if content:
+                return content
+
+        if not client.has_collection(settings.MILVUS_DOC_COLLECTION_NAME):
+            return ""
+
         rows = client.query(
             collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
             filter=f'document_id == "{document_id}"',
@@ -475,33 +600,50 @@ def get_document_content(document_id: str) -> Dict:
         db.close()
 
 
-def _insert_document_chunks_to_milvus(
+def _insert_parent_child_chunks_to_milvus(
     document_id: str,
-    chunks: List[str],
+    parent_rows: List[Dict],
+    child_rows: List[Dict],
     source_name: str,
     file_type: str,
     content_type: Optional[str],
 ) -> List[str]:
-    """使用 MilvusClient 原生写入文档切块。"""
+    """写入标准 Parent-Child RAG 数据：Parent 存文本，Child 存向量。"""
     from app.core.embeddings import get_default_embeddings
 
-    logger.info(f"开始初始化 BGE Embedding (document_id={document_id}, chunks={len(chunks)})")
+    child_texts = [str(row.get("child_text") or "") for row in child_rows]
+    logger.info(f"开始初始化 BGE Embedding (document_id={document_id}, children={len(child_texts)})")
     embeddings = get_default_embeddings()
-    logger.info(f"BGE Embedding 就绪，开始向量化 (document_id={document_id}, chunks={len(chunks)})")
-    vectors = embeddings.embed_documents(chunks)
+    logger.info(f"BGE Embedding 就绪，开始向量化 (document_id={document_id}, children={len(child_texts)})")
+    vectors = embeddings.embed_documents(child_texts)
     logger.info(f"BGE 向量化完成 (document_id={document_id}, vectors={len(vectors)})")
     client = get_milvus_client()
 
-    rows = []
-    for index, chunk in enumerate(chunks):
-        rows.append(
+    parent_payload = [
+        {
+            **row,
+            "vector": [0.0] * settings.EMBEDDING_DIMENSION,
+            "source_name": source_name,
+            "file_type": file_type,
+            "content_type": content_type or "",
+        }
+        for row in parent_rows
+    ]
+    child_payload = []
+    for index, row in enumerate(child_rows):
+        child_text = child_texts[index]
+        child_payload.append(
             {
-                "text": chunk,
+                "text": child_text,
                 "vector": vectors[index],
-                "document_id": document_id,
-                "chunk_index": index,
+                "document_id": row["document_id"],
+                "child_id": row["child_id"],
+                "parent_id": row["parent_id"],
+                "parent_index": row["parent_index"],
+                "chunk_index": row["child_index"],
                 "source_name": source_name,
-                "chunk_text": chunk,
+                "chunk_text": child_text,
+                "child_text": child_text,
                 "file_type": file_type,
                 "content_type": content_type or "",
             }
@@ -509,13 +651,22 @@ def _insert_document_chunks_to_milvus(
 
     from app.storage.milvus_store import insert_rows_with_retry
 
+    insert_rows_with_retry(
+        client=client,
+        collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
+        rows=parent_payload,
+    )
     ids = insert_rows_with_retry(
         client=client,
-        collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
-        rows=rows,
+        collection_name=settings.MILVUS_CHILD_COLLECTION_NAME,
+        rows=child_payload,
     )
-    client.flush(collection_name=settings.MILVUS_DOC_COLLECTION_NAME)
-    logger.info(f"Milvus 文档切块写入成功 (document_id={document_id}, chunks={len(ids)})")
+    client.flush(collection_name=settings.MILVUS_PARENT_COLLECTION_NAME)
+    client.flush(collection_name=settings.MILVUS_CHILD_COLLECTION_NAME)
+    logger.info(
+        f"Milvus Parent-Child 写入成功 "
+        f"(document_id={document_id}, parents={len(parent_payload)}, children={len(ids)})"
+    )
     return ids
 
 
@@ -524,17 +675,23 @@ def _delete_document_chunks_from_milvus(
 ) -> bool:
     """使用 MilvusClient 原生删除文档切块。"""
 
-    collection_name = settings.MILVUS_DOC_COLLECTION_NAME
     client = get_milvus_client()
-    if not client.has_collection(collection_name):
-        logger.warning(f"[文档删除][2/4] Milvus collection 不存在，无需删除切块 ({collection_name}, document_id={document_id})")
-        return False
-
-    client.delete(
-        collection_name=collection_name,
-        filter=f'document_id == "{document_id}"',
-    )
-    return True
+    deleted = False
+    for collection_name in dict.fromkeys(
+        [
+            settings.MILVUS_CHILD_COLLECTION_NAME,
+            settings.MILVUS_PARENT_COLLECTION_NAME,
+            settings.MILVUS_DOC_COLLECTION_NAME,
+        ]
+    ):
+        if not collection_name or not client.has_collection(collection_name):
+            continue
+        client.delete(
+            collection_name=collection_name,
+            filter=f'document_id == "{document_id}"',
+        )
+        deleted = True
+    return deleted
 
 
 def _document_delete_requested(document_id: str) -> bool:
@@ -581,12 +738,16 @@ def _process_document_upload(
         if not text.strip():
             raise DocumentException("文档内容为空，无法生成向量")
 
-        logger.info(f"开始切块 (document_id={document_id})")
-        chunks = split_document_text(text, file_type=file_type)
-        logger.info(
-            f"切块完成 (document_id={document_id}, chunk_count={len(chunks)})"
+        logger.info(f"开始 Parent-Child 切块 (document_id={document_id})")
+        parent_rows, child_rows = build_parent_child_chunks(
+            document_id=document_id,
+            text=text,
+            file_type=file_type,
         )
-        if not chunks:
+        logger.info(
+            f"切块完成 (document_id={document_id}, parents={len(parent_rows)}, children={len(child_rows)})"
+        )
+        if not child_rows:
             raise DocumentException("文档切块失败，未生成有效内容")
 
         if _document_delete_requested(document_id):
@@ -596,11 +757,12 @@ def _process_document_upload(
         _log_upload_step(
             document_id,
             "3/3",
-            f"开始写入 Milvus (chunks={len(chunks)})",
+            f"开始写入 Milvus (parents={len(parent_rows)}, children={len(child_rows)})",
         )
-        _insert_document_chunks_to_milvus(
+        _insert_parent_child_chunks_to_milvus(
             document_id=document_id,
-            chunks=chunks,
+            parent_rows=parent_rows,
+            child_rows=child_rows,
             source_name=original_name,
             file_type=file_type,
             content_type=content_type,
@@ -608,7 +770,7 @@ def _process_document_upload(
         _log_upload_step(
             document_id,
             "3/3",
-            f"Milvus 写入成功: chunks={len(chunks)}",
+            f"Milvus 写入成功: children={len(child_rows)}",
         )
 
         if _document_delete_requested(document_id):
@@ -619,13 +781,17 @@ def _process_document_upload(
         logger.info(f"开始更新文档状态为 ready (document_id={document_id})")
         record = db.query(DocumentRecord).filter(DocumentRecord.document_id == document_id).first()
         if record:
-            _replace_document_chunk_records(db, document_id, chunks)
+            _replace_document_chunk_records(
+                db,
+                document_id,
+                [row["parent_text"] for row in parent_rows],
+            )
             record.status = "ready"
-            record.chunk_count = len(chunks)
+            record.chunk_count = len(child_rows)
             record.error_message = None
             db.commit()
-            logger.info(f"文档状态更新完成 (document_id={document_id}, status=ready, chunks={len(chunks)})")
-        logger.info(f"✓ 文档后台处理完成 (document_id={document_id}, chunks={len(chunks)})")
+            logger.info(f"文档状态更新完成 (document_id={document_id}, status=ready, children={len(child_rows)})")
+        logger.info(f"✓ 文档后台处理完成 (document_id={document_id}, children={len(child_rows)})")
     except Exception as e:
         db.rollback()
         try:
@@ -709,28 +875,37 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
         if not text.strip():
             raise DocumentException("文档内容为空，无法生成向量")
 
-        chunks = split_document_text(text, file_type=file_type)
-        if not chunks:
+        parent_rows, child_rows = build_parent_child_chunks(
+            document_id=document_id,
+            text=text,
+            file_type=file_type,
+        )
+        if not child_rows:
             raise DocumentException("文档切块失败，未生成有效内容")
 
-        _insert_document_chunks_to_milvus(
+        _insert_parent_child_chunks_to_milvus(
             document_id=document_id,
-            chunks=chunks,
+            parent_rows=parent_rows,
+            child_rows=child_rows,
             source_name=original_name,
             file_type=file_type,
             content_type=file.content_type,
         )
 
         record.status = "ready"
-        record.chunk_count = len(chunks)
+        record.chunk_count = len(child_rows)
         record.error_message = None
-        _replace_document_chunk_records(db, document_id, chunks)
+        _replace_document_chunk_records(
+            db,
+            document_id,
+            [row["parent_text"] for row in parent_rows],
+        )
         db.commit()
         db.refresh(record)
         _log_upload_step(
             document_id,
             "3/3",
-            f"Milvus 写入成功并更新文档状态: ready, chunk_count={len(chunks)}",
+            f"Milvus 写入成功并更新文档状态: ready, child_count={len(child_rows)}",
         )
 
         return _serialize_record(record)
