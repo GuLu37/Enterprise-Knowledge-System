@@ -133,7 +133,8 @@ psycopg-pool==3.3.0
 # 作用：Milvus 向量库、PostgreSQL 检查点、SQL 数据源
 # =========================================================
 langchain-milvus==0.3.3
-pymilvus==2.6.12
+pymilvus[milvus-lite]==2.6.12
+milvus-lite==3.1.1
 SQLAlchemy==2.0.48
 pymysql==1.1.1
 

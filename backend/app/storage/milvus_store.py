@@ -1,5 +1,6 @@
 """Milvus 向量块存储"""
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from pymilvus import DataType, MilvusClient
@@ -24,12 +25,27 @@ _RATE_LIMIT_MARKERS = (
 )
 
 
+def _is_lite_mode() -> bool:
+    """判断当前是否使用 Milvus Lite。"""
+    return settings.VECTOR_STORE_TYPE in {"milvus_lite", "lite"}
+
+
+def _vector_index_type() -> str:
+    """按向量库模式选择索引类型。"""
+    return "FLAT" if _is_lite_mode() else "AUTOINDEX"
+
+
 def _build_connection_args() -> Dict[str, Any]:
     """生成 MilvusClient 连接参数。"""
+    if _is_lite_mode():
+        lite_path = Path(settings.MILVUS_LITE_PATH)
+        lite_path.parent.mkdir(parents=True, exist_ok=True)
+        return {"uri": str(lite_path)}
+
     args: Dict[str, Any] = {
         "uri": f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}",
     }
-    if settings.MILVUS_DB_NAME:
+    if settings.MILVUS_DB_NAME and settings.MILVUS_DB_NAME != "default":
         args["db_name"] = settings.MILVUS_DB_NAME
     return args
 
@@ -39,7 +55,7 @@ def get_milvus_client() -> MilvusClient:
     global _milvus_client
     if _milvus_client is None:
         _milvus_client = MilvusClient(**_build_connection_args())
-        if settings.MILVUS_DB_NAME and settings.MILVUS_DB_NAME != "default":
+        if not _is_lite_mode() and settings.MILVUS_DB_NAME and settings.MILVUS_DB_NAME != "default":
             try:
                 _milvus_client.use_database(settings.MILVUS_DB_NAME)
             except Exception:
@@ -68,7 +84,7 @@ def _create_index_params():
     index_params = MilvusClient.prepare_index_params()
     index_params.add_index(
         field_name="vector",
-        index_type="AUTOINDEX",
+        index_type=_vector_index_type(),
         metric_type="COSINE",
     )
     return index_params
@@ -79,7 +95,7 @@ def _create_parent_index_params():
     index_params = MilvusClient.prepare_index_params()
     index_params.add_index(
         field_name="vector",
-        index_type="AUTOINDEX",
+        index_type=_vector_index_type(),
         metric_type="COSINE",
     )
     index_params.add_index(field_name="parent_id", index_type="INVERTED")

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 APP_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = APP_DIR.parent
 _env_path = BACKEND_DIR / ".env"
-load_dotenv(_env_path, override=True)
+load_dotenv(_env_path, override=False)
 
 
 def _configure_langsmith_tracing() -> None:
@@ -210,9 +210,17 @@ class Settings:
     BGE_LOCAL_FILES_ONLY: bool = os.getenv("BGE_LOCAL_FILES_ONLY", "false").lower() == "true"
 
     # ==================== 向量数据库配置 ====================
-    MILVUS_HOST: str = os.getenv("MILVUS_HOST")
-    MILVUS_PORT: int = int(os.getenv("MILVUS_PORT"))
-    MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME")
+    # 向量库模式：milvus / milvus_lite
+    VECTOR_STORE_TYPE: str = (os.getenv("VECTOR_STORE_TYPE") or "milvus").strip().lower()
+    # 仅服务端 Milvus 使用；Lite 模式会忽略这两个值。
+    MILVUS_HOST: str = os.getenv("MILVUS_HOST", "localhost")
+    MILVUS_PORT: int = int(os.getenv("MILVUS_PORT", "19530"))
+    MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME", "default")
+    # Milvus Lite 本地文件路径，最终会解析到 backend/app/data 下。
+    MILVUS_LITE_PATH: str = _resolve_app_path(
+        os.getenv("MILVUS_LITE_PATH"),
+        "data/milvus_lite.db",
+    )
     # 文档向量和长期记忆分开存储，分别使用不同的 collection
     MILVUS_DOC_COLLECTION_NAME: str = os.getenv(
         "MILVUS_DOC_COLLECTION_NAME",
@@ -231,7 +239,6 @@ class Settings:
         "memory_chunks",
     )
 
-    VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE")
     SEARCH_TOP_K: int = int(os.getenv("SEARCH_TOP_K"))
     SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD"))
 

@@ -97,7 +97,7 @@ flowchart TD
 | 后端 | Python、FastAPI、Uvicorn、SQLAlchemy、Loguru |
 | 检索 | LangChain、BGE Embedding、BM25、RRF、Reranker |
 | 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |
-| 存储 | Milvus、SQLite（默认）、MySQL（可选） |
+| 存储 | Milvus / Milvus Lite、SQLite（默认）、MySQL（可选） |
 | 部署 | Docker、Docker Compose |
 
 ## 快速开始
@@ -106,7 +106,7 @@ flowchart TD
 
 - Python 3.10+
 - Node.js 18+
-- Milvus 2.x
+- Milvus 2.x 或 Milvus Lite
 - 一个可用的大模型服务
 
 ### 本地开发
@@ -155,7 +155,9 @@ cp frontend/.env.example frontend/.env
 | --- | --- | --- |
 | `backend/.env` | `LLM_PROVIDER` | 选择模型供应商，如 `deepseek`、`ollama`、`openai` |
 | `backend/.env` | `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` | 按所选模型服务填写 |
-| `backend/.env` | `MILVUS_HOST` / `MILVUS_PORT` | 指向可访问的 Milvus 地址 |
+| `backend/.env` | `VECTOR_STORE_TYPE` | `milvus` 使用服务端 Milvus；`milvus_lite` 使用本地轻量文件库 |
+| `backend/.env` | `MILVUS_HOST` / `MILVUS_PORT` | `VECTOR_STORE_TYPE=milvus` 时指向可访问的 Milvus 地址 |
+| `backend/.env` | `MILVUS_LITE_PATH` | `VECTOR_STORE_TYPE=milvus_lite` 时的本地向量库文件路径 |
 | `backend/.env` | `DATABASE_URL` | 默认 SQLite；如启用 MySQL 可改为 `mysql+pymysql://...@mysql:3306/rag_db?charset=utf8mb4` |
 | `backend/.env` | `JWT_SECRET_KEY` | 生产环境请替换为强随机密钥 |
 | `frontend/.env` | `VITE_API_BASE_URL` | 容器同域部署保持 `/api/v1` 即可 |
@@ -164,12 +166,18 @@ cp frontend/.env.example frontend/.env
 
 | 服务 | 端口 / 挂载 | 说明 |
 | --- | --- | --- |
-| `backend` | `8000`，挂载 `backend/app/data`、`backend/app/logs`、`backend/.env` | FastAPI 后端容器 |
+| `backend` | `8000`，挂载 `backend/models`、`backend/app/data`、`backend/app/logs`、`backend/.env` | FastAPI 后端容器，本地 BGE 模型从 `backend/models` 读取 |
 | `frontend` | `80:80` | Nginx 前端容器，反向代理 `/api/v1` 到后端 |
 | `mysql` | `3306`，`profile=mysql` 时启用 | 可选元数据数据库 |
 
 ```bash
 docker compose up -d --build
+```
+
+2 核 4G 展示服务器建议使用 Milvus Lite 覆盖配置：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lite.yml up -d --build
 ```
 
 如需 MySQL：
@@ -178,7 +186,7 @@ docker compose up -d --build
 docker compose --profile mysql up -d --build
 ```
 
-> 注意：当前 Compose 不包含 Milvus 服务，请将 `MILVUS_HOST` 配置为可访问的 Milvus 地址。  
+> 注意：常规 Compose 不包含服务端 Milvus，请将 `MILVUS_HOST` 配置为可访问的 Milvus 地址；低配展示环境可使用 `docker-compose.lite.yml`，向量数据会持久化到 `backend/app/data/milvus_lite.db`。  
 > 如果你使用 MySQL，请同时把 `backend/.env` 里的 `DATABASE_URL` 切换到 MySQL 连接串，并按需修改 `MYSQL_ROOT_PASSWORD`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`。
 
 ## 配置说明
@@ -188,7 +196,9 @@ docker compose --profile mysql up -d --build
 | 配置项 | 说明 |
 | --- | --- |
 | `LLM_PROVIDER` | 模型供应商，如 `ollama`、`openai`、`deepseek`、`openrouter`、`anthropic` |
+| `VECTOR_STORE_TYPE` | 向量库模式，支持 `milvus` 和 `milvus_lite` |
 | `MILVUS_HOST` / `MILVUS_PORT` | Milvus 服务地址 |
+| `MILVUS_LITE_PATH` | Milvus Lite 本地文件路径 |
 | `DATABASE_URL` | 元数据数据库连接，默认 SQLite |
 | `BGE_MODEL_NAME` | 向量模型名称或本地路径 |
 | `BGE_LOCAL_FILES_ONLY` | 是否只使用本地模型文件 |
@@ -230,6 +240,7 @@ docker compose --profile mysql up -d --build
 │   ├── images/demo.png
 │   └── rag_accuracy_demo/
 ├── docker-compose.yml
+├── docker-compose.lite.yml
 └── README.md
 ```
 

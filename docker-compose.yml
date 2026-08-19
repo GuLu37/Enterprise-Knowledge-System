@@ -5,6 +5,7 @@ services:
     env_file:
       - ./backend/.env
     volumes:
+      - ./backend/models:/app/models
       - ./backend/app/data:/app/app/data
       - ./backend/app/logs:/app/app/logs
       - ./backend/.env:/app/.env:ro
