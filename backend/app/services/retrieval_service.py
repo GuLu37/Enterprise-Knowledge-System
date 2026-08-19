@@ -147,6 +147,11 @@ def _result_contains_identifier(result: RetrievalResult, identifier: str) -> boo
     return _identifier_key(identifier) in _identifier_key(search_text)
 
 
+def _candidate_pool_limit(top_k: int) -> int:
+    """统一控制候选池大小，避免不同流程各自写一套上限公式。"""
+    return max(top_k * 8, top_k + 20, MIN_RAG_CANDIDATE_POOL)
+
+
 @dataclass
 class RagWorkflowResult:
     """一次 RAG 工具执行后的结构化结果。"""
@@ -240,6 +245,27 @@ def _resolve_retrieval_method_for_query(query: str, retrieval_method: str) -> st
     return normalized_method
 
 
+def _post_process_retrieval_results(
+    query: str,
+    results: Sequence[RetrievalResult],
+    top_k: Optional[int] = None,
+) -> List[RetrievalResult]:
+    """统一收口检索结果：先过滤，再补结构化证据和父块上下文。"""
+    filtered_results = filter_retrieval_results(
+        query,
+        results,
+        top_k=top_k,
+    )
+    filtered_results = _expand_structured_section_evidence(
+        filtered_results,
+        query=query,
+    )
+    return _expand_parent_evidence(
+        filtered_results,
+        query=query,
+    )
+
+
 def retrieve_documents(
     query: str,
     top_k: Optional[int] = None,
@@ -257,13 +283,11 @@ def retrieve_documents(
         top_k=resolved_top_k,
         retrieval_method=resolved_method,
     )
-    filtered = filter_retrieval_results(
+    return _post_process_retrieval_results(
         normalized_query,
         reranked,
         top_k=resolved_top_k,
     )
-    filtered = _expand_structured_section_evidence(filtered, query=normalized_query)
-    return _expand_parent_evidence(filtered, query=normalized_query, top_k=resolved_top_k)
 
 
 def _normalize_query_variants(
@@ -560,7 +584,7 @@ def retrieve_documents_multi_query(
         return []
 
     resolved_top_k = max(1, min(top_k or settings.SEARCH_TOP_K, 50))
-    candidate_k = max(resolved_top_k * 8, resolved_top_k + 20, MIN_RAG_CANDIDATE_POOL)
+    candidate_k = _candidate_pool_limit(resolved_top_k)
     resolved_method = _resolve_retrieval_method_for_query(query, retrieval_method)
     retriever = _build_retriever(candidate_k, retrieval_method=resolved_method)
     if retriever is None:
@@ -602,11 +626,7 @@ def retrieve_documents_multi_query(
         ],
         rrf_k=60,
     )
-    candidate_limit = max(
-        resolved_top_k * 8,
-        resolved_top_k + 20,
-        MIN_RAG_CANDIDATE_POOL,
-    )
+    candidate_limit = _candidate_pool_limit(resolved_top_k)
     selected_results = list(fused_results[:candidate_limit])
     seen_keys = {_citation_chunk_key(item) for item in selected_results}
 
@@ -654,18 +674,6 @@ def retrieve_documents_multi_query(
                     break
 
     return selected_results
-
-
-def _citation_document_key(result: RetrievalResult) -> str:
-    """引用资料按 Parent 优先去重，旧数据再退回文档去重。"""
-    metadata = result.metadata or {}
-    return str(
-        metadata.get("parent_id")
-        or metadata.get("document_id")
-        or metadata.get("source_name")
-        or result.content
-        or ""
-    )
 
 
 def _citation_chunk_key(result: RetrievalResult) -> tuple[str, str, Any]:
@@ -982,7 +990,6 @@ def _build_structured_section_summary(
 def _expand_parent_evidence(
     results: Sequence[RetrievalResult],
     query: str,
-    top_k: Optional[int] = None,
 ) -> List[RetrievalResult]:
     """保留 Child 命中，并把 Parent 上下文挂到元数据里供 Prompt 使用。"""
     if not results:
@@ -1227,18 +1234,9 @@ def run_rag_workflow(
         retrieval_method=resolved_method,
         expanded_queries=expanded_queries,
     )
-    filtered_results = filter_retrieval_results(
+    filtered_results = _post_process_retrieval_results(
         normalized_query,
         recalled_results,
-        top_k=top_k,
-    )
-    filtered_results = _expand_structured_section_evidence(
-        filtered_results,
-        query=normalized_query,
-    )
-    filtered_results = _expand_parent_evidence(
-        filtered_results,
-        query=normalized_query,
         top_k=top_k,
     )
 

@@ -2,6 +2,9 @@ const defaultBaseUrl = '/api/v1'
 const AUTH_TOKEN_KEY = 'enterprise-knowledge-system.auth-token'
 const REFRESH_TOKEN_KEY = 'enterprise-knowledge-system.refresh-token'
 const RENEWED_ACCESS_TOKEN_HEADER = 'X-Access-Token'
+const JSON_HEADERS = {
+  'Content-Type': 'application/json',
+}
 
 function getBaseUrl() {
   return (import.meta.env.VITE_API_BASE_URL || defaultBaseUrl).replace(/\/$/, '')
@@ -9,6 +12,17 @@ function getBaseUrl() {
 
 function buildUrl(path) {
   return `${getBaseUrl()}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+function withJsonBody(options = {}, payload = {}) {
+  return {
+    ...options,
+    headers: {
+      ...JSON_HEADERS,
+      ...(options.headers || {}),
+    },
+    body: JSON.stringify(payload),
+  }
 }
 
 async function parseJsonResponse(response) {
@@ -80,6 +94,13 @@ export function clearAuthToken() {
   localStorage.removeItem(REFRESH_TOKEN_KEY)
 }
 
+function storeAuthTokens(result = {}) {
+  setAuthTokens({
+    accessToken: result.access_token,
+    refreshToken: result.refresh_token,
+  })
+}
+
 function buildHeaders(headers = {}, withAuth = true) {
   const nextHeaders = { ...headers }
   if (withAuth) {
@@ -105,18 +126,10 @@ async function refreshAuthSession() {
   }
 
   const result = await requestJson('/auth/refresh', {
-    method: 'POST',
-    auth: false,
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+    ...withJsonBody({ method: 'POST', auth: false }, { refresh_token: refreshToken }),
   }, false)
 
-  setAuthTokens({
-    accessToken: result.access_token,
-    refreshToken: result.refresh_token,
-  })
+  storeAuthTokens(result)
   return result
 }
 
@@ -129,7 +142,7 @@ async function requestJson(path, options = {}, allowRetry = true) {
   captureRenewedAccessToken(response)
 
   if (!response.ok) {
-    const detail = formatErrorDetail((await parseJsonResponse(response))?.detail)
+    // 先尝试用刷新令牌恢复会话，再决定是否把错误抛给上层。
     if (response.status === 401 && auth && allowRetry && getRefreshToken()) {
       try {
         await refreshAuthSession()
@@ -138,6 +151,7 @@ async function requestJson(path, options = {}, allowRetry = true) {
         clearAuthToken()
       }
     }
+    const detail = formatErrorDetail((await parseJsonResponse(response))?.detail)
     throw new Error(detail)
   }
   return response.json()
@@ -192,44 +206,22 @@ export async function deleteConversation(conversationId) {
 }
 
 export async function generateChat(payload) {
-  return requestJson('/chat/generate', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  })
+  return requestJson('/chat/generate', withJsonBody({ method: 'POST' }, payload))
 }
 
 export async function login(payload) {
   const result = await requestJson('/auth/login', {
-    method: 'POST',
-    auth: false,
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
+    ...withJsonBody({ method: 'POST', auth: false }, payload),
   })
-  setAuthTokens({
-    accessToken: result.access_token,
-    refreshToken: result.refresh_token,
-  })
+  storeAuthTokens(result)
   return result
 }
 
 export async function register(payload) {
   const result = await requestJson('/auth/register', {
-    method: 'POST',
-    auth: false,
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
+    ...withJsonBody({ method: 'POST', auth: false }, payload),
   })
-  setAuthTokens({
-    accessToken: result.access_token,
-    refreshToken: result.refresh_token,
-  })
+  storeAuthTokens(result)
   return result
 }
 
@@ -243,20 +235,14 @@ export async function refreshLogin() {
 
 export async function changePassword(payload) {
   const result = await requestJson('/auth/password', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
+    ...withJsonBody({ method: 'POST' }, payload),
   })
-  setAuthTokens({
-    accessToken: result.access_token,
-    refreshToken: result.refresh_token,
-  })
+  storeAuthTokens(result)
   return result
 }
 
 function parseSseEventBlock(block) {
+  // SSE 的单个事件块可能包含多行 data，这里先按行拆分再恢复成一条事件。
   const lines = block.split('\n')
   let event = 'message'
   const dataLines = []
@@ -280,6 +266,7 @@ function parseSseEventBlock(block) {
 }
 
 export async function streamChat(payload, onEvent) {
+  // 先发起一次流式请求，若鉴权过期则补刷一次刷新令牌后重试。
   const requestInit = {
     method: 'POST',
     headers: {

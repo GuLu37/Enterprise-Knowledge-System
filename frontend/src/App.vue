@@ -265,34 +265,43 @@ function getConversationTurnCount(conversation) {
   return (conversation.messages || []).filter((message) => message.role === 'user' && !message.ephemeral).length
 }
 
+function resolveSourceMeta(source, fallbackName = '未知来源') {
+  const metadata = source?.metadata && typeof source.metadata === 'object'
+    ? source.metadata
+    : {}
+  const sourceName = (
+    source?.source_name
+    || metadata.source_name
+    || source?.original_filename
+    || metadata.original_filename
+    || metadata.stored_filename
+    || metadata.document_id
+    || fallbackName
+  )
+  return {
+    metadata,
+    sourceName: String(sourceName).trim() || fallbackName,
+    parentId: String(source?.parent_id || metadata.parent_id || '').trim(),
+    documentId: String(source?.document_id || metadata.document_id || '').trim(),
+    chunkIndex: metadata.chunk_index ?? source?.chunk_index ?? null,
+    content: source?.content || '',
+    score: Number(source?.score || 0),
+  }
+}
+
 function getDisplaySources(message) {
   const grouped = []
   const groups = new Map()
 
   for (const source of message?.sources || []) {
-    const metadata = source?.metadata && typeof source.metadata === 'object'
-      ? source.metadata
-      : {}
-    const sourceName = (
-      source?.source_name
-      || metadata.source_name
-      || source?.original_filename
-      || metadata.original_filename
-      || metadata.stored_filename
-      || metadata.document_id
-      || '未知来源'
-    )
-    const parentId = String(
-      source?.parent_id
-      || metadata.parent_id
-      || '',
-    ).trim()
-    const documentId = String(
-      source?.document_id
-      || metadata.document_id
-      || '',
-    ).trim()
-    const chunkIndex = metadata.chunk_index ?? source?.chunk_index ?? null
+    const {
+      sourceName,
+      parentId,
+      documentId,
+      chunkIndex,
+      content,
+      score,
+    } = resolveSourceMeta(source)
     const groupKey = parentId
       ? `${sourceName}::${parentId}`
       : `${sourceName}::${documentId}::${chunkIndex ?? grouped.length}`
@@ -300,9 +309,9 @@ function getDisplaySources(message) {
 
     if (existing) {
       existing.count += 1
-      existing.maxScore = Math.max(existing.maxScore, Number(source?.score || 0))
-      if (!existing.content && source?.content) {
-        existing.content = source.content
+      existing.maxScore = Math.max(existing.maxScore, score)
+      if (!existing.content && content) {
+        existing.content = content
       }
       if (chunkIndex != null) {
         existing.chunkIndices.add(Number(chunkIndex))
@@ -315,9 +324,9 @@ function getDisplaySources(message) {
       sourceName,
       parentId,
       documentId,
-      content: source?.content || '',
-      score: Number(source?.score || 0),
-      maxScore: Number(source?.score || 0),
+      content,
+      score,
+      maxScore: score,
       count: 1,
       chunkIndices: new Set(chunkIndex != null ? [Number(chunkIndex)] : []),
     }
@@ -392,6 +401,7 @@ function renderMessageContent(content = '') {
 
   const openList = (type) => {
     if (listType !== type) {
+      // 先结束上一个列表，再开启新的列表，避免嵌套结构错乱。
       closeList()
       html.push(`<${type}>`)
       listType = type
@@ -402,6 +412,7 @@ function renderMessageContent(content = '') {
     const line = rawLine.trimEnd()
     const trimmed = line.trim()
 
+    // 代码块用独立状态收集，避免被后面的标题和列表规则误处理。
     if (trimmed.startsWith('```')) {
       closeList()
       if (inCodeBlock) {
@@ -419,11 +430,13 @@ function renderMessageContent(content = '') {
       return
     }
 
+    // 空行只负责收束当前列表，不生成多余节点。
     if (!trimmed) {
       closeList()
       return
     }
 
+    // 标题、有序列表、无序列表和引用块按优先级逐层匹配。
     const heading = trimmed.match(/^(#{1,4})\s+(.+)$/)
     if (heading) {
       closeList()
@@ -459,6 +472,7 @@ function renderMessageContent(content = '') {
 
   closeList()
   if (inCodeBlock && codeLines.length) {
+    // 收尾时补一次未闭合代码块，避免内容被静默丢掉。
     html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
   }
   return html.join('')
@@ -486,6 +500,18 @@ function scheduleChatBottomSync(force = false) {
   })
 }
 
+function shouldStickToBottom() {
+  return scrollHost.value ? isNearBottom(scrollHost.value) : true
+}
+
+function resetSelectedDocPreview() {
+  selectedDocId.value = ''
+  selectedDocContent.value = ''
+  selectedDocError.value = ''
+  selectedDocLoading.value = false
+  previewRequestSeq += 1
+}
+
 function normalizeMessageSources(payload) {
   const candidates = Array.isArray(payload)
     ? payload
@@ -496,23 +522,19 @@ function normalizeMessageSources(payload) {
 }
 
 function getSourceFilename(source) {
-  const metadata = source?.metadata && typeof source.metadata === 'object'
-    ? source.metadata
-    : {}
-  const sourceName = (
-    source?.source_name
-    || metadata.source_name
-    || source?.original_filename
-    || metadata.original_filename
-    || metadata.stored_filename
-    || metadata.document_id
-    || '未知文件'
-  )
-  return String(sourceName).trim() || '未知文件'
+  return resolveSourceMeta(source, '未知文件').sourceName || '未知文件'
 }
 
 function findConversation(id = activeConversationId.value) {
   return conversations.value.find((conversation) => conversation.conversation_id === id)
+}
+
+function syncActiveConversation(conversation) {
+  if (!conversation) return
+  activeConversationId.value = conversation.conversation_id
+  conversationId.value = conversation.conversation_id
+  sessionId.value = conversation.session_id
+  chatMessages.value = conversation.messages
 }
 
 function replaceConversations(nextConversations) {
@@ -521,10 +543,7 @@ function replaceConversations(nextConversations) {
     : [createConversation()]
   conversations.value = normalized
   const nextActive = conversationList.value[0] || conversations.value[0]
-  activeConversationId.value = nextActive.conversation_id
-  conversationId.value = nextActive.conversation_id
-  sessionId.value = nextActive.session_id
-  chatMessages.value = nextActive.messages
+  syncActiveConversation(nextActive)
   expandedSources.value = {}
   autoScrollEnabled.value = true
 }
@@ -600,6 +619,7 @@ async function generateAssistantReply({
   historyMessages = null,
 }) {
   if (!conversation) return
+  // 先插入一条占位的助手消息，界面能立刻看到“正在生成”的状态。
   const assistantMessage = {
     id: crypto.randomUUID(),
     role: 'assistant',
@@ -626,6 +646,7 @@ async function generateAssistantReply({
     scrollToBottom(shouldStickToBottom)
   }
 
+  // 请求体只保留后端真正需要的字段，历史消息先在前端整理好。
   const thinkingStartedAt = performance.now()
   const payload = {
     query,
@@ -646,6 +667,7 @@ async function generateAssistantReply({
   let encounteredError = false
   try {
     if (payload.stream) {
+      // 流式模式下逐段接收消息、工具调用和最终结果。
       await streamChat(payload, (event) => {
         if (event.event === 'message') {
           const content = readStreamContent(event.data)
@@ -709,6 +731,7 @@ async function generateAssistantReply({
         }
       })
     } else {
+      // 非流式模式一次性拿完整结果，逻辑更短但体验更保守。
       const result = await generateChat(payload)
       updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
         message.content = result.response || ''
@@ -723,11 +746,13 @@ async function generateAssistantReply({
     }
   } catch (error) {
     encounteredError = true
+    // 出错时把消息直接落成错误态，避免界面一直挂在“thinking”。
     updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
       message.content = error.message || '请求失败'
       message.status = 'error'
     }, true)
   } finally {
+    // 无论成功失败，都统一收尾：补齐来源、状态和耗时，然后恢复输入。
     if (!encounteredError) {
       updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
         if (message.status !== 'error') {
@@ -773,9 +798,7 @@ function touchConversation(id, shouldUpdateTime = true) {
     conversation.updated_at = new Date().toISOString()
   }
   if (activeConversationId.value === id) {
-    chatMessages.value = conversation.messages
-    conversationId.value = conversation.conversation_id
-    sessionId.value = conversation.session_id
+    syncActiveConversation(conversation)
   }
 }
 
@@ -796,10 +819,7 @@ function activateConversation(id) {
   if (!target) return
 
   closeMessageEditor()
-  activeConversationId.value = target.conversation_id
-  conversationId.value = target.conversation_id
-  sessionId.value = target.session_id
-  chatMessages.value = target.messages
+  syncActiveConversation(target)
   inputText.value = ''
   errorText.value = ''
   expandedSources.value = {}
@@ -1180,6 +1200,7 @@ function parseSpreadsheetPreview(content) {
 
   const commitSheet = () => {
     if (!currentSheet) return
+    // 先去掉空行，再根据首行确定表头，剩余内容统一当作数据行。
     const rows = currentSheet.rows.filter((row) => row.some((cell) => cell !== ''))
     if (rows.length) {
       const headers = rows[0]
@@ -1198,6 +1219,7 @@ function parseSpreadsheetPreview(content) {
     const line = rawLine.trimEnd()
     if (!line.trim()) continue
 
+    // 以 [Sheet] 作为分段边界，确保一个工作表只收进一个块里。
     if (line.startsWith('[Sheet] ')) {
       commitSheet()
       currentSheet = {
@@ -1209,6 +1231,7 @@ function parseSpreadsheetPreview(content) {
     }
 
     if (!currentSheet) {
+      // 某些导出内容没有显式 Sheet 头时，兜底挂到默认 Sheet。
       currentSheet = {
         name: 'Sheet',
         headers: [],
@@ -1388,9 +1411,7 @@ async function refreshDocs() {
 
 async function loadSelectedDocumentContent(documentId) {
   if (!documentId) {
-    selectedDocContent.value = ''
-    selectedDocError.value = ''
-    selectedDocLoading.value = false
+    resetSelectedDocPreview()
     return
   }
 
@@ -1416,32 +1437,24 @@ async function loadSelectedDocumentContent(documentId) {
 
 function selectDocument(doc) {
   if (!doc?.document_id) return
-  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+  const stickToBottom = shouldStickToBottom()
   if (selectedDocId.value === doc.document_id) {
-    selectedDocId.value = ''
-    selectedDocContent.value = ''
-    selectedDocError.value = ''
-    selectedDocLoading.value = false
-    previewRequestSeq += 1
-    if (shouldStickToBottom) {
+    resetSelectedDocPreview()
+    if (stickToBottom) {
       scheduleChatBottomSync(true)
     }
     return
   }
   selectedDocId.value = doc.document_id
-  if (shouldStickToBottom) {
+  if (stickToBottom) {
     scheduleChatBottomSync(true)
   }
 }
 
 function closeDocumentPreview() {
-  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
-  selectedDocId.value = ''
-  selectedDocContent.value = ''
-  selectedDocError.value = ''
-  selectedDocLoading.value = false
-  previewRequestSeq += 1
-  if (shouldStickToBottom) {
+  const stickToBottom = shouldStickToBottom()
+  resetSelectedDocPreview()
+  if (stickToBottom) {
     scheduleChatBottomSync(true)
   }
 }
@@ -1542,7 +1555,7 @@ async function regenerateAssistantMessage(message) {
   }
   if (userIndex < 0) return
 
-  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+  const stickToBottom = shouldStickToBottom()
   truncateConversationAfterIndex(conversation, userIndex)
   expandedSources.value = {}
   closeMessageEditor()
@@ -1551,7 +1564,7 @@ async function regenerateAssistantMessage(message) {
     runConversationId,
     conversation,
     query: conversation.messages[userIndex]?.content || '',
-    shouldStickToBottom,
+    shouldStickToBottom: stickToBottom,
   })
 }
 
@@ -1575,7 +1588,7 @@ async function submitMessageEdit() {
 
   messageEditSubmitting.value = true
   messageEditError.value = ''
-  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+  const stickToBottom = shouldStickToBottom()
 
   try {
     const historyMessages = conversation.messages.slice(0, messageIndex)
@@ -1596,7 +1609,7 @@ async function submitMessageEdit() {
       runConversationId,
       conversation,
       query: draft,
-      shouldStickToBottom,
+      shouldStickToBottom: stickToBottom,
       historyMessages,
     })
   } catch (error) {
@@ -1614,7 +1627,7 @@ async function sendMessage() {
   const runConversationId = activeConversationId.value
   const conversation = findConversation(runConversationId)
   if (!conversation) return
-  const shouldStickToBottom = scrollHost.value ? isNearBottom(scrollHost.value) : true
+  const stickToBottom = shouldStickToBottom()
 
   const userMessage = {
     id: crypto.randomUUID(),
@@ -1629,7 +1642,7 @@ async function sendMessage() {
     runConversationId,
     conversation,
     query: text,
-    shouldStickToBottom,
+    shouldStickToBottom: stickToBottom,
   })
 }
 
@@ -1678,10 +1691,7 @@ function resetChat() {
   touchActiveConversation(false)
   const nextConversation = createConversation()
   conversations.value.push(nextConversation)
-  activeConversationId.value = nextConversation.conversation_id
-  conversationId.value = nextConversation.conversation_id
-  sessionId.value = nextConversation.session_id
-  chatMessages.value = nextConversation.messages
+  syncActiveConversation(nextConversation)
   inputText.value = ''
   errorText.value = ''
   expandedSources.value = {}
@@ -2091,7 +2101,7 @@ watch(conversations, () => {
                   <div class="chat-welcome__copy">
                     <div class="chat-welcome__eyebrow">企业知识库问答助手</div>
                     <h3>你好，直接告诉我你想查什么</h3>
-                    <p>我会先帮你检索文档、制度和流程，再把结果整理成清晰答案。适合问退款、报销、审批、权限和文档内容。</p>
+                    <p>支持闲聊，也支持文档检索。聊得越久，会越懂你的个性化助手。</p>
                   </div>
                 </div>
 
