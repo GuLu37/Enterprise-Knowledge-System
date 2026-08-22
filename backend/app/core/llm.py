@@ -97,6 +97,7 @@ class FallbackLLM:
         self.temperature = temperature
         self.timeout = timeout
         self.active_provider: Optional[str] = None
+        self._active_timeout: Optional[int] = None
         self._active_llm: Optional[Any] = None
         self._failure_at: dict[str, float] = {}
 
@@ -120,14 +121,20 @@ class FallbackLLM:
         # 如果所有 provider 都被暂时跳过了，就退回到完整顺序，保证不会永久饿死
         return candidates or [provider for provider in providers if _provider_is_configured(provider, self.model)]
 
-    def _instantiate_provider(self, provider: str):
+    def _instantiate_provider(self, provider: str, timeout: Optional[int] = None):
         logger.info(f"尝试初始化 LLM provider: {provider}")
         return _create_llm(
             provider=provider,
             model=self.model,
             temperature=self.temperature,
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
         )
+
+    def _attempt_timeout(self, attempt_count: int) -> int:
+        """把单次请求的超时预算分摊到本次候选 provider。"""
+        total_timeout = max(1, _resolve_timeout(self.timeout))
+        normalized_attempt_count = max(1, attempt_count)
+        return max(1, total_timeout // normalized_attempt_count)
 
     def _attempt_providers(self) -> list[str]:
         """限制单次调用的候选数量，避免故障时轮询全部 provider。"""
@@ -140,6 +147,7 @@ class FallbackLLM:
             try:
                 self._active_llm = self._instantiate_provider(provider)
                 self.active_provider = provider
+                self._active_timeout = _resolve_timeout(self.timeout)
                 return provider
             except Exception as exc:
                 errors.append(f"{provider}: {exc}")
@@ -154,19 +162,32 @@ class FallbackLLM:
             self.prime()
         return self._active_llm
 
+    def _get_provider_llm(self, provider: str, timeout: int):
+        if (
+            provider == self.active_provider
+            and self._active_llm is not None
+            and self._active_timeout == timeout
+        ):
+            return self._active_llm
+
+        llm = self._instantiate_provider(provider, timeout=timeout)
+        self._active_llm = llm
+        self.active_provider = provider
+        self._active_timeout = timeout
+        return llm
+
     def _fallback_call(self, method_name: str, *args, **kwargs):
         errors: list[str] = []
         providers = self._attempt_providers()
+        attempt_timeout = self._attempt_timeout(len(providers))
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
 
         for provider in providers:
             try:
-                llm = self._active_llm if provider == self.active_provider and self._active_llm else self._instantiate_provider(provider)
+                llm = self._get_provider_llm(provider, attempt_timeout)
                 result = getattr(llm, method_name)(*args, **kwargs)
-                self._active_llm = llm
-                self.active_provider = provider
                 return result
             except Exception as exc:
                 errors.append(f"{provider}: {exc}")
@@ -175,6 +196,7 @@ class FallbackLLM:
                 if provider == self.active_provider:
                     self._active_llm = None
                     self.active_provider = None
+                    self._active_timeout = None
 
         raise LLMException(
             "所有 LLM 提供商均不可用: " + (" | ".join(errors) if errors else "无可用 provider")
@@ -189,15 +211,14 @@ class FallbackLLM:
     def stream(self, *args, **kwargs):
         errors: list[str] = []
         providers = self._attempt_providers()
+        attempt_timeout = self._attempt_timeout(len(providers))
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
 
         for provider in providers:
             try:
-                llm = self._active_llm if provider == self.active_provider and self._active_llm else self._instantiate_provider(provider)
-                self._active_llm = llm
-                self.active_provider = provider
+                llm = self._get_provider_llm(provider, attempt_timeout)
                 for chunk in llm.stream(*args, **kwargs):
                     yield chunk
                 return
@@ -208,6 +229,7 @@ class FallbackLLM:
                 if provider == self.active_provider:
                     self._active_llm = None
                     self.active_provider = None
+                    self._active_timeout = None
 
         raise LLMException(
             "所有 LLM 提供商均不可用: " + (" | ".join(errors) if errors else "无可用 provider")
@@ -216,15 +238,14 @@ class FallbackLLM:
     async def astream(self, *args, **kwargs):
         errors: list[str] = []
         providers = self._attempt_providers()
+        attempt_timeout = self._attempt_timeout(len(providers))
         if self.active_provider in providers:
             providers.remove(self.active_provider)
             providers.insert(0, self.active_provider)
 
         for provider in providers:
             try:
-                llm = self._active_llm if provider == self.active_provider and self._active_llm else self._instantiate_provider(provider)
-                self._active_llm = llm
-                self.active_provider = provider
+                llm = self._get_provider_llm(provider, attempt_timeout)
                 async for chunk in llm.astream(*args, **kwargs):
                     yield chunk
                 return
@@ -235,6 +256,7 @@ class FallbackLLM:
                 if provider == self.active_provider:
                     self._active_llm = None
                     self.active_provider = None
+                    self._active_timeout = None
 
         raise LLMException(
             "所有 LLM 提供商均不可用: " + (" | ".join(errors) if errors else "无可用 provider")

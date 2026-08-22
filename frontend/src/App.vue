@@ -292,8 +292,9 @@ function resolveSourceMeta(source, fallbackName = '未知来源') {
 function getDisplaySources(message) {
   const grouped = []
   const groups = new Map()
+  const sourceList = message?.sources?.length ? message.sources : message?.pendingSources || []
 
-  for (const source of message?.sources || []) {
+  for (const source of sourceList) {
     const {
       sourceName,
       parentId,
@@ -352,6 +353,26 @@ function getDisplaySources(message) {
       score: source.maxScore ?? source.score,
     }
   })
+}
+
+const ASSISTANT_BUSY_STATUSES = new Set(['thinking', 'retrieving', 'generating', 'streaming'])
+
+function isAssistantBusyStatus(status) {
+  return ASSISTANT_BUSY_STATUSES.has(status)
+}
+
+function getAssistantStatusLabel(message) {
+  const status = message?.status || ''
+  if (status === 'done') {
+    return message?.thinkingTimeMs != null
+      ? `已思考（用时 ${formatThinkingTime(message.thinkingTimeMs)}）`
+      : '已完成'
+  }
+  if (status === 'retrieving') return '正在检索'
+  if (status === 'generating') return '正在生成'
+  if (status === 'streaming') return '正在输出'
+  if (status === 'thinking') return '正在思考'
+  return '正在处理'
 }
 
 async function handleQuickQuestion(question) {
@@ -674,7 +695,7 @@ async function generateAssistantReply({
           if (content) {
             updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
               message.content += content
-              message.status = 'thinking'
+              message.status = 'streaming'
             })
           }
           if (activeConversationId.value === runConversationId && autoScrollEnabled.value) {
@@ -684,7 +705,7 @@ async function generateAssistantReply({
         }
         if (event.event === 'tool_call') {
           updateConversationMessage(runConversationId, assistantMessage.id, (message) => {
-            message.status = 'thinking'
+            message.status = 'retrieving'
           })
           return
         }
@@ -700,6 +721,7 @@ async function generateAssistantReply({
             if (retrievalMethod) {
               message.retrievalMethod = retrievalMethod
             }
+            message.status = 'generating'
           })
           return
         }
@@ -2135,27 +2157,31 @@ watch(conversations, () => {
                 <div class="message__meta">
                   <span class="message__author">{{ message.role === 'user' ? '你' : '助手' }}</span>
                   <div
-                    v-if="message.role === 'assistant' && (message.status === 'streaming' || message.status === 'thinking' || message.thinkingTimeMs != null)"
+                    v-if="message.role === 'assistant' && (isAssistantBusyStatus(message.status) || message.thinkingTimeMs != null)"
                     class="thinking-status"
                     :class="{
-                      'is-thinking': message.status === 'streaming' || message.status === 'thinking',
-                      'is-complete': message.thinkingTimeMs != null && message.status !== 'streaming' && message.status !== 'thinking',
+                      'is-thinking': isAssistantBusyStatus(message.status),
+                      'is-complete': message.thinkingTimeMs != null && !isAssistantBusyStatus(message.status),
                     }"
                     aria-live="polite"
                   >
                     <span class="thinking-status__label">
-                      {{ message.status === 'streaming' || message.status === 'thinking'
-                        ? '正在思考'
-                        : `已思考（用时 ${formatThinkingTime(message.thinkingTimeMs)}）` }}
+                      {{ getAssistantStatusLabel(message) }}
                     </span>
                     <span
-                      v-if="message.status === 'streaming' || message.status === 'thinking'"
+                      v-if="isAssistantBusyStatus(message.status)"
                       class="thinking-status__dots"
                       aria-hidden="true"
                     >
                       <span>.</span><span>.</span><span>.</span>
                     </span>
                   </div>
+                  <span
+                    v-if="message.role === 'assistant' && getDisplaySources(message).length && message.status !== 'done'"
+                    class="typing-chip"
+                  >
+                    已检索到 {{ getDisplaySources(message).length }} 条资料
+                  </span>
                   <span v-if="message.status === 'error'" class="typing-chip error">出错</span>
                 </div>
                 <div class="message__content" :class="{ empty: !message.content, editing: isEditingMessage(message.id) }">
@@ -2176,8 +2202,8 @@ watch(conversations, () => {
                 <div
                   class="message__footer"
                   :class="{
-                    'has-sources': message.role === 'assistant' && message.status === 'done' && message.sources?.length,
-                    'assistant-no-sources': message.role === 'assistant' && (!message.sources || !message.sources.length),
+                    'has-sources': message.role === 'assistant' && getDisplaySources(message).length,
+                    'assistant-no-sources': message.role === 'assistant' && !getDisplaySources(message).length,
                   }"
                 >
                   <div v-if="message.role === 'assistant' && message.status === 'done' && getDisplaySources(message).length" class="sources">

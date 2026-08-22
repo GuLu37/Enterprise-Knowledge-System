@@ -198,6 +198,7 @@ KNOWLEDGE_INTENT_KEYWORDS = (
     "密码",
     "登录",
     "注册",
+    "常见问题",
     "修改密码",
     "重置密码",
     "找回密码",
@@ -346,6 +347,12 @@ def _build_intent_router_messages(query: str, history: Optional[Iterable[Any]] =
     if history_hint.strip():
         human_prompt += f"\n\n最近对话上下文：\n{history_hint.strip()}"
 
+    if _has_signal_conflict(query):
+        human_prompt += (
+            "\n\n补充说明：当前问题同时命中直答词和知识词，属于低置信冲突样本。"
+            "请先消歧，再输出 JSON。"
+        )
+
     return [
         SystemMessage(content=INTENT_ROUTER_SYSTEM_PROMPT),
         HumanMessage(content=human_prompt),
@@ -421,6 +428,21 @@ def _intent_from_payload(payload: Dict[str, Any], source: str = "llm") -> Option
     )
 
 
+def _get_route_signals(query: str) -> Tuple[bool, bool]:
+    """提取直答词和知识词信号，供规则快判和冲突升级共用。"""
+    normalized_query = (query or "").strip()
+    lowered = normalized_query.lower()
+    has_direct_signal = any(keyword in lowered for keyword in DIRECT_INTENT_KEYWORDS)
+    has_knowledge_signal = any(keyword in lowered for keyword in KNOWLEDGE_INTENT_KEYWORDS)
+    return has_direct_signal, has_knowledge_signal
+
+
+def _has_signal_conflict(query: str) -> bool:
+    """判断是否同时命中直答词和知识词。"""
+    has_direct_signal, has_knowledge_signal = _get_route_signals(query)
+    return has_direct_signal and has_knowledge_signal
+
+
 def _rule_route_query_intent(query: str, use_retrieval: bool = True) -> QueryIntent:
     """用低延迟规则判断本轮是否需要进入知识库 RAG 工具。"""
     normalized_query = (query or "").strip()
@@ -429,9 +451,16 @@ def _rule_route_query_intent(query: str, use_retrieval: bool = True) -> QueryInt
     if not normalized_query:
         return QueryIntent(needs_retrieval=False, reason="empty_query", source="rule")
 
-    lowered = normalized_query.lower()
-    has_direct_signal = any(keyword in lowered for keyword in DIRECT_INTENT_KEYWORDS)
-    has_knowledge_signal = any(keyword in lowered for keyword in KNOWLEDGE_INTENT_KEYWORDS)
+    has_direct_signal, has_knowledge_signal = _get_route_signals(normalized_query)
+
+    if has_direct_signal and has_knowledge_signal:
+        return QueryIntent(
+            needs_retrieval=True,
+            reason="signal_conflict",
+            source="rule",
+            confidence=0.2,
+            rewritten_query=normalized_query,
+        )
 
     if is_identifier_query(normalized_query):
         return QueryIntent(
@@ -455,6 +484,43 @@ def _rule_route_query_intent(query: str, use_retrieval: bool = True) -> QueryInt
     return QueryIntent(needs_retrieval=False, reason="direct_default", source="rule")
 
 
+def _fallback_route_query_intent(query: str, use_retrieval: bool = True) -> QueryIntent:
+    """LLM 路由失败时的最终兜底，内部事实类问题保守进入 RAG。"""
+    normalized_query = (query or "").strip()
+    if not use_retrieval:
+        return QueryIntent(needs_retrieval=False, reason="retrieval_disabled", source="fallback")
+    if not normalized_query:
+        return QueryIntent(needs_retrieval=False, reason="empty_query", source="fallback")
+
+    has_direct_signal, has_knowledge_signal = _get_route_signals(normalized_query)
+    if is_identifier_query(normalized_query) or has_knowledge_signal:
+        reason = "identifier_query" if is_identifier_query(normalized_query) else "knowledge_keyword"
+        if has_direct_signal:
+            reason = "signal_conflict"
+        return QueryIntent(
+            needs_retrieval=True,
+            reason=f"fallback:{reason}",
+            source="fallback",
+            confidence=0.0,
+            rewritten_query=normalized_query,
+        )
+
+    if has_direct_signal:
+        return QueryIntent(
+            needs_retrieval=False,
+            reason="fallback:direct_keyword",
+            source="fallback",
+            confidence=0.0,
+        )
+
+    return QueryIntent(
+        needs_retrieval=False,
+        reason="fallback:direct_default",
+        source="fallback",
+        confidence=0.0,
+    )
+
+
 def route_query_intent(
     query: str,
     use_retrieval: bool = True,
@@ -468,7 +534,7 @@ def route_query_intent(
     if not normalized_query:
         return QueryIntent(needs_retrieval=False, reason="empty_query", source="rule")
 
-    if is_identifier_query(normalized_query):
+    if is_identifier_query(normalized_query) and not _has_signal_conflict(normalized_query):
         rule_intent = QueryIntent(
             needs_retrieval=True,
             reason="identifier_query",
@@ -496,39 +562,50 @@ def route_query_intent(
         return rule_intent
 
     if rule_intent.needs_retrieval:
-        logger.info(
-            "意图路由结果: source=%s route=%s reason=%s",
-            rule_intent.source,
-            "rag",
-            rule_intent.reason,
-        )
-        return rule_intent
+        if rule_intent.reason == "signal_conflict":
+            # 信号冲突是低置信状态，必须优先交给 LLM 消歧。
+            pass
+        else:
+            logger.info(
+                "意图路由结果: source=%s route=%s reason=%s",
+                rule_intent.source,
+                "rag",
+                rule_intent.reason,
+            )
+            return rule_intent
 
-    if llm is not None:
-        try:
-            response = llm.invoke(_build_intent_router_messages(normalized_query, history=history))
-            payload = _parse_intent_router_payload(_extract_text(response))
-            intent = _intent_from_payload(payload, source="llm")
-            if intent is not None:
-                logger.info(
-                    "意图路由结果: source=%s route=%s confidence=%s reason=%s",
-                    intent.source,
-                    "rag" if intent.needs_retrieval else "direct",
-                    intent.confidence,
-                    intent.reason,
+    if rule_intent.reason == "signal_conflict" or not rule_intent.needs_retrieval:
+        if llm is not None:
+            try:
+                response = llm.invoke(
+                    _build_intent_router_messages(normalized_query, history=history)
                 )
-                return intent
-        except Exception as exc:
-            logger.warning("LLM 意图路由失败，已回退规则判断: %s", exc)
+                payload = _parse_intent_router_payload(_extract_text(response))
+                intent = _intent_from_payload(payload, source="llm")
+                if intent is not None:
+                    logger.info(
+                        "意图路由结果: source=%s route=%s confidence=%s reason=%s",
+                        intent.source,
+                        "rag" if intent.needs_retrieval else "direct",
+                        intent.confidence,
+                        intent.reason,
+                    )
+                    return intent
+            except Exception as exc:
+                logger.warning("LLM 意图路由失败，进入最终兜底: %s", exc)
 
-    rule_intent = _rule_route_query_intent(normalized_query, use_retrieval=use_retrieval)
-    logger.info(
-        "意图路由结果: source=%s route=%s reason=%s",
-        rule_intent.source,
-        "rag" if rule_intent.needs_retrieval else "direct",
-        rule_intent.reason,
-    )
-    return rule_intent
+        fallback_intent = _fallback_route_query_intent(
+            normalized_query,
+            use_retrieval=use_retrieval,
+        )
+        logger.info(
+            "意图路由结果: source=%s route=%s confidence=%s reason=%s",
+            fallback_intent.source,
+            "rag" if fallback_intent.needs_retrieval else "direct",
+            fallback_intent.confidence,
+            fallback_intent.reason,
+        )
+        return fallback_intent
 
 
 def _build_rag_query_rewrite_messages(query: str, history: Optional[Iterable[Any]] = None) -> List[Any]:
@@ -1324,19 +1401,21 @@ def stream_chat(
         rag_payload["original_query"] = query
         rag_payload["rewritten_query"] = retrieval_query
         resolved_retrieval_method = str(rag_payload.get("retrieval_method") or normalized_retrieval_method)
+
+        yield {
+            "event": "tool_result",
+            "data": {
+                "sources": _deduplicate_sources(sources),
+                "retrieval_method": resolved_retrieval_method,
+                "rewritten_query": rag_payload.get("rewritten_query") or "",
+                "expanded_queries": rag_payload.get("expanded_queries") or [],
+                "message": rag_payload.get("message") or "",
+            },
+        }
+
         if is_identifier_query(query) and not sources:
             final_text = _build_identifier_no_result_answer(query)
             yield {"event": "message", "data": {"content": final_text}}
-            yield {
-                "event": "tool_result",
-                "data": {
-                    "sources": [],
-                    "retrieval_method": resolved_retrieval_method,
-                    "rewritten_query": rag_payload.get("rewritten_query") or "",
-                    "expanded_queries": rag_payload.get("expanded_queries") or [],
-                    "message": rag_payload.get("message") or "",
-                },
-            }
             yield {
                 "event": "done",
                 "data": {
@@ -1359,16 +1438,6 @@ def stream_chat(
         if not sources:
             final_text = _build_rag_no_result_answer(query, str(rag_payload.get("message") or ""))
             yield {"event": "message", "data": {"content": final_text}}
-            yield {
-                "event": "tool_result",
-                "data": {
-                    "sources": [],
-                    "retrieval_method": resolved_retrieval_method,
-                    "rewritten_query": rag_payload.get("rewritten_query") or "",
-                    "expanded_queries": rag_payload.get("expanded_queries") or [],
-                    "message": rag_payload.get("message") or "",
-                },
-            }
             yield {
                 "event": "done",
                 "data": {
@@ -1416,18 +1485,6 @@ def stream_chat(
             yield {"event": "message", "data": {"content": text}}
 
     deduplicated_sources = _deduplicate_sources(sources) if intent.needs_retrieval else []
-    if intent.needs_retrieval:
-        yield {
-            "event": "tool_result",
-            "data": {
-                "sources": deduplicated_sources,
-                "retrieval_method": resolved_retrieval_method,
-                "rewritten_query": rag_payload.get("rewritten_query") or "",
-                "expanded_queries": rag_payload.get("expanded_queries") or [],
-                "message": rag_payload.get("message") or "",
-            },
-        }
-
     cleaned_final_text = clean_rag_response_text(final_text)
     yield {
         "event": "done",
