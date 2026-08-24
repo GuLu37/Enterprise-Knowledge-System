@@ -18,6 +18,10 @@ from app.rag.retrieval.reranker import (
     rerank_results,
 )
 from app.utils.logger import setup_logger
+from app.storage.sqlite_metadata import (
+    DocumentChunkRecord,
+    SessionLocal,
+)
 
 logger = setup_logger(__name__)
 _RETRIEVER_CACHE: Dict[str, Any] = {}
@@ -448,36 +452,42 @@ def _identifier_query_variants(query: str) -> List[str]:
 def _load_parent_context(
     anchor: RetrievalResult,
 ) -> Optional[RetrievalResult]:
-    """通过 parent_id 从 Milvus 读取对应 Parent 文本。"""
+    """通过 parent_id 从 SQLite 读取对应 Parent 文本。"""
     metadata = anchor.metadata or {}
     parent_id = str(metadata.get("parent_id") or "").strip()
-    if not parent_id:
+    document_id = str(metadata.get("document_id") or "").strip()
+    if not document_id:
         return None
 
+    db = SessionLocal()
     try:
-        from app.storage.milvus_store import get_milvus_client
+        parent = None
+        if parent_id:
+            parent = (
+                db.query(DocumentChunkRecord)
+                .filter(
+                    DocumentChunkRecord.document_id == document_id,
+                    DocumentChunkRecord.parent_id == parent_id,
+                )
+                .first()
+            )
 
-        client = get_milvus_client()
-        escaped_parent_id = parent_id.replace("\\", "\\\\").replace('"', '\\"')
-        parent_rows = client.query(
-            collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
-            filter=f'parent_id == "{escaped_parent_id}"',
-            output_fields=[
-                "parent_id",
-                "document_id",
-                "parent_index",
-                "parent_text",
-                "source_name",
-                "file_type",
-                "content_type",
-            ],
-            limit=1,
-        )
-        if not parent_rows:
+        if parent is None:
+            parent_index = metadata.get("parent_index")
+            if parent_index is not None:
+                parent = (
+                    db.query(DocumentChunkRecord)
+                    .filter(
+                        DocumentChunkRecord.document_id == document_id,
+                        DocumentChunkRecord.chunk_index == int(parent_index),
+                    )
+                    .first()
+                )
+
+        if parent is None:
             return None
 
-        parent = parent_rows[0]
-        parent_text = str(parent.get("parent_text") or "").strip()
+        parent_text = str(parent.chunk_text or "").strip()
         if not parent_text:
             return None
 
@@ -485,20 +495,19 @@ def _load_parent_context(
             content=parent_text,
             metadata={
                 **metadata,
-                "document_id": parent.get("document_id") or metadata.get("document_id"),
-                "parent_id": parent.get("parent_id") or parent_id,
-                "parent_index": parent.get("parent_index") or metadata.get("parent_index"),
-                "source_name": parent.get("source_name") or metadata.get("source_name"),
-                "file_type": parent.get("file_type") or metadata.get("file_type"),
-                "content_type": parent.get("content_type") or metadata.get("content_type"),
+                "document_id": document_id,
+                "parent_id": parent.parent_id or parent_id,
+                "parent_index": parent.chunk_index,
                 "context_expansion": True,
             },
             score=float(anchor.score or 0.0),
             source=anchor.source,
         )
     except Exception as exc:
-        logger.debug("Parent 上下文读取失败，继续使用原始命中: %s", exc)
+        logger.debug("SQLite Parent 上下文读取失败，继续使用原始命中: %s", exc)
         return None
+    finally:
+        db.close()
 
 
 def _parse_multi_query_payload(text: str) -> Dict[str, Any]:
@@ -833,38 +842,33 @@ def _structured_schema_score(result: RetrievalResult, query: str) -> float:
     return min(1.0, score)
 
 
-def _escape_milvus_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def _query_parent_rows_by_document(document_id: str) -> List[Dict[str, Any]]:
-    """按 document_id 读取 parent，避免运行时扫全库。"""
+    """按 document_id 从 SQLite 读取 Parent，避免运行时扫全库。"""
     if not document_id:
         return []
+    db = SessionLocal()
     try:
-        from app.storage.milvus_store import get_milvus_client
-
-        client = get_milvus_client()
-        if not client.has_collection(settings.MILVUS_PARENT_COLLECTION_NAME):
-            return []
-        rows = client.query(
-            collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
-            filter=f'document_id == "{_escape_milvus_value(document_id)}"',
-            output_fields=[
-                "parent_id",
-                "document_id",
-                "parent_index",
-                "parent_text",
-                "source_name",
-                "file_type",
-                "content_type",
-            ],
-            limit=10000,
+        rows = (
+            db.query(DocumentChunkRecord)
+            .filter(DocumentChunkRecord.document_id == document_id)
+            .order_by(DocumentChunkRecord.chunk_index.asc())
+            .all()
         )
-        return list(rows or [])
+        return [
+            {
+                "parent_id": row.parent_id or f"{document_id}:p{row.chunk_index:06d}",
+                "document_id": row.document_id,
+                "parent_index": row.chunk_index,
+                "parent_text": row.chunk_text,
+            }
+            for row in rows
+            if str(row.chunk_text or "").strip()
+        ]
     except Exception as exc:
-        logger.debug("结构化 parent 扩展读取失败，继续使用原始命中: %s", exc)
+        logger.debug("结构化 SQLite Parent 扩展读取失败，继续使用原始命中: %s", exc)
         return []
+    finally:
+        db.close()
 
 
 def _parse_structured_table(parent_texts: Sequence[str]) -> tuple[str, List[str], List[str], List[int]]:

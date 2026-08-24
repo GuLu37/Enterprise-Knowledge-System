@@ -221,18 +221,14 @@ class Settings:
         os.getenv("MILVUS_LITE_PATH"),
         "data/milvus_lite.db",
     )
-    # 文档向量和长期记忆分开存储，分别使用不同的 collection
+    # 文档 Child 向量和长期记忆分开存储；Parent 正文统一由 SQLite 保存。
     MILVUS_DOC_COLLECTION_NAME: str = os.getenv(
         "MILVUS_DOC_COLLECTION_NAME",
-        "doc_chunks",
-    )
-    MILVUS_PARENT_COLLECTION_NAME: str = os.getenv(
-        "MILVUS_PARENT_COLLECTION_NAME",
-        "doc_parent_chunks",
+        "doc_chunk",
     )
     MILVUS_CHILD_COLLECTION_NAME: str = os.getenv(
         "MILVUS_CHILD_COLLECTION_NAME",
-        "doc_child_chunks",
+        os.getenv("MILVUS_DOC_COLLECTION_NAME", "doc_chunk"),
     )
     MILVUS_MEMORY_COLLECTION_NAME: str = os.getenv(
         "MILVUS_MEMORY_COLLECTION_NAME",

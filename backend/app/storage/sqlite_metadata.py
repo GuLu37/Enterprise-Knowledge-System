@@ -3,7 +3,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -51,7 +63,7 @@ class DocumentRecord(Base):
 
 
 class DocumentChunkRecord(Base):
-    """文档正文切片，用于预览已上传文档且不依赖服务端原始文件。"""
+    """文档父块正文，用于预览和检索上下文恢复。"""
 
     __tablename__ = "document_chunks"
     __table_args__ = (
@@ -66,6 +78,7 @@ class DocumentChunkRecord(Base):
         nullable=False,
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_id: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -144,6 +157,28 @@ def init_metadata_db():
         if database_path and database_path != ":memory:" and not database_path.startswith("file:"):
             Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    if settings.DATABASE_URL.startswith("sqlite"):
+        columns = {
+            str(column.get("name"))
+            for column in inspect(engine).get_columns("document_chunks")
+        }
+        if "parent_id" not in columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE document_chunks ADD COLUMN parent_id VARCHAR(128)")
+                )
+            logger.info("SQLite document_chunks 已补充 parent_id 字段")
+        with engine.begin() as connection:
+            migrated = connection.execute(
+                text(
+                    "UPDATE document_chunks "
+                    "SET parent_id = document_id || char(58) || 'p' "
+                    "|| printf('%06d', chunk_index) "
+                    "WHERE parent_id IS NULL"
+                )
+            ).rowcount
+        if migrated:
+            logger.info("SQLite document_chunks 已补齐历史 Parent ID: %s", migrated)
     try:
         from app.services.auth_service import seed_bootstrap_admin_user
 

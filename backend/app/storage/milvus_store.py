@@ -90,19 +90,6 @@ def _create_index_params():
     return index_params
 
 
-def _create_parent_index_params():
-    """Parent collection 只需要按 parent_id/document_id 精确查询。"""
-    index_params = MilvusClient.prepare_index_params()
-    index_params.add_index(
-        field_name="vector",
-        index_type=_vector_index_type(),
-        metric_type="COSINE",
-    )
-    index_params.add_index(field_name="parent_id", index_type="INVERTED")
-    index_params.add_index(field_name="document_id", index_type="INVERTED")
-    return index_params
-
-
 def _is_rate_limited_error(error: Exception) -> bool:
     """判断异常是否属于 Milvus 写入限流。"""
     message = str(error).lower()
@@ -193,6 +180,30 @@ def _collection_field_names(client: MilvusClient, collection_name: str) -> set[s
     return {str(field.get("name")) for field in description.get("fields", []) if field.get("name")}
 
 
+def _child_collection_expected_fields() -> set[str]:
+    """返回 Child collection 必须具备的字段。"""
+    return {
+        "pk",
+        "text",
+        "vector",
+        "document_id",
+        "child_id",
+        "parent_id",
+        "parent_index",
+        "chunk_index",
+        "source_name",
+        "chunk_text",
+        "child_text",
+        "file_type",
+        "content_type",
+    }
+
+
+def get_child_collection_name(client: Optional[MilvusClient] = None) -> str:
+    """返回当前唯一的文档 Child collection。"""
+    return settings.MILVUS_CHILD_COLLECTION_NAME
+
+
 def is_collection_loaded(client: MilvusClient, collection_name: str) -> bool:
     """检查 collection 是否已经加载完成。"""
     try:
@@ -211,8 +222,7 @@ def warmup_collections(collection_names: Optional[Sequence[str]] = None) -> None
     """在启动阶段一次性预热 Milvus collection。"""
     client = get_milvus_client()
     names = list(collection_names or (
-        settings.MILVUS_CHILD_COLLECTION_NAME,
-        settings.MILVUS_PARENT_COLLECTION_NAME,
+        get_child_collection_name(client),
         settings.MILVUS_MEMORY_COLLECTION_NAME,
     ))
 
@@ -246,7 +256,6 @@ def initialize_collections() -> bool:
     try:
         client = get_milvus_client()
         _ensure_child_collection(client)
-        _ensure_parent_collection(client)
         _ensure_memory_collection(client)
         warmup_collections()
         return True
@@ -275,28 +284,10 @@ def _create_child_collection(client: MilvusClient) -> None:
         schema=schema,
         index_params=_create_index_params(),
     )
-    logger.info(f"✓ Milvus Child collection 创建完成 ({settings.MILVUS_CHILD_COLLECTION_NAME})")
-
-
-def _create_parent_collection(client: MilvusClient) -> None:
-    """创建 Parent collection：只按 parent_id 精确读取。"""
-    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
-    schema.add_field(field_name="pk", datatype=DataType.INT64, is_primary=True, auto_id=True)
-    schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=settings.EMBEDDING_DIMENSION)
-    schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=128)
-    schema.add_field(field_name="document_id", datatype=DataType.VARCHAR, max_length=128)
-    schema.add_field(field_name="parent_index", datatype=DataType.INT64)
-    schema.add_field(field_name="parent_text", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
-    schema.add_field(field_name="source_name", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
-    schema.add_field(field_name="file_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
-    schema.add_field(field_name="content_type", datatype=DataType.VARCHAR, max_length=_VARCHAR_MAX_LENGTH)
-
-    client.create_collection(
-        collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
-        schema=schema,
-        index_params=_create_parent_index_params(),
+    logger.info(
+        "✓ Milvus Child collection 创建完成 (%s)",
+        settings.MILVUS_CHILD_COLLECTION_NAME,
     )
-    logger.info(f"✓ Milvus Parent collection 创建完成 ({settings.MILVUS_PARENT_COLLECTION_NAME})")
 
 
 def _create_memory_collection(client: MilvusClient) -> None:
@@ -321,23 +312,9 @@ def _create_memory_collection(client: MilvusClient) -> None:
 
 
 def _ensure_child_collection(client: MilvusClient) -> None:
-    """确保 Child collection 存在，不存在时按当前 schema 创建。"""
-    collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
-    expected_fields = {
-        "pk",
-        "text",
-        "vector",
-        "document_id",
-        "child_id",
-        "parent_id",
-        "parent_index",
-        "chunk_index",
-        "source_name",
-        "chunk_text",
-        "child_text",
-        "file_type",
-        "content_type",
-    }
+    """确保当前 Child collection 存在且 schema 正确。"""
+    collection_name = get_child_collection_name(client)
+    expected_fields = _child_collection_expected_fields()
     if client.has_collection(collection_name):
         existing_fields = _collection_field_names(client, collection_name)
         if not expected_fields.issubset(existing_fields):
@@ -350,34 +327,6 @@ def _ensure_child_collection(client: MilvusClient) -> None:
         return
 
     _create_child_collection(client)
-
-
-def _ensure_parent_collection(client: MilvusClient) -> None:
-    """确保 Parent collection 存在，不存在时按当前 schema 创建。"""
-    collection_name = settings.MILVUS_PARENT_COLLECTION_NAME
-    expected_fields = {
-        "pk",
-        "vector",
-        "parent_id",
-        "document_id",
-        "parent_index",
-        "parent_text",
-        "source_name",
-        "file_type",
-        "content_type",
-    }
-    if client.has_collection(collection_name):
-        existing_fields = _collection_field_names(client, collection_name)
-        if not expected_fields.issubset(existing_fields):
-            missing_fields = sorted(expected_fields - existing_fields)
-            raise VectorStoreException(
-                f"Milvus Parent collection schema 不匹配: {collection_name} "
-                f"缺少字段 {missing_fields}，请执行迁移或清理后重新初始化"
-            )
-        _ensure_index(client, collection_name)
-        return
-
-    _create_parent_collection(client)
 
 
 def _ensure_memory_collection(client: MilvusClient) -> None:

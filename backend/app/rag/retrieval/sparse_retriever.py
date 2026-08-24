@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Optional
 
 from .base import BaseRetriever, RetrievalResult
 from app.config import settings
-from app.storage.milvus_store import get_milvus_client, is_collection_loaded
+from app.storage.milvus_store import (
+    get_child_collection_name,
+    get_milvus_client,
+    is_collection_loaded,
+)
 from app.rag.retrieval.reranker import (
     extract_identifier_terms,
     normalize_text,
@@ -217,7 +221,7 @@ class SparseRetriever(BaseRetriever):
                 return []
 
             client = self.vector_store or get_milvus_client()
-            collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
+            collection_name = get_child_collection_name(client)
             if not self._is_collection_ready(client):
                 return []
 

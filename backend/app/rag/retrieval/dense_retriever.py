@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from .base import BaseRetriever, RetrievalResult
 from app.config import settings
 from app.storage.milvus_store import (
+    get_child_collection_name,
     is_collection_loaded,
     get_milvus_client,
 )
@@ -67,7 +68,7 @@ class DenseRetriever(BaseRetriever):
         ):
             return False
 
-        collection_name = settings.MILVUS_CHILD_COLLECTION_NAME
+        collection_name = get_child_collection_name(client)
         self._last_collection_check_at = now
         self._collection_ready = (
             client.has_collection(collection_name)
@@ -148,7 +149,7 @@ class DenseRetriever(BaseRetriever):
                 ]
 
             search_result = client.search(
-                collection_name=settings.MILVUS_CHILD_COLLECTION_NAME,
+                collection_name=get_child_collection_name(client),
                 data=query_vectors,
                 anns_field="vector",
                 limit=resolved_top_k,

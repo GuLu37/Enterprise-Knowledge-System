@@ -18,7 +18,10 @@ from app.storage.sqlite_metadata import (
     SessionLocal,
     init_metadata_db,
 )
-from app.storage.milvus_store import get_milvus_client
+from app.storage.milvus_store import (
+    get_child_collection_name,
+    get_milvus_client,
+)
 from app.utils.chunking import build_parent_child_chunks
 from app.utils.exceptions import DocumentException
 from app.utils.logger import setup_logger
@@ -500,17 +503,19 @@ def _update_document_record(document_id: str, **fields) -> None:
 def _replace_document_chunk_records(
     db: Session,
     document_id: str,
-    chunks: List[str],
+    parent_rows: List[Dict],
 ) -> None:
-    """用当前解析结果覆盖 SQLite 中的文档正文切片。"""
+    """用当前 Parent 解析结果覆盖 SQLite 中的父块正文。"""
     db.query(DocumentChunkRecord).filter(DocumentChunkRecord.document_id == document_id).delete()
     db.add_all(
         DocumentChunkRecord(
             document_id=document_id,
-            chunk_index=index,
-            chunk_text=chunk,
+            chunk_index=int(row.get("parent_index") or index),
+            parent_id=str(row.get("parent_id") or f"{document_id}:p{index:06d}"),
+            chunk_text=str(row.get("parent_text") or ""),
         )
-        for index, chunk in enumerate(chunks)
+        for index, row in enumerate(parent_rows)
+        if str(row.get("parent_text") or "").strip()
     )
 
 
@@ -526,32 +531,30 @@ def _get_document_content_from_sqlite(db: Session, document_id: str) -> str:
 
 
 def _get_document_content_from_milvus(document_id: str) -> str:
-    """从 Milvus Parent collection 重组正文，兼容旧 doc_chunks。"""
+    """从旧版 Milvus Child/Doc collection 重组正文，兼容历史数据。"""
     try:
         client = get_milvus_client()
-        if client.has_collection(settings.MILVUS_PARENT_COLLECTION_NAME):
-            rows = client.query(
-                collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
-                filter=f'document_id == "{document_id}"',
-                output_fields=["parent_index", "parent_text"],
-                limit=10000,
-            )
-            sorted_rows = sorted(rows or [], key=lambda item: int(item.get("parent_index") or 0))
-            content = "\n\n".join(
-                str(row.get("parent_text") or "").strip()
-                for row in sorted_rows
-                if str(row.get("parent_text") or "").strip()
-            )
-            if content:
-                return content
+        collection_name = get_child_collection_name(client)
+        if not client.has_collection(collection_name):
+            return ""
 
-        if not client.has_collection(settings.MILVUS_DOC_COLLECTION_NAME):
+        fields = {
+            str(field.get("name"))
+            for field in client.describe_collection(collection_name).get("fields", [])
+            if field.get("name")
+        }
+        output_fields = [
+            field
+            for field in ("chunk_index", "child_text", "chunk_text", "text")
+            if field in fields
+        ]
+        if not output_fields:
             return ""
 
         rows = client.query(
-            collection_name=settings.MILVUS_DOC_COLLECTION_NAME,
+            collection_name=collection_name,
             filter=f'document_id == "{document_id}"',
-            output_fields=["chunk_index", "chunk_text"],
+            output_fields=output_fields,
             limit=10000,
         )
     except Exception as exc:
@@ -560,9 +563,9 @@ def _get_document_content_from_milvus(document_id: str) -> str:
 
     sorted_rows = sorted(rows or [], key=lambda item: int(item.get("chunk_index") or 0))
     return "\n\n".join(
-        str(row.get("chunk_text") or "").strip()
+        str(row.get("child_text") or row.get("chunk_text") or row.get("text") or "").strip()
         for row in sorted_rows
-        if str(row.get("chunk_text") or "").strip()
+        if str(row.get("child_text") or row.get("chunk_text") or row.get("text") or "").strip()
     )
 
 
@@ -619,16 +622,6 @@ def _insert_parent_child_chunks_to_milvus(
     logger.info(f"BGE 向量化完成 (document_id={document_id}, vectors={len(vectors)})")
     client = get_milvus_client()
 
-    parent_payload = [
-        {
-            **row,
-            "vector": [0.0] * settings.EMBEDDING_DIMENSION,
-            "source_name": source_name,
-            "file_type": file_type,
-            "content_type": content_type or "",
-        }
-        for row in parent_rows
-    ]
     child_payload = []
     for index, row in enumerate(child_rows):
         child_text = child_texts[index]
@@ -651,21 +644,15 @@ def _insert_parent_child_chunks_to_milvus(
 
     from app.storage.milvus_store import insert_rows_with_retry
 
-    insert_rows_with_retry(
-        client=client,
-        collection_name=settings.MILVUS_PARENT_COLLECTION_NAME,
-        rows=parent_payload,
-    )
     ids = insert_rows_with_retry(
         client=client,
-        collection_name=settings.MILVUS_CHILD_COLLECTION_NAME,
+        collection_name=get_child_collection_name(client),
         rows=child_payload,
     )
-    client.flush(collection_name=settings.MILVUS_PARENT_COLLECTION_NAME)
-    client.flush(collection_name=settings.MILVUS_CHILD_COLLECTION_NAME)
+    client.flush(collection_name=get_child_collection_name(client))
     logger.info(
-        f"Milvus Parent-Child 写入成功 "
-        f"(document_id={document_id}, parents={len(parent_payload)}, children={len(ids)})"
+        f"Milvus Child 写入成功 "
+        f"(document_id={document_id}, parents={len(parent_rows)}, children={len(ids)})"
     )
     return ids
 
@@ -676,22 +663,15 @@ def _delete_document_chunks_from_milvus(
     """使用 MilvusClient 原生删除文档切块。"""
 
     client = get_milvus_client()
-    deleted = False
-    for collection_name in dict.fromkeys(
-        [
-            settings.MILVUS_CHILD_COLLECTION_NAME,
-            settings.MILVUS_PARENT_COLLECTION_NAME,
-            settings.MILVUS_DOC_COLLECTION_NAME,
-        ]
-    ):
-        if not collection_name or not client.has_collection(collection_name):
-            continue
-        client.delete(
-            collection_name=collection_name,
-            filter=f'document_id == "{document_id}"',
-        )
-        deleted = True
-    return deleted
+    collection_name = get_child_collection_name(client)
+    if not client.has_collection(collection_name):
+        return False
+
+    client.delete(
+        collection_name=collection_name,
+        filter=f'document_id == "{document_id}"',
+    )
+    return True
 
 
 def _document_delete_requested(document_id: str) -> bool:
@@ -784,7 +764,7 @@ def _process_document_upload(
             _replace_document_chunk_records(
                 db,
                 document_id,
-                [row["parent_text"] for row in parent_rows],
+                parent_rows,
             )
             record.status = "ready"
             record.chunk_count = len(child_rows)
@@ -898,7 +878,7 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
         _replace_document_chunk_records(
             db,
             document_id,
-            [row["parent_text"] for row in parent_rows],
+            parent_rows,
         )
         db.commit()
         db.refresh(record)
