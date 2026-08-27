@@ -15,7 +15,7 @@ from app.rag.retrieval.reranker import (
     is_identifier_query,
     normalize_text,
     passes_keyword_relevance_gate,
-    rerank_results,
+    cascade_rerank_results,
 )
 from app.utils.logger import setup_logger
 from app.storage.sqlite_metadata import (
@@ -1097,14 +1097,26 @@ def filter_retrieval_results(
     if not candidates:
         return []
 
-    reranked = rerank_results(query=query, results=candidates, top_k=len(candidates))
+    reranked = cascade_rerank_results(
+        query=query,
+        results=candidates,
+        top_k=len(candidates),
+    )
     if not reranked:
         return []
 
     keyword_matched = [item for item in reranked if passes_keyword_relevance_gate(query, item)]
     # 关键词相关性只做优先级信号，不做硬拒绝。否则同义词、数值范围、
     # 表格字段表达不一致时，会把 Dense/RRF 已经召回的候选直接清零。
-    ranking_pool = list(reranked) if structured_lookup else (keyword_matched or list(reranked))
+    has_cross_encoder = any(
+        bool((item.metadata or {}).get("cross_encoder_used"))
+        for item in reranked
+    )
+    ranking_pool = (
+        list(reranked)
+        if structured_lookup or has_cross_encoder
+        else (keyword_matched or list(reranked))
+    )
 
     best_score = max(float(item.score or 0.0) for item in ranking_pool)
     structured_matched = [item for item in ranking_pool if _is_structured_result(item)]

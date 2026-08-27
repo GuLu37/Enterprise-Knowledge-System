@@ -99,6 +99,11 @@ class ChatRuntimeStatusResponse(BaseModel):
     status: str = "initializing"
     llm_warmed: bool = False
     embedding_warmed: bool = False
+    cross_encoder_enabled: bool = False
+    cross_encoder_warmed: bool = False
+    cross_encoder_model: Optional[str] = None
+    cross_encoder_device: Optional[str] = None
+    cross_encoder_error: Optional[str] = None
     provider: Optional[str] = None
 
 
@@ -108,9 +113,51 @@ class ConversationDeleteResponse(BaseModel):
 
 
 class ChatWarmupResponse(BaseModel):
+    status: str = "initializing"
     llm_warmed: bool = False
     embedding_warmed: bool = False
+    cross_encoder_enabled: bool = False
+    cross_encoder_warmed: bool = False
+    cross_encoder_model: Optional[str] = None
+    cross_encoder_device: Optional[str] = None
+    cross_encoder_error: Optional[str] = None
     provider: Optional[str] = None
+
+
+class SkillExecutionContextRequest(BaseModel):
+    conversation_id: Optional[str] = None
+    session_id: Optional[str] = None
+    query: Optional[str] = None
+    trace_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillExecuteRequest(BaseModel):
+    name: str = Field(min_length=1)
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    context: SkillExecutionContextRequest = Field(default_factory=SkillExecutionContextRequest)
+
+
+class SkillExecuteResponse(BaseModel):
+    skill: str
+    category: str
+    kind: str
+    provider: Optional[str] = None
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    result: Dict[str, Any] = Field(default_factory=dict)
+    executed_at: str
+
+
+class SkillDefinitionResponse(BaseModel):
+    name: str
+    description: str
+    category: str
+    kind: str
+    tags: List[str] = Field(default_factory=list)
+    provider: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    function_calling: Dict[str, Any] = Field(default_factory=dict)
 
 
 class LoginRequest(BaseModel):
@@ -170,6 +217,10 @@ __all__ = [
     "RegisterRequest",
     "PasswordChangeRequest",
     "RefreshTokenRequest",
+    "SkillDefinitionResponse",
+    "SkillExecuteRequest",
+    "SkillExecuteResponse",
+    "SkillExecutionContextRequest",
     "TokenResponse",
     "UserResponse",
 ]

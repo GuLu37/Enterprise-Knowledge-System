@@ -26,6 +26,7 @@ def _include_routes(app: FastAPI) -> None:
     from app.api.routes.documents import router as documents_router
     from app.api.routes.retrieval import router as retrieval_router
     from app.api.routes.chat import router as chat_router
+    from app.api.routes.skills import router as skills_router
 
     app.include_router(
         auth_router,
@@ -50,6 +51,12 @@ def _include_routes(app: FastAPI) -> None:
         tags=["Chat"],
         dependencies=[Depends(require_current_user)],
     )
+    app.include_router(
+        skills_router,
+        prefix=f"{settings.API_PREFIX}/skills",
+        tags=["Skills"],
+        dependencies=[Depends(require_current_user)],
+    )
 
 
 def _warmup_chat_runtime_in_background(app: FastAPI) -> None:
@@ -61,14 +68,20 @@ def _warmup_chat_runtime_in_background(app: FastAPI) -> None:
         result = warmup_chat_runtime()
         result["status"] = (
             "ready"
-            if result.get("llm_warmed") and result.get("embedding_warmed")
+            if result.get("llm_warmed")
+            and result.get("embedding_warmed")
+            and (
+                not result.get("cross_encoder_enabled")
+                or result.get("cross_encoder_warmed")
+            )
             else "failed"
         )
         app.state.runtime_warmup = result
         logger.info(
-            "聊天运行时后台预热完成: llm=%s embedding=%s provider=%s duration=%.2fms",
+            "聊天运行时后台预热完成: llm=%s embedding=%s cross_encoder=%s provider=%s duration=%.2fms",
             result.get("llm_warmed"),
             result.get("embedding_warmed"),
+            result.get("cross_encoder_warmed"),
             result.get("provider"),
             (time.perf_counter() - warmup_started_at) * 1000,
         )
@@ -76,8 +89,13 @@ def _warmup_chat_runtime_in_background(app: FastAPI) -> None:
         app.state.runtime_warmup = {
             "llm_warmed": False,
             "embedding_warmed": False,
+            "cross_encoder_enabled": settings.CROSS_ENCODER_ENABLED,
+            "cross_encoder_warmed": False,
+            "cross_encoder_model": settings.CROSS_ENCODER_MODEL_NAME,
+            "cross_encoder_device": settings.CROSS_ENCODER_DEVICE,
             "provider": None,
             "error": str(exc),
+            "status": "failed",
         }
         logger.warning("聊天运行时后台预热出错，首次请求将按需初始化: %s", exc)
 
@@ -120,6 +138,10 @@ def _start_background_initialization(app: FastAPI) -> None:
     app.state.runtime_warmup = {
         "llm_warmed": False,
         "embedding_warmed": False,
+        "cross_encoder_enabled": settings.CROSS_ENCODER_ENABLED,
+        "cross_encoder_warmed": False,
+        "cross_encoder_model": settings.CROSS_ENCODER_MODEL_NAME,
+        "cross_encoder_device": settings.CROSS_ENCODER_DEVICE,
         "provider": None,
         "status": "initializing",
     }

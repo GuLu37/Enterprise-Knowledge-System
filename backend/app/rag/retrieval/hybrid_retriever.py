@@ -17,8 +17,8 @@ class HybridRetriever(BaseRetriever):
         dense_retriever: BaseRetriever,
         sparse_retriever: BaseRetriever,
         top_k: int = 5,
-        dense_weight: float = 0.6,
-        sparse_weight: float = 0.4,
+        dense_weight: float = 0.5,
+        sparse_weight: float = 0.5,
     ):
         super().__init__(top_k)
         self.dense_retriever = dense_retriever

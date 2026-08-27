@@ -13,6 +13,51 @@
 - 交互体验：回答支持流式输出；引用资料在完整回答结束后再显示。
 - 会话记忆：支持多会话、长期记忆和用户画像记忆。
 
+## 技术亮点
+
+### Skill + MCP 可插拔能力体系
+
+技能与工具现在统一收敛到 `backend/app/skills/registry.py`，由这里统一输出能力目录、Function Calling schema 和执行入口。
+
+当前已抽象出两类标准化 Skill：
+
+- `document_hot_word_statistics`：按文件名或文档 ID 查询文档热词
+- `memory_query`：查询用户画像记忆和长期事件记忆
+
+RAG 也被视为工具之一，统一以 `search_knowledge_base` 进入 Function Calling。
+
+技能文件采用平铺方式存放在 `backend/app/skills/` 下，索引文件为 `backend/app/skills/skill.md`，Agent 会先读工具列表，再读索引，再按需展开对应 Skill。
+
+后端同时保留远程 MCP manifest 注册层，未来可直接把 MCP 工具适配成新的 Skill 暴露给 Agent。
+
+当前已提供：
+
+- `GET /api/v1/skills`
+- `GET /api/v1/skills/capabilities`
+- `GET /api/v1/skills/function-calling`
+- `POST /api/v1/skills/execute`
+
+#### 可行性
+
+- 高：当前后端已经具备意图路由、RAG 工具封装、长期记忆服务和流式 `tool_call` / `tool_result` 事件。
+- 高：技能目录已经落地为统一注册表和 Function Calling 规格输出，且工具执行会显式落到后台日志/事件。
+- 高：`backend/requirements.txt` 已包含 `mcp`、`fastmcp` 和 `langchain-mcp-adapters`，说明技术栈层面已经预留了远程接入条件。
+
+#### 现阶段必要性
+
+- 中：如果当前目标仍是“把知识问答、检索和记忆做稳”，优先级不如检索质量、文档解析质量和记忆准确率高。
+- 高：如果下一阶段目标是“让系统具备企业助手/Agent 化能力”，这层抽象已经把底座铺好了，后续主要是继续加 Skill 和接 MCP。
+- 建议：先把现有两类 Skill 用在前端/管理端和 Agent 场景里，稳定后再接远程 MCP 工具。
+
+#### 运行边界
+
+- 单轮最多 2 次工具调用，仍未完成时自动转为澄清或结束。
+- 工具调用必须经过 Function Calling 入口，不再走单独的旁路执行。
+- 技能、工具、MCP 的调用都会在后端显式输出，便于排查和审计。
+
+详细评估见 [docs/skill_mcp_highlight_assessment.md](docs/skill_mcp_highlight_assessment.md)。
+技能手册索引见 [backend/app/skills/skill.md](backend/app/skills/skill.md)。
+
 ## 最终存储架构
 
 Parent 是切块时的逻辑概念，不再单独建立 Milvus Parent 表。
@@ -190,8 +235,10 @@ docker compose --profile mysql up -d --build
 │   ├── app/
 │   │   ├── api/          # 接口路由
 │   │   ├── core/         # LLM、Embedding、常量
+│   │   ├── skills/       # Skill 注册、能力目录、技能文档
 │   │   ├── rag/          # 检索实现
 │   │   ├── services/     # 业务编排
+│   │   ├── tools/        # 统一工具封装与 tracing
 │   │   ├── storage/      # SQLite / Milvus 访问
 │   │   └── main.py
 │   ├── tests/
@@ -216,6 +263,7 @@ docker compose --profile mysql up -d --build
 - 表格资料尽量保留表头，不要只上传截图。
 - 对例外情况单独成节，写清触发条件和审批人。
 - 查询时补充金额、时间、部门、项目或环境，通常更容易命中准确上下文。
+- 如果是需要技能处理的问题，优先写清文件名或记忆目标，系统会先看工具列表，再按需展开对应 Skill。
 
 ## 许可证
 

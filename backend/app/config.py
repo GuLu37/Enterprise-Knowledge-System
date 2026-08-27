@@ -93,6 +93,23 @@ def _parse_list(value: Optional[str], default: str = "") -> List[str]:
     return [str(item).strip().strip('"').strip("'") for item in parsed if str(item).strip()]
 
 
+def _parse_dict_list(value: Optional[str], default: str = "[]") -> List[dict]:
+    """解析 JSON 对象数组配置，失败时返回空列表。"""
+    raw_value = (value or default).strip()
+    if not raw_value:
+        return []
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
 class Settings:
     """应用配置 - 所有值从 .env 文件通过 os.getenv() 加载"""
 
@@ -197,7 +214,7 @@ class Settings:
     # BGE 本地向量化配置
     BGE_MODEL_NAME: str = _resolve_backend_model_path(
         os.getenv("BGE_MODEL_NAME"),
-        "./models/bge-base-zh-v1.5",
+        "./app/models/bge-base-zh-v1.5",
     )
     BGE_DEVICE: str = os.getenv("BGE_DEVICE", "auto")
     BGE_MAX_LENGTH: int = int(os.getenv("BGE_MAX_LENGTH", "512"))
@@ -205,7 +222,10 @@ class Settings:
     BGE_NORMALIZE_EMBEDDINGS: bool = os.getenv("BGE_NORMALIZE_EMBEDDINGS", "true").lower() == "true"
     BGE_QUERY_INSTRUCTION: str = os.getenv("BGE_QUERY_INSTRUCTION", "为这个句子生成表示以用于检索相关文章：")
     # BGE 模型缓存目录；为空时使用 HuggingFace/Transformers 默认缓存目录
-    BGE_CACHE_DIR: Optional[str] = os.getenv("BGE_CACHE_DIR") or None
+    BGE_CACHE_DIR: Optional[str] = _resolve_backend_path(
+        os.getenv("BGE_CACHE_DIR"),
+        "app/models",
+    )
     # 是否只从本地读取模型；true 时不会尝试联网下载 HuggingFace 模型
     BGE_LOCAL_FILES_ONLY: bool = os.getenv("BGE_LOCAL_FILES_ONLY", "false").lower() == "true"
 
@@ -261,6 +281,47 @@ class Settings:
     DENSE_WEIGHT: float = float(os.getenv("DENSE_WEIGHT"))
     SPARSE_WEIGHT: float = float(os.getenv("SPARSE_WEIGHT"))
 
+    # ==================== 重排配置 ====================
+    # Cross-Encoder 默认关闭；配置模型路径并显式打开后，会在启动预热阶段加载并参与规则后精排。
+    CROSS_ENCODER_ENABLED: bool = (
+        os.getenv("CROSS_ENCODER_ENABLED", "false").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+    CROSS_ENCODER_MODEL_NAME: str = _resolve_backend_model_path(
+        os.getenv("CROSS_ENCODER_MODEL_NAME"),
+        "BAAI/bge-reranker-base",
+    )
+    CROSS_ENCODER_DEVICE: str = os.getenv("CROSS_ENCODER_DEVICE", "auto")
+    CROSS_ENCODER_MAX_LENGTH: int = int(
+        os.getenv("CROSS_ENCODER_MAX_LENGTH", "512")
+    )
+    CROSS_ENCODER_BATCH_SIZE: int = int(
+        os.getenv("CROSS_ENCODER_BATCH_SIZE", "8")
+    )
+    CROSS_ENCODER_CACHE_DIR: Optional[str] = (
+        _resolve_backend_path(
+            os.getenv("CROSS_ENCODER_CACHE_DIR"),
+            "app/models",
+        )
+    )
+    CROSS_ENCODER_LOCAL_FILES_ONLY: bool = (
+        os.getenv("CROSS_ENCODER_LOCAL_FILES_ONLY", "false").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+    # 规则只负责宽松预排序和精确约束，Cross-Encoder 只精排前 N 个候选。
+    CROSS_ENCODER_CANDIDATE_K: int = max(
+        1,
+        int(os.getenv("CROSS_ENCODER_CANDIDATE_K", "30")),
+    )
+    CROSS_ENCODER_WEIGHT: float = min(
+        1.0,
+        max(0.0, float(os.getenv("CROSS_ENCODER_WEIGHT", "0.65"))),
+    )
+    RULE_RERANK_WEIGHT: float = min(
+        1.0,
+        max(0.0, float(os.getenv("RULE_RERANK_WEIGHT", "0.35"))),
+    )
+
     # ==================== 缓存配置 ====================
     ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE").lower() == "true"
     CACHE_DIR: str = _resolve_backend_path(
@@ -268,6 +329,12 @@ class Settings:
         "data/cache",
     )
     CACHE_TTL: int = int(os.getenv("CACHE_TTL"))
+
+    # ==================== MCP / Skill 适配配置 ====================
+    MCP_REMOTE_TOOL_MANIFESTS: List[dict] = _parse_dict_list(
+        os.getenv("MCP_REMOTE_TOOL_MANIFESTS"),
+        "[]",
+    )
 
     # ==================== 日志配置 ====================
     LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")

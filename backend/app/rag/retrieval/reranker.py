@@ -5,7 +5,12 @@ import math
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from app.config import settings
+from app.utils.logger import setup_logger
+
 from .base import RetrievalResult
+
+logger = setup_logger(__name__)
 
 _QUERY_TERM_PATTERN = re.compile(r"[A-Za-z0-9]+|[一-鿿]{2,}")
 _IDENTIFIER_PATTERN = re.compile(
@@ -709,6 +714,170 @@ def rerank_results(
     ]
 
 
+def _normalize_rank_scores(scores: Sequence[float]) -> List[float]:
+    """把同一候选集合内的分数压到 [0, 1]。"""
+    if not scores:
+        return []
+    numeric_scores = [float(score or 0.0) for score in scores]
+    minimum = min(numeric_scores)
+    maximum = max(numeric_scores)
+    span = maximum - minimum
+    if span <= 1e-9:
+        return [1.0 if maximum > 0.0 else 0.0 for _ in numeric_scores]
+    return [(score - minimum) / span for score in numeric_scores]
+
+
+def _build_cross_encoder_text(result: RetrievalResult) -> str:
+    """构造给 Cross-Encoder 的短文本，保留来源和标题信息但避免重复 Parent。"""
+    metadata = result.metadata or {}
+    source_name = str(metadata.get("source_name") or "").strip()
+    content = str(result.content or "").strip()
+    heading = _build_result_heading_text(result).strip()
+    parts = []
+    if source_name:
+        parts.append(f"来源: {source_name}")
+    if heading and heading != content:
+        parts.append(f"标题: {heading}")
+    if content:
+        parts.append(f"内容: {content}")
+    return "\n".join(parts)
+
+
+def cascade_rerank_results(
+    query: str,
+    results: Sequence[RetrievalResult],
+    top_k: int | None = None,
+    cross_encoder: Any | None = None,
+    cross_encoder_candidate_k: int | None = None,
+) -> List[RetrievalResult]:
+    """规则宽排后使用 Cross-Encoder 对前 N 个候选做精排。
+
+    规则层不再承担过重的硬过滤职责；编号查询仍由规则保护，其他查询让
+    Cross-Encoder 负责判断语义细节。模型不可用时完整回退到规则结果。
+    """
+    rule_ranked = rerank_results(query=query, results=results, top_k=len(results))
+    if not rule_ranked:
+        return []
+
+    if not settings.CROSS_ENCODER_ENABLED or is_identifier_query(query):
+        return rule_ranked[: max(1, top_k or len(rule_ranked))]
+
+    candidate_limit = max(
+        1,
+        min(
+            len(rule_ranked),
+            cross_encoder_candidate_k or settings.CROSS_ENCODER_CANDIDATE_K,
+        ),
+    )
+    ce_candidates = rule_ranked[:candidate_limit]
+
+    try:
+        scorer = cross_encoder
+        if scorer is None:
+            from .cross_encoder import get_cross_encoder_scorer
+
+            scorer = get_cross_encoder_scorer()
+        score_method = getattr(scorer, "score", None)
+        if not callable(score_method):
+            raise TypeError("Cross-Encoder scorer 未提供 score 方法")
+
+        cross_scores = list(
+            score_method(
+                query,
+                [_build_cross_encoder_text(item) for item in ce_candidates],
+            )
+        )
+        if len(cross_scores) != len(ce_candidates):
+            raise ValueError(
+                "Cross-Encoder 返回分数数量不匹配: "
+                f"expected={len(ce_candidates)}, actual={len(cross_scores)}"
+            )
+    except Exception as exc:
+        logger.warning("Cross-Encoder 精排失败，回退规则重排: %s", exc)
+        return [
+            RetrievalResult(
+                content=item.content,
+                metadata={
+                    **(item.metadata or {}),
+                    "rerank_stage": "rule_fallback",
+                    "cross_encoder_used": False,
+                    "cross_encoder_error": str(exc),
+                },
+                score=float(item.score or 0.0),
+                source=item.source,
+            )
+            for item in rule_ranked[: max(1, top_k or len(rule_ranked))]
+        ]
+
+    rule_scores = _normalize_rank_scores(
+        [float(item.score or 0.0) for item in rule_ranked]
+    )
+    ce_scores = [
+        min(1.0, max(0.0, float(score or 0.0)))
+        for score in cross_scores
+    ]
+    ce_weight = min(1.0, max(0.0, float(settings.CROSS_ENCODER_WEIGHT)))
+    rule_weight = min(1.0, max(0.0, float(settings.RULE_RERANK_WEIGHT)))
+    weight_total = ce_weight + rule_weight
+    if weight_total <= 1e-9:
+        ce_weight, rule_weight = 0.65, 0.35
+        weight_total = 1.0
+    ce_weight /= weight_total
+    rule_weight /= weight_total
+
+    scored: List[Tuple[int, RetrievalResult, float, float | None]] = []
+    ce_by_index = {
+        index: ce_scores[index]
+        for index in range(len(ce_candidates))
+    }
+    for index, item in enumerate(rule_ranked):
+        rule_score = rule_scores[index]
+        if index in ce_by_index:
+            ce_score = ce_by_index[index]
+            final_score = ce_weight * ce_score + rule_weight * rule_score
+        else:
+            # 候选池外保留规则分数，避免模型候选数变化造成非确定性淘汰。
+            ce_score = None
+            final_score = rule_score
+        scored.append((index, item, final_score, ce_score))
+
+    scored.sort(
+        key=lambda item: (
+            -item[2],
+            -(item[3] if item[3] is not None else -1.0),
+            -float(item[1].score or 0.0),
+            item[0],
+        )
+    )
+
+    limited = scored[: max(1, top_k or len(scored))]
+    output: List[RetrievalResult] = []
+    for index, item, final_score, ce_score in limited:
+        metadata = {
+            **(item.metadata or {}),
+            "rerank_stage": "rule_then_cross_encoder",
+            "cross_encoder_used": ce_score is not None,
+            "rule_score": float(item.score or 0.0),
+            "rule_score_normalized": float(rule_scores[index]),
+            "cross_encoder_score": (
+                float(ce_score) if ce_score is not None else None
+            ),
+            "final_score": float(final_score),
+            "cross_encoder_candidate_rank": (
+                index + 1 if ce_score is not None else None
+            ),
+        }
+        output.append(
+            RetrievalResult(
+                content=item.content,
+                metadata=metadata,
+                score=float(final_score),
+                source=item.source,
+            )
+        )
+    return output
+
+
 def _dedup_key(result: RetrievalResult) -> Tuple[str, int, str]:
     """生成跨检索器稳定去重键。"""
     metadata = result.metadata or {}
@@ -779,8 +948,8 @@ def fuse_ranked_results(
 def fuse_retrieval_results(
     dense_results: Sequence[RetrievalResult],
     sparse_results: Sequence[RetrievalResult],
-    dense_weight: float = 0.6,
-    sparse_weight: float = 0.4,
+    dense_weight: float = 0.5,
+    sparse_weight: float = 0.5,
 ) -> List[RetrievalResult]:
     """按 reciprocal rank fusion 方式融合 dense/sparse 两路结果。"""
     return fuse_ranked_results(

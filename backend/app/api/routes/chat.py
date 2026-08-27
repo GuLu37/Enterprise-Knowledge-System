@@ -37,7 +37,11 @@ async def get_chat_runtime_status(request: Request):
     runtime_warmup = getattr(request.app.state, "runtime_warmup", {}) or {}
     llm_warmed = bool(runtime_warmup.get("llm_warmed"))
     embedding_warmed = bool(runtime_warmup.get("embedding_warmed"))
-    ready = llm_warmed and embedding_warmed
+    cross_encoder_enabled = bool(runtime_warmup.get("cross_encoder_enabled"))
+    cross_encoder_warmed = bool(runtime_warmup.get("cross_encoder_warmed"))
+    ready = llm_warmed and embedding_warmed and (
+        not cross_encoder_enabled or cross_encoder_warmed
+    )
     status = "ready" if ready else str(runtime_warmup.get("status") or "initializing")
 
     return ChatRuntimeStatusResponse(
@@ -45,6 +49,11 @@ async def get_chat_runtime_status(request: Request):
         status=status,
         llm_warmed=llm_warmed,
         embedding_warmed=embedding_warmed,
+        cross_encoder_enabled=cross_encoder_enabled,
+        cross_encoder_warmed=cross_encoder_warmed,
+        cross_encoder_model=runtime_warmup.get("cross_encoder_model"),
+        cross_encoder_device=runtime_warmup.get("cross_encoder_device"),
+        cross_encoder_error=runtime_warmup.get("cross_encoder_error"),
         provider=runtime_warmup.get("provider"),
     )
 
