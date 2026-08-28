@@ -13,6 +13,7 @@ from sqlalchemy import or_
 from app.config import settings
 from app.core.constants import CHAT_CHUNK_OVERLAP, CHAT_CHUNK_SIZE
 from app.rag.retrieval.base import RetrievalResult
+from app.rag.retrieval.reranker import normalize_text
 from app.storage.sqlite_metadata import MemoryRecord, SessionLocal, init_metadata_db
 from app.utils.chunking import (
     ConversationChunk,
@@ -1129,6 +1130,118 @@ def delete_long_term_memory(conversation_id: str, user_id: Optional[str] = None)
 def delete_conversation_memory(conversation_id: str, user_id: Optional[str] = None) -> bool:
     """按用户和 conversation_id 删除长期记忆。"""
     return delete_long_term_memory(conversation_id, user_id=user_id)
+
+
+def delete_profile_memories(
+    user_id: Optional[str],
+    memory_keys: Optional[Sequence[str]] = None,
+    keywords: Optional[Sequence[str]] = None,
+    max_deletes: int = 50,
+) -> Dict[str, Any]:
+    """按 memory_key 精确或按关键词模糊删除用户的个性化记忆。
+
+    与 LLM 抽取路径（action=delete）不同，这里是确定性的主动删除入口，
+    供「用户明确要求删除记忆」的 skill 调用。删除采用软删除（标记
+    DELETED），保留版本历史以便追溯。
+    """
+    user_key = _require_user_id(user_id)
+    normalized_keys = [
+        str(item).strip().lower()
+        for item in (memory_keys or [])
+        if str(item or "").strip()
+    ]
+    normalized_keywords = [
+        normalize_text(str(item))
+        for item in (keywords or [])
+        if str(item or "").strip()
+    ]
+    if not normalized_keys and not normalized_keywords:
+        return {
+            "deleted_count": 0,
+            "matched": [],
+            "summary": "未提供任何删除条件，请指定 memory_key 或 keywords。",
+        }
+
+    db = SessionLocal()
+    deleted: List[Dict[str, Any]] = []
+    try:
+        candidates = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_key,
+                MemoryRecord.memory_type == MEMORY_TYPE_PROFILE,
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+            )
+            .all()
+        )
+        if not candidates:
+            return {
+                "deleted_count": 0,
+                "matched": [],
+                "summary": "当前没有可删除的个性化记忆。",
+            }
+
+        matched: List[MemoryRecord] = []
+        for record in candidates:
+            record_key = str(record.memory_key or "").strip().lower()
+            record_content = normalize_text(record.content or "")
+            if normalized_keys and record_key in normalized_keys:
+                matched.append(record)
+                continue
+            if normalized_keywords and any(
+                keyword and (keyword in record_key or keyword in record_content)
+                for keyword in normalized_keywords
+            ):
+                matched.append(record)
+
+        if not matched:
+            return {
+                "deleted_count": 0,
+                "matched": [],
+                "summary": "没有匹配到符合条件的个性化记忆。",
+            }
+
+        if len(matched) > max_deletes:
+            return {
+                "deleted_count": 0,
+                "matched": [
+                    {
+                        "memory_key": str(record.memory_key or ""),
+                        "content": str(record.content or "")[:200],
+                    }
+                    for record in matched[:max_deletes]
+                ],
+                "summary": (
+                    f"匹配到 {len(matched)} 条记忆，超过单次删除上限 {max_deletes}，"
+                    "为避免误删请用更精确的 memory_key 或关键词重试。"
+                ),
+            }
+
+        now = _utcnow_naive()
+        for record in matched:
+            record.status = MEMORY_STATUS_DELETED
+            record.updated_at = now
+            deleted.append(
+                {
+                    "memory_id": record.memory_id,
+                    "memory_key": record.memory_key,
+                    "content": str(record.content or "")[:400],
+                    "confidence_score": float(record.confidence_score or 0.0),
+                }
+            )
+        db.commit()
+        return {
+            "deleted_count": len(deleted),
+            "matched": deleted,
+            "summary": f"已删除 {len(deleted)} 条个性化记忆。",
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 __all__ = [
     "store_semantic_long_term_memory",
     "store_long_term_memory",
@@ -1140,5 +1253,6 @@ __all__ = [
     "get_active_profile_memories",
     "upsert_profile_memory_candidates",
     "register_event_memory_records",
+    "delete_profile_memories",
     "cleanup_memory_records",
 ]

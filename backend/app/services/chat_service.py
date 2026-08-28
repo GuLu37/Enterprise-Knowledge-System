@@ -10,9 +10,11 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 
 from app.skills.registry import (
+    RAG_TOOL_DEFINITION,
     execute_agent_tool,
     list_agent_capabilities,
     list_agent_function_calling_tools,
@@ -35,6 +37,7 @@ from app.rag.retrieval.reranker import (
     is_identifier_query,
     normalize_text,
 )
+from app.rag.adaptive import AdaptiveRAGController
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +169,25 @@ AGENT_ROUTER_SYSTEM_PROMPT = (
     "如果能直接回答就 route=direct。"
     "如果应该调用工具，route=skill，并在 skill_name 里填写工具名；RAG 也写成 skill，但 tool name 必须是 search_knowledge_base。"
     "如果信息不够，route=clarify。"
+)
+
+
+REACT_SYSTEM_PROMPT = (
+    "你是企业知识库智能助手，可以调用工具查询知识库、统计文档热词、查询用户记忆。"
+    "请自主规划：先判断是否需要调用工具，需要就调用并观察结果，直到信息足够后再给出最终回答。"
+    "只有当你确信已经能回答用户问题时，才停止调用工具并直接输出答案。"
+    "回答必须基于工具返回的资料，不要把未检索到的内容当成企业内部事实。"
+    "默认用简洁中文回答，可使用 Markdown 让结构更清晰。"
+)
+
+
+RAG_REACT_SYSTEM_PROMPT = (
+    "你是企业知识库检索决策者。你的任务是检索到足够回答用户问题的资料，不要回答用户问题本身。\n"
+    "可用工具：\n"
+    "- search_knowledge_base：执行检索，可通过参数 retrieval_method(dense/sparse/hybrid) 与 top_k 自主选择检索策略\n"
+    "规则信号：{signal}\n"
+    "流程：调用 search_knowledge_base 检索；如果结果不足，可换 retrieval_method 或改写 query 再次检索。\n"
+    "当你认为已经检索到足够资料时，直接输出简短说明（如「检索完成」）并停止调用工具。"
 )
 
 
@@ -378,6 +400,68 @@ def _extract_tool_call(message: Any) -> Optional[Dict[str, Any]]:
         "name": name,
         "arguments": arguments,
     }
+
+
+def _extract_tool_calls(message: Any) -> List[Dict[str, Any]]:
+    """从 LangChain 消息中提取全部 function calling 结果（含 tool_call_id）。"""
+    if message is None:
+        return []
+
+    tool_calls = getattr(message, "tool_calls", None)
+    if not tool_calls and isinstance(message, dict):
+        tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        additional_kwargs = getattr(message, "additional_kwargs", None) or {}
+        tool_calls = additional_kwargs.get("tool_calls") or []
+
+    extracted: List[Dict[str, Any]] = []
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            function_payload = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            name = str(
+                tool_call.get("name")
+                or function_payload.get("name")
+                or ""
+            ).strip()
+            arguments = (
+                tool_call.get("arguments")
+                or tool_call.get("args")
+                or function_payload.get("arguments")
+                or {}
+            )
+            call_id = tool_call.get("id")
+        else:
+            name = str(
+                getattr(tool_call, "name", "")
+                or getattr(getattr(tool_call, "function", None), "name", "")
+                or ""
+            ).strip()
+            arguments = (
+                getattr(tool_call, "arguments", None)
+                or getattr(tool_call, "args", None)
+                or getattr(getattr(tool_call, "function", None), "arguments", None)
+                or {}
+            )
+            call_id = getattr(tool_call, "id", None)
+
+        if not name:
+            continue
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        extracted.append(
+            {
+                "id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }
+        )
+    return extracted
 
 
 def _is_profile_name_query(query: str) -> bool:
@@ -734,6 +818,9 @@ def _run_agent_tool_turn(
     current_intent = intent
     current_history = list(history or [])
     tool_runs: List[Dict[str, Any]] = []
+    adaptive_rag = AdaptiveRAGController()
+    adaptive_llm = llm if settings.ADAPTIVE_RAG_LLM_DECISION_ENABLED else None
+    rag_decision = None
 
     for attempt in range(MAX_TOOL_CALLS_PER_TURN):
         if current_intent.route not in {"skill", "rag"}:
@@ -784,11 +871,62 @@ def _run_agent_tool_turn(
                     "tool_runs": tool_runs,
                 }
         else:
-            retrieval_query = _resolve_rag_query(query, current_intent, llm=llm, history=current_history)
+            react_loop = _run_rag_react_loop(
+                query=query,
+                history=current_history,
+                llm=llm,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                provider=provider,
+                model=model,
+                top_k=top_k,
+                retrieval_method=normalized_retrieval_method,
+                max_iterations=settings.REACT_MAX_ITERATIONS,
+            )
+            if react_loop is not None and react_loop.get("rag_payload"):
+                # ReAct 检索决策循环已由模型自主完成侦查与检索。
+                return {
+                    "status": "complete",
+                    "intent": current_intent,
+                    "tool_runs": react_loop.get("tool_runs") or [],
+                    "rag_payload": react_loop.get("rag_payload"),
+                    "retrieval_method": react_loop.get("retrieval_method"),
+                }
+            # ReAct 检索决策失败（bind_tools 不可用）或无结果 → 回退规则决策。
+            if rag_decision is None:
+                initial_query = _resolve_rag_query(
+                    query,
+                    current_intent,
+                    llm=llm,
+                    history=current_history,
+                )
+                rag_decision = adaptive_rag.select_initial(
+                    query=initial_query,
+                    top_k=top_k,
+                    retrieval_method=normalized_retrieval_method,
+                    llm=adaptive_llm,
+                )
+            else:
+                # 第二轮只由 Adaptive-RAG 决定，不再重新询问动作路由器，
+                # 避免回到同一工具和同一检索策略。
+                rag_decision = adaptive_rag.plan_follow_up(
+                    original_query=query,
+                    decision=rag_decision,
+                    assessment=tool_runs[-1]["evidence"],
+                    llm=adaptive_llm,
+                )
+                if rag_decision is None:
+                    break
+
             tool_arguments = {
-                "query": retrieval_query,
-                "top_k": top_k,
-                "retrieval_method": normalized_retrieval_method,
+                "query": rag_decision.query,
+                "top_k": rag_decision.top_k,
+                "retrieval_method": rag_decision.retrieval_method,
+            }
+            adaptive_metadata = {
+                "decision": rag_decision.to_dict(),
+                "controller": "llm_v1" if rag_decision.strategy.startswith("llm_") else "rule_v1",
             }
             execution = execute_agent_tool(
                 "search_knowledge_base",
@@ -800,13 +938,19 @@ def _run_agent_tool_turn(
                     query=query,
                     provider=provider,
                     model=model,
+                    metadata={"adaptive_rag": adaptive_metadata},
                 ),
                 llm=llm,
             )
             payload = dict(execution.get("result") or {})
             payload["original_query"] = query
-            payload["rewritten_query"] = retrieval_query
-            sufficient = _tool_result_has_signal("search_knowledge_base", payload)
+            payload["rewritten_query"] = rag_decision.query
+            evidence = adaptive_rag.assess_evidence(query, payload, llm=adaptive_llm)
+            payload["adaptive_rag"] = {
+                **adaptive_metadata,
+                "evidence": evidence.to_dict(),
+            }
+            sufficient = evidence.sufficient
             tool_runs.append(
                 {
                     "intent": current_intent,
@@ -815,6 +959,8 @@ def _run_agent_tool_turn(
                     "execution": execution,
                     "payload": payload,
                     "sufficient": sufficient,
+                    "evidence": evidence,
+                    "adaptive_rag": payload["adaptive_rag"],
                 }
             )
             if sufficient:
@@ -827,6 +973,10 @@ def _run_agent_tool_turn(
 
         if attempt + 1 >= MAX_TOOL_CALLS_PER_TURN:
             break
+
+        if current_intent.route == "rag":
+            # RAG 的下一轮已经由上面的 Adaptive-RAG 计划决定。
+            continue
 
         current_history = _append_tool_result_to_history(
             current_history,
@@ -864,6 +1014,466 @@ def _run_agent_tool_turn(
         "status": current_intent.route if current_intent.route else "direct",
         "intent": current_intent,
         "tool_runs": tool_runs,
+    }
+
+
+def _run_react_agent_loop(
+    query: str,
+    history: Optional[Iterable[Any]],
+    llm: Any,
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    max_iterations: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """真正的 ReAct 循环：模型自主在 Thought→Action→Observation 中迭代。
+
+    模型每轮带着（系统提示 + 历史 + 已执行工具结果）自主决定下一步：
+    输出 tool_calls 则执行并回填结果继续，不再输出 tool_calls 则视为最终回答。
+    达到 max_iterations 时强制基于已有结果总结，不硬中断。
+    返回 None 表示模型不支持 tool-calling（bind_tools 失败），调用方回退现有链路。
+    """
+    tools = list_agent_function_calling_tools()
+    try:
+        llm_with_tools = llm.bind_tools(tools)
+    except Exception as exc:
+        logger.warning("ReAct 模式 bind_tools 失败，回退现有链路: %s", exc)
+        return None
+
+    messages: List[Any] = [SystemMessage(content=REACT_SYSTEM_PROMPT)]
+    if history:
+        messages.extend(_history_to_langchain_messages(history))
+    messages.append(HumanMessage(content=(query or "").strip()))
+
+    context = SkillExecutionContext(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        query=query,
+        provider=provider,
+        model=model,
+    )
+    tool_runs: List[Dict[str, Any]] = []
+    sources: List[Dict[str, Any]] = []
+    resolved_retrieval_method: Optional[str] = None
+
+    for iteration in range(1, max_iterations + 1):
+        response = llm_with_tools.invoke(messages)
+        tool_calls = _extract_tool_calls(response)
+
+        if not tool_calls:
+            return {
+                "status": "complete",
+                "text": clean_rag_response_text(_extract_text(response)),
+                "sources": _deduplicate_sources(sources),
+                "tool_runs": tool_runs,
+                "iterations": iteration,
+                "retrieval_method": resolved_retrieval_method,
+            }
+
+        messages.append(response)
+        for index, tool_call in enumerate(tool_calls):
+            tool_name = tool_call["name"]
+            arguments = tool_call["arguments"]
+            try:
+                execution = execute_agent_tool(tool_name, arguments, context, llm=llm)
+            except Exception as exc:
+                execution = {
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "error": str(exc),
+                }
+                logger.warning("ReAct 工具执行失败: %s -> %s", tool_name, exc)
+
+            if tool_name == "search_knowledge_base":
+                result_payload = dict(execution.get("result") or {})
+                sources.extend(result_payload.get("results") or [])
+                resolved_retrieval_method = (
+                    resolved_retrieval_method
+                    or str(result_payload.get("retrieval_method") or "")
+                )
+
+            tool_call_id = tool_call.get("id") or f"call_{iteration}_{index}"
+            messages.append(
+                ToolMessage(
+                    content=json.dumps(execution, ensure_ascii=False),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            tool_runs.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_arguments": arguments,
+                    "execution": execution,
+                }
+            )
+
+    # 达到迭代上限：强制基于已有工具结果总结回答。
+    messages.append(
+        HumanMessage(content="请基于已获得的工具结果直接给出最终回答，不要再调用工具。")
+    )
+    final_response = llm.invoke(messages)
+    return {
+        "status": "exhausted",
+        "text": clean_rag_response_text(_extract_text(final_response)),
+        "sources": _deduplicate_sources(sources),
+        "tool_runs": tool_runs,
+        "iterations": max_iterations,
+        "retrieval_method": resolved_retrieval_method,
+    }
+
+
+def _stream_react_agent_loop(
+    query: str,
+    history: Optional[Iterable[Any]],
+    llm: Any,
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    max_iterations: int = 5,
+):
+    """流式 ReAct 循环：边流式输出文本边解析 tool_calls 继续迭代。
+
+    每轮用 stream 累积 AIMessageChunk（content 实时 yield，tool_calls 增量累积），
+    流结束后判断：无 tool_calls 即最终回答，有则执行工具回填后继续下一轮。
+    返回最终回答文本表示已完整处理；返回 None 表示 bind_tools 失败，调用方回退现有链路。
+    """
+    tools = list_agent_function_calling_tools()
+    try:
+        llm_with_tools = llm.bind_tools(tools)
+    except Exception as exc:
+        logger.warning("流式 ReAct bind_tools 失败，回退现有链路: %s", exc)
+        return None
+
+    messages: List[Any] = [SystemMessage(content=REACT_SYSTEM_PROMPT)]
+    if history:
+        messages.extend(_history_to_langchain_messages(history))
+    messages.append(HumanMessage(content=(query or "").strip()))
+
+    context = SkillExecutionContext(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        query=query,
+        provider=provider,
+        model=model,
+    )
+    sources: List[Dict[str, Any]] = []
+    resolved_retrieval_method: Optional[str] = None
+
+    for iteration in range(1, max_iterations + 1):
+        full_message = None
+        for chunk in llm_with_tools.stream(messages):
+            if full_message is None:
+                full_message = chunk
+            else:
+                full_message = full_message + chunk
+            text = _extract_text(chunk)
+            if text:
+                yield {"event": "message", "data": {"content": text}}
+
+        tool_calls = _extract_tool_calls(full_message)
+
+        if not tool_calls:
+            cleaned = clean_rag_response_text(_extract_text(full_message))
+            yield {
+                "event": "done",
+                "data": {
+                    "sources": _deduplicate_sources(sources),
+                    "retrieval_method": resolved_retrieval_method,
+                    "content": cleaned,
+                },
+            }
+            return cleaned
+
+        messages.append(full_message)
+        for index, tool_call in enumerate(tool_calls):
+            tool_name = tool_call["name"]
+            arguments = tool_call["arguments"]
+            yield {"event": "tool_call", "data": {"name": tool_name, "args": arguments}}
+            try:
+                execution = execute_agent_tool(tool_name, arguments, context, llm=llm)
+            except Exception as exc:
+                execution = {"tool": tool_name, "arguments": arguments, "error": str(exc)}
+                logger.warning("流式 ReAct 工具执行失败: %s -> %s", tool_name, exc)
+
+            if tool_name == "search_knowledge_base":
+                result_payload = dict(execution.get("result") or {})
+                sources.extend(result_payload.get("results") or [])
+                resolved_retrieval_method = (
+                    resolved_retrieval_method
+                    or str(result_payload.get("retrieval_method") or "")
+                )
+                yield {
+                    "event": "tool_result",
+                    "data": {
+                        "sources": _deduplicate_sources(sources),
+                        "retrieval_method": resolved_retrieval_method,
+                        "message": result_payload.get("message") or "",
+                    },
+                }
+            else:
+                yield {
+                    "event": "tool_result",
+                    "data": {
+                        "skill": execution.get("skill"),
+                        "kind": execution.get("kind"),
+                        "result": execution.get("result") or {},
+                    },
+                }
+
+            messages.append(
+                ToolMessage(
+                    content=json.dumps(execution, ensure_ascii=False),
+                    tool_call_id=tool_call.get("id") or f"call_{iteration}_{index}",
+                )
+            )
+
+    # 达到迭代上限：强制流式总结。
+    messages.append(
+        HumanMessage(content="请基于已获得的工具结果直接给出最终回答，不要再调用工具。")
+    )
+    final_text = ""
+    for chunk in llm.stream(messages):
+        text = _extract_text(chunk)
+        if text:
+            final_text += text
+            yield {"event": "message", "data": {"content": text}}
+
+    cleaned = clean_rag_response_text(final_text)
+    yield {
+        "event": "done",
+        "data": {
+            "sources": _deduplicate_sources(sources),
+            "retrieval_method": resolved_retrieval_method,
+            "content": cleaned,
+        },
+    }
+    return cleaned
+
+
+def _compact_react_tool_result(execution: Dict[str, Any]) -> Dict[str, Any]:
+    """把工具执行结果压缩成适合回填模型的精简版，控制上下文 token。"""
+    tool = str(execution.get("tool") or "")
+    payload = dict(execution.get("result") or {})
+    if tool == "search_knowledge_base":
+        compact_results = []
+        for item in (payload.get("results") or [])[:5]:
+            if isinstance(item, dict):
+                content = str(item.get("content") or "")[:200]
+                score = item.get("score")
+                source = (item.get("metadata") or {}).get("source_name")
+            else:
+                content = str(getattr(item, "content", "") or "")[:200]
+                score = getattr(item, "score", None)
+                source = (getattr(item, "metadata", None) or {}).get("source_name")
+            compact_results.append(
+                {"content": content, "score": score, "source": source}
+            )
+        return {
+            "tool": tool,
+            "message": payload.get("message") or "",
+            "result_count": len(payload.get("results") or []),
+            "results": compact_results,
+        }
+    return {"tool": tool, "result": execution.get("result") or {}}
+
+
+def _rule_rag_fallback(
+    query: str,
+    context: SkillExecutionContext,
+    llm: Any,
+    *,
+    top_k: int,
+    retrieval_method: str,
+) -> Optional[Dict[str, Any]]:
+    """规则兜底：Adaptive-RAG select_initial 决策 + 执行一次检索。"""
+    controller = AdaptiveRAGController()
+    decision = controller.select_initial(
+        query=query,
+        top_k=top_k,
+        retrieval_method=retrieval_method,
+    )
+    tool_arguments = {
+        "query": decision.query,
+        "top_k": decision.top_k,
+        "retrieval_method": decision.retrieval_method,
+    }
+    execution = execute_agent_tool("search_knowledge_base", tool_arguments, context, llm=llm)
+    payload = dict(execution.get("result") or {})
+    if not payload:
+        return None
+    return {
+        "tool_run": {
+            "tool_name": "search_knowledge_base",
+            "tool_arguments": tool_arguments,
+            "execution": execution,
+        },
+        "payload": payload,
+        "sources": payload.get("results") or [],
+        "retrieval_method": str(payload.get("retrieval_method") or decision.retrieval_method or ""),
+    }
+
+
+def _run_rag_react_loop(
+    query: str,
+    history: Optional[Iterable[Any]],
+    llm: Any,
+    *,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    top_k: int = 5,
+    retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
+    max_iterations: int = 3,
+) -> Optional[Dict[str, Any]]:
+    """rag 分支的 ReAct 检索决策循环：模型自主选择检索策略并迭代检索。
+
+    仅暴露 search_knowledge_base（检索）工具，不开放记忆查询/热词统计等技能
+    ——意图路由已负责 skill 分流，rag 分支应专注检索决策。模型可自主指定
+    retrieval_method/top_k 迭代检索；无 tool_calls 视为检索完成，达到上限强制结束；
+    循环未产出检索结果时回退 Adaptive-RAG 规则决策。返回 None 表示
+    bind_tools 失败，调用方回退规则链路。
+    """
+    try:
+        tools = [dict(RAG_TOOL_DEFINITION)]
+        llm_with_tools = llm.bind_tools(tools)
+    except Exception as exc:
+        logger.warning("ReAct 检索决策 bind_tools 失败，回退规则检索: %s", exc)
+        return None
+
+    try:
+        controller = AdaptiveRAGController()
+        initial = controller.select_initial(query=query, top_k=top_k, retrieval_method=retrieval_method)
+        signal_text = (
+            f"查询特征策略={initial.strategy}（{initial.reason}），"
+            f"规则建议检索方式={initial.retrieval_method}"
+        )
+    except Exception:
+        signal_text = "通用知识库问题，建议 hybrid 检索"
+
+    messages: List[Any] = [
+        SystemMessage(content=RAG_REACT_SYSTEM_PROMPT.format(signal=signal_text))
+    ]
+    if history:
+        messages.extend(_history_to_langchain_messages(history))
+    messages.append(HumanMessage(content=(query or "").strip()))
+
+    context = SkillExecutionContext(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        query=query,
+        provider=provider,
+        model=model,
+    )
+    tool_runs: List[Dict[str, Any]] = []
+    sources: List[Dict[str, Any]] = []
+    rag_payload: Optional[Dict[str, Any]] = None
+    resolved_retrieval_method: Optional[str] = None
+    iterations = 0
+    seen_queries: set[str] = set()
+
+    for iteration in range(1, max_iterations + 1):
+        iterations = iteration
+        response = llm_with_tools.invoke(messages)
+        tool_calls = _extract_tool_calls(response)
+        if not tool_calls:
+            break
+
+        messages.append(response)
+        for index, tool_call in enumerate(tool_calls):
+            tool_name = tool_call["name"]
+            arguments = tool_call["arguments"]
+
+            # 同 query 去重：模型重复检索同一查询时跳过执行，避免浪费一轮完整检索。
+            if tool_name == "search_knowledge_base":
+                query_key = normalize_text(str(arguments.get("query") or ""))
+                if query_key in seen_queries:
+                    execution = {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "skipped_duplicate": True,
+                        "result": {},
+                    }
+                else:
+                    seen_queries.add(query_key)
+                    try:
+                        execution = execute_agent_tool(tool_name, arguments, context, llm=llm)
+                    except Exception as exc:
+                        execution = {"tool": tool_name, "arguments": arguments, "error": str(exc)}
+                        logger.warning("ReAct 检索决策工具执行失败: %s -> %s", tool_name, exc)
+            else:
+                try:
+                    execution = execute_agent_tool(tool_name, arguments, context, llm=llm)
+                except Exception as exc:
+                    execution = {"tool": tool_name, "arguments": arguments, "error": str(exc)}
+                    logger.warning("ReAct 检索决策工具执行失败: %s -> %s", tool_name, exc)
+
+            tool_runs.append(
+                {"tool_name": tool_name, "tool_arguments": arguments, "execution": execution}
+            )
+            messages.append(
+                ToolMessage(
+                    content=json.dumps(
+                        _compact_react_tool_result(execution), ensure_ascii=False
+                    ),
+                    tool_call_id=tool_call.get("id") or f"call_{iteration}_{index}",
+                )
+            )
+
+            if tool_name == "search_knowledge_base":
+                payload = dict(execution.get("result") or {})
+                if payload:
+                    sources.extend(payload.get("results") or [])
+                    rag_payload = payload
+                    resolved_retrieval_method = (
+                        resolved_retrieval_method
+                        or str(payload.get("retrieval_method") or "")
+                    )
+
+    # 兜底：循环未产出检索结果 → 回退 Adaptive-RAG 规则决策执行一次。
+    if rag_payload is None:
+        fallback = _rule_rag_fallback(
+            query,
+            context,
+            llm,
+            top_k=top_k,
+            retrieval_method=retrieval_method,
+        )
+        if fallback is not None:
+            tool_runs.append(fallback["tool_run"])
+            rag_payload = fallback["payload"]
+            sources = fallback["sources"]
+            resolved_retrieval_method = fallback["retrieval_method"]
+
+    # 把最后一次检索 run 排到末尾，保证主链路 tool_runs[-1] 是检索结果。
+    if rag_payload is not None:
+        last_rag_index = max(
+            (
+                i
+                for i, run in enumerate(tool_runs)
+                if run.get("tool_name") == "search_knowledge_base"
+            ),
+            default=-1,
+        )
+        if 0 <= last_rag_index < len(tool_runs) - 1:
+            tool_runs.append(tool_runs.pop(last_rag_index))
+
+    return {
+        "tool_runs": tool_runs,
+        "rag_payload": rag_payload,
+        "sources": _deduplicate_sources(sources),
+        "iterations": iterations,
+        "retrieval_method": resolved_retrieval_method,
     }
 
 
@@ -1553,6 +2163,22 @@ def _split_history_messages(history: Optional[Iterable[Any]]) -> Tuple[List[Dict
     return system_messages, turns
 
 
+def _history_to_langchain_messages(history: Optional[Iterable[Any]]) -> List[Any]:
+    """把 ChatMessage/历史列表转成 LangChain 消息序列，供 ReAct 循环直接使用。"""
+    system_messages, turns = _split_history_messages(history)
+    messages: List[Any] = [SystemMessage(content=item["content"]) for item in system_messages]
+    for turn in turns:
+        for message in turn:
+            role = message["role"]
+            if role == "user":
+                messages.append(HumanMessage(content=message["content"]))
+            elif role == "assistant":
+                messages.append(AIMessage(content=message["content"]))
+            else:
+                messages.append(SystemMessage(content=message["content"]))
+    return messages
+
+
 def _render_conversation_blocks(turns: Sequence[Sequence[Dict[str, str]]]) -> str:
     """把若干轮对话渲染成适合摘要的纯文本。"""
     role_labels = {
@@ -2016,16 +2642,21 @@ def _run_skill_action(
     )
 
 
-def _deduplicate_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _deduplicate_sources(sources: List[Any]) -> List[Any]:
     """按文档和 chunk 去重，避免模型重复调用工具时来源重复。"""
-    deduplicated: List[Dict[str, Any]] = []
+    deduplicated: List[Any] = []
     seen = set()
     for source in sources:
-        metadata = source.get("metadata") or {}
+        if isinstance(source, dict):
+            metadata = source.get("metadata") or {}
+            content = source.get("content")
+        else:
+            metadata = getattr(source, "metadata", None) or {}
+            content = getattr(source, "content", None)
         key = (
             metadata.get("document_id"),
             metadata.get("chunk_index"),
-            source.get("content"),
+            content,
         )
         if key not in seen:
             seen.add(key)

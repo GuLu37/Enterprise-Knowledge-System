@@ -37,13 +37,23 @@ def _vector_index_type() -> str:
 
 def _build_connection_args() -> Dict[str, Any]:
     """生成 MilvusClient 连接参数。"""
+    # Milvus Lite 内部 gRPC server 对 keepalive ping 频率敏感：
+    # pymilvus 默认 keepalive_time_ms=10000 且 keepalive_permit_without_calls=True
+    # （无活动请求也每 10s ping），会被判定 too_many_pings 触发 GOAWAY(ENHANCE_YOUR_CALM)
+    # 断开连接，导致启动/预热失败。这里调大 ping 间隔并禁止无调用 ping。
+    grpc_options = {
+        "grpc.keepalive_time_ms": 300000,
+        "grpc.keepalive_timeout_ms": 30000,
+        "grpc.keepalive_permit_without_calls": False,
+    }
     if _is_lite_mode():
         lite_path = Path(settings.MILVUS_LITE_PATH)
         lite_path.parent.mkdir(parents=True, exist_ok=True)
-        return {"uri": str(lite_path)}
+        return {"uri": str(lite_path), "grpc_options": grpc_options}
 
     args: Dict[str, Any] = {
         "uri": f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}",
+        "grpc_options": grpc_options,
     }
     if settings.MILVUS_DB_NAME and settings.MILVUS_DB_NAME != "default":
         args["db_name"] = settings.MILVUS_DB_NAME

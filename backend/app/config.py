@@ -23,6 +23,21 @@ def _configure_langsmith_tracing() -> None:
 _configure_langsmith_tracing()
 
 
+def _configure_huggingface_offline() -> None:
+    """默认离线加载 HuggingFace 模型，避免本地模型已缓存时仍联网检查导致超时。
+
+    transformers 5.x 的 local_files_only 在部分路径下仍会访问 hub；
+    强制 HF_HUB_OFFLINE 可彻底切断联网。需要联网下载模型时设 HF_HUB_OFFLINE=false。
+    """
+    offline = (os.getenv("HF_HUB_OFFLINE") or "true").strip().lower()
+    if offline in {"true", "1", "yes", "on"}:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+_configure_huggingface_offline()
+
+
 def _resolve_app_path(path_value: Optional[str], default: str) -> str:
     """把应用内部路径固定解析到 backend/app 下，避免受启动目录影响。"""
     path = Path(path_value or default)
@@ -335,6 +350,19 @@ class Settings:
         os.getenv("MCP_REMOTE_TOOL_MANIFESTS"),
         "[]",
     )
+
+    # ==================== Adaptive-RAG 控制器配置 ====================
+    # 是否启用 LLM 消歧决策（规则评估置信度 → LLM 决策 → 规则兜底）。
+    # 关闭后控制器退回纯规则判定，不产生额外 LLM 调用。
+    ADAPTIVE_RAG_LLM_DECISION_ENABLED: bool = (
+        os.getenv("ADAPTIVE_RAG_LLM_DECISION_ENABLED", "true").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+
+    # ==================== ReAct 检索决策配置 ====================
+    # ReAct 检索决策循环最大迭代轮数（rag 分支模型自主迭代检索的上限），
+    # 防止模型无限调用工具；ReAct 失败或无结果时回退 Adaptive-RAG 规则决策。
+    REACT_MAX_ITERATIONS: int = max(1, int(os.getenv("REACT_MAX_ITERATIONS", "3")))
 
     # ==================== 日志配置 ====================
     LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")

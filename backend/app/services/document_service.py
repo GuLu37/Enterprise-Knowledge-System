@@ -888,6 +888,11 @@ def ingest_document(file: UploadFile, background_tasks: Optional[BackgroundTasks
             f"Milvus 写入成功并更新文档状态: ready, child_count={len(child_rows)}",
         )
 
+        # 文档内容变更后清空检索结果缓存，避免返回过期结果。
+        from app.services.retrieval_service import clear_rag_result_cache
+
+        clear_rag_result_cache()
+
         return _serialize_record(record)
     except Exception as e:
         db.rollback()
@@ -1015,6 +1020,10 @@ def delete_document(document_id: str, already_marked: bool = False) -> Dict:
         payload["file_deleted"] = file_deleted
 
         logger.info(f"✓ 文档删除完成 (document_id={document_id})")
+        # 文档删除后清空检索结果缓存，避免返回已删除内容。
+        from app.services.retrieval_service import clear_rag_result_cache
+
+        clear_rag_result_cache()
         return payload
     except Exception as e:
         db.rollback()

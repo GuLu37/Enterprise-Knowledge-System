@@ -19,10 +19,11 @@
 
 技能与工具现在统一收敛到 `backend/app/skills/registry.py`，由这里统一输出能力目录、Function Calling schema 和执行入口。
 
-当前已抽象出两类标准化 Skill：
+当前已抽象出三类标准化 Skill：
 
 - `document_hot_word_statistics`：按文件名或文档 ID 查询文档热词
 - `memory_query`：查询用户画像记忆和长期事件记忆
+- `delete_profile_memory`：删除指定用户的画像记忆
 
 RAG 也被视为工具之一，统一以 `search_knowledge_base` 进入 Function Calling。
 
@@ -37,26 +38,38 @@ RAG 也被视为工具之一，统一以 `search_knowledge_base` 进入 Function
 - `GET /api/v1/skills/function-calling`
 - `POST /api/v1/skills/execute`
 
-#### 可行性
-
-- 高：当前后端已经具备意图路由、RAG 工具封装、长期记忆服务和流式 `tool_call` / `tool_result` 事件。
-- 高：技能目录已经落地为统一注册表和 Function Calling 规格输出，且工具执行会显式落到后台日志/事件。
-- 高：`backend/requirements.txt` 已包含 `mcp`、`fastmcp` 和 `langchain-mcp-adapters`，说明技术栈层面已经预留了远程接入条件。
-
-#### 现阶段必要性
-
-- 中：如果当前目标仍是“把知识问答、检索和记忆做稳”，优先级不如检索质量、文档解析质量和记忆准确率高。
-- 高：如果下一阶段目标是“让系统具备企业助手/Agent 化能力”，这层抽象已经把底座铺好了，后续主要是继续加 Skill 和接 MCP。
-- 建议：先把现有两类 Skill 用在前端/管理端和 Agent 场景里，稳定后再接远程 MCP 工具。
 
 #### 运行边界
 
-- 单轮最多 2 次工具调用，仍未完成时自动转为澄清或结束。
+- 意图路由与技能分支：单轮最多 2 次工具调用，仍未完成时自动转为澄清或结束。
+- RAG 检索分支：进入 ReAct 检索决策循环，模型自主选择检索方式（dense / sparse / hybrid）与 `top_k` 迭代检索；无工具调用视为检索完成，达到 `REACT_MAX_ITERATIONS`（默认 3 轮）强制结束；ReAct 决策失败或无结果时回退 Adaptive-RAG 规则决策。循环仅暴露检索工具，不开放记忆查询/热词统计等技能（技能由意图路由分流）。
 - 工具调用必须经过 Function Calling 入口，不再走单独的旁路执行。
 - 技能、工具、MCP 的调用都会在后端显式输出，便于排查和审计。
 
 详细评估见 [docs/skill_mcp_highlight_assessment.md](docs/skill_mcp_highlight_assessment.md)。
 技能手册索引见 [backend/app/skills/skill.md](backend/app/skills/skill.md)。
+
+### Agent 化决策体系
+
+检索与路由决策统一遵循「规则前置分流 → 模型消歧决策 → 规则降级兜底」三级级联思想，按场景落地为以下机制。
+
+#### Adaptive-RAG 检索决策
+
+`backend/app/rag/adaptive.py` 实现规则版自适应控制器：
+
+- `select_initial`：按查询特征选择检索策略——编号查询走稀疏精确匹配，结构化/多条件查询扩大候选，流程制度类保持混合，通用问题混合兜底。
+- `assess_evidence`：以最高分、关键词覆盖、编号命中判定证据是否充分；落在模糊区间时交给 LLM 消歧决策，失败回退规则阈值。
+- `plan_follow_up`：证据不足时切换检索方式并改写查询重试（上限 2 轮）。
+
+#### ReAct 检索决策循环
+
+RAG 分支（`_run_rag_react_loop`）由模型自主决策检索：仅暴露 `search_knowledge_base` 工具（可指定 `retrieval_method` / `top_k`），模型观察检索结果后决定换参数重试或停止；无工具调用视为检索完成，达到 `REACT_MAX_ITERATIONS`（默认 3 轮）强制结束；模型不可用或无结果时自动回退 Adaptive-RAG 规则决策。技能类能力仍由意图路由统一分流，检索循环内不开放记忆查询/热词统计。
+
+#### 检索性能优化
+
+- 检索结果缓存：相同查询（规范化）在 TTL 内直接返回，重复/相似问题与 ReAct 循环内重复检索显著降延迟；文档入库或删除后自动失效。
+- ReAct 循环同查询去重：模型重复检索同一查询时跳过执行。
+- Multi-Query 变体精简：查询扩展上限 3 条，控制单次检索开销。
 
 ## 最终存储架构
 
@@ -108,6 +121,8 @@ flowchart TD
     C --> A
     B --> A
 ```
+
+RAG 检索层内部为 ReAct 检索决策循环：模型以 `search_knowledge_base` 工具（可指定 `retrieval_method` / `top_k`）自主执行检索，观察结果后可换参数重试；Adaptive-RAG 规则层提供查询特征信号与失败兜底。循环仅暴露检索工具，技能类能力仍由意图路由统一分流。
 
 完整回答返回后，前端再显示引用资料按钮。这样首屏可以尽快开始呈现回答，引用区域不会阻塞主要内容。
 

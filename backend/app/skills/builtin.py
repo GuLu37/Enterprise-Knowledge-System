@@ -10,7 +10,11 @@ from typing import Any, Dict, List, Sequence
 from sqlalchemy import or_
 
 from app.rag.retrieval.reranker import normalize_text
-from app.services.memory_service import get_active_profile_memories, search_long_term_memory
+from app.services.memory_service import (
+    delete_profile_memories,
+    get_active_profile_memories,
+    search_long_term_memory,
+)
 from app.skills.registry import SkillDefinition, SkillExecutionContext, register_skill
 from app.storage.sqlite_metadata import DocumentChunkRecord, DocumentRecord, SessionLocal
 
@@ -322,6 +326,32 @@ def _skill_memory_query(context: SkillExecutionContext, arguments: Dict[str, Any
     return result
 
 
+def _skill_delete_profile_memory(context: SkillExecutionContext, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """按 memory_key 或关键词删除用户个性化记忆。"""
+    memory_keys = _normalize_string_list(arguments.get("memory_keys"))
+    keywords = _normalize_string_list(arguments.get("keywords"))
+    max_deletes = _coerce_int(arguments.get("max_deletes", 50), default=50, minimum=1, maximum=200)
+
+    if not memory_keys and not keywords:
+        return {
+            "deleted_count": 0,
+            "matched": [],
+            "summary": "未提供删除条件，请指定 memory_keys 或 keywords。",
+        }
+
+    result = delete_profile_memories(
+        user_id=context.user_id,
+        memory_keys=memory_keys,
+        keywords=keywords,
+        max_deletes=max_deletes,
+    )
+    return {
+        "deleted_count": int(result.get("deleted_count") or 0),
+        "matched": result.get("matched", []),
+        "summary": str(result.get("summary") or ""),
+    }
+
+
 def register_builtin_skills() -> None:
     """注册当前阶段支持的本地技能。"""
     register_skill(
@@ -407,5 +437,43 @@ def register_builtin_skills() -> None:
             },
             executor=_skill_memory_query,
             metadata={"returns": "memory_query_result"},
+        )
+    )
+    register_skill(
+        SkillDefinition(
+            name="delete_profile_memory",
+            description=(
+                "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除"
+                "某条个人信息（如名字、偏好、地点、习惯等）时使用。可指定 memory_key "
+                "精确删除，或提供 keywords 按内容模糊匹配删除。"
+            ),
+            category="memory",
+            kind="local",
+            tags=("memory", "profile", "delete", "privacy"),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "memory_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选，精确删除的 memory_key 列表，如 profile.location、profile.name。",
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选，按内容关键词模糊匹配要删除的记忆，如 ['北京']。",
+                    },
+                    "max_deletes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 50,
+                        "description": "单次最多删除条数，超过会拒绝并要求更精确条件。",
+                    },
+                },
+            },
+            executor=_skill_delete_profile_memory,
+            metadata={"returns": "delete_profile_memory_result"},
         )
     )

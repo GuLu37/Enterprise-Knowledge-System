@@ -261,7 +261,77 @@ def _init_loguru() -> None:
     _install_exception_hooks()
 
 
+class _LoguruCompat:
+    """兼容 %s 风格日志的 loguru 封装。
+
+    loguru 原生只认 {} 占位符，历史代码大量使用 %s 风格导致参数被吞。
+    这里在统一入口做兼容：消息含 % 占位符时先用 Python % 格式化合并，
+    否则原样交给 loguru（保留 {} 用法），一处修复全项目 + 未来调用。
+    """
+
+    def __init__(self, logger):
+        self._logger = logger
+
+    @staticmethod
+    def _compose(message: str, args) -> str:
+        if args and "%" in message:
+            try:
+                return message % args
+            except (TypeError, ValueError):
+                return message
+        return message
+
+    def _emit(self, level: str, message: str, args, kwargs) -> None:
+        if args and "%" in message:
+            try:
+                message = message % args
+                args = ()
+            except (TypeError, ValueError):
+                pass
+        if args:
+            self._logger.log(level, message, *args, **kwargs)
+        else:
+            self._logger.log(level, message, **kwargs)
+
+    def info(self, message, *args, **kwargs):
+        self._emit("INFO", message, args, kwargs)
+
+    def warning(self, message, *args, **kwargs):
+        self._emit("WARNING", message, args, kwargs)
+
+    def error(self, message, *args, **kwargs):
+        self._emit("ERROR", message, args, kwargs)
+
+    def debug(self, message, *args, **kwargs):
+        self._emit("DEBUG", message, args, kwargs)
+
+    def trace(self, message, *args, **kwargs):
+        self._emit("TRACE", message, args, kwargs)
+
+    def success(self, message, *args, **kwargs):
+        self._emit("SUCCESS", message, args, kwargs)
+
+    def critical(self, message, *args, **kwargs):
+        self._emit("CRITICAL", message, args, kwargs)
+
+    def exception(self, message, *args, **kwargs):
+        composed = self._compose(message, args)
+        try:
+            self._logger.opt(exception=True).log("ERROR", composed, **kwargs)
+        except Exception:
+            self._logger.error(composed, **kwargs)
+
+    def log(self, level, message, *args, **kwargs):
+        self._emit(str(level).upper(), message, args, kwargs)
+
+    def bind(self, **kwargs):
+        return _LoguruCompat(self._logger.bind(**kwargs))
+
+    def opt(self, *args, **kwargs):
+        return _LoguruCompat(self._logger.opt(*args, **kwargs))
+
+
 def setup_logger(name: str):
     """获取绑定了模块名的 loguru logger，首次调用时完成全局初始化。"""
     _init_loguru()
-    return loguru_logger.bind(name=name)
+    return _LoguruCompat(loguru_logger.bind(name=name))

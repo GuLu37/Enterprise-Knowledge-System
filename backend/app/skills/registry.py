@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from app.config import APP_DIR
 from app.tools.trace import log_tool_call, log_tool_error, log_tool_result
 from app.utils.logger import setup_logger
-
 logger = setup_logger(__name__)
 
 SkillExecutor = Callable[["SkillExecutionContext", Dict[str, Any]], Dict[str, Any]]

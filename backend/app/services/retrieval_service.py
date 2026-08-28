@@ -2,8 +2,9 @@
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import settings
 from app.rag.retrieval.base import RetrievalResult
@@ -28,7 +29,7 @@ _RETRIEVER_CACHE: Dict[str, Any] = {}
 _RETRIEVER_CACHE_LOCK = threading.Lock()
 
 MIN_MULTI_QUERY_COUNT = 3
-MAX_MULTI_QUERY_COUNT = 4
+MAX_MULTI_QUERY_COUNT = 3
 MAX_CITATION_RESULTS = 3
 STRUCTURED_QUERY_CITATION_RESULTS = 12
 RAG_CONTEXT_MAX_CHARS = 6500
@@ -40,7 +41,7 @@ STRUCTURED_SECTION_ROW_CHAR_LIMIT = 24000
 NO_RESULTS_MESSAGE = "当前知识库未检索到足够相关资料"
 MULTI_QUERY_SYSTEM_PROMPT = (
     "你是企业知识库检索查询扩展器。"
-    "把用户问题改写为 3 到 5 条适合检索的查询，不回答问题本身。"
+    "把用户问题改写为 3 条适合检索的查询，不回答问题本身。"
     "必须覆盖：原始问法、关键词短语、可能的文件名或标题表达、同义表达。"
     "如果问题包含编号、工号、产品号、人名、文档名或带书名号的名称，必须原样保留。"
     "只输出严格 JSON，格式：{\"queries\":[\"查询1\",\"查询2\",\"查询3\"]}"
@@ -166,6 +167,63 @@ class RagWorkflowResult:
     results: List[RetrievalResult] = field(default_factory=list)
     context: str = ""
     message: str = "未检索到相关内容"
+
+
+_RAG_RESULT_CACHE: Dict[str, Tuple[float, RagWorkflowResult]] = {}
+_RAG_RESULT_CACHE_LOCK = threading.Lock()
+_RAG_CACHE_MAX_ENTRIES = 1000
+
+
+def _rag_cache_key(query: str, top_k: int, retrieval_method: str) -> str:
+    """生成检索结果缓存 key：规范化 query + top_k + 检索方式。"""
+    return f"{normalize_text(query)}::t{top_k}::{retrieval_method}"
+
+
+def _copy_rag_result(result: RagWorkflowResult) -> RagWorkflowResult:
+    """浅拷贝缓存结果，避免调用方修改污染缓存。"""
+    return RagWorkflowResult(
+        query=result.query,
+        retrieval_method=result.retrieval_method,
+        expanded_queries=list(result.expanded_queries),
+        results=list(result.results),
+        context=result.context,
+        message=result.message,
+    )
+
+
+def _cache_put(cache_key: str, result: RagWorkflowResult) -> None:
+    """写入检索缓存，写入时惰性清理过期条目并限制缓存条数上限。
+
+    仅在缓存接近上限时才做清理（遍历成本低），避免每次写入都全量扫描。
+    """
+    now = time.monotonic()
+    ttl = settings.CACHE_TTL
+    with _RAG_RESULT_CACHE_LOCK:
+        if len(_RAG_RESULT_CACHE) >= _RAG_CACHE_MAX_ENTRIES:
+            expired = [
+                key
+                for key, (cached_at, _) in _RAG_RESULT_CACHE.items()
+                if (now - cached_at) >= ttl
+            ]
+            for key in expired:
+                del _RAG_RESULT_CACHE[key]
+
+            if len(_RAG_RESULT_CACHE) >= _RAG_CACHE_MAX_ENTRIES:
+                oldest_keys = sorted(
+                    _RAG_RESULT_CACHE.keys(),
+                    key=lambda key: _RAG_RESULT_CACHE[key][0],
+                )
+                overflow = len(_RAG_RESULT_CACHE) - _RAG_CACHE_MAX_ENTRIES + 1
+                for key in oldest_keys[: max(0, overflow)]:
+                    del _RAG_RESULT_CACHE[key]
+
+        _RAG_RESULT_CACHE[cache_key] = (now, result)
+
+
+def clear_rag_result_cache() -> None:
+    """清空检索结果缓存（文档入库/删除后调用，避免返回过期结果）。"""
+    with _RAG_RESULT_CACHE_LOCK:
+        _RAG_RESULT_CACHE.clear()
 
 
 def _extract_text_content(message: Any) -> str:
@@ -553,7 +611,7 @@ def generate_multi_query_variants(
     prompt = (
         f"{MULTI_QUERY_SYSTEM_PROMPT}\n\n"
         f"用户问题：{normalized_query}\n\n"
-        f"请输出 3 到 5 条查询变体，避免长句，优先提升 source_name、标题、编号和正文关键词召回。"
+        f"请输出 3 条查询变体，避免长句，优先提升 source_name、标题、编号和正文关键词召回。"
     )
 
     try:
@@ -1243,6 +1301,20 @@ def run_rag_workflow(
         return RagWorkflowResult(query="")
 
     resolved_method = _resolve_retrieval_method_for_query(normalized_query, retrieval_method)
+
+    # 检索结果缓存：相同 query（规范化）+ top_k + 检索方式在 TTL 内秒回，
+    # 显著降低重复/相似问题与 ReAct 循环内重复检索的延迟。
+    cache_key = None
+    if settings.ENABLE_CACHE:
+        cache_key = _rag_cache_key(normalized_query, top_k or 0, resolved_method)
+        with _RAG_RESULT_CACHE_LOCK:
+            cached_entry = _RAG_RESULT_CACHE.get(cache_key)
+            if cached_entry is not None:
+                cached_at, cached_result = cached_entry
+                if (time.monotonic() - cached_at) < settings.CACHE_TTL:
+                    logger.info("检索结果缓存命中: query=%s method=%s", normalized_query, resolved_method)
+                    return _copy_rag_result(cached_result)
+
     expanded_queries = expand_multi_query(normalized_query, llm=llm)
     recalled_results = retrieve_documents_multi_query(
         normalized_query,
@@ -1286,7 +1358,7 @@ def run_rag_workflow(
         "best_score": max((float(item.score or 0.0) for item in filtered_results), default=0.0),
     }
     logger.info(f"RAG 检索诊断: {json.dumps(logger_data, ensure_ascii=False)}")
-    return RagWorkflowResult(
+    result = RagWorkflowResult(
         query=normalized_query,
         retrieval_method=resolved_method,
         expanded_queries=expanded_queries,
@@ -1294,6 +1366,10 @@ def run_rag_workflow(
         context=context,
         message="检索完成" if filtered_results else NO_RESULTS_MESSAGE,
     )
+
+    if cache_key is not None:
+        _cache_put(cache_key, result)
+    return result
 
 
 def serialize_retrieval_results(results: List[RetrievalResult]) -> List[Dict[str, Any]]:
