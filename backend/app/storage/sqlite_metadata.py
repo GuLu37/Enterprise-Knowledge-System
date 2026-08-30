@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     inspect,
     text,
@@ -148,6 +149,26 @@ class MemoryRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
+
+
+class MemoryConsolidationRecord(Base):
+    """递进摘要合并游标：记录每个对话各层已合并到的轮次。"""
+
+    __tablename__ = "memory_consolidation"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "conversation_id", "level",
+            name="uq_memory_consolidation_level",
+        ),
+        Index("ix_memory_consolidation_user_conv", "user_id", "conversation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_merged_turn: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_merged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 def init_metadata_db():

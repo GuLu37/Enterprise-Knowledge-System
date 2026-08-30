@@ -16,7 +16,6 @@ from app.skills.registry import (
     list_agent_capabilities,
     list_agent_function_calling_tools,
     list_skill_definitions,
-    read_skill_index_markdown,
 )
 
 router = APIRouter()
@@ -36,13 +35,12 @@ async def get_function_calling_tools(current_user=Depends(require_current_user))
 
 @router.get("/capabilities")
 async def get_capabilities(current_user=Depends(require_current_user)):
-    """返回统一能力目录，供 Agent 先看工具列表再看技能索引。"""
+    """返回统一能力目录，Function Calling 工具列表是 Skill 的发现入口。"""
     tools = list_agent_function_calling_tools()
     return {
         "capabilities": list_agent_capabilities(),
         "tools": tools,
         "function_calling": tools,
-        "skill_index": read_skill_index_markdown(),
     }
 
 

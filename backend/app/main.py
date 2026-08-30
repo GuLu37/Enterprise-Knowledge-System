@@ -273,5 +273,6 @@ if __name__ == "__main__":
         host=settings.SERVER_HOST,
         port=settings.SERVER_PORT,
         reload=settings.DEBUG,
+        reload_excludes=[settings.LOG_DIR],
         log_config=None,  # 禁用 uvicorn 默认日志配置，由 loguru 统一接管
     )

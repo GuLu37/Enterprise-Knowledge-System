@@ -2,7 +2,7 @@
 
 from .registry import (
     RAG_TOOL_DEFINITION,
-    SKILL_INDEX_PATH,
+    SKILLS_DIR,
     SkillDefinition,
     SkillExecutionContext,
     SkillExecutionError,
@@ -10,18 +10,19 @@ from .registry import (
     execute_agent_tool,
     execute_skill,
     get_skill_definition,
+    read_skill_document,
+    get_skill_document_path,
     list_agent_capabilities,
     list_agent_function_calling_tools,
     list_function_calling_tools,
     list_skill_definitions,
-    read_skill_index_markdown,
     register_skill,
     reset_skill_registry,
 )
 
 __all__ = [
     "RAG_TOOL_DEFINITION",
-    "SKILL_INDEX_PATH",
+    "SKILLS_DIR",
     "SkillDefinition",
     "SkillExecutionContext",
     "SkillExecutionError",
@@ -29,11 +30,12 @@ __all__ = [
     "execute_agent_tool",
     "execute_skill",
     "get_skill_definition",
+    "read_skill_document",
+    "get_skill_document_path",
     "list_agent_capabilities",
     "list_agent_function_calling_tools",
     "list_function_calling_tools",
     "list_skill_definitions",
-    "read_skill_index_markdown",
     "register_skill",
     "reset_skill_registry",
 ]

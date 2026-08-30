@@ -22,6 +22,7 @@ _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}")
 _NOISY_TERMS = {
     "文档",
     "文件",
+    "章节",
     "内容",
     "信息",
     "资料",
@@ -107,16 +108,39 @@ def _is_noisy_term(term: str) -> bool:
     return False
 
 
+def _chinese_ngrams(token: str) -> List[str]:
+    """中文串按字符切分生成二元/三元 gram。
+
+    中文没有空格分隔，若直接把整段连续汉字当成一个词，会丢失『密码』『账号』
+    这类有意义的短词，且整句作为 term 对关键词统计毫无价值。改为切分 2/3 元
+    gram 是无分词模型时最稳妥的轻量关键词提取方式。
+    """
+    grams: List[str] = []
+    for n in (2, 3):
+        for start in range(len(token) - n + 1):
+            grams.append(token[start : start + n])
+    return grams
+
+
 def _extract_term_frequencies_from_text(text: str) -> Counter[str]:
     frequencies: Counter[str] = Counter()
     if not text:
         return frequencies
 
     for match in _TOKEN_PATTERN.finditer(text):
-        cleaned = normalize_text(match.group(0))
-        if _is_noisy_term(cleaned):
-            continue
-        frequencies[cleaned] += 1
+        token = match.group(0)
+        # 纯英文/数字词按整词提取；中文串走 n-gram，避免整句被当成一个无用语。
+        if re.fullmatch(r"[A-Za-z0-9]+", token):
+            cleaned = normalize_text(token)
+            if _is_noisy_term(cleaned):
+                continue
+            frequencies[cleaned] += 1
+        else:
+            for gram in _chinese_ngrams(token):
+                cleaned = normalize_text(gram)
+                if _is_noisy_term(cleaned):
+                    continue
+                frequencies[cleaned] += 1
 
     return frequencies
 
@@ -352,12 +376,100 @@ def _skill_delete_profile_memory(context: SkillExecutionContext, arguments: Dict
     }
 
 
+def _skill_list_knowledge_base_files(context: SkillExecutionContext, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """列出知识库已上传文档，并可概括其内容（章节大纲、内容预览、主题关键词）。"""
+    document_ids = _normalize_string_list(arguments.get("document_ids"))
+    file_types = _normalize_string_list(arguments.get("file_types"))
+    statuses = _normalize_string_list(arguments.get("statuses") or arguments.get("status"))
+    file_name = str(arguments.get("file_name") or arguments.get("filename") or "").strip()
+    summarize = bool(arguments.get("summarize", True))
+    preview_chars = _coerce_int(arguments.get("preview_chars", 1500), default=1500, minimum=200, maximum=6000)
+    limit = _coerce_int(arguments.get("limit", 20), default=20, minimum=1, maximum=100)
+
+    # 默认只列已入库(ready)的文档，符合「已上传的文件」语义；可按 statuses 覆盖。
+    if not statuses:
+        statuses = ["ready"]
+
+    db = SessionLocal()
+    try:
+        docs_query = db.query(DocumentRecord)
+        docs_query = _apply_document_filters(docs_query, document_ids, file_types, statuses, file_name)
+        documents = docs_query.order_by(DocumentRecord.original_filename).limit(limit).all()
+        filters = {
+            "document_ids": document_ids,
+            "file_types": file_types,
+            "statuses": statuses,
+            "file_name": file_name,
+            "limit": limit,
+        }
+        if not documents:
+            return {
+                "summary": {
+                    "document_count": 0,
+                    "message": "未找到匹配的已上传文档，请确认文件名或状态。",
+                },
+                "documents": [],
+                "filters": filters,
+            }
+
+        doc_map = {record.document_id: record for record in documents}
+        chunks_query = (
+            db.query(
+                DocumentChunkRecord.document_id,
+                DocumentChunkRecord.chunk_text,
+                DocumentChunkRecord.chunk_index,
+            )
+            .filter(DocumentChunkRecord.document_id.in_(list(doc_map.keys())))
+            .order_by(DocumentChunkRecord.document_id, DocumentChunkRecord.chunk_index)
+        )
+        chunks_by_document: Dict[str, List[str]] = defaultdict(list)
+        for document_id, chunk_text, _chunk_index in chunks_query.all():
+            text = str(chunk_text or "").strip()
+            if text:
+                chunks_by_document[str(document_id)].append(text)
+
+        documents_out: List[Dict[str, Any]] = []
+        for record in documents:
+            doc = _serialize_document_record(record)
+            if summarize:
+                chunks = chunks_by_document.get(record.document_id, [])
+                combined = "\n".join(chunks)
+                outline = [
+                    line.strip()[len("[章节]"):].strip(" :")
+                    for line in combined.splitlines()
+                    if line.strip().startswith("[章节]")
+                ]
+                preview = combined[:preview_chars]
+                keywords = sorted(
+                    _extract_term_frequencies_from_text(combined).items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
+                doc["outline"] = outline
+                doc["content_preview"] = preview
+                doc["topic_keywords"] = [term for term, _ in keywords]
+            documents_out.append(doc)
+
+        return {
+            "summary": {
+                "document_count": len(documents_out),
+                "chunk_count": sum(int(record.chunk_count or 0) for record in documents),
+            },
+            "documents": _make_json_safe(documents_out),
+            "filters": filters,
+        }
+    finally:
+        db.close()
+
+
 def register_builtin_skills() -> None:
     """注册当前阶段支持的本地技能。"""
     register_skill(
         SkillDefinition(
             name="document_hot_word_statistics",
-            description="按文件名定位文档，统计对应文档内容中的高频热词，并返回热词、频次和示例文档。",
+            description=(
+                "按文件名或文档 ID 定位文档并统计高频热词。适用于用户询问具体文件中的热词、"
+                "关键词或出现频率；不用于回答文档正文、制度流程或内部事实。"
+            ),
             category="document",
             kind="local",
             tags=("statistics", "documents", "keywords"),
@@ -374,7 +486,7 @@ def register_builtin_skills() -> None:
                     },
                     "file_name": {
                         "type": "string",
-                        "description": "可选，按原始文件名或存储文件名模糊定位目标文档。",
+                        "description": "可选，按原始文件名或存储文件名模糊定位目标文档；用户提到文件名时优先填写。",
                     },
                     "document_ids": {
                         "type": "array",
@@ -408,7 +520,10 @@ def register_builtin_skills() -> None:
     register_skill(
         SkillDefinition(
             name="memory_query",
-            description="查询用户的长期记忆或画像记忆，支持按文本召回和当前画像查看。",
+            description=(
+                "查询当前用户自己的长期记忆或画像记忆。适用于‘你记得什么’、‘我之前说过什么’、"
+                "‘我的偏好是什么’等问题；不用于查询企业文档，也不能跨用户读取记忆。"
+            ),
             category="memory",
             kind="local",
             tags=("memory", "profile", "search"),
@@ -445,7 +560,8 @@ def register_builtin_skills() -> None:
             description=(
                 "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除"
                 "某条个人信息（如名字、偏好、地点、习惯等）时使用。可指定 memory_key "
-                "精确删除，或提供 keywords 按内容模糊匹配删除。"
+                "精确删除，或提供 keywords 按内容模糊匹配删除；用户表达模糊时先查询并确认，"
+                "不能删除事件记忆或其他用户数据。"
             ),
             category="memory",
             kind="local",
@@ -475,5 +591,69 @@ def register_builtin_skills() -> None:
             },
             executor=_skill_delete_profile_memory,
             metadata={"returns": "delete_profile_memory_result"},
+        )
+    )
+    register_skill(
+        SkillDefinition(
+            name="list_knowledge_base_files",
+            description=(
+                "列出知识库中已上传的文档，可按文件名、文档 ID、文件类型或状态筛选；"
+                "并可概括指定文档的内容（章节大纲、内容预览、主题关键词）。"
+                "适用于『知识库里有哪些文件』『帮我看看 04_产品与账号常见问题 这个文档讲了什么』"
+                "『列出全部已上传文档』『这份文档包含哪些章节』等需求；不用于按内容检索具体答案，"
+                "那应使用 search_knowledge_base。"
+            ),
+            category="document",
+            kind="local",
+            tags=("documents", "list", "summary", "overview"),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "file_name": {
+                        "type": "string",
+                        "description": "可选，按文件名模糊筛选；用户提到具体文件名时填写，如『产品与账号常见问题』。",
+                    },
+                    "document_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选，只列出指定 document_id 的文档。",
+                    },
+                    "file_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选，只列出指定文件类型，如 ['pdf','docx','md']。",
+                    },
+                    "statuses": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["processing", "ready", "failed", "deleting", "deleted"],
+                        },
+                        "description": "可选，按状态筛选，默认只列已入库(ready)的文档。",
+                    },
+                    "summarize": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "是否概括内容（章节大纲、内容预览、主题关键词）。",
+                    },
+                    "preview_chars": {
+                        "type": "integer",
+                        "minimum": 200,
+                        "maximum": 6000,
+                        "default": 1500,
+                        "description": "每个文档内容预览的最大字符数。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": "最多返回多少条文档。",
+                    },
+                },
+            },
+            executor=_skill_list_knowledge_base_files,
+            metadata={"returns": "knowledge_base_files"},
         )
     )

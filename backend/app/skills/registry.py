@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from app.config import APP_DIR
@@ -14,20 +15,53 @@ SkillExecutor = Callable[["SkillExecutionContext", Dict[str, Any]], Dict[str, An
 
 _SKILL_REGISTRY: Dict[str, "SkillDefinition"] = {}
 _BUILTIN_SKILLS_LOADED = False
-SKILL_INDEX_PATH = APP_DIR / "skills" / "skill.md"
+SKILLS_DIR = APP_DIR / "skills"
+
+
+def get_skill_document_path(skill_name: str) -> Path:
+    """返回 Skill 对应的同名目录和文档路径。"""
+    normalized_name = (skill_name or "").strip()
+    if (
+        not normalized_name
+        or normalized_name in {".", ".."}
+        or Path(normalized_name).name != normalized_name
+    ):
+        raise ValueError(f"非法 Skill 名称: {skill_name}")
+    return SKILLS_DIR / normalized_name / f"{normalized_name}.md"
+
+
+def read_skill_document(skill_name: str) -> str:
+    """按已注册 Skill 名称读取详细规则，未配置文档时返回空字符串。"""
+    definition = get_skill_definition(skill_name)
+    return _read_skill_document_for_definition(definition)
+
+
+def _read_skill_document_for_definition(definition: "SkillDefinition") -> str:
+    """读取已解析 Skill 定义对应的详细规则。"""
+    if definition.kind != "local":
+        return ""
+
+    skills_root = SKILLS_DIR.resolve()
+    document_path = get_skill_document_path(definition.name).resolve()
+    if skills_root not in document_path.parents:
+        raise ValueError(f"Skill 文档路径超出技能目录: {definition.name}")
+    if not document_path.is_file():
+        logger.warning("Skill 详细文档不存在: %s", document_path)
+        return ""
+    return document_path.read_text(encoding="utf-8")
 
 RAG_TOOL_DEFINITION: Dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "search_knowledge_base",
-        "description": "检索企业知识库，适用于文档内容、制度流程、上传资料和内部事实核验。",
+        "description": "检索企业知识库，适用于文档内容、制度流程、上传资料、内部事实核验，以及按文件名/文档名查询某份文档是否存在。",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "用于知识库检索的改写问题。",
+                    "description": "用于知识库检索的改写问题。当用户提到文件名/文档名时，可直接用文件名作为检索词。",
                 },
                 "top_k": {
                     "type": "integer",
@@ -141,14 +175,6 @@ def list_function_calling_tools() -> List[Dict[str, Any]]:
     return [definition.to_function_calling_tool() for definition in sorted(_SKILL_REGISTRY.values(), key=lambda item: item.name)]
 
 
-def read_skill_index_markdown() -> str:
-    """读取给 Agent 看的技能索引。"""
-    try:
-        return SKILL_INDEX_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-
-
 def list_agent_capabilities() -> List[Dict[str, Any]]:
     """列出给 Agent 的统一能力目录。"""
     capabilities: List[Dict[str, Any]] = [
@@ -168,7 +194,9 @@ def list_agent_capabilities() -> List[Dict[str, Any]]:
             {
                 **skill,
                 "source": "skill",
-                "location": f"backend/app/skills/{skill['name']}.md",
+                "location": get_skill_document_path(skill["name"])
+                .relative_to(APP_DIR.parent.parent)
+                .as_posix(),
             }
         )
 
@@ -249,6 +277,7 @@ def execute_skill(
         raise SkillExecutionError(f"skill 暂未配置执行器: {name}")
 
     resolved_context = context or SkillExecutionContext()
+    skill_instructions = _read_skill_document_for_definition(definition)
     resolved_arguments = dict(arguments or {})
     trace_kind = "mcp" if definition.kind == "remote_mcp" else "skill"
     context_payload = {
@@ -267,8 +296,21 @@ def execute_skill(
         arguments=resolved_arguments,
         context=context_payload,
     )
+    execution_context = SkillExecutionContext(
+        user_id=resolved_context.user_id,
+        conversation_id=resolved_context.conversation_id,
+        session_id=resolved_context.session_id,
+        query=resolved_context.query,
+        provider=resolved_context.provider,
+        model=resolved_context.model,
+        trace_id=resolved_context.trace_id,
+        metadata={
+            **dict(resolved_context.metadata),
+            "skill_instructions": skill_instructions,
+        },
+    )
     try:
-        payload = definition.executor(resolved_context, resolved_arguments)
+        payload = definition.executor(execution_context, resolved_arguments)
     except Exception as exc:
         log_tool_error(
             kind=trace_kind,
@@ -296,6 +338,7 @@ def execute_skill(
         "provider": definition.provider,
         "arguments": resolved_arguments,
         "context": context_payload,
+        "skill_instructions": skill_instructions,
         "result": payload,
         "executed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -327,7 +370,7 @@ def reset_skill_registry() -> None:
 
 __all__ = [
     "RAG_TOOL_DEFINITION",
-    "SKILL_INDEX_PATH",
+    "SKILLS_DIR",
     "SkillExecutionContext",
     "SkillDefinition",
     "SkillExecutionError",
@@ -335,11 +378,12 @@ __all__ = [
     "execute_agent_tool",
     "execute_skill",
     "get_skill_definition",
+    "get_skill_document_path",
     "list_agent_capabilities",
     "list_agent_function_calling_tools",
     "list_function_calling_tools",
     "list_skill_definitions",
-    "read_skill_index_markdown",
+    "read_skill_document",
     "register_skill",
     "reset_skill_registry",
 ]

@@ -1,6 +1,7 @@
 """日志配置"""
 import asyncio
 import logging
+import os
 import sys
 import threading
 import warnings
@@ -77,7 +78,8 @@ def _find_reusable_log_file(now: datetime) -> Path | None:
     """优先复用当天且未超过阈值的最新日志文件。"""
     candidates: list[tuple[float, Path]] = []
 
-    for path in log_dir.glob("*.log"):
+    process_prefix = f"_p{os.getpid()}"
+    for path in log_dir.glob(f"*{process_prefix}.log"):
         try:
             stat = path.stat()
         except OSError:
@@ -99,13 +101,13 @@ def _find_reusable_log_file(now: datetime) -> Path | None:
 
 
 def _build_log_file_pattern(now: datetime | None = None) -> str:
-    """优先复用当天日志，否则新建纯时间戳文件名。"""
+    """优先复用当前进程当天日志，否则新建带进程标识的文件名。"""
     now = now or datetime.now()
     reusable = _find_reusable_log_file(now)
     if reusable is not None:
         return str(reusable)
 
-    candidate = log_dir / f"{now:%Y%m%d%H%M%S}.log"
+    candidate = log_dir / f"{now:%Y%m%d%H%M%S}_p{os.getpid()}.log"
     offset_seconds = 1
     while candidate.exists():
         try:
@@ -116,7 +118,10 @@ def _build_log_file_pattern(now: datetime | None = None) -> str:
         if size < _LOG_ROTATION_MAX_BYTES:
             return str(candidate)
 
-        candidate = log_dir / f"{(now + timedelta(seconds=offset_seconds)):%Y%m%d%H%M%S}.log"
+        candidate = log_dir / (
+            f"{(now + timedelta(seconds=offset_seconds)):%Y%m%d%H%M%S}"
+            f"_p{os.getpid()}.log"
+        )
         offset_seconds += 1
 
     return str(candidate)

@@ -4,7 +4,6 @@ import {
   ArrowDown,
   ArrowRight,
   Bot,
-  Check,
   ChevronDown,
   CircleAlert,
   Copy,
@@ -171,8 +170,6 @@ const chatRuntimeMessage = computed(() => {
   return chatRuntime.value.status === 'failed' ? '系统初始化失败' : '系统正在初始化...'
 })
 const streamMode = ref(true)
-const retrievalMethod = ref('hybrid')
-const retrievalMenuOpen = ref(false)
 const errorText = ref('')
 const conversationId = ref(conversations.value[0].conversation_id)
 const sessionId = ref(conversations.value[0].session_id)
@@ -182,7 +179,6 @@ const selectedDocLoading = ref(false)
 const selectedDocError = ref('')
 const scrollHost = ref(null)
 const fileInput = ref(null)
-const retrievalMenuRef = ref(null)
 const conversationFullNotice = ref(false)
 const autoScrollEnabled = ref(true)
 const expandedSources = ref({})
@@ -198,11 +194,6 @@ let chatRuntimeStatusTimer = null
 let chatScrollResizeObserver = null
 let chatBottomSyncFrame = null
 
-const retrievalOptions = [
-  { value: 'hybrid', label: '混合检索' },
-  { value: 'dense', label: '密集检索' },
-  { value: 'sparse', label: '稀疏检索' },
-]
 const welcomeQuickQuestions = [
   {
     icon: Wand2,
@@ -228,10 +219,6 @@ const retrievalMethodLabels = {
   dense: '密集检索',
   sparse: '稀疏检索',
 }
-
-const currentRetrievalLabel = computed(
-  () => retrievalOptions.find((option) => option.value === retrievalMethod.value)?.label || '混合检索',
-)
 
 const maxConversations = computed(() => {
   const configured = Number(chatSettings.value.max_conversations)
@@ -678,7 +665,6 @@ async function generateAssistantReply({
     session_id: conversation.session_id,
     use_retrieval: true,
     stream: streamMode.value,
-    retrieval_method: retrievalMethod.value,
     short_memory_strategy: 'window',
     short_memory_n: 5,
     short_memory_m: 10,
@@ -1114,21 +1100,6 @@ function trimText(text, limit = 90) {
   const normalized = (text || '').replace(/\s+/g, ' ').trim()
   if (!normalized) return ''
   return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized
-}
-
-function toggleRetrievalMenu() {
-  retrievalMenuOpen.value = !retrievalMenuOpen.value
-}
-
-function chooseRetrievalMethod(value) {
-  retrievalMethod.value = value
-  retrievalMenuOpen.value = false
-}
-
-function handleRetrievalMenuClick(event) {
-  if (retrievalMenuRef.value && !retrievalMenuRef.value.contains(event.target)) {
-    retrievalMenuOpen.value = false
-  }
 }
 
 function toggleSources(messageId) {
@@ -1746,7 +1717,6 @@ onMounted(async () => {
     })
     chatScrollResizeObserver.observe(scrollHost.value)
   }
-  document.addEventListener('click', handleRetrievalMenuClick)
 })
 
 onBeforeUnmount(() => {
@@ -1769,7 +1739,6 @@ onBeforeUnmount(() => {
   }
   stopChatRuntimeStatusPolling()
   persistConversations()
-  document.removeEventListener('click', handleRetrievalMenuClick)
 })
 
 watch(selectedDocId, async (documentId) => {
@@ -2322,34 +2291,6 @@ watch(conversations, () => {
                 <span>{{ chatRuntimeMessage }}</span>
               </div>
               <div class="composer-actions">
-                <div ref="retrievalMenuRef" class="retrieval-menu composer-retrieval">
-                  <button
-                    class="ghost-button retrieval-menu__button"
-                    type="button"
-                    :disabled="!chatRuntimeReady"
-                    @click.stop="toggleRetrievalMenu"
-                  >
-                    <span>{{ currentRetrievalLabel }}</span>
-                    <ChevronDown :size="16" :class="{ open: retrievalMenuOpen }" />
-                  </button>
-
-                  <transition name="retrieval-menu">
-                    <div v-if="retrievalMenuOpen" class="retrieval-menu__panel">
-                      <button
-                        v-for="option in retrievalOptions"
-                        :key="option.value"
-                        type="button"
-                        class="retrieval-menu__item"
-                        :class="{ active: retrievalMethod === option.value }"
-                        @click.stop="chooseRetrievalMethod(option.value)"
-                      >
-                        <span>{{ option.label }}</span>
-                        <Check v-if="retrievalMethod === option.value" :size="14" />
-                      </button>
-                    </div>
-                  </transition>
-                </div>
-
                 <button
                   class="primary-button send-button"
                   type="button"

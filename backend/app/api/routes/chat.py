@@ -91,6 +91,30 @@ async def delete_conversation(conversation_id: str, current_user=Depends(require
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/consolidate")
+async def consolidate_conversation(conversation_id: str, current_user=Depends(require_current_user)):
+    """会话结束兜底：对整段历史执行三层递进摘要合并。
+
+    前端在切换会话 / 关闭页面时调用一次，把对话内容提炼成
+    semantic_memory_l1/l2/l3 摘要块入库，供后续跨会话语义召回。
+    """
+    try:
+        from app.core.llm import get_default_llm
+        from app.services.memory_service import consolidate_conversation_memory
+
+        merged = await run_in_threadpool(
+            consolidate_conversation_memory,
+            user_id=current_user["user_id"],
+            conversation_id=conversation_id,
+            llm=get_default_llm(),
+        )
+        return {"conversation_id": conversation_id, "consolidated": merged}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/generate", response_model=ChatResponse)
 async def generate_response(request: ChatRequest, current_user=Depends(require_current_user)):
     """生成一次先做意图路由、再按需调用 RAG 工具的回答。"""

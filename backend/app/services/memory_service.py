@@ -14,12 +14,18 @@ from app.config import settings
 from app.core.constants import CHAT_CHUNK_OVERLAP, CHAT_CHUNK_SIZE
 from app.rag.retrieval.base import RetrievalResult
 from app.rag.retrieval.reranker import normalize_text
-from app.storage.sqlite_metadata import MemoryRecord, SessionLocal, init_metadata_db
+from app.storage.sqlite_metadata import (
+    MemoryConsolidationRecord,
+    MemoryRecord,
+    SessionLocal,
+    init_metadata_db,
+)
 from app.utils.chunking import (
     ConversationChunk,
     LongTermMemoryChunk,
     build_conversation_chunks,
     build_semantic_memory_chunks,
+    format_long_term_memory_chunk,
     split_conversation_chunks,
     split_conversation_turns,
 )
@@ -58,6 +64,7 @@ def _build_memory_filter(
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     chunk_type: Optional[str] = None,
+    chunk_types: Optional[Sequence[str]] = None,
     topic: Optional[str] = None,
 ) -> str:
     """构建记忆检索过滤条件。"""
@@ -68,6 +75,12 @@ def _build_memory_filter(
         clauses.append(f'session_id == "{_escape_filter_value(session_id)}"')
     if chunk_type:
         clauses.append(f'chunk_type == "{_escape_filter_value(chunk_type)}"')
+    if chunk_types:
+        escaped_types = ", ".join(
+            f'"{_escape_filter_value(item)}"' for item in chunk_types if str(item or "").strip()
+        )
+        if escaped_types:
+            clauses.append(f"chunk_type in [{escaped_types}]")
     if topic:
         clauses.append(f'topic == "{_escape_filter_value(topic)}"')
     return " and ".join(clauses)
@@ -397,10 +410,14 @@ def register_event_memory_records(
             chunk_index = row.get("chunk_index")
             row_chunk_type = str(row.get("chunk_type") or "").strip()
             if row_chunk_type == "dialogue":
-                logical_key = f"event:{user_key}:{row_conversation_id or 'unknown'}:{memory_id}"
+                logical_key = (
+                    f"event:{user_key}:{row_conversation_id or 'unknown'}:"
+                    f"dialogue:{memory_id}"
+                )
             else:
                 logical_key = (
                     f"event:{user_key}:{row_conversation_id or 'unknown'}:"
+                    f"{row_chunk_type or 'event'}:"
                     f"{chunk_index if chunk_index is not None else memory_id}"
                 )
             current = (
@@ -926,6 +943,7 @@ def search_long_term_memory(
     conversation_id: Optional[str] = None,
     session_id: Optional[str] = None,
     chunk_type: Optional[str] = None,
+    chunk_types: Optional[Sequence[str]] = None,
     topic: Optional[str] = None,
 ) -> List[RetrievalResult]:
     """按向量相似度检索长期记忆。"""
@@ -960,6 +978,7 @@ def search_long_term_memory(
             conversation_id=conversation_id,
             session_id=session_id,
             chunk_type=chunk_type,
+            chunk_types=chunk_types,
             topic=topic,
         )
 
@@ -1242,6 +1261,414 @@ def delete_profile_memories(
         db.close()
 
 
+
+# ==================== 递进摘要合并（memory consolidation）====================
+
+# 三层递进摘要阈值：每满 5 轮合并 L1，满 10 轮合并 L2，满 20 轮合并 L3。
+# 每层是上一层的 2 倍，L2 输入恰好 2 个 L1，L3 输入恰好 2 个 L2，层级自洽。
+CONSOLIDATION_LEVELS: tuple[tuple[int, int], ...] = ((5, 1), (10, 2), (20, 3))
+MERGE_SUMMARY_SYSTEM_PROMPT = (
+    "你是长期记忆递进摘要器。把以下多个摘要块压缩成一段更精炼的高层摘要。"
+    "保留跨块共有的主题、结论、偏好和待办；丢弃单块琐碎细节。"
+    "只输出严格 JSON，格式：{\"topic\":\"主题\",\"summary\":\"一段摘要\"}"
+)
+
+
+def _require_user_key(value: Optional[str]) -> str:
+    return _require_user_id(value)
+
+
+def _get_consolidation_cursor(
+    user_id: str,
+    conversation_id: str,
+    level: int,
+) -> int:
+    """读取某一层的合并游标（已合并到的轮次），无记录返回 0。"""
+    db = SessionLocal()
+    try:
+        record = (
+            db.query(MemoryConsolidationRecord)
+            .filter(
+                MemoryConsolidationRecord.user_id == user_id,
+                MemoryConsolidationRecord.conversation_id == conversation_id,
+                MemoryConsolidationRecord.level == level,
+            )
+            .first()
+        )
+        return int(record.last_merged_turn or 0) if record else 0
+    finally:
+        db.close()
+
+
+def _update_consolidation_cursor(
+    user_id: str,
+    conversation_id: str,
+    level: int,
+    new_turn: int,
+) -> None:
+    """更新某一层的合并游标；不存在则创建。"""
+    db = SessionLocal()
+    try:
+        record = (
+            db.query(MemoryConsolidationRecord)
+            .filter(
+                MemoryConsolidationRecord.user_id == user_id,
+                MemoryConsolidationRecord.conversation_id == conversation_id,
+                MemoryConsolidationRecord.level == level,
+            )
+            .first()
+        )
+        if record is None:
+            record = MemoryConsolidationRecord(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                level=level,
+                last_merged_turn=0,
+            )
+            db.add(record)
+        record.last_merged_turn = max(0, int(new_turn))
+        record.last_merged_at = _utcnow_naive()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _count_dialogue_turns(user_id: str, conversation_id: str) -> int:
+    """统计当前对话已写入的 dialogue 块数量，作为轮次计数。"""
+    prefix = f"event:{user_id}:{conversation_id}:dialogue:"
+    db = SessionLocal()
+    try:
+        return int(
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.conversation_id == conversation_id,
+                MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                MemoryRecord.memory_key.like(prefix + "%"),
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+            )
+            .count()
+        )
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def _load_summary_chunks(
+    user_id: str,
+    conversation_id: str,
+    level: int,
+    start_turn: int,
+    end_turn: int,
+) -> List[Dict[str, str]]:
+    """读取某一层在轮次区间内生成的摘要块，返回 [{topic, summary}] 列表。"""
+    prefix = f"event:{user_id}:{conversation_id}:semantic_memory_l{level}:"
+    db = SessionLocal()
+    try:
+        records = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.conversation_id == conversation_id,
+                MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                MemoryRecord.memory_key.like(prefix + "%"),
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+            )
+            .order_by(MemoryRecord.id.asc())
+            .all()
+        )
+        chunks: List[Dict[str, str]] = []
+        for record in records:
+            content = str(record.content or "")
+            topic = ""
+            summary = ""
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("【主题】"):
+                    topic = line.removeprefix("【主题】").strip()
+                elif line.startswith("【摘要】"):
+                    summary = line.removeprefix("【摘要】").strip()
+            if summary:
+                chunks.append({"topic": topic, "summary": summary})
+        return chunks
+    finally:
+        db.close()
+
+
+def _load_dialogue_turn_range_by_prefix(
+    user_id: str,
+    conversation_id: str,
+    start_turn: int,
+    end_turn: int,
+) -> List[Dict[str, str]]:
+    """按 memory_key 前缀读取 dialogue 原文（兼容 register 时的 key 规则）。"""
+    db = SessionLocal()
+    try:
+        prefix = f"event:{user_id}:{conversation_id}:dialogue:"
+        records = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.conversation_id == conversation_id,
+                MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
+                MemoryRecord.memory_key.like(prefix + "%"),
+                MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+            )
+            .order_by(MemoryRecord.id.asc())
+            .offset(start_turn)
+            .limit(max(0, end_turn - start_turn))
+            .all()
+        )
+        messages: List[Dict[str, str]] = []
+        for record in records:
+            content = str(record.content or "")
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("用户:"):
+                    messages.append({"role": "user", "content": line[3:].strip()})
+                elif line.startswith("助手:"):
+                    messages.append({"role": "assistant", "content": line[3:].strip()})
+        return messages
+    finally:
+        db.close()
+
+
+def merge_summary_level(
+    chunks: Sequence[Dict[str, str]],
+    llm: Any,
+    user_id: str,
+    conversation_id: str,
+    level: int,
+    turn_start: int,
+    turn_end: int,
+) -> int:
+    """把低层摘要块压缩成高层摘要块，入库为 semantic_memory_l{level}。
+
+    输入 chunks 只含低层摘要的 topic/summary，不含原文——高层只负责
+    跨段浓缩，细节下沉在低层。返回写入的块数。
+    """
+    if not chunks:
+        return 0
+    if llm is None:
+        return 0
+
+    texts = []
+    for chunk in chunks:
+        topic = str(chunk.get("topic") or "").strip()
+        summary = str(chunk.get("summary") or "").strip()
+        if topic:
+            texts.append(f"[{topic}] {summary}")
+        else:
+            texts.append(summary)
+
+    response = llm.invoke(
+        [
+            SystemMessage(content=MERGE_SUMMARY_SYSTEM_PROMPT),
+            HumanMessage(content="\n\n".join(texts)),
+        ]
+    )
+    payload = _safe_json_loads(_extract_text(response))
+    topic = str(payload.get("topic") or "对话摘要").strip()
+    summary = str(payload.get("summary") or "").strip()
+    if not summary:
+        summary = (texts[0] if texts else "")[:120]
+
+    block_text = format_long_term_memory_chunk(
+        summary=summary,
+        transcript="\n".join(texts),
+        topic=topic,
+    )
+
+    try:
+        from app.core.embeddings import get_default_embeddings
+        from app.storage.milvus_store import (
+            _ensure_memory_collection,
+            _validate_vector_dimension,
+            get_milvus_client,
+            insert_rows_with_retry,
+        )
+
+        client = get_milvus_client()
+        _ensure_memory_collection(client)
+        _validate_vector_dimension(client, settings.MILVUS_MEMORY_COLLECTION_NAME)
+
+        embeddings = get_default_embeddings()
+        vector = embeddings.embed_documents([block_text])[0]
+
+        memory_id = (
+            f"{user_id}:{conversation_id}:L{level}:"
+            f"{turn_start}:{turn_end}:{uuid.uuid4().hex}"
+        )
+        chunk_index = _count_dialogue_turns(user_id, conversation_id) + turn_start
+        row = {
+            "text": block_text,
+            "vector": vector,
+            "memory_id": memory_id,
+            "chunk_index": chunk_index,
+            "source_name": "conversation",
+            "chunk_text": block_text,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "session_id": conversation_id,
+            "chunk_type": f"semantic_memory_l{level}",
+            "topic": topic,
+            "turn_start": turn_start,
+            "turn_end": turn_end,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        inserted_ids = insert_rows_with_retry(
+            client=client,
+            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
+            rows=[row],
+        )
+        register_event_memory_records(
+            user_id=user_id,
+            rows=[row],
+            conversation_id=conversation_id,
+        )
+        logger.info(
+            "✓ 递进摘要 L%d 写入成功 (user_id=%s, conversation_id=%s, turns=%s-%s)",
+            level,
+            user_id,
+            conversation_id,
+            turn_start,
+            turn_end,
+        )
+        return len(inserted_ids)
+    except Exception as error:
+        logger.error(f"递进摘要 L{level} 写入失败: {str(error)}")
+        return 0
+
+
+def _consolidate_level(
+    user_id: str,
+    conversation_id: str,
+    level: int,
+    threshold: int,
+    llm: Any,
+) -> int:
+    """执行某一层的增量合并：只处理上次合并后的新段。"""
+    user_key = _require_user_key(user_id)
+    cursor = _get_consolidation_cursor(user_key, conversation_id, level)
+    segment_start = (cursor // threshold) * threshold
+
+    if level == 1:
+        # L1：输入新增 dialogue 原文 → 复用语义切块（话题检测 + 摘要 + 原文）
+        messages = _load_dialogue_turn_range_by_prefix(
+            user_key,
+            conversation_id,
+            start_turn=segment_start,
+            end_turn=segment_start + threshold,
+        )
+        if not messages:
+            return 0
+        try:
+            inserted = store_semantic_long_term_memory(
+                messages=messages,
+                user_id=user_key,
+                conversation_id=conversation_id,
+                chunk_type="semantic_memory_l1",
+                llm=llm,
+                token_limit=700,
+                include_system=False,
+                # 合并的就是窗口外历史，不能再排除最近 N 轮，否则全部轮次被丢弃
+                short_window_n=0,
+            )
+        except Exception as exc:
+            logger.warning("L1 合并失败，下次触发点重试: %s", exc)
+            return 0
+    else:
+        # L2 / L3：输入是低层摘要块 → LLM 递进压缩
+        lower_chunks = _load_summary_chunks(
+            user_key,
+            conversation_id,
+            level=level - 1,
+            start_turn=segment_start,
+            end_turn=segment_start + threshold,
+        )
+        inserted = merge_summary_level(
+            chunks=lower_chunks,
+            llm=llm,
+            user_id=user_key,
+            conversation_id=conversation_id,
+            level=level,
+            turn_start=segment_start,
+            turn_end=segment_start + threshold,
+        )
+
+    _update_consolidation_cursor(
+        user_key,
+        conversation_id,
+        level,
+        segment_start + threshold,
+    )
+    # store_semantic_long_term_memory 返回 List，merge_summary_level 返回 int，
+    # 统一归一为写入块数，避免 consolidate_check 里 merged += list 报错。
+    return len(inserted) if isinstance(inserted, (list, tuple)) else int(inserted or 0)
+
+
+def consolidate_check(
+    user_id: Optional[str],
+    conversation_id: Optional[str],
+    llm: Optional[Any] = None,
+) -> int:
+    """每轮写入后调用：逐层检查是否达到合并阈值。
+
+    纯计数检查，未到阈值零成本返回。触发顺序按 L1 → L2 → L3，
+    保证低层先于高层执行（L2 依赖 L1，L3 依赖 L2）。
+    """
+    user_key = _require_user_id(user_id)
+    normalized_conversation = (conversation_id or "").strip()
+    if not normalized_conversation:
+        return 0
+
+    current_turn = _count_dialogue_turns(user_key, normalized_conversation)
+    if current_turn <= 0:
+        return 0
+
+    merged = 0
+    for threshold, level in CONSOLIDATION_LEVELS:
+        if current_turn < threshold:
+            continue
+        cursor = _get_consolidation_cursor(user_key, normalized_conversation, level)
+        if current_turn // threshold > cursor // threshold:
+            merged += _consolidate_level(
+                user_key,
+                normalized_conversation,
+                level=level,
+                threshold=threshold,
+                llm=llm,
+            )
+    return merged
+
+
+def consolidate_conversation_memory(
+    user_id: Optional[str],
+    conversation_id: Optional[str],
+    llm: Optional[Any] = None,
+) -> int:
+    """会话结束兜底：对整段历史做一次全量三层合并。"""
+    user_key = _require_user_id(user_id)
+    normalized_conversation = (conversation_id or "").strip()
+    if not normalized_conversation:
+        return 0
+
+    merged = 0
+    for threshold, level in CONSOLIDATION_LEVELS:
+        merged += _consolidate_level(
+            user_key,
+            normalized_conversation,
+            level=level,
+            threshold=threshold,
+            llm=llm,
+        )
+    return merged
+
+
 __all__ = [
     "store_semantic_long_term_memory",
     "store_long_term_memory",
@@ -1255,4 +1682,7 @@ __all__ = [
     "register_event_memory_records",
     "delete_profile_memories",
     "cleanup_memory_records",
+    "consolidate_check",
+    "consolidate_conversation_memory",
+    "merge_summary_level",
 ]

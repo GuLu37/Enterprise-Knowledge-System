@@ -99,6 +99,15 @@ def _build_filter_terms(query: str, max_terms: int = 12) -> List[str]:
     for part in semantic_parts:
         if part:
             query_terms.append(part)
+        if re.fullmatch(r"[一-鿿]{3,}", part):
+            # 同时补二元词，与 _tokenize 的 bigram 切分保持一致。否则中文查询只
+            # 用整词/三元做候选预筛，会漏掉真正命中相关块的二元词（如「账号密码」
+            # 查询下，讲「修改密码」的块只共享「账号」「密码」二元词却被排除）。
+            query_terms.extend(
+                part[index:index + 2]
+                for index in range(len(part) - 1)
+                if not any(char in "的之与和及在是有为从到对把将" for char in part[index:index + 2])
+            )
         if re.fullmatch(r"[一-鿿]{4,}", part):
             query_terms.extend(
                 part[index:index + 3]

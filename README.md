@@ -27,7 +27,7 @@
 
 RAG 也被视为工具之一，统一以 `search_knowledge_base` 进入 Function Calling。
 
-技能文件采用平铺方式存放在 `backend/app/skills/` 下，索引文件为 `backend/app/skills/skill.md`，Agent 会先读工具列表，再读索引，再按需展开对应 Skill。
+Function Calling 工具列表是 Skill 的发现入口，包含 Skill 名称、适用范围和参数说明。模型选中某个 Skill 后，后端才按名称加载对应目录中的详细文档，并将其用于本次执行和回答。
 
 后端同时保留远程 MCP manifest 注册层，未来可直接把 MCP 工具适配成新的 Skill 暴露给 Agent。
 
@@ -47,7 +47,6 @@ RAG 也被视为工具之一，统一以 `search_knowledge_base` 进入 Function
 - 技能、工具、MCP 的调用都会在后端显式输出，便于排查和审计。
 
 详细评估见 [docs/skill_mcp_highlight_assessment.md](docs/skill_mcp_highlight_assessment.md)。
-技能手册索引见 [backend/app/skills/skill.md](backend/app/skills/skill.md)。
 
 ### Agent 化决策体系
 
@@ -251,6 +250,9 @@ docker compose --profile mysql up -d --build
 │   │   ├── api/          # 接口路由
 │   │   ├── core/         # LLM、Embedding、常量
 │   │   ├── skills/       # Skill 注册、能力目录、技能文档
+│   │   │   ├── memory_query/memory_query.md
+│   │   │   ├── document_hot_word_statistics/document_hot_word_statistics.md
+│   │   │   └── delete_profile_memory/delete_profile_memory.md
 │   │   ├── rag/          # 检索实现
 │   │   ├── services/     # 业务编排
 │   │   ├── tools/        # 统一工具封装与 tracing
