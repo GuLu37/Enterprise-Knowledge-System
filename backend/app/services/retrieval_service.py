@@ -1013,6 +1013,102 @@ def _build_structured_section_summary(
     )
 
 
+def _load_parent_contexts_batch(
+    anchors: Sequence[RetrievalResult],
+) -> Dict[int, str]:
+    """一次会话批量读取所有 anchor 的 Parent 文本，键为 anchor 下标。
+
+    旧实现对每条结果各开一个 SessionLocal（最多 12 次/请求），
+    这里改为两轮 IN 查询（parent_id 优先、parent_index 兜底）一次取回。
+    """
+    wanted: List[Tuple[int, str, str, Any]] = []
+    for index, anchor in enumerate(anchors):
+        metadata = anchor.metadata or {}
+        document_id = str(metadata.get("document_id") or "").strip()
+        if not document_id:
+            continue
+        parent_id = str(metadata.get("parent_id") or "").strip()
+        parent_index = metadata.get("parent_index")
+        wanted.append((index, document_id, parent_id, parent_index))
+    if not wanted:
+        return {}
+
+    parent_texts: Dict[int, str] = {}
+
+    def _record(target_indexes: List[int], row: Any) -> None:
+        text = str(row.chunk_text or "").strip()
+        if not text:
+            return
+        for target_index in target_indexes:
+            if target_index not in parent_texts:
+                parent_texts[target_index] = text
+
+    db = SessionLocal()
+    try:
+        by_parent_key: Dict[Tuple[str, str], List[int]] = {}
+        for index, document_id, parent_id, _parent_index in wanted:
+            if parent_id:
+                by_parent_key.setdefault((document_id, parent_id), []).append(index)
+
+        if by_parent_key:
+            rows = (
+                db.query(DocumentChunkRecord)
+                .filter(
+                    DocumentChunkRecord.document_id.in_(
+                        sorted({key[0] for key in by_parent_key})
+                    ),
+                    DocumentChunkRecord.parent_id.in_(
+                        sorted({key[1] for key in by_parent_key})
+                    ),
+                )
+                .all()
+            )
+            for row in rows:
+                targets = by_parent_key.get((row.document_id, row.parent_id))
+                if targets:
+                    _record(targets, row)
+
+        by_index_key: Dict[Tuple[str, int], List[int]] = {}
+        for index, document_id, _parent_id, parent_index in wanted:
+            if index in parent_texts or parent_index is None:
+                continue
+            try:
+                by_index_key.setdefault(
+                    (document_id, int(parent_index)), []
+                ).append(index)
+            except (TypeError, ValueError):
+                continue
+
+        if by_index_key:
+            rows = (
+                db.query(DocumentChunkRecord)
+                .filter(
+                    DocumentChunkRecord.document_id.in_(
+                        sorted({key[0] for key in by_index_key})
+                    ),
+                    DocumentChunkRecord.chunk_index.in_(
+                        sorted({key[1] for key in by_index_key})
+                    ),
+                )
+                .all()
+            )
+            for row in rows:
+                targets = by_index_key.get((row.document_id, row.chunk_index))
+                if targets:
+                    _record(targets, row)
+    except Exception as exc:
+        logger.debug("SQLite Parent 上下文批量读取失败，逐条回退: %s", exc)
+        for index, anchor in enumerate(anchors):
+            if index in parent_texts:
+                continue
+            single = _load_parent_context(anchor)
+            if single and (single.content or "").strip():
+                parent_texts[index] = single.content
+    finally:
+        db.close()
+    return parent_texts
+
+
 def _expand_parent_evidence(
     results: Sequence[RetrievalResult],
     query: str,
@@ -1021,12 +1117,14 @@ def _expand_parent_evidence(
     if not results:
         return list(results)
 
-    expanded_results: List[RetrievalResult] = []
+    output_slots: List[Optional[RetrievalResult]] = []
+    pending: List[Tuple[int, RetrievalResult]] = []
+    candidates: List[RetrievalResult] = []
     seen_children = set()
 
     for result in results:
         if (result.metadata or {}).get("structured_aggregation"):
-            expanded_results.append(result)
+            output_slots.append(result)
             continue
 
         metadata = result.metadata or {}
@@ -1038,23 +1136,26 @@ def _expand_parent_evidence(
         if child_key in seen_children:
             continue
         seen_children.add(child_key)
+        candidates.append(result)
+        pending.append((len(output_slots), result))
+        output_slots.append(None)
 
-        parent_result = _load_parent_context(result)
-        metadata_with_parent = dict(metadata)
-        if parent_result and (parent_result.content or "").strip():
-            metadata_with_parent["parent_context_text"] = parent_result.content
+    parent_texts = _load_parent_contexts_batch(candidates)
+
+    for candidate_position, (output_index, result) in enumerate(pending):
+        parent_text = parent_texts.get(candidate_position)
+        metadata_with_parent = dict(result.metadata or {})
+        if parent_text:
+            metadata_with_parent["parent_context_text"] = parent_text
             metadata_with_parent["context_expansion"] = True
-
-        expanded_results.append(
-            RetrievalResult(
-                content=result.content,
-                metadata=metadata_with_parent,
-                score=result.score,
-                source=result.source,
-            )
+        output_slots[output_index] = RetrievalResult(
+            content=result.content,
+            metadata=metadata_with_parent,
+            score=result.score,
+            source=result.source,
         )
 
-    return expanded_results
+    return [slot for slot in output_slots if slot is not None]
 
 
 def _expand_structured_section_evidence(

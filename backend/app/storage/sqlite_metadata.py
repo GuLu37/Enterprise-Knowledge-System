@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
     inspect,
     text,
 )
@@ -24,12 +25,27 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+_IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False}
-    if settings.DATABASE_URL.startswith("sqlite")
+    connect_args={"check_same_thread": False, "timeout": 15}
+    if _IS_SQLITE
     else {},
 )
+
+if _IS_SQLITE:
+    # WAL 模式: 读不再阻塞写（检索路径高频读 parent 全文，写入方为文档入库
+    # 与记忆生命周期更新）；WAL 下 synchronous=NORMAL 已足够安全且明显更快。
+    @event.listens_for(engine, "connect")
+    def _sqlite_tune_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=15000")
+        finally:
+            cursor.close()
+
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
