@@ -663,8 +663,41 @@ def _flatten_turn_messages(turns: Sequence[Sequence[Any]]) -> List[Any]:
     return flattened
 
 
+def _topic_text_similarity(current_text: str, next_text: str) -> float:
+    """下一轮 bigram 被当前缓冲的包含度: 高值是同话题的高置信信号。
+
+    注意中文同话题常换措辞（如「报销」vs「住宿费」），包含度低并不
+    代表换题，因此该指标只用于跳过 LLM 的"延续"判定，不做反向推断。
+    """
+    def _bigrams(text: str) -> set:
+        normalized = re.sub(r"\s+", "", (text or ""))
+        return {normalized[i:i + 2] for i in range(len(normalized) - 1)}
+
+    current, incoming = _bigrams(current_text), _bigrams(next_text)
+    if not current or not incoming:
+        return 0.0
+    return len(current & incoming) / len(incoming)
+
+
+# 高置信话题延续信号: 候选轮以指示词开头，或其 bigram 大部分已被缓冲覆盖。
+_TOPIC_CONTINUATION_CUES = (
+    "那",
+    "这个",
+    "它",
+    "上面",
+    "刚才",
+    "继续",
+    "还是",
+    "其中",
+    "他的",
+    "她的",
+    "该",
+)
+_TOPIC_CONTAINMENT_THRESHOLD = 0.50
+
+
 def _build_topic_change_detector(llm: Any):
-    """构建话题切换判断函数。"""
+    """构建话题切换判断函数: 仅高置信"延续"时跳过 LLM，其余交给 LLM。"""
     if llm is None:
         raise ValueError("长期记忆语义切块需要提供 llm")
 
@@ -674,6 +707,11 @@ def _build_topic_change_detector(llm: Any):
     )
 
     def detect(current_text: str, next_text: str) -> bool:
+        stripped_next = (next_text or "").strip()
+        if stripped_next.startswith(_TOPIC_CONTINUATION_CUES):
+            return False
+        if _topic_text_similarity(current_text, stripped_next) >= _TOPIC_CONTAINMENT_THRESHOLD:
+            return False
         response = llm.invoke(
             [
                 SystemMessage(content=system_prompt),
@@ -682,7 +720,7 @@ def _build_topic_change_detector(llm: Any):
                         "当前缓冲区对话：\n"
                         f"{current_text.strip()}\n\n"
                         "候选新增对话：\n"
-                        f"{next_text.strip()}\n\n"
+                        f"{stripped_next.strip()}\n\n"
                         "如果已经明显换题，请返回 changed=true；否则返回 changed=false。"
                     )
                 ),

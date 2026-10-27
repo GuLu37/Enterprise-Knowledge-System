@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import queue
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -3187,6 +3188,39 @@ def _persist_long_term_memory(
         logger.warning("个性化记忆写入失败，已跳过: %s", exc)
 
 
+_MEMORY_PERSIST_QUEUE: "queue.Queue" = queue.Queue(maxsize=100)
+_MEMORY_PERSIST_WORKER_STARTED = False
+_MEMORY_PERSIST_WORKER_LOCK = threading.Lock()
+
+
+def _memory_persist_worker() -> None:
+    """串行消费长期记忆写入任务，异常不中断工作线程。"""
+    while True:
+        task_kwargs = _MEMORY_PERSIST_QUEUE.get()
+        try:
+            _persist_long_term_memory(**task_kwargs)
+        except Exception as exc:
+            logger.warning("后台长期记忆写入失败: %s", exc)
+        finally:
+            _MEMORY_PERSIST_QUEUE.task_done()
+
+
+def _ensure_memory_persist_worker() -> None:
+    """懒启动唯一的长期记忆写入工作线程。"""
+    global _MEMORY_PERSIST_WORKER_STARTED
+    if _MEMORY_PERSIST_WORKER_STARTED:
+        return
+    with _MEMORY_PERSIST_WORKER_LOCK:
+        if _MEMORY_PERSIST_WORKER_STARTED:
+            return
+        threading.Thread(
+            target=_memory_persist_worker,
+            name="memory-persist",
+            daemon=True,
+        ).start()
+        _MEMORY_PERSIST_WORKER_STARTED = True
+
+
 def _persist_long_term_memory_async(
     history: Optional[Iterable[Any]],
     query: str,
@@ -3197,25 +3231,36 @@ def _persist_long_term_memory_async(
     short_window_n: int = DEFAULT_SHORT_MEMORY_N,
     llm: Optional[Any] = None,
 ) -> None:
-    """后台写入长期记忆，不阻塞本次回答结束。"""
+    """后台写入长期记忆，不阻塞本次回答结束。
+
+    使用单工作线程 + 有界队列: 旧实现每条回答起一个裸 daemon 线程，
+    高并发下线程数无界、且多个记忆管线（embedding + LLM 摘要）同时
+    与检索推理抢 CPU。串行消费还能保证对话轮次的记忆写入顺序。
+    队列满时丢弃本轮记忆并记日志，记忆属于尽力而为的增强数据。
+    """
     if not answer or not answer.strip():
         return
 
-    worker = threading.Thread(
-        target=_persist_long_term_memory,
-        kwargs={
-            "history": history,
-            "query": query,
-            "answer": answer,
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "session_id": session_id,
-            "short_window_n": short_window_n,
-            "llm": llm,
-        },
-        daemon=True,
-    )
-    worker.start()
+    _ensure_memory_persist_worker()
+    try:
+        _MEMORY_PERSIST_QUEUE.put_nowait(
+            {
+                "history": history,
+                "query": query,
+                "answer": answer,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "short_window_n": short_window_n,
+                "llm": llm,
+            }
+        )
+    except queue.Full:
+        logger.warning(
+            "长期记忆写入队列已满(%d)，丢弃本轮记忆: query=%s",
+            _MEMORY_PERSIST_QUEUE.maxsize,
+            (query or "")[:32],
+        )
 
 
 def build_chat_messages(
