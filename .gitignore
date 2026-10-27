@@ -12,6 +12,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# ==================== Rust 构建产物 ====================
+backend/native/*/target/
+backend/native/*/dist/
+
 # ==================== 基准/评估产物 ====================
 # 汇总数据集保留入库（rrf_ablation_eval.json），其余明细/基线文件不入库
 docs/rrf_*.json

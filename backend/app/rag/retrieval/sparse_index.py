@@ -19,6 +19,14 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+try:  # Rust 加速内核可选；缺失时自动回退纯 Python 实现
+    from rag_kernels import SparseIndex as _RustSparseIndex
+
+    _RUST_SPARSE_AVAILABLE = True
+except Exception:  # pragma: no cover - 无编译扩展的环境
+    _RustSparseIndex = None
+    _RUST_SPARSE_AVAILABLE = False
+
 _SPARSE_OUTPUT_FIELDS = [
     "child_id",
     "document_id",
@@ -54,19 +62,23 @@ def _tokenize(text: str) -> List[str]:
 class _IndexSnapshot:
     """不可变快照: 构建完成后整体替换引用，读路径完全无锁。"""
 
-    __slots__ = ("rows", "tokens", "bm25", "built_at")
+    __slots__ = ("rows", "tokens", "bm25", "built_at", "rust_index", "row_texts")
 
     def __init__(
         self,
         rows: List[Dict[str, Any]],
-        tokens: List[List[str]],
+        tokens: Optional[List[List[str]]],
         bm25: Any,
         built_at: float,
+        rust_index: Any = None,
+        row_texts: Optional[List[str]] = None,
     ):
         self.rows = rows
         self.tokens = tokens
         self.bm25 = bm25
         self.built_at = built_at
+        self.rust_index = rust_index
+        self.row_texts = row_texts
 
 
 class CachedSparseIndex:
@@ -108,14 +120,15 @@ class CachedSparseIndex:
         self,
         client: Any,
         collection_name: str,
-        query_tokens: Sequence[str],
+        query: str,
         limit: int,
-    ) -> Optional[List[Tuple[Dict[str, Any], float, List[str]]]]:
-        """返回 (行, 切片内 BM25 分, 行 token) top-N; 索引不可用时返回 None。
+    ) -> Optional[List[Tuple[Dict[str, Any], float, float]]]:
+        """返回 (行, 切片内 BM25 分, 词法覆盖分) top-N; 索引不可用时返回 None。
 
         两段式设计: 全语料 BM25 只负责候选选择（等价旧路径的 LIKE 预筛，
         但无全表扫）；选出切片后在切片内重建 BM25 重打分，与旧路径的
         子集统计语义保持一致，避免 IDF 口径变化引起排序回归。
+        Rust 内核可用时整段在原生侧完成（含分词与词法打分）。
         """
         snapshot = self._ensure_snapshot(client, collection_name)
         if snapshot is None:
@@ -123,6 +136,21 @@ class CachedSparseIndex:
         if not snapshot.rows:
             return []
 
+        if snapshot.rust_index is not None:
+            hits = snapshot.rust_index.search(query, limit)
+            return [
+                (snapshot.rows[row_index], float(bm25_score), float(lexical_score))
+                for row_index, bm25_score, lexical_score in hits
+            ]
+
+        from rank_bm25 import BM25Okapi
+
+        from app.rag.retrieval.sparse_retriever import (
+            _lexical_match_score,
+            _tokenize,
+        )
+
+        query_tokens = _tokenize(query)
         global_scores = snapshot.bm25.get_scores(list(query_tokens))
         order = sorted(range(len(global_scores)), key=lambda index: -global_scores[index])
         slice_indexes: List[int] = []
@@ -133,12 +161,19 @@ class CachedSparseIndex:
         if not slice_indexes:
             return []
 
-        from rank_bm25 import BM25Okapi
-
         slice_bm25 = BM25Okapi([snapshot.tokens[index] for index in slice_indexes])
         slice_scores = slice_bm25.get_scores(list(query_tokens))
         return [
-            (snapshot.rows[index], float(slice_scores[position]), snapshot.tokens[index])
+            (
+                snapshot.rows[index],
+                float(slice_scores[position]),
+                _lexical_match_score(
+                    query_tokens,
+                    snapshot.tokens[index],
+                    query,
+                    snapshot.row_texts[index],
+                ),
+            )
             for position, index in enumerate(slice_indexes)
         ]
 
@@ -182,22 +217,39 @@ class CachedSparseIndex:
             )
             return None
 
-        corpus = []
+        row_texts: List[str] = []
         for row in rows:
             source_name = str(row.get("source_name") or "")
             content = str(row.get("child_text") or "")
-            corpus.append(_tokenize("\n".join(part for part in (source_name, content) if part)))
-        bm25 = BM25Okapi(corpus) if corpus else None
+            row_texts.append(
+                "\n".join(part for part in (source_name, content) if part)
+            )
+
+        rust_index = None
+        tokens: Optional[List[List[str]]] = None
+        bm25 = None
+        if _RUST_SPARSE_AVAILABLE:
+            try:
+                rust_index = _RustSparseIndex(row_texts)
+            except Exception as exc:
+                logger.warning("Rust 稀疏内核构建失败，回退纯 Python: %s", exc)
+        if rust_index is None:
+            tokens = [_tokenize(text) for text in row_texts]
+            bm25 = BM25Okapi(tokens) if tokens else None
+
         logger.info(
-            "稀疏持久索引构建完成: rows=%d elapsed=%.2fs",
+            "稀疏持久索引构建完成: rows=%d kernel=%s elapsed=%.2fs",
             len(rows),
+            "rust" if rust_index is not None else "python",
             time.time() - started_at,
         )
         return _IndexSnapshot(
             rows=rows,
-            tokens=corpus,
+            tokens=tokens,
             bm25=bm25,
             built_at=time.time(),
+            rust_index=rust_index,
+            row_texts=row_texts,
         )
 
 

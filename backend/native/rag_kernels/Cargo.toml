@@ -1,0 +1,16 @@
+[package]
+name = "rag_kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Enterprise Knowledge System 检索链路的 Rust 加速内核（BM25/CJK分词/词法打分/规则重排）"
+
+[lib]
+name = "rag_kernels"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py39"] }
+
+[profile.release]
+opt-level = 3
+lto = true

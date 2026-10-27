@@ -1,6 +1,7 @@
 """检索结果打分、重排与融合。"""
 from __future__ import annotations
 
+import functools
 import math
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -11,6 +12,16 @@ from app.utils.logger import setup_logger
 from .base import RetrievalResult
 
 logger = setup_logger(__name__)
+
+try:  # Rust 重排内核可选；缺失或失败时自动回退纯 Python 实现
+    from rag_kernels import fuse_ranked as _rust_fuse_ranked
+    from rag_kernels import rerank as _rust_rerank
+
+    _RUST_RERANK_AVAILABLE = True
+except Exception:  # pragma: no cover - 无编译扩展的环境
+    _rust_rerank = None
+    _rust_fuse_ranked = None
+    _RUST_RERANK_AVAILABLE = False
 
 _QUERY_TERM_PATTERN = re.compile(r"[A-Za-z0-9]+|[一-鿿]{2,}")
 _IDENTIFIER_PATTERN = re.compile(
@@ -184,6 +195,11 @@ def is_identifier_query(query: str) -> bool:
 
 def normalize_text(text: str) -> str:
     """把文本压成便于匹配的形式。"""
+    return _normalize_text_cached(text)
+
+
+@functools.lru_cache(maxsize=8192)
+def _normalize_text_cached(text: str) -> str:
     normalized = (text or "").strip().lower()
     if not normalized:
         return ""
@@ -636,12 +652,61 @@ def _score_result(
     )
 
 
+def _rerank_results_rust(
+    query: str,
+    results: Sequence[RetrievalResult],
+    top_k: int | None,
+) -> List[RetrievalResult]:
+    """Rust 重排内核委托：打分/信号在原生侧完成，pydantic 重建留在 Python。"""
+    candidates = [item for item in results if item and (item.content or "").strip()]
+    if not candidates:
+        return []
+    items = [
+        (
+            item.content or "",
+            str((item.metadata or {}).get("source_name") or ""),
+            float(item.score or 0.0),
+            item.source or "",
+        )
+        for item in candidates
+    ]
+    ranked = _rust_rerank(query, items, top_k)
+    output: List[RetrievalResult] = []
+    for original_index, score, signals in ranked:
+        item = candidates[original_index]
+        specificity = float(signals.get("keyword_specificity") or 0.0)
+        metadata = {
+            **(item.metadata or {}),
+            **{
+                key: value
+                for key, value in signals.items()
+                if key not in {"query_keywords", "query_focus_terms"}
+            },
+            "_relevance_signals": signals,
+            "keyword_specificity": specificity,
+        }
+        output.append(
+            RetrievalResult(
+                content=item.content,
+                metadata=metadata,
+                score=float(score),
+                source=item.source,
+            )
+        )
+    return output
+
+
 def rerank_results(
     query: str,
     results: Sequence[RetrievalResult],
     top_k: int | None = None,
 ) -> List[RetrievalResult]:
     """根据查询词覆盖和原始分数重排结果。"""
+    if _RUST_RERANK_AVAILABLE:
+        try:
+            return _rerank_results_rust(query, results, top_k)
+        except Exception as exc:
+            logger.warning("Rust 重排内核失败，回退纯 Python: %s", exc)
     candidates = [item for item in results if item and (item.content or "").strip()]
     if not candidates:
         return []
@@ -987,6 +1052,58 @@ def _dedup_key(result: RetrievalResult) -> Tuple[str, int, str]:
     return (document_id, chunk_index_value, (result.content or "").strip())
 
 
+def _fuse_ranked_rust(
+    result_sets: Sequence[Sequence[RetrievalResult]],
+    weights: Sequence[float] | None,
+    source_labels: Sequence[str] | None,
+    rrf_k: int,
+) -> List[RetrievalResult]:
+    """Rust RRF 融合委托：融合分与来源标记在原生侧完成，重建留在 Python。"""
+    first_seen: Dict[Tuple[str, int, str], RetrievalResult] = {}
+    py_sets = []
+    for results in result_sets:
+        rows = []
+        for item in results:
+            metadata = item.metadata or {}
+            try:
+                chunk_key = int(metadata.get("chunk_index"))
+            except (TypeError, ValueError):
+                chunk_key = -1
+            content = item.content or ""
+            key = (
+                str(metadata.get("document_id") or ""),
+                chunk_key,
+                content.strip(),
+            )
+            first_seen.setdefault(key, item)
+            rows.append((key[0], metadata.get("chunk_index"), content, float(item.score or 0.0)))
+        py_sets.append(rows)
+
+    fused = _rust_fuse_ranked(
+        py_sets,
+        list(weights or []),
+        list(source_labels or []),
+        int(rrf_k),
+    )
+    merged: List[RetrievalResult] = []
+    for document_id, chunk_key, stripped_content, fused_score, sources in fused:
+        base = first_seen.get((document_id, chunk_key, stripped_content))
+        if base is None:
+            continue
+        metadata = dict(base.metadata or {})
+        metadata["matched_sources"] = list(sources)
+        metadata["fusion_score"] = float(fused_score)
+        merged.append(
+            RetrievalResult(
+                content=base.content,
+                metadata=metadata,
+                score=float(fused_score),
+                source="hybrid",
+            )
+        )
+    return merged
+
+
 def fuse_ranked_results(
     result_sets: Sequence[Sequence[RetrievalResult]],
     weights: Sequence[float] | None = None,
@@ -994,6 +1111,11 @@ def fuse_ranked_results(
     rrf_k: int = 60,
 ) -> List[RetrievalResult]:
     """对多路有序结果执行 RRF 融合，并做初步去重。"""
+    if _RUST_RERANK_AVAILABLE:
+        try:
+            return _fuse_ranked_rust(result_sets, weights, source_labels, rrf_k)
+        except Exception as exc:
+            logger.warning("Rust RRF 融合失败，回退纯 Python: %s", exc)
     fused: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
     resolved_weights = list(weights or [])
     resolved_labels = list(source_labels or [])

@@ -234,18 +234,18 @@ class SparseRetriever(BaseRetriever):
             if not self._is_collection_ready(client):
                 return []
 
-            query_tokens = _tokenize(query)
             candidate_limit = max(top_k * 30, 80)
 
             scored_rows: Optional[List[tuple]] = None
             if (settings.SPARSE_INDEX_MODE or "cached").strip().lower() == "cached":
                 # 进程内持久索引: 无 LIKE 全表扫、无重复分词/建索引，不可用时回退旧路径。
+                # 返回 (行, 切片 BM25 分, 词法覆盖分)，词法分由内核（Rust/Python）统一产出。
                 from .sparse_index import get_sparse_index
 
                 scored_rows = get_sparse_index().search(
                     client,
                     collection_name,
-                    query_tokens,
+                    query,
                     candidate_limit,
                 )
 
@@ -260,14 +260,7 @@ class SparseRetriever(BaseRetriever):
                 return []
 
             ranked_rows = []
-            for row, raw_bm25_score, row_tokens in scored_rows:
-                row_text = _build_searchable_row_text(row)
-                lexical_score = _lexical_match_score(
-                    query_tokens,
-                    row_tokens,
-                    query,
-                    row_text,
-                )
+            for row, raw_bm25_score, lexical_score in scored_rows:
                 final_score = max(0.0, float(raw_bm25_score)) + lexical_score
                 if final_score > 0.0:
                     ranked_rows.append((final_score, row))
@@ -358,8 +351,18 @@ class SparseRetriever(BaseRetriever):
 
         corpus = [_tokenize(_build_searchable_row_text(row)) for row in rows]
         bm25 = BM25Okapi(corpus)
-        bm25_scores = bm25.get_scores(_tokenize(query))
+        query_tokens = _tokenize(query)
+        bm25_scores = bm25.get_scores(query_tokens)
         return [
-            (row, float(score), corpus[index])
+            (
+                row,
+                float(score),
+                _lexical_match_score(
+                    query_tokens,
+                    corpus[index],
+                    query,
+                    _build_searchable_row_text(row),
+                ),
+            )
             for index, (row, score) in enumerate(zip(rows, bm25_scores))
         ]
