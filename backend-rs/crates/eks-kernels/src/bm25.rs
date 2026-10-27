@@ -51,8 +51,7 @@ impl BM25Okapi {
         let mut raw_idf: HashMap<String, f64> = HashMap::with_capacity(doc_frequency.len());
         let mut idf_sum = 0.0f64;
         for (word, df) in &doc_frequency {
-            let value =
-                ((doc_count as f64 - *df as f64 + 0.5) / (*df as f64 + 0.5)).ln();
+            let value = ((doc_count as f64 - *df as f64 + 0.5) / (*df as f64 + 0.5)).ln();
             raw_idf.insert(word.clone(), value);
             idf_sum += value;
         }
@@ -87,7 +86,6 @@ impl BM25Okapi {
         for doc_index in 0..self.doc_count {
             let freqs = &self.doc_term_freqs[doc_index];
             let dl = self.doc_len[doc_index] as f64;
-            // avgdl 为 0（全空语料）时按 rank_bm25 的数学结果：tf 全 0，得分为 0。
             let norm = if self.avgdl > 0.0 {
                 K1 * (1.0 - B + B * dl / self.avgdl)
             } else {
@@ -127,7 +125,7 @@ mod tests {
         let bm25 = BM25Okapi::build(&corpus);
         let query: Vec<String> = vec!["a".into(), "b".into()];
         let scores = bm25.get_scores(&query);
-        assert!(scores[0] > scores[2]); // doc2 无命中
+        assert!(scores[0] > scores[2]);
         assert!(scores[1] > 0.0);
     }
 

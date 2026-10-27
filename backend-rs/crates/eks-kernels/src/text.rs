@@ -4,7 +4,6 @@
 //! 与 `sparse_retriever.py _tokenize`），由 tests/parity 向量钉死。
 
 /// 复刻 reranker._CLEANUP_PATTERN 的字符集：这些字符在归一化时整体移除。
-/// Python 正则类: `[\s\-_.,;:!?，。！？；：、“”‘’"\'`~…·/\\|()[\]{}<>《》]+`
 fn is_cleanup_char(c: char) -> bool {
     c.is_whitespace() // 对齐 Python re 的 \s（含全角空格 U+3000 等 Unicode 空白）
         || matches!(
@@ -30,7 +29,6 @@ pub fn normalize_text(text: &str) -> String {
         .collect()
 }
 
-/// Python 侧 `_QUERY_TERM_PATTERN` 的字符分类：ASCII 字母数字 或 CJK 基本区。
 #[inline]
 fn is_ascii_alnum(c: char) -> bool {
     c.is_ascii_alphanumeric()
@@ -104,9 +102,7 @@ mod tests {
     fn tokenize_basic_cjk() {
         assert_eq!(
             tokenize_cjk("报销时限"),
-            vec![
-                "报销时限", "报销", "销时", "时限", "报销时", "销时限"
-            ]
+            vec!["报销时限", "报销", "销时", "时限", "报销时", "销时限"]
         );
     }
 

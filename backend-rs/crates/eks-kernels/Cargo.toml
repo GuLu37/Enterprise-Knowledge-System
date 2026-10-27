@@ -1,0 +1,7 @@
+[package]
+name = "eks-kernels"
+version.workspace = true
+edition.workspace = true
+description = "Enterprise Knowledge System 检索内核（纯 Rust，无 FFI 依赖；pyo3 扩展与 eks-server 共用）"
+
+[dependencies]

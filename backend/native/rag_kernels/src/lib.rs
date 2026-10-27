@@ -2,15 +2,12 @@
 
 use pyo3::prelude::*;
 
-mod bm25;
 mod embedder;
-mod lexical;
 mod rerank;
-mod text;
 
-use crate::bm25::BM25Okapi;
-use crate::lexical::lexical_match_score;
-use crate::text::{normalize_text, tokenize_cjk};
+use eks_kernels::bm25::BM25Okapi;
+use eks_kernels::lexical::lexical_match_score;
+use eks_kernels::text::{normalize_text, tokenize_cjk};
 
 /// 进程内常驻稀疏索引，替代 Python 侧 rank_bm25 的每次查询重建与全语料打分循环。
 ///

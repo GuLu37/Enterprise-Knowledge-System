@@ -12,7 +12,6 @@ pub fn lexical_match_score(
     query: &str,
     row_text: &str,
 ) -> f64 {
-    // 去重保持顺序
     let mut seen: HashSet<&str> = HashSet::with_capacity(query_tokens.len());
     let unique: Vec<&str> = query_tokens
         .iter()
@@ -59,6 +58,6 @@ mod tests {
         let row_text = "报销时限说明";
         let r = tokenize_cjk(row_text);
         let score = lexical_match_score(&q, &r, query, row_text);
-        assert!(score > 0.35); // 命中 + 整句子串加分
+        assert!(score > 0.35);
     }
 }

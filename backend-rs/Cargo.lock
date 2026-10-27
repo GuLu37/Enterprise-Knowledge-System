@@ -294,6 +294,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eks-kernels"
+version = "0.1.0"
+
+[[package]]
 name = "eks-server"
 version = "0.1.0"
 dependencies = [
