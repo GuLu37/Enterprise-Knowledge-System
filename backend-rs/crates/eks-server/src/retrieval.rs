@@ -67,6 +67,8 @@ pub struct RetrievalItem {
     pub signals: Option<ItemSignals>,
     pub parent_context_text: Option<String>,
     pub rerank_stage: Option<String>,
+    /// Cross-Encoder 精排分数（触发精排时填充）。
+    pub cross_encoder_score: Option<f64>,
     /// 结构化同 Sheet 聚合标记（_expand_structured_section_evidence 产物）。
     pub structured_aggregation: bool,
     pub section_name: Option<String>,
@@ -119,6 +121,7 @@ impl RetrievalItem {
             signals: None,
             parent_context_text: None,
             rerank_stage: None,
+            cross_encoder_score: None,
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
@@ -161,6 +164,10 @@ impl RetrievalItem {
         }
         if self.parent_context_text.is_some() {
             map.insert("context_expansion".into(), json!(true));
+        }
+        if let Some(ce_score) = self.cross_encoder_score {
+            map.insert("cross_encoder_used".into(), json!(true));
+            map.insert("cross_encoder_score".into(), json!(ce_score));
         }
         if self.structured_aggregation {
             map.insert("structured_aggregation".into(), json!(true));

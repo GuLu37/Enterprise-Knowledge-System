@@ -31,9 +31,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder = eks_server::embedder::shared_embedder(&config)
         .map_err(|e| format!("Embedding 内核初始化失败: {e}"))?;
     let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
-    let engine = std::sync::Arc::new(eks_server::retrieval_engine::RetrievalEngine::new(
+    let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
         store, embedder, pool.clone(),
-    ));
+    );
+    if config.cross_encoder_enabled {
+        match eks_server::cross_encoder::CrossEncoder::load(
+            &eks_server::cross_encoder::CrossEncoderConfig {
+                onnx_path: std::path::PathBuf::from(&config.cross_encoder_onnx),
+                tokenizer_path: std::path::PathBuf::from(&config.cross_encoder_tokenizer),
+                max_length: 512,
+                batch_size: 8,
+            },
+        ) {
+            Ok(ce) => {
+                tracing::info!("✓ Cross-Encoder ONNX 内核就绪 (adaptive)");
+                engine = engine.with_cross_encoder(
+                    std::sync::Arc::new(ce),
+                    config.cross_encoder_candidate_k,
+                    config.cross_encoder_weight,
+                    config.rule_rerank_weight,
+                    config.cross_encoder_confidence_threshold,
+                    config.cross_encoder_confidence_margin,
+                    config.cross_encoder_trigger_mode.clone(),
+                );
+            }
+            Err(exc) => {
+                tracing::warn!(
+                    "Cross-Encoder 内核不可用，检索将走纯规则路径: {exc}"
+                );
+            }
+        }
+    }
+    let engine = std::sync::Arc::new(engine);
 
     tracing::info!(
         "eks-server 启动: {addr} | sqlite={} | prefix={}",

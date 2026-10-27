@@ -148,6 +148,13 @@ pub struct RetrievalEngine {
     pub store: MilvusLiteStore,
     pub embedder: Arc<Embedder>,
     pub pool: sqlx::SqlitePool,
+    pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
+    pub ce_candidate_k: usize,
+    pub ce_weight: f64,
+    pub rule_weight: f64,
+    pub ce_threshold: f64,
+    pub ce_margin: f64,
+    pub ce_trigger_mode: String,
     sparse: tokio::sync::RwLock<Option<Arc<SparseIndexSnapshot>>>,
 }
 
@@ -157,8 +164,35 @@ impl RetrievalEngine {
             store,
             embedder,
             pool,
+            cross_encoder: None,
+            ce_candidate_k: 30,
+            ce_weight: 0.65,
+            rule_weight: 0.35,
+            ce_threshold: 0.60,
+            ce_margin: 0.08,
+            ce_trigger_mode: "adaptive".to_string(),
             sparse: tokio::sync::RwLock::new(None),
         }
+    }
+
+    pub fn with_cross_encoder(
+        mut self,
+        ce: crate::cross_encoder::SharedCrossEncoder,
+        candidate_k: usize,
+        ce_weight: f64,
+        rule_weight: f64,
+        threshold: f64,
+        margin: f64,
+        trigger_mode: String,
+    ) -> Self {
+        self.cross_encoder = Some(ce);
+        self.ce_candidate_k = candidate_k;
+        self.ce_weight = ce_weight;
+        self.rule_weight = rule_weight;
+        self.ce_threshold = threshold;
+        self.ce_margin = margin;
+        self.ce_trigger_mode = trigger_mode;
+        self
     }
 
     async fn sparse_snapshot(&self) -> Result<Arc<SparseIndexSnapshot>, String> {
@@ -328,6 +362,10 @@ impl RetrievalEngine {
     }
 
     /// 规则重排（Rust 侧无 cross-encoder，等价 adaptive 跳过路径的打分）。
+    pub fn rule_rerank_pub(&self, query: &str, items: Vec<RetrievalItem>) -> Vec<RetrievalItem> {
+        self.rule_rerank(query, items)
+    }
+
     fn rule_rerank(&self, query: &str, items: Vec<RetrievalItem>) -> Vec<RetrievalItem> {
         if items.is_empty() {
             return items;
@@ -506,7 +544,11 @@ impl RetrievalEngine {
         if candidates.is_empty() {
             return Vec::new();
         }
-        let reranked = self.rule_rerank(query, candidates);
+        let candidates_count = candidates.len();
+        // Python 语义: filter 以 top_k=len(candidates) 调用 cascade —— small_pool
+        // 门控因此几乎总跳过精排，只有显式低置信路径才会触发 CE。
+        let cascade_limit = candidates_count;
+        let reranked = self.cascade_rerank(query, candidates, cascade_limit);
         if reranked.is_empty() {
             return Vec::new();
         }

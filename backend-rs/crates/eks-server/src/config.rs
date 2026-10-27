@@ -15,6 +15,15 @@ pub struct Config {
     pub bge_query_instruction: String,
     pub bge_max_length: i64,
     pub milvus_lite_path: String,
+    pub cross_encoder_enabled: bool,
+    pub cross_encoder_onnx: String,
+    pub cross_encoder_tokenizer: String,
+    pub cross_encoder_candidate_k: usize,
+    pub cross_encoder_weight: f64,
+    pub rule_rerank_weight: f64,
+    pub cross_encoder_confidence_threshold: f64,
+    pub cross_encoder_confidence_margin: f64,
+    pub cross_encoder_trigger_mode: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -28,6 +37,23 @@ fn env_i64(key: &str, default: i64) -> i64 {
     env::var(key)
         .ok()
         .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_lowercase();
+            normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on"
+        })
         .unwrap_or(default)
 }
 
@@ -61,6 +87,15 @@ impl Config {
                 "EKS_MILVUS_LITE_PATH",
                 "../backend/app/data/milvus_lite.db",
             ),
+            cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", true),
+            cross_encoder_onnx: env_or("EKS_CROSS_ENCODER_ONNX", ""),
+            cross_encoder_tokenizer: env_or("EKS_CROSS_ENCODER_TOKENIZER", ""),
+            cross_encoder_candidate_k: env_i64("CROSS_ENCODER_CANDIDATE_K", 30).max(1) as usize,
+            cross_encoder_weight: env_f64("CROSS_ENCODER_WEIGHT", 0.65).clamp(0.0, 1.0),
+            rule_rerank_weight: env_f64("RULE_RERANK_WEIGHT", 0.35).clamp(0.0, 1.0),
+            cross_encoder_confidence_threshold: env_f64("CROSS_ENCODER_CONFIDENCE_THRESHOLD", 0.60).clamp(0.0, 1.0),
+            cross_encoder_confidence_margin: env_f64("CROSS_ENCODER_CONFIDENCE_MARGIN", 0.08).clamp(0.0, 1.0),
+            cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
         }
     }
 }

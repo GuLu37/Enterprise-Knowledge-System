@@ -1,5 +1,7 @@
 //! eks-server 库层：供二进制入口与集成测试共用。
 pub mod auth;
+pub mod cascade;
+pub mod cross_encoder;
 pub mod config;
 pub mod db;
 pub mod embedder;

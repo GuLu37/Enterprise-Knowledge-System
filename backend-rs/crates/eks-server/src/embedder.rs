@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 
 static ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
 
-fn ort_environment() -> Result<&'static ort::environment::Environment, String> {
+pub fn ort_environment_shared() -> Result<&'static ort::environment::Environment, String> {
     if let Some(env) = ORT_ENV.get() {
         return Ok(env);
     }
@@ -75,7 +75,7 @@ impl Embedder {
             .token_to_id("[PAD]")
             .ok_or("vocab 缺少 [PAD]")? as i64;
 
-        let environment = ort_environment().map_err(String::from)?;
+        let environment = ort_environment_shared()?;
         let session = ort::session::Session::builder(environment)
             .and_then(|b| {
                 b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
