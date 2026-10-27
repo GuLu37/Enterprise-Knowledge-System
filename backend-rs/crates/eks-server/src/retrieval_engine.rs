@@ -21,6 +21,8 @@ use crate::retrieval::{
 
 const MAX_MULTI_QUERY_COUNT: usize = 3;
 const MIN_RAG_CANDIDATE_POOL: usize = 60;
+const STRUCTURED_SECTION_PARENT_LIMIT: usize = 200;
+const STRUCTURED_SECTION_ROW_CHAR_LIMIT: usize = 24000;
 
 fn candidate_pool_limit(top_k: usize) -> usize {
     (top_k * 8).max(top_k + 20).max(MIN_RAG_CANDIDATE_POOL)
@@ -181,7 +183,7 @@ impl RetrievalEngine {
         *self.sparse.write().await = None;
     }
 
-    /// 完整 RAG 工作流（对齐 run_rag_workflow, llm=None；结构化聚合展开留待 B4b）。
+    /// 完整 RAG 工作流（对齐 run_rag_workflow, llm=None）。
     pub async fn run_rag_workflow(
         &self,
         query: &str,
@@ -193,7 +195,15 @@ impl RetrievalEngine {
         }
         let recalled = self.retrieve_documents_multi_query(normalized_query, top_k).await?;
         let processed = self.post_process(normalized_query, recalled, top_k).await?;
-        let context = crate::retrieval::assemble_rag_context(&processed, 6500);
+        let max_chars = if processed
+            .iter()
+            .any(|item| item.structured_aggregation)
+        {
+            crate::retrieval::STRUCTURED_CONTEXT_MAX_CHARS
+        } else {
+            crate::retrieval::RAG_CONTEXT_MAX_CHARS
+        };
+        let context = crate::retrieval::assemble_rag_context(&processed, max_chars);
         Ok((processed, context))
     }
 
@@ -394,7 +404,83 @@ impl RetrievalEngine {
         top_k: usize,
     ) -> Result<Vec<RetrievalItem>, String> {
         let filtered = self.filter_retrieval_results(query, results, top_k);
-        self.expand_parent_evidence(filtered).await
+        let expanded = self.expand_structured_section_evidence(query, filtered).await;
+        self.expand_parent_evidence(expanded).await
+    }
+
+    /// 复刻 _expand_structured_section_evidence：同 Sheet parent 聚合为可读证据。
+    async fn expand_structured_section_evidence(
+        &self,
+        query: &str,
+        results: Vec<RetrievalItem>,
+    ) -> Vec<RetrievalItem> {
+        if !results.iter().any(is_structured_result) {
+            return results;
+        }
+        let mut parent_cache: HashMap<String, Vec<ParentRecord>> = HashMap::new();
+        let mut seen_sections: HashSet<(String, String)> = HashSet::new();
+        let mut expanded: Vec<RetrievalItem> = Vec::with_capacity(results.len());
+        for item in results {
+            if !is_structured_result(&item) || is_reference_index_result(&item.content) {
+                expanded.push(item);
+                continue;
+            }
+            let section_name = structured_section_marker(&item.content);
+            let section_key = (item.document_id.clone(), section_name.clone());
+            if item.document_id.is_empty() || section_name.is_empty()
+                || seen_sections.contains(&section_key)
+            {
+                expanded.push(item);
+                continue;
+            }
+            seen_sections.insert(section_key);
+            if !parent_cache.contains_key(&item.document_id) {
+                let rows = self.query_parent_rows_by_document(&item.document_id).await;
+                parent_cache.insert(item.document_id.clone(), rows);
+            }
+            let parent_rows = parent_cache
+                .get(&item.document_id)
+                .cloned()
+                .unwrap_or_default();
+            match build_structured_section_summary(&item, &parent_rows, query) {
+                Some(summary) => expanded.push(summary),
+                None => expanded.push(item),
+            }
+        }
+        expanded
+    }
+
+    /// 按 document_id 读取全部 parent 行（chunk_index 升序）。
+    async fn query_parent_rows_by_document(
+        &self,
+        document_id: &str,
+    ) -> Vec<ParentRecord> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            parent_id: Option<String>,
+            document_id: String,
+            chunk_index: i64,
+            chunk_text: String,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT parent_id, document_id, chunk_index, chunk_text FROM document_chunks \
+             WHERE document_id = ? ORDER BY chunk_index ASC",
+        )
+        .bind(document_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .filter(|row| !row.chunk_text.trim().is_empty())
+            .map(|row| ParentRecord {
+                parent_id: row
+                    .parent_id
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| format!("{}:p{:06}", row.document_id, row.chunk_index)),
+                parent_index: row.chunk_index,
+                parent_text: row.chunk_text,
+            })
+            .collect()
     }
 
     fn filter_retrieval_results(
@@ -565,6 +651,11 @@ impl RetrievalEngine {
         let mut output: Vec<RetrievalItem> = Vec::with_capacity(results.len());
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         for item in results {
+            if item.structured_aggregation {
+                // 聚合证据已是完整上下文，跳过父块回填（对齐 Python 语义）。
+                output.push(item);
+                continue;
+            }
             let key = citation_chunk_key(&item);
             if seen.contains(&key) {
                 continue;
@@ -685,4 +776,152 @@ impl RetrievalItem {
             source: &self.source,
         }
     }
+}
+
+// ---------------- 结构化聚合辅助（复刻 _parse_structured_table 等） ----------------
+
+#[derive(Debug, Clone)]
+pub struct ParentRecord {
+    pub parent_id: String,
+    pub parent_index: i64,
+    pub parent_text: String,
+}
+
+/// 复刻 _structured_section_marker_from_text：首个非空行匹配 [Sheet] 名。
+fn structured_section_marker(text: &str) -> String {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("[sheet]") {
+            return rest.trim().to_string();
+        }
+        return String::new();
+    }
+    String::new()
+}
+
+fn parse_structured_table(
+    parent_texts: &[String],
+) -> (String, Vec<String>, Vec<String>) {
+    let mut sheet_name = String::new();
+    let mut header = String::new();
+    let mut rows: Vec<String> = Vec::new();
+    let mut seen_rows: HashSet<String> = HashSet::new();
+
+    for parent_text in parent_texts {
+        let lines: Vec<&str> = parent_text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        for line in lines {
+            let lower = line.to_lowercase();
+            if let Some(rest) = lower.strip_prefix("[sheet]") {
+                let current = rest.trim().to_string();
+                if sheet_name.is_empty() {
+                    sheet_name = current;
+                }
+                continue;
+            }
+            if header.is_empty() {
+                header = line.to_string();
+                continue;
+            }
+            if eks_kernels::text::normalize_text(line) == eks_kernels::text::normalize_text(&header) {
+                continue;
+            }
+            let row_key = eks_kernels::text::normalize_text(line);
+            if row_key.is_empty() || seen_rows.contains(&row_key) {
+                continue;
+            }
+            seen_rows.insert(row_key);
+            rows.push(line.to_string());
+        }
+    }
+    let headers: Vec<String> = header
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    (sheet_name, headers, rows)
+}
+
+fn row_matches_query(row: &str, query: &str) -> bool {
+    let keywords = build_query_keywords(query, 32);
+    let normalized_row = eks_kernels::text::normalize_text(row);
+    let stop = ["员工", "人员", "部门", "名单", "列表", "清单", "统计", "总数", "数量"];
+    let useful: Vec<&String> = keywords
+        .iter()
+        .filter(|k| !k.is_empty() && !stop.contains(&k.as_str()) && k.chars().count() >= 2)
+        .collect();
+    if useful.is_empty() {
+        return false;
+    }
+    useful
+        .iter()
+        .any(|keyword| normalized_row.contains(keyword.as_str()))
+}
+
+/// 复刻 _build_structured_section_summary：同 sheet parent 压缩为可读证据。
+fn build_structured_section_summary(
+    anchor: &RetrievalItem,
+    parent_rows: &[ParentRecord],
+    query: &str,
+) -> Option<RetrievalItem> {
+    let section_name = structured_section_marker(&anchor.content);
+    if section_name.is_empty() {
+        return None;
+    }
+    let mut same_section: Vec<&ParentRecord> = parent_rows
+        .iter()
+        .filter(|row| structured_section_marker(&row.parent_text) == section_name)
+        .collect();
+    same_section.sort_by_key(|row| row.parent_index);
+    same_section.truncate(crate::retrieval_engine::STRUCTURED_SECTION_PARENT_LIMIT);
+    if same_section.is_empty() {
+        return None;
+    }
+    let texts: Vec<String> = same_section
+        .iter()
+        .map(|row| row.parent_text.clone())
+        .collect();
+    let (sheet_name, headers, rows) = parse_structured_table(&texts);
+    if rows.is_empty() {
+        return None;
+    }
+
+    let matched_rows: Vec<&String> = rows.iter().filter(|row| row_matches_query(row, query)).collect();
+    let matched_set: HashSet<&String> = matched_rows.iter().copied().collect();
+    let mut ordered: Vec<&String> = matched_rows.clone();
+    ordered.extend(rows.iter().filter(|row| !matched_set.contains(row)));
+
+    let mut rendered: Vec<&String> = Vec::new();
+    let mut used_chars = 0usize;
+    for row in ordered {
+        let next_len = row.chars().count() + 1;
+        if used_chars + next_len > STRUCTURED_SECTION_ROW_CHAR_LIMIT {
+            break;
+        }
+        rendered.push(row);
+        used_chars += next_len;
+    }
+    if rendered.is_empty() {
+        return None;
+    }
+
+    let content = format!(
+        "[Sheet] {}\n字段: {}\n去重记录数: {}\n优先匹配行数: {}\n数据行:\n{}",
+        if sheet_name.is_empty() { section_name.clone() } else { sheet_name.clone() },
+        if headers.is_empty() { "未知".to_string() } else { headers.join("、") },
+        rows.len(),
+        matched_rows.len(),
+        rendered.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
+    );
+    let mut summary = anchor.clone();
+    summary.content = content;
+    summary.structured_aggregation = true;
+    summary.section_name = Some(if sheet_name.is_empty() { section_name } else { sheet_name });
+    summary.chunk_indices = same_section.iter().map(|row| row.parent_index).collect();
+    summary.score = anchor.score.max(0.0) + 0.08;
+    summary.source = "structured_evidence".to_string();
+    Some(summary)
 }

@@ -26,6 +26,7 @@ const MAX_MULTI_QUERY_COUNT: usize = 3;
 pub const MAX_CITATION_RESULTS: usize = 3;
 pub const STRUCTURED_QUERY_CITATION_RESULTS: usize = 12;
 pub const RAG_CONTEXT_MAX_CHARS: usize = 6500;
+pub const STRUCTURED_CONTEXT_MAX_CHARS: usize = 30000;
 pub const MIN_FINAL_RELEVANCE_SCORE: f64 = 0.28;
 const MIN_RAG_CANDIDATE_POOL: usize = 60;
 
@@ -66,6 +67,10 @@ pub struct RetrievalItem {
     pub signals: Option<ItemSignals>,
     pub parent_context_text: Option<String>,
     pub rerank_stage: Option<String>,
+    /// 结构化同 Sheet 聚合标记（_expand_structured_section_evidence 产物）。
+    pub structured_aggregation: bool,
+    pub section_name: Option<String>,
+    pub chunk_indices: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +119,9 @@ impl RetrievalItem {
             signals: None,
             parent_context_text: None,
             rerank_stage: None,
+            structured_aggregation: false,
+            section_name: None,
+            chunk_indices: Vec::new(),
         }
     }
 
@@ -153,6 +161,15 @@ impl RetrievalItem {
         }
         if self.parent_context_text.is_some() {
             map.insert("context_expansion".into(), json!(true));
+        }
+        if self.structured_aggregation {
+            map.insert("structured_aggregation".into(), json!(true));
+            if let Some(section) = &self.section_name {
+                map.insert("section_name".into(), json!(section));
+            }
+            if !self.chunk_indices.is_empty() {
+                map.insert("chunk_indices".into(), json!(self.chunk_indices));
+            }
         }
         json!({
             "content": self.content,
