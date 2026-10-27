@@ -24,6 +24,17 @@ pub struct Config {
     pub cross_encoder_confidence_threshold: f64,
     pub cross_encoder_confidence_margin: f64,
     pub cross_encoder_trigger_mode: String,
+    pub llm_temperature: f64,
+    pub llm_timeout: u64,
+    pub llm_max_fallback_attempts: usize,
+    pub deepseek_api_key: String,
+    pub deepseek_base_url: String,
+    pub deepseek_model: String,
+    pub openrouter_api_key: String,
+    pub openrouter_api_base: String,
+    pub openrouter_model: String,
+    pub openai_api_key: String,
+    pub openai_model: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -96,6 +107,17 @@ impl Config {
             cross_encoder_confidence_threshold: env_f64("CROSS_ENCODER_CONFIDENCE_THRESHOLD", 0.60).clamp(0.0, 1.0),
             cross_encoder_confidence_margin: env_f64("CROSS_ENCODER_CONFIDENCE_MARGIN", 0.08).clamp(0.0, 1.0),
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
+            llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
+            llm_timeout: env_i64("LLM_TIMEOUT", 60).max(1) as u64,
+            llm_max_fallback_attempts: env_i64("LLM_MAX_FALLBACK_ATTEMPTS", 2).max(1) as usize,
+            deepseek_api_key: env_or("DEEPSEEK_API_KEY", ""),
+            deepseek_base_url: env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            deepseek_model: env_or("DEEPSEEK_MODEL", "deepseek-chat"),
+            openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
+            openrouter_api_base: env_or("OPENROUTER_API_BASE", ""),
+            openrouter_model: env_or("OPENROUTER_MODEL", ""),
+            openai_api_key: env_or("OPENAI_API_KEY", ""),
+            openai_model: env_or("OPENAI_MODEL", "gpt-4o-mini"),
         }
     }
 }

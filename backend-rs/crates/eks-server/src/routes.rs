@@ -68,7 +68,7 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
 }
 
 /// 与 Python `require_current_user` 等价：验令牌 + 会话有效性 + 滑动续期。
-async fn require_current_user(
+pub async fn require_current_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<db::UserRow, AuthError> {
@@ -265,6 +265,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             &format!("{prefix}/retrieval/cache-clear"),
             post(retrieval_cache_clear),
+        )
+        .route(
+            &format!("{prefix}/chat/stream"),
+            post(crate::chat_stream::stream_chat),
         )
         .with_state(state)
 }
