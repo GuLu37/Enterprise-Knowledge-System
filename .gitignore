@@ -1,0 +1,26 @@
+# ==================== 安全/代理工具状态目录 ====================
+.mimosa/
+.workbuddy/
+.zcode/
+
+# ==================== IDE / 编辑器 ====================
+.idea/
+.vscode/
+
+# ==================== Python 缓存（根目录级） ====================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ==================== 基准/评估产物 ====================
+# 汇总数据集保留入库（rrf_ablation_eval.json），其余明细/基线文件不入库
+docs/rrf_*.json
+!docs/rrf_ablation_eval.json
+docs/rrf_*.log
+backend/bench_*.txt
+backend/bench_results/
+
+# ==================== 本地临时文件 ====================
+*.tmp
+*.bak
+.DS_Store
