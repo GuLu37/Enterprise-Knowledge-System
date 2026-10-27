@@ -280,6 +280,18 @@ pub fn router(state: AppState) -> axum::Router {
             axum::routing::put(crate::conversations::upsert_conversation)
                 .delete(crate::conversations::delete_conversation),
         )
+        .route(
+            &format!("{prefix}/documents"),
+            get(crate::documents::list_documents),
+        )
+        .route(
+            &format!("{prefix}/documents/{{document_id}}"),
+            axum::routing::delete(crate::documents::delete_document),
+        )
+        .route(
+            &format!("{prefix}/skills"),
+            get(crate::documents::list_skills),
+        )
         .with_state(state)
 }
 

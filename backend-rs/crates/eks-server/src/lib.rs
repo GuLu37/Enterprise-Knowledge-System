@@ -6,6 +6,7 @@ pub mod conversations;
 pub mod cross_encoder;
 pub mod config;
 pub mod db;
+pub mod documents;
 pub mod embedder;
 pub mod llm;
 pub mod milvus_lite;
