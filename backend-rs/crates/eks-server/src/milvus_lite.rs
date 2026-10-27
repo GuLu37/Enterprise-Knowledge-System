@@ -77,7 +77,7 @@ struct PartitionFiles {
 
 #[derive(Clone)]
 pub struct MilvusLiteStore {
-    root: PathBuf,
+    pub root: PathBuf,
     cache: Arc<RwLock<HashMap<String, (SystemTime, Arc<CollectionSnapshot>)>>>,
 }
 

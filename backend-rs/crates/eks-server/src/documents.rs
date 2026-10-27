@@ -162,3 +162,137 @@ impl AuthError {
         }
     }
 }
+
+// POST /api/v1/documents/upload (multipart)
+pub async fn upload_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+
+    // 读取第一个文件字段
+    let mut filename = String::new();
+    let mut file_data: Vec<u8> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AuthError::bad_request(&format!("multipart 读取失败: {e}")))?
+    {
+        if field.name() == Some("file") {
+            filename = field.file_name().unwrap_or("unknown").to_string();
+            file_data = field
+                .bytes()
+                .await
+                .map_err(|e| AuthError::bad_request(&format!("文件读取失败: {e}")))?
+                .to_vec();
+            break;
+        }
+    }
+
+    if filename.is_empty() || file_data.is_empty() {
+        return Err(AuthError::bad_request("文件不能为空"));
+    }
+
+    let document_id = uuid::Uuid::new_v4().simple().to_string();
+    let file_type = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+
+    // 1) 文本提取
+    let text = crate::ingest::extract_text(&filename, &file_data)
+        .map_err(|e| AuthError::bad_request(&format!("文档解析失败: {e}")))?;
+
+    if text.trim().is_empty() {
+        return Err(AuthError::bad_request("文档内容为空，无法生成向量"));
+    }
+
+    // 2) Parent-Child 切块
+    let chunks = crate::ingest::build_parent_child_chunks(&document_id, &text, &file_type);
+    if chunks.children.is_empty() {
+        return Err(AuthError::bad_request("文档切块失败，未生成有效内容"));
+    }
+
+    // 3) 向量化
+    let child_texts: Vec<String> = chunks
+        .children
+        .iter()
+        .map(|c| c.child_text.clone())
+        .collect();
+    let vectors = state
+        .engine
+        .embedder
+        .embed_documents(&child_texts)
+        .map_err(|e| AuthError {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            detail: format!("向量化失败: {e}"),
+        })?;
+
+    // 4) milvus_lite 追加写入
+    crate::ingest::append_to_milvus_lite(
+        &state.engine.store,
+        "doc_chunk",
+        &chunks.children,
+        &filename,
+        &file_type,
+        "application/octet-stream",
+        &vectors,
+    )
+    .await
+    .map_err(|e| AuthError {
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("向量库写入失败: {e}"),
+    })?;
+
+    // 5) SQLite 元数据
+    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    sqlx::query(
+        "INSERT INTO documents (document_id, original_filename, stored_filename, file_path,          content_type, file_type, file_size, status, chunk_count, error_message, created_at, updated_at)          VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, NULL, ?, ?)",
+    )
+    .bind(&document_id)
+    .bind(&filename)
+    .bind(&format!("{document_id}.{file_type}"))
+    .bind("") // file_path 由 Python 端管理
+    .bind("application/octet-stream")
+    .bind(&file_type)
+    .bind(file_data.len() as i64)
+    .bind(chunks.children.len() as i64)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await
+    .map_err(AuthError::from)?;
+
+    // parent 行写入 document_chunks
+    for parent in &chunks.parents {
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at)              VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&parent.document_id)
+        .bind(parent.parent_index)
+        .bind(&parent.parent_id)
+        .bind(&parent.parent_text)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .map_err(AuthError::from)?;
+    }
+
+    // 6) 失效缓存
+    state.engine.invalidate().await;
+
+    // 保存上传文件
+    let upload_dir = std::path::Path::new(&state.config.sqlite_path)
+        .parent()
+        .map(|p| p.join("uploads"))
+        .unwrap_or_default();
+    let _ = std::fs::create_dir_all(&upload_dir);
+    let _ = std::fs::write(upload_dir.join(&format!("{document_id}.{file_type}")), &file_data);
+
+    Ok(Json(json!({
+        "document_id": document_id,
+        "original_filename": filename,
+        "file_type": file_type,
+        "file_size": file_data.len(),
+        "status": "ready",
+        "chunk_count": chunks.children.len(),
+    })))
+}

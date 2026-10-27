@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod documents;
 pub mod embedder;
+pub mod ingest;
 pub mod llm;
 pub mod milvus_lite;
 pub mod retrieval;

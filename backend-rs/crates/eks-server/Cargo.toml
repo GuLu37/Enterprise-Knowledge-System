@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Enterprise Knowledge System 后端（Rust 全量重写，分阶段绞杀 Python 版）"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +28,8 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 async-stream = "0.3"
 futures-util = "0.3"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+calamine = "0.24"
+zip = "1"
 parquet = { version = "53", features = ["arrow"] }
 arrow = "53"
 arrow-array = "53"

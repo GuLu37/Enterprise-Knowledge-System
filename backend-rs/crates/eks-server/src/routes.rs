@@ -285,6 +285,10 @@ pub fn router(state: AppState) -> axum::Router {
             get(crate::documents::list_documents),
         )
         .route(
+            &format!("{prefix}/documents/upload"),
+            axum::routing::post(crate::documents::upload_document),
+        )
+        .route(
             &format!("{prefix}/documents/{{document_id}}"),
             axum::routing::delete(crate::documents::delete_document),
         )
