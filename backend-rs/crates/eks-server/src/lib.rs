@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod chat_stream;
 pub mod cascade;
+pub mod conversations;
 pub mod cross_encoder;
 pub mod config;
 pub mod db;

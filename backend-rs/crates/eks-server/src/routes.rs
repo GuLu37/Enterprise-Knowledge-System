@@ -270,6 +270,16 @@ pub fn router(state: AppState) -> axum::Router {
             &format!("{prefix}/chat/stream"),
             post(crate::chat_stream::stream_chat),
         )
+        .route(
+            &format!("{prefix}/chat/conversations"),
+            get(crate::conversations::list_conversations)
+                .delete(crate::conversations::clear_conversations),
+        )
+        .route(
+            &format!("{prefix}/chat/conversations/{{conversation_id}}"),
+            axum::routing::put(crate::conversations::upsert_conversation)
+                .delete(crate::conversations::delete_conversation),
+        )
         .with_state(state)
 }
 
