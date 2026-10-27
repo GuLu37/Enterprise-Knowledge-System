@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 
 mod bm25;
+mod embedder;
 mod lexical;
 mod rerank;
 mod text;
@@ -130,6 +131,7 @@ fn lexical_score(query: String, row_text: String) -> f64 {
 #[pymodule]
 fn rag_kernels(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SparseIndex>()?;
+    m.add_class::<embedder::RustEmbedder>()?;
     m.add_function(wrap_pyfunction!(tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(bm25_scores, m)?)?;

@@ -133,6 +133,69 @@ class TestLexicalParity:
         assert index.row_count == 2
 
 
+class TestEmbedderParity:
+    """Rust ONNX 内核 vs torch 的向量一致性（>0.999）与内核选择。"""
+
+    def _torch_embedder(self):
+        from app.core.embeddings import get_bge_embeddings
+
+        return get_bge_embeddings()
+
+    def _rust_embedder(self):
+        from app.core.embeddings import RustBGEEmbeddings
+        from app.config import settings
+
+        return RustBGEEmbeddings(
+            model_dir=settings.BGE_MODEL_NAME,
+            max_length=settings.BGE_MAX_LENGTH,
+            batch_size=settings.BGE_BATCH_SIZE,
+            query_instruction=settings.BGE_QUERY_INSTRUCTION,
+        )
+
+    def test_query_cosine_parity(self):
+        rust = self._rust_embedder()
+        torch_emb = self._torch_embedder()
+        queries = [
+            "出差结束后最晚多久要提交报销单？",
+            "员工号 E0011 的姓名和所属部门是什么？",
+            "一线城市 P5 员工每晚住宿费上限是多少？",
+            "哪些情况发生时应该立即停止扩容并启动回滚？",
+            "ABC-1234_rev2 与 2024年01月、full-width　空格测试",
+        ]
+        tv = torch_emb.embed_queries(queries)
+        rv = rust.embed_queries(queries)
+        for r, t in zip(rv, tv):
+            assert abs(sum(a * b for a, b in zip(r, t)) - 1.0) < 0.001
+
+    def test_document_cosine_parity(self):
+        rust = self._rust_embedder()
+        torch_emb = self._torch_embedder()
+        docs = [
+            "差旅报销制度第3条：报销时限为出差结束后 30 日内。",
+            "住宿费标准 P5 一线城市 600 元/晚，[Sheet] 费用标准表——第3列",
+            "回滚条件: 数据库迁移不可逆时先回滚应用层。",
+        ]
+        td = torch_emb.embed_documents(docs)
+        rd = rust.embed_documents(docs)
+        for r, t in zip(rd, td):
+            assert abs(sum(a * b for a, b in zip(r, t)) - 1.0) < 0.001
+
+    def test_kernel_resolution_prefers_rust_when_available(self):
+        from app.core.embeddings import _resolve_embedding_kernel
+        from app.config import settings
+
+        if settings.EMBEDDING_KERNEL == "torch":
+            import pytest
+
+            pytest.skip("EMBEDDING_KERNEL=torch 显式指定，跳过")
+        assert _resolve_embedding_kernel() == "rust"
+
+    def test_empty_inputs(self):
+        rust = self._rust_embedder()
+        assert rust.embed_documents([]) == []
+        assert rust.embed_queries([]) == []
+
+
 class TestFallbackMode:
     def test_python_fallback_still_importable(self):
         """Rust 存在时，纯 Python 实现仍可作为回退路径正常工作。"""

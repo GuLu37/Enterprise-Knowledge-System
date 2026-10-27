@@ -247,6 +247,11 @@ class Settings:
     )
     # 是否只从本地读取模型；true 时不会尝试联网下载 HuggingFace 模型
     BGE_LOCAL_FILES_ONLY: bool = os.getenv("BGE_LOCAL_FILES_ONLY", "false").lower() == "true"
+    # BGE 推理内核: auto=优先 Rust ONNX(fp32, ~52ms/查询批) 缺产物回退 torch(~82ms);
+    # rust=强制 Rust（不可用时告警回退）; torch=强制 PyTorch。
+    EMBEDDING_KERNEL: str = (
+        os.getenv("EMBEDDING_KERNEL", "auto").strip().lower()
+    )
 
     # ==================== 向量数据库配置 ====================
     # 向量库模式：milvus / milvus_lite
