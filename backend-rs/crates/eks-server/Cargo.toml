@@ -22,3 +22,7 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
+eks-kernels = { path = "../eks-kernels" }
+parquet = { version = "53", features = ["arrow"] }
+arrow = "53"
+arrow-array = "53"

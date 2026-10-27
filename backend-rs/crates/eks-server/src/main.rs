@@ -3,6 +3,7 @@
 mod auth;
 mod config;
 mod db;
+mod milvus_lite;
 mod routes;
 mod state;
 #[cfg(test)]
