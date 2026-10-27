@@ -23,6 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
 eks-kernels = { path = "../eks-kernels" }
+ort = { version = "2.0.0-rc.15" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 parquet = { version = "53", features = ["arrow"] }
 arrow = "53"
 arrow-array = "53"

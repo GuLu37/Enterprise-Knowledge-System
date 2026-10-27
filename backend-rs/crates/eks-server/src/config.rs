@@ -11,6 +11,10 @@ pub struct Config {
     pub access_token_expire_minutes: i64,
     pub refresh_token_expire_minutes: i64,
     pub session_idle_timeout_minutes: i64,
+    pub bge_model_dir: String,
+    pub bge_query_instruction: String,
+    pub bge_max_length: i64,
+    pub milvus_lite_path: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -44,6 +48,19 @@ impl Config {
             access_token_expire_minutes: env_i64("ACCESS_TOKEN_EXPIRE_MINUTES", 60),
             refresh_token_expire_minutes: env_i64("REFRESH_TOKEN_EXPIRE_MINUTES", 60),
             session_idle_timeout_minutes: env_i64("SESSION_IDLE_TIMEOUT_MINUTES", 60),
+            bge_model_dir: env_or(
+                "EKS_BGE_MODEL_DIR",
+                "../backend/app/models/bge-base-zh-v1.5",
+            ),
+            bge_query_instruction: env_or(
+                "BGE_QUERY_INSTRUCTION",
+                "为这个句子生成表示以用于检索相关文章：",
+            ),
+            bge_max_length: env_i64("BGE_MAX_LENGTH", 512),
+            milvus_lite_path: env_or(
+                "EKS_MILVUS_LITE_PATH",
+                "../backend/app/data/milvus_lite.db",
+            ),
         }
     }
 }
