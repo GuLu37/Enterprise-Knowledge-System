@@ -727,6 +727,85 @@ def _normalize_rank_scores(scores: Sequence[float]) -> List[float]:
     return [(score - minimum) / span for score in numeric_scores]
 
 
+def _rule_top1_confidence(rule_ranked: Sequence[RetrievalResult]) -> float:
+    """评估规则重排 top-1 的置信分（0~1），供 adaptive 模式决定是否跳过精排。
+
+    组合三个已有信号: 关键词覆盖度、焦点词覆盖度、关键词特异度，
+    整词精确命中额外加分。基准显示规则层高置信时 recall@5 已达 1.0，
+    此时 Cross-Encoder 精排只贡献极小的排序收益。
+    """
+    if not rule_ranked:
+        return 0.0
+    metadata = rule_ranked[0].metadata or {}
+    signals = metadata.get("_relevance_signals") or {}
+
+    def _signal(key: str) -> float:
+        try:
+            return float(signals.get(key, metadata.get(key)) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    coverage = _signal("keyword_coverage")
+    focus_coverage = _signal("focus_coverage")
+    specificity = _signal("keyword_specificity")
+    exact_match = bool(signals.get("exact_match") or metadata.get("exact_match"))
+    confidence = (
+        0.45 * min(1.0, coverage)
+        + 0.30 * min(1.0, focus_coverage)
+        + 0.25 * min(1.0, specificity)
+    )
+    if exact_match:
+        confidence += 0.20
+    return min(1.0, confidence)
+
+
+def _attach_rule_only_metadata(
+    items: Sequence[RetrievalResult],
+    stage: str,
+    confidence: float | None = None,
+) -> List[RetrievalResult]:
+    """给跳过精排的结果打上可观测标记，便于基准与线上统计跳过率。"""
+    output: List[RetrievalResult] = []
+    for item in items:
+        metadata = {**(item.metadata or {})}
+        metadata["rerank_stage"] = stage
+        metadata["cross_encoder_used"] = False
+        if confidence is not None:
+            metadata["rule_confidence"] = float(confidence)
+        output.append(
+            RetrievalResult(
+                content=item.content,
+                metadata=metadata,
+                score=float(item.score or 0.0),
+                source=item.source,
+            )
+        )
+    return output
+
+
+def _should_skip_cross_encoder(
+    query: str,
+    rule_ranked: List[RetrievalResult],
+    return_limit: int,
+) -> Tuple[bool, str, float]:
+    """adaptive 模式下判断是否可以跳过 Cross-Encoder 精排。
+
+    返回 (是否跳过, 跳过原因 stage, top-1 置信分)。跳过条件:
+    1. 候选池不大于最终返回数 —— 重排同一集合无区分意义;
+    2. top-1 置信分达阈值且与 top-2 分差足够 —— 规则已高置信。
+    """
+    confidence = _rule_top1_confidence(rule_ranked)
+    if len(rule_ranked) <= return_limit:
+        return True, "rule_only_small_pool", confidence
+    threshold = float(settings.CROSS_ENCODER_CONFIDENCE_THRESHOLD)
+    margin = float(settings.CROSS_ENCODER_CONFIDENCE_MARGIN)
+    top1_score = float(rule_ranked[0].score or 0.0)
+    top2_score = float(rule_ranked[1].score or 0.0) if len(rule_ranked) > 1 else 0.0
+    if confidence >= threshold and (top1_score - top2_score) >= margin:
+        return True, "rule_only_high_confidence", confidence
+    return False, "", confidence
+
+
 def _build_cross_encoder_text(result: RetrievalResult) -> str:
     """构造给 Cross-Encoder 的短文本，保留来源和标题信息但避免重复 Parent。"""
     metadata = result.metadata or {}
@@ -759,8 +838,26 @@ def cascade_rerank_results(
     if not rule_ranked:
         return []
 
-    if not settings.CROSS_ENCODER_ENABLED or is_identifier_query(query):
-        return rule_ranked[: max(1, top_k or len(rule_ranked))]
+    return_limit = max(1, top_k or len(rule_ranked))
+    trigger_mode = (settings.CROSS_ENCODER_TRIGGER_MODE or "adaptive").strip().lower()
+    if not settings.CROSS_ENCODER_ENABLED or trigger_mode == "off":
+        return _attach_rule_only_metadata(
+            rule_ranked[:return_limit], "rule_only_disabled"
+        )
+    if is_identifier_query(query):
+        # 编号类查询由规则精确保护，精排无增益。
+        return _attach_rule_only_metadata(
+            rule_ranked[:return_limit], "rule_only_identifier"
+        )
+
+    if trigger_mode != "always":
+        skip, stage, confidence = _should_skip_cross_encoder(
+            query, rule_ranked, return_limit
+        )
+        if skip:
+            return _attach_rule_only_metadata(
+                rule_ranked[:return_limit], stage, confidence
+            )
 
     candidate_limit = max(
         1,

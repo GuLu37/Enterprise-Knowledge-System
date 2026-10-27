@@ -340,6 +340,22 @@ class Settings:
         1.0,
         max(0.0, float(os.getenv("RULE_RERANK_WEIGHT", "0.35"))),
     )
+    # 精排触发模式: adaptive=规则高置信跳过精排（默认，基准显示规则重排
+    # recall@5 已达 1.0，精排仅 MRR +0.02 却多 ~4s）；always=始终精排；
+    # off=等同于关闭精排（保留 CROSS_ENCODER_ENABLED 原有总开关语义）。
+    CROSS_ENCODER_TRIGGER_MODE: str = (
+        os.getenv("CROSS_ENCODER_TRIGGER_MODE", "adaptive").strip().lower()
+    )
+    # adaptive 模式的置信度阈值: 规则 top-1 综合置信分超过该值即跳过精排。
+    CROSS_ENCODER_CONFIDENCE_THRESHOLD: float = min(
+        1.0,
+        max(0.0, float(os.getenv("CROSS_ENCODER_CONFIDENCE_THRESHOLD", "0.60"))),
+    )
+    # adaptive 模式的领先幅度阈值: top-1 需领先 top-2 的规则分差。
+    CROSS_ENCODER_CONFIDENCE_MARGIN: float = min(
+        1.0,
+        max(0.0, float(os.getenv("CROSS_ENCODER_CONFIDENCE_MARGIN", "0.08"))),
+    )
 
     # ==================== 缓存配置 ====================
     ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE").lower() == "true"
