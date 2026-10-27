@@ -115,21 +115,41 @@ pub async fn list_skills(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    // Rust 后端当前只暴露 RAG 检索工具，skills 注册表待 Phase D3 移植
+    // 工具 schema 对齐 Python skills/registry.py 的 function calling 目录
     Ok(Json(json!({
         "skills": [
             {
-                "name": "search_knowledge_base",
-                "description": "在企业知识库中检索相关文档片段",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "检索关键词"},
-                        "top_k": {"type": "integer", "description": "返回条数", "default": 5},
+                "type": "function",
+                "function": {
+                    "name": "search_knowledge_base",
+                    "description": "在企业知识库中检索相关文档片段。支持按制度名、流程、编号、人名等关键词检索，也可按文件名查询某份文档是否存在。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "检索关键词或文件名"},
+                            "top_k": {"type": "integer", "description": "返回条数(1-50)", "default": 5},
+                            "retrieval_method": {"type": "string", "enum": ["dense", "sparse", "hybrid"], "description": "检索方式", "default": "hybrid"},
+                        },
+                        "required": ["query"],
                     },
-                    "required": ["query"],
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_knowledge_base_files",
+                    "description": "列出当前知识库中已上传的所有文档文件名和状态。",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_available_tools",
+                    "description": "列出当前系统可用的全部工具及其参数说明。",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
         ]
     })))
 }
