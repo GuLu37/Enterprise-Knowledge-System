@@ -22,6 +22,11 @@ _ORIGINAL_STDERR = sys.stderr
 _LOG_ROTATION_MAX_BYTES = 100 * 1024 * 1024
 
 
+def _should_show_in_console(record: dict) -> bool:
+    """控制台只显示业务日志，保留 access log 到文件即可。"""
+    return record["extra"].get("source_logger") != "uvicorn.access"
+
+
 class _StreamToLogger:
     """把 stdout/stderr 的原始输出按行写入 loguru，覆盖 print 和未接管的报错输出。"""
 
@@ -69,9 +74,10 @@ class _InterceptHandler(logging.Handler):
         except ValueError:
             depth = 2
 
-        loguru_logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
+        loguru_logger.bind(source_logger=record.name).opt(
+            depth=depth,
+            exception=record.exc_info,
+        ).log(level, record.getMessage())
 
 
 def _find_reusable_log_file(now: datetime) -> Path | None:
@@ -207,6 +213,7 @@ def _init_loguru() -> None:
         format=color_fmt,
         level=settings.LOG_LEVEL,
         colorize=True,
+        filter=_should_show_in_console,
     )
 
     # 文件（纯文本，按天/按大小轮转，文件名包含精确时间戳）。

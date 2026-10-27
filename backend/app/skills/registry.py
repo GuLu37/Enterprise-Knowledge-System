@@ -18,6 +18,15 @@ _BUILTIN_SKILLS_LOADED = False
 SKILLS_DIR = APP_DIR / "skills"
 
 
+def _public_context_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """过滤只能在服务端使用的运行时对象，生成可返回/记录的上下文快照。"""
+    return {
+        str(key): value
+        for key, value in dict(metadata or {}).items()
+        if key != "memory_context"
+    }
+
+
 def get_skill_document_path(skill_name: str) -> Path:
     """返回 Skill 对应的同名目录和文档路径。"""
     normalized_name = (skill_name or "").strip()
@@ -175,8 +184,20 @@ def list_function_calling_tools() -> List[Dict[str, Any]]:
     return [definition.to_function_calling_tool() for definition in sorted(_SKILL_REGISTRY.values(), key=lambda item: item.name)]
 
 
+def _is_tool_ready(skill: Dict[str, Any]) -> bool:
+    """工具是否具备真实执行能力。
+
+    远程 MCP 若未配置 endpoint，注册时会被打上 executor_ready=False，意味着它只是
+    目录里的占位符，调用必然抛错。这类工具不应进入模型的动作空间。
+    """
+    metadata = skill.get("metadata")
+    if not isinstance(metadata, dict):
+        return True
+    return bool(metadata.get("executor_ready", True))
+
+
 def list_agent_capabilities() -> List[Dict[str, Any]]:
-    """列出给 Agent 的统一能力目录。"""
+    """列出给 Agent 的统一能力目录（含未就绪工具，用 available 标识）。"""
     capabilities: List[Dict[str, Any]] = [
         {
             "name": RAG_TOOL_DEFINITION["function"]["name"],
@@ -184,6 +205,7 @@ def list_agent_capabilities() -> List[Dict[str, Any]]:
             "category": "retrieval",
             "kind": "tool",
             "source": "rag",
+            "available": True,
             "location": "app.tools.rag.run_rag_tool",
             "function_calling": dict(RAG_TOOL_DEFINITION),
         }
@@ -194,6 +216,7 @@ def list_agent_capabilities() -> List[Dict[str, Any]]:
             {
                 **skill,
                 "source": "skill",
+                "available": _is_tool_ready(skill),
                 "location": get_skill_document_path(skill["name"])
                 .relative_to(APP_DIR.parent.parent)
                 .as_posix(),
@@ -204,12 +227,18 @@ def list_agent_capabilities() -> List[Dict[str, Any]]:
 
 
 def list_agent_function_calling_tools() -> List[Dict[str, Any]]:
-    """列出给模型做 Function Calling 的工具 schema。"""
+    """列出给模型做 Function Calling 的工具 schema。
+
+    只暴露具备真实执行能力的工具：未接入执行器的远程 MCP 会被过滤掉，模型看不到
+    就不会误调，也省掉每轮 invoke 都要携带的 schema token。被过滤的工具仍可通过
+    list_agent_capabilities() 查到（available=False），用于展示注册表对 MCP 的支持。
+    """
     return [
         dict(RAG_TOOL_DEFINITION),
         *[
             dict(skill["function_calling"])
             for skill in list_skill_definitions()
+            if _is_tool_ready(skill)
         ],
     ]
 
@@ -235,7 +264,7 @@ def execute_agent_tool(
             "provider": getattr(context, "provider", None),
             "model": getattr(context, "model", None),
             "trace_id": getattr(context, "trace_id", None),
-            "metadata": dict(getattr(context, "metadata", {}) or {}),
+            "metadata": _public_context_metadata(getattr(context, "metadata", {}) or {}),
         }
         context_payload.update(
             {
@@ -288,7 +317,7 @@ def execute_skill(
         "provider": resolved_context.provider,
         "model": resolved_context.model,
         "trace_id": resolved_context.trace_id,
-        "metadata": dict(resolved_context.metadata),
+        "metadata": _public_context_metadata(resolved_context.metadata),
     }
     log_tool_call(
         kind=trace_kind,

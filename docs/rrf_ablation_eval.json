@@ -1,0 +1,248 @@
+[
+  {
+    "id": "travel_01",
+    "category": "差旅制度",
+    "query": "出差结束后最晚多久要提交报销单？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx"]
+  },
+  {
+    "id": "travel_02",
+    "category": "差旅制度",
+    "query": "晚上十点以后从机场打车回去，这笔费用能报销吗？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "travel_03",
+    "category": "差旅制度",
+    "query": "高铁单程超过六个小时，可以买一等座吗？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "travel_04",
+    "category": "差旅制度",
+    "query": "电子发票重复打印后，能不能再报销一次？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "travel_05",
+    "category": "差旅制度",
+    "query": "酒店已经提供早餐，当天餐补应该扣多少钱？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "travel_06",
+    "category": "差旅制度",
+    "query": "几个人一起住酒店，住宿费怎么分摊报销？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "travel_07",
+    "category": "差旅制度",
+    "query": "出差期间因为个人原因多住几天，公司还承担这几天的住宿和餐补吗？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx"]
+  },
+  {
+    "id": "travel_08",
+    "category": "差旅制度",
+    "query": "因为客户临时取消行程产生的退票费可以报吗，需要留什么材料？",
+    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+  },
+  {
+    "id": "procurement_01",
+    "category": "采购流程",
+    "query": "含税金额不超过5000元的采购由谁审批？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_02",
+    "category": "采购流程",
+    "query": "采购金额在5万到20万之间，需要哪些审批人和材料？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_03",
+    "category": "采购流程",
+    "query": "紧急采购可以先做，之后多长时间内补录申请？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_04",
+    "category": "采购流程",
+    "query": "采购申请审批通过后，能不能先给供应商下订单？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_05",
+    "category": "采购流程",
+    "query": "单一来源采购需要提供什么价格合理性证明？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_06",
+    "category": "采购流程",
+    "query": "第一次合作的供应商在下单前要完成哪些准入核验？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "procurement_07",
+    "category": "采购流程",
+    "query": "同一个供应商在30天内多次购买同类服务，金额怎么计算？",
+    "relevant_sources": ["02_采购审批流程.docx"]
+  },
+  {
+    "id": "alpha_01",
+    "category": "项目上线",
+    "query": "项目 Alpha 常规生产发布窗口是每周什么时候？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "alpha_02",
+    "category": "项目上线",
+    "query": "哪些情况发生时应该立即停止扩容并启动回滚？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "alpha_03",
+    "category": "项目上线",
+    "query": "Alpha 生产回滚要求在多长时间内恢复？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "alpha_04",
+    "category": "项目上线",
+    "query": "测试环境验证通过后，可以直接把版本发到生产吗？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "alpha_05",
+    "category": "项目上线",
+    "query": "如果数据库迁移不可逆，发生故障时应该先回滚什么？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "alpha_06",
+    "category": "项目上线",
+    "query": "生产全量发布后至少要观察多久才能结束首轮观察？",
+    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+  },
+  {
+    "id": "faq_01",
+    "category": "产品账号FAQ",
+    "query": "还能正常登录时，修改密码应该怎么操作？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "faq_02",
+    "category": "产品账号FAQ",
+    "query": "管理员和系统管理员的权限边界有什么不同？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "faq_03",
+    "category": "产品账号FAQ",
+    "query": "项目 Alpha 的生产环境访问权限最长可以申请多久？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "faq_04",
+    "category": "产品账号FAQ",
+    "query": "连续输错几次密码会锁定账号，锁多久？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "faq_05",
+    "category": "产品账号FAQ",
+    "query": "文档上传后为什么不能马上搜索到？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "faq_06",
+    "category": "产品账号FAQ",
+    "query": "什么情况下回答不会显示知识库引用资料？",
+    "relevant_sources": ["04_产品与账号常见问题.md"]
+  },
+  {
+    "id": "expense_01",
+    "category": "费用标准表",
+    "query": "一线城市 P5 员工每晚住宿费上限是多少？",
+    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+  },
+  {
+    "id": "expense_02",
+    "category": "费用标准表",
+    "query": "新一线或省会城市的 P4 员工每天餐补标准是多少？",
+    "relevant_sources": ["05_费用标准表.xlsx"]
+  },
+  {
+    "id": "expense_03",
+    "category": "费用标准表",
+    "query": "酒店含早餐时，餐补按什么规则扣减？",
+    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+  },
+  {
+    "id": "expense_04",
+    "category": "费用标准表",
+    "query": "客户宴请可以算在差旅餐补里吗？",
+    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+  },
+  {
+    "id": "expense_05",
+    "category": "费用标准表",
+    "query": "出差地的公交、地铁和机场快线能否据实报销？",
+    "relevant_sources": ["05_费用标准表.xlsx"]
+  },
+  {
+    "id": "employee_01",
+    "category": "员工信息表",
+    "query": "员工号 E0011 的姓名和所属部门是什么？",
+    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+  },
+  {
+    "id": "employee_02",
+    "category": "员工信息表",
+    "query": "采购部的部门邮箱是什么？",
+    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+  },
+  {
+    "id": "employee_03",
+    "category": "员工信息表",
+    "query": "哪些产品适合运维部采购使用？",
+    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+  },
+  {
+    "id": "employee_04",
+    "category": "员工信息表",
+    "query": "产品号 P90003 主要适合什么业务场景？",
+    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+  },
+  {
+    "id": "employee_05",
+    "category": "员工信息表",
+    "query": "财务部负责费用审核和付款的员工是谁？",
+    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+  },
+  {
+    "id": "salary_01",
+    "category": "工资表",
+    "query": "员工号 E0008 的实发工资是多少？",
+    "relevant_sources": ["07_本月工资表.xlsx"]
+  },
+  {
+    "id": "salary_02",
+    "category": "工资表",
+    "query": "员工工资明细表里有哪些字段？",
+    "relevant_sources": ["07_本月工资表.xlsx"]
+  },
+  {
+    "id": "salary_03",
+    "category": "工资表",
+    "query": "运维部员工 E0013 当前是什么状态，实发工资多少？",
+    "relevant_sources": ["07_本月工资表.xlsx"]
+  },
+  {
+    "id": "salary_04",
+    "category": "工资表",
+    "query": "员工号 E0024 的岗位和实发工资是什么？",
+    "relevant_sources": ["07_本月工资表.xlsx"]
+  }
+]

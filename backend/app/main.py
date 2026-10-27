@@ -148,6 +148,26 @@ def _start_background_initialization(app: FastAPI) -> None:
     app.state.milvus_ready = False
     app.state.memory_maintenance_stop_event = threading.Event()
 
+    if settings.STARTUP_INIT_LLM:
+        try:
+            from app.core.llm import get_default_llm
+
+            llm_started_at = time.perf_counter()
+            default_llm = get_default_llm()
+            app.state.runtime_warmup.update(
+                {
+                    "llm_warmed": True,
+                    "provider": getattr(default_llm, "active_provider", None),
+                }
+            )
+            logger.info(
+                "启动阶段 LLM 初始化完成: provider=%s duration=%.2fms",
+                app.state.runtime_warmup.get("provider"),
+                (time.perf_counter() - llm_started_at) * 1000,
+            )
+        except Exception as exc:
+            logger.warning("启动阶段 LLM 初始化失败，将回退到后台预热: %s", exc)
+
     threading.Thread(
         target=_warmup_chat_runtime_in_background,
         args=(app,),
@@ -222,7 +242,7 @@ async def log_requests(request: Request, call_next):
     if request.url.query:
         request_line = f"{request_line}?{request.url.query}"
 
-    logger.info(f"请求开始: {request_line} client={client_host}")
+    logger.debug(f"请求开始: {request_line} client={client_host}")
     try:
         response = await call_next(request)
     except Exception:
@@ -238,7 +258,7 @@ async def log_requests(request: Request, call_next):
     )
     if renewed_access_token:
         response.headers["X-Access-Token"] = renewed_access_token
-    logger.info(
+    logger.debug(
         f"请求完成: {request_line} status={response.status_code} duration={duration_ms:.2f}ms"
     )
     return response

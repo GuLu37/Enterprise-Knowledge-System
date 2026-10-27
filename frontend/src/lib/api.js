@@ -205,6 +205,28 @@ export async function deleteConversation(conversationId) {
   })
 }
 
+export async function clearAllConversations() {
+  return requestJson('/chat/conversations', {
+    method: 'DELETE',
+  })
+}
+
+export async function listConversations() {
+  return requestJson('/chat/conversations')
+}
+
+export async function saveConversation(conversation) {
+  return requestJson(`/chat/conversations/${conversation.conversation_id}`, withJsonBody(
+    { method: 'PUT' },
+    {
+      session_id: conversation.session_id || null,
+      created_at: conversation.created_at || null,
+      updated_at: conversation.updated_at || null,
+      messages: conversation.messages || [],
+    },
+  ))
+}
+
 export async function generateChat(payload) {
   return requestJson('/chat/generate', withJsonBody({ method: 'POST' }, payload))
 }

@@ -40,7 +40,7 @@ def run_rag_tool(
         )
         results = serialize_retrieval_results(workflow.results)
         context_metadata = dict((context or {}).get("metadata") or {})
-        adaptive_rag = context_metadata.get("adaptive_rag")
+        retrieval_plan = context_metadata.get("retrieval_plan")
 
         if sources_sink is not None:
             sources_sink.extend(results)
@@ -53,8 +53,8 @@ def run_rag_tool(
             "context": workflow.context,
             "message": workflow.message,
         }
-        if adaptive_rag:
-            payload["adaptive_rag"] = adaptive_rag
+        if retrieval_plan:
+            payload["retrieval_plan"] = retrieval_plan
         log_tool_result(
             kind="tool",
             name="search_knowledge_base",
@@ -63,7 +63,7 @@ def run_rag_tool(
                 "expanded_queries": payload["expanded_queries"],
                 "result_count": len(results),
                 "message": payload["message"],
-                "adaptive_rag": adaptive_rag or {},
+                "retrieval_plan": retrieval_plan or {},
             },
             context=context or {},
         )

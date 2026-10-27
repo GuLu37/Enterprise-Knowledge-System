@@ -1,10 +1,11 @@
-"""内置 Skill：热点词统计、记忆查询。"""
+"""内置 Skill：热点词统计、记忆查询和工具目录展示。"""
 from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable as IterableABC
 from datetime import date, datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Sequence
 
 from sqlalchemy import or_
@@ -13,9 +14,16 @@ from app.rag.retrieval.reranker import normalize_text
 from app.services.memory_service import (
     delete_profile_memories,
     get_active_profile_memories,
+    retrieve_original_conversation,
     search_long_term_memory,
 )
-from app.skills.registry import SkillDefinition, SkillExecutionContext, register_skill
+from app.skills.registry import (
+    SkillDefinition,
+    SkillExecutionContext,
+    list_agent_capabilities,
+    list_agent_function_calling_tools,
+    register_skill,
+)
 from app.storage.sqlite_metadata import DocumentChunkRecord, DocumentRecord, SessionLocal
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}")
@@ -329,18 +337,100 @@ def _skill_memory_query(context: SkillExecutionContext, arguments: Dict[str, Any
         "matched_memories": [],
     }
 
+    def _dedupe_memories(records: List[Any]) -> List[Any]:
+        seen: set[str] = set()
+        deduplicated: List[Any] = []
+        for record in records:
+            metadata = getattr(record, "metadata", None) or {}
+            memory_id = str(metadata.get("memory_id") or getattr(record, "memory_id", "") or "").strip()
+            key = memory_id or f"{getattr(record, 'conversation_id', None)}:{getattr(record, 'turn_start', None)}:{getattr(record, 'turn_end', None)}:{normalize_text(str(getattr(record, 'content', '') or '')[:120])}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduplicated.append(record)
+        return deduplicated
+
+    def _merge_current_history(original: List[Any]) -> List[Any]:
+        memory_context = (context.metadata or {}).get("memory_context")
+        if memory_context is None or not getattr(memory_context, "recent_history", None):
+            return original
+        try:
+            from app.utils.chunking import split_conversation_turns
+        except Exception:
+            return original
+
+        turns = split_conversation_turns(memory_context.recent_history)
+        if not turns:
+            return original
+
+        recent_turns = turns[-max(1, top_k):]
+        existing_texts = {
+            normalize_text(str(getattr(record, "content", "") or ""))
+            for record in original
+        }
+        extra_records = []
+        for turn in recent_turns:
+            block_lines = []
+            for message in turn:
+                role = str(getattr(message, "role", "") or "").strip().lower()
+                content = str(getattr(message, "content", "") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    block_lines.append(f"用户: {content}")
+                elif role == "assistant":
+                    block_lines.append(f"助手: {content}")
+            block_text = "\n".join(block_lines).strip()
+            if not block_text:
+                continue
+            normalized_block = normalize_text(block_text)
+            if normalized_block in existing_texts:
+                continue
+            existing_texts.add(normalized_block)
+            extra_records.append(
+                SimpleNamespace(
+                    content=block_text,
+                    score=1.0,
+                    conversation_id=context.conversation_id,
+                    turn_start=None,
+                    turn_end=None,
+                    metadata={
+                        "memory_id": None,
+                        "conversation_id": context.conversation_id,
+                        "chunk_type": "dialogue_current_turn",
+                        "turn_start": None,
+                        "turn_end": None,
+                    },
+                )
+            )
+        return original + extra_records
+
     if include_profile:
-        profile_memories = get_active_profile_memories(context.user_id, limit=top_k)
+        memory_context = (context.metadata or {}).get("memory_context")
+        if memory_context is not None and hasattr(memory_context, "get_profile_memories"):
+            profile_memories = memory_context.get_profile_memories(limit=top_k)
+        else:
+            profile_memories = get_active_profile_memories(context.user_id, limit=top_k)
         result["profile_memories"] = [_serialize_profile_memory(record) for record in profile_memories]
 
     if include_event and query:
-        matched_memories = search_long_term_memory(
-            query=query,
-            top_k=top_k,
-            user_id=context.user_id,
-            conversation_id=context.conversation_id,
-            session_id=context.session_id,
-        )
+        memory_context = (context.metadata or {}).get("memory_context")
+        if memory_context is not None and hasattr(memory_context, "search"):
+            matched_memories = memory_context.search(
+                query=query,
+                top_k=top_k,
+                conversation_id=context.conversation_id,
+                session_id=context.session_id,
+            )
+        else:
+            matched_memories = search_long_term_memory(
+                query=query,
+                top_k=top_k,
+                user_id=context.user_id,
+                conversation_id=context.conversation_id,
+                session_id=context.session_id,
+            )
+        matched_memories = _merge_current_history(_dedupe_memories(list(matched_memories)))
         result["matched_memories"] = [_serialize_retrieval_memory(record) for record in matched_memories]
 
     result["summary"] = {
@@ -348,6 +438,46 @@ def _skill_memory_query(context: SkillExecutionContext, arguments: Dict[str, Any
         "matched_count": len(result["matched_memories"]),
     }
     return result
+
+
+def _skill_memory_retrieve_original(
+    context: SkillExecutionContext,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """按摘要引用渐进式披露原始对话。"""
+    memory_ids = _normalize_string_list(
+        arguments.get("memory_ids") or arguments.get("summary_memory_ids")
+    )
+    query = str(arguments.get("query") or "").strip()
+    conversation_id = str(arguments.get("conversation_id") or "").strip() or None
+    turn_start = arguments.get("turn_start")
+    turn_end = arguments.get("turn_end")
+    include_neighbors = _coerce_int(
+        arguments.get("include_neighbors", 0),
+        default=0,
+        minimum=0,
+        maximum=5,
+    )
+    top_k = _coerce_int(arguments.get("top_k", 8), default=8, minimum=1, maximum=50)
+    max_chars = _coerce_int(
+        arguments.get("max_chars", 12000),
+        default=12000,
+        minimum=500,
+        maximum=50000,
+    )
+    include_all_conversation = bool(arguments.get("include_all_conversation", False))
+    return retrieve_original_conversation(
+        user_id=context.user_id,
+        memory_ids=memory_ids,
+        query=query,
+        conversation_id=conversation_id or context.conversation_id,
+        turn_start=turn_start,
+        turn_end=turn_end,
+        include_neighbors=include_neighbors,
+        include_all_conversation=include_all_conversation,
+        top_k=top_k,
+        max_chars=max_chars,
+    )
 
 
 def _skill_delete_profile_memory(context: SkillExecutionContext, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -461,8 +591,76 @@ def _skill_list_knowledge_base_files(context: SkillExecutionContext, arguments: 
         db.close()
 
 
+def _skill_list_available_tools(
+    context: SkillExecutionContext,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """展示当前 Agent Function Calling 注册表中的全部工具。"""
+    schemas = list_agent_function_calling_tools()
+    capabilities = {
+        str(item.get("name") or ""): item
+        for item in list_agent_capabilities()
+        if str(item.get("name") or "").strip()
+    }
+    tools: List[Dict[str, Any]] = []
+    for schema in schemas:
+        function = dict(schema.get("function") or {})
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        capability = capabilities.get(name) or {}
+        tools.append(
+            {
+                "name": name,
+                "description": str(
+                    capability.get("description") or function.get("description") or ""
+                ).strip(),
+                "category": capability.get("category") or "general",
+                "kind": capability.get("kind") or "skill",
+                "source": capability.get("source") or "skill",
+                "provider": capability.get("provider"),
+                "location": capability.get("location"),
+                "parameters": function.get("parameters") or {},
+            }
+        )
+
+    categories: Dict[str, int] = {}
+    for tool in tools:
+        category = str(tool.get("category") or "general")
+        categories[category] = categories.get(category, 0) + 1
+
+    return {
+        "summary": {
+            "tool_count": len(tools),
+            "categories": categories,
+            "message": "以下是当前统一 Agent Function Calling 注册表中的全部工具。",
+        },
+        "tools": tools,
+    }
+
+
 def register_builtin_skills() -> None:
     """注册当前阶段支持的本地技能。"""
+    register_skill(
+        SkillDefinition(
+            name="list_available_tools",
+            description=(
+                "展示当前 Agent Function Calling 注册表中的全部可用工具和 Skill，"
+                "包括知识库检索、本地 Skill 以及已注册的远程 MCP Skill。"
+                "适用于用户询问『列出你的工具』『你有什么技能』『有哪些可用能力』等问题。"
+            ),
+            category="system",
+            kind="local",
+            tags=("tools", "skills", "function_calling", "registry"),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+            executor=_skill_list_available_tools,
+            metadata={"returns": "registered_agent_tools"},
+        )
+    )
     register_skill(
         SkillDefinition(
             name="document_hot_word_statistics",
@@ -552,6 +750,76 @@ def register_builtin_skills() -> None:
             },
             executor=_skill_memory_query,
             metadata={"returns": "memory_query_result"},
+        )
+    )
+    register_skill(
+        SkillDefinition(
+            name="memory_retrieve_original",
+            description=(
+                "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。"
+                "当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，"
+                "或需要核对原始措辞时使用；只能读取当前用户自己的对话。"
+            ),
+            category="memory",
+            kind="local",
+            tags=("memory", "conversation", "original", "progressive_disclosure"),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "memory_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选，摘要注入中提供的 memory_id 列表；优先使用。",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "可选，摘要 memory_id 不明确时用于语义定位原始对话。",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "可选，限定某个会话；默认使用当前会话。",
+                    },
+                    "turn_start": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "可选，原始对话起始轮次。",
+                    },
+                    "turn_end": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "可选，原始对话结束轮次。",
+                    },
+                    "include_neighbors": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "default": 0,
+                        "description": "可选，在定位范围前后各多取几块上下文。",
+                    },
+                    "include_all_conversation": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "可选，无摘要引用时是否展开当前会话的全部原始对话。",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 8,
+                        "description": "最多展开多少个摘要对应的原始块。",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 500,
+                        "maximum": 50000,
+                        "default": 12000,
+                        "description": "本次最多返回的原文字符数。",
+                    },
+                },
+            },
+            executor=_skill_memory_retrieve_original,
+            metadata={"returns": "original_conversation_result", "progressive_disclosure": True},
         )
     )
     register_skill(

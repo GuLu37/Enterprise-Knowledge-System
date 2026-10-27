@@ -172,6 +172,10 @@ class Settings:
     ANTHROPIC_MODEL: Optional[str] = os.getenv("ANTHROPIC_MODEL")
 
     # LLM 通用参数
+    # 服务启动时是否同步初始化默认 LLM，避免第一次对话请求等待 provider 初始化。
+    STARTUP_INIT_LLM: bool = (
+        os.getenv("STARTUP_INIT_LLM", "true").strip().lower() == "true"
+    )
     # 温度: 0=确定性最强(代码/数据抽取), 1=默认平衡, 2=最有创意
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE"))
     # 最大输出TOKENS数量
@@ -351,18 +355,39 @@ class Settings:
         "[]",
     )
 
-    # ==================== Adaptive-RAG 控制器配置 ====================
+    # ==================== 常规检索规划器（RetrievalPlanner）配置 ====================
     # 是否启用 LLM 消歧决策（规则评估置信度 → LLM 决策 → 规则兜底）。
-    # 关闭后控制器退回纯规则判定，不产生额外 LLM 调用。
-    ADAPTIVE_RAG_LLM_DECISION_ENABLED: bool = (
-        os.getenv("ADAPTIVE_RAG_LLM_DECISION_ENABLED", "true").strip().lower()
+    # 关闭后规划器退回纯规则判定，不产生额外 LLM 调用。
+    RETRIEVAL_PLANNER_LLM_DECISION_ENABLED: bool = (
+        os.getenv("RETRIEVAL_PLANNER_LLM_DECISION_ENABLED", "true").strip().lower()
         in {"true", "1", "yes", "on"}
     )
 
     # ==================== ReAct 检索决策配置 ====================
     # ReAct 检索决策循环最大迭代轮数（rag 分支模型自主迭代检索的上限），
-    # 防止模型无限调用工具；ReAct 失败或无结果时回退 Adaptive-RAG 规则决策。
+    # 防止模型无限调用工具；ReAct 失败或无结果时回退常规检索规划（规则决策）。
     REACT_MAX_ITERATIONS: int = max(1, int(os.getenv("REACT_MAX_ITERATIONS", "3")))
+
+    # ==================== 统一 ReAct 编排配置 ====================
+    # 是否启用统一 ReAct 编排循环。开启后，模型在同一条 messages 轨迹里跨工具自主
+    # 编排（工具空间 = list_agent_function_calling_tools()，含 RAG 检索 + 本地 Skills
+    # + 远程 MCP），而不是每轮重建路由后再执行单步工具的「伪 ReAct」。
+    # 关闭、或 bind_tools 不被供应商支持时，回退 rag 专用循环 _run_rag_react_loop
+    # （只暴露 search_knowledge_base），保证链路不中断。
+    UNIFIED_REACT_ENABLED: bool = (
+        os.getenv("UNIFIED_REACT_ENABLED", "true").strip().lower()
+        in {"true", "1", "yes", "on"}
+    )
+
+    # 统一 ReAct 编排循环的迭代上限（模型自主编排工具的最大轮数），防止无限调用工具。
+    UNIFIED_REACT_MAX_ITERATIONS: int = max(
+        1, int(os.getenv("UNIFIED_REACT_MAX_ITERATIONS", "3"))
+    )
+
+    # 一轮内并行执行多个工具调用的线程上限（检索与远程 MCP 均为 IO 密集）。
+    UNIFIED_REACT_PARALLEL_WORKERS: int = max(
+        1, int(os.getenv("UNIFIED_REACT_PARALLEL_WORKERS", "4"))
+    )
 
     # ==================== 日志配置 ====================
     LOG_DIR: str = _resolve_app_path(os.getenv("LOG_DIR"), "logs")
@@ -377,8 +402,29 @@ class Settings:
     LANGSMITH_PROJECT: Optional[str] = os.getenv("LANGSMITH_PROJECT")
 
 
+def _validate_runtime_security(config: Settings) -> None:
+    """非调试环境禁止使用示例认证配置。"""
+    if config.DEBUG:
+        return
+
+    if (
+        not config.JWT_SECRET_KEY
+        or config.JWT_SECRET_KEY == "change-me-in-production"
+        or len(config.JWT_SECRET_KEY) < 32
+    ):
+        raise RuntimeError(
+            "生产环境必须配置长度至少 32 个字符的 JWT_SECRET_KEY"
+        )
+
+    if config.BOOTSTRAP_ADMIN_PASSWORD in {"123456", "password", "change-me"}:
+        raise RuntimeError(
+            "生产环境禁止使用默认 BOOTSTRAP_ADMIN_PASSWORD"
+        )
+
+
 # 全局配置实例
 settings = Settings()
+_validate_runtime_security(settings)
 
 
 def get_settings() -> Settings:

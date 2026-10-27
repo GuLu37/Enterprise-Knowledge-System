@@ -155,11 +155,6 @@ def _parse_section_heading(line: str) -> tuple[int, str] | None:
     return None
 
 
-def _is_section_heading(line: str) -> bool:
-    """识别常见文档标题行。"""
-    return _parse_section_heading(line) is not None
-
-
 def _clean_section_heading(line: str) -> str:
     """把标题行清洗成稳定的 chunk 前缀。"""
     heading = re.sub(r"\s+", " ", (line or "").strip())
@@ -847,36 +842,37 @@ def build_conversation_chunks(
     include_system: bool = False,
 ) -> List[ConversationChunk]:
     """把消息序列切成适合长期记忆入库的结构化 chunk。"""
-    normalized_messages = _normalize_messages(messages, include_system=include_system)
-    if not normalized_messages:
+    turns = split_conversation_turns(messages, include_system=include_system)
+    if not turns:
         return []
 
     chunks: List[ConversationChunk] = []
     current_blocks: List[tuple[int, str]] = []
 
-    for turn_index, message in enumerate(normalized_messages):
-        message_blocks = _split_message_into_blocks(message, chunk_size, chunk_overlap)
-        for block in message_blocks:
-            block_length = len(block)
-            if current_blocks and _joined_length(current_blocks + [(turn_index, block)]) > chunk_size:
-                chunks.append(_build_chunk(current_blocks, len(chunks)))
-                current_blocks = _build_overlap_tail(current_blocks, chunk_overlap)
+    for turn_index, turn in enumerate(turns):
+        for message in turn:
+            message_blocks = _split_message_into_blocks(message, chunk_size, chunk_overlap)
+            for block in message_blocks:
+                block_length = len(block)
                 if current_blocks and _joined_length(current_blocks + [(turn_index, block)]) > chunk_size:
-                    current_blocks = []
+                    chunks.append(_build_chunk(current_blocks, len(chunks)))
+                    current_blocks = _build_overlap_tail(current_blocks, chunk_overlap)
+                    if current_blocks and _joined_length(current_blocks + [(turn_index, block)]) > chunk_size:
+                        current_blocks = []
 
-            if not current_blocks and block_length > chunk_size:
-                chunks.append(
-                    ConversationChunk(
-                        chunk_index=len(chunks),
-                        text=block,
-                        turn_start=turn_index,
-                        turn_end=turn_index,
-                        message_count=1,
+                if not current_blocks and block_length > chunk_size:
+                    chunks.append(
+                        ConversationChunk(
+                            chunk_index=len(chunks),
+                            text=block,
+                            turn_start=turn_index,
+                            turn_end=turn_index,
+                            message_count=1,
+                        )
                     )
-                )
-                continue
+                    continue
 
-            current_blocks.append((turn_index, block))
+                current_blocks.append((turn_index, block))
 
     if current_blocks:
         chunks.append(_build_chunk(current_blocks, len(chunks)))

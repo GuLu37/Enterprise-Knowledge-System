@@ -26,6 +26,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import {
+  clearAllConversations,
   deleteConversation,
   deleteDocument,
   changePassword as apiChangePassword,
@@ -34,9 +35,11 @@ import {
   getChatRuntimeStatus,
   getCurrentUser,
   getDocumentContent,
+  listConversations,
   listDocuments,
   login as apiLogin,
   register as apiRegister,
+  saveConversation,
   streamChat,
   uploadDocument,
   clearAuthToken,
@@ -44,6 +47,7 @@ import {
 } from './lib/api'
 
 const CONVERSATION_STORAGE_KEY_PREFIX = 'enterprise-knowledge-system.conversations'
+const CONVERSATION_SYNCED_STORAGE_KEY_PREFIX = 'enterprise-knowledge-system.conversations-synced'
 const DEFAULT_MAX_CONVERSATIONS = 20
 const APP_NAME = '企业知识库问答系统'
 const APP_VERSION = '1.0.0'
@@ -106,6 +110,39 @@ function getConversationStorageKey(user) {
   return userKey ? `${CONVERSATION_STORAGE_KEY_PREFIX}.${userKey}` : ''
 }
 
+function getConversationSyncedStorageKey(user) {
+  const userKey = typeof user === 'string'
+    ? user
+    : user?.user_id || user?.username || ''
+  return userKey ? `${CONVERSATION_SYNCED_STORAGE_KEY_PREFIX}.${userKey}` : ''
+}
+
+function hasSyncedConversations(user) {
+  const storageKey = getConversationSyncedStorageKey(user)
+  return Boolean(storageKey && localStorage.getItem(storageKey) === '1')
+}
+
+function markConversationsSynced(user) {
+  const storageKey = getConversationSyncedStorageKey(user)
+  if (storageKey) {
+    localStorage.setItem(storageKey, '1')
+  }
+}
+
+function clearLocalConversationCache(user) {
+  const keys = new Set([
+    getConversationStorageKey(user),
+    getConversationSyncedStorageKey(user),
+  ])
+  if (typeof user !== 'string' && user?.username) {
+    keys.add(getConversationStorageKey(user.username))
+    keys.add(getConversationSyncedStorageKey(user.username))
+  }
+  for (const key of keys) {
+    if (key) localStorage.removeItem(key)
+  }
+}
+
 function loadConversationsForUser(user) {
   const storageKey = getConversationStorageKey(user)
   if (!storageKey) return [createConversation()]
@@ -118,6 +155,64 @@ function loadConversationsForUser(user) {
     // Ignore corrupt browser storage and start a clean local conversation list.
   }
   return [createConversation()]
+}
+
+function conversationHasContent(conversation) {
+  return Boolean((conversation?.messages || []).some((message) => (
+    message
+    && !message.ephemeral
+    && ['user', 'assistant'].includes(message.role)
+    && typeof message.content === 'string'
+    && message.content.trim()
+  )))
+}
+
+function conversationReadyToPersist(conversation) {
+  if (!conversation || isConversationStreaming(conversation.conversation_id)) {
+    return false
+  }
+  const hasPendingAssistantMessage = (conversation.messages || []).some((message) => (
+    !message.ephemeral
+    && message.role === 'assistant'
+    && ['thinking', 'retrieving', 'generating', 'streaming'].includes(message.status)
+  ))
+  return conversationHasContent(conversation) && !hasPendingAssistantMessage
+}
+
+function buildConversationServerPayload(conversation) {
+  const messages = (conversation?.messages || [])
+    .filter((message) => (
+      message
+      && !message.ephemeral
+      && ['user', 'assistant'].includes(message.role)
+    ))
+    .map((message) => ({ ...message }))
+  return {
+    conversation_id: conversation.conversation_id,
+    session_id: conversation.session_id || null,
+    created_at: conversation.created_at || null,
+    updated_at: conversation.updated_at || null,
+    messages,
+  }
+}
+
+function getPersistableConversations() {
+  return conversations.value.filter(conversationReadyToPersist)
+}
+
+function hasPersistableConversations() {
+  return getPersistableConversations().length > 0
+}
+
+async function syncConversationsToServer() {
+  if (!currentUser.value || !hasPersistableConversations()) return
+  const persistable = getPersistableConversations()
+  await Promise.all(
+    persistable.map((conversation) => (
+      saveConversation(buildConversationServerPayload(conversation))
+    )),
+  )
+  markConversationsSynced(currentUser.value)
 }
 
 const isAuthenticated = ref(false)
@@ -153,6 +248,7 @@ const conversations = ref([createConversation()])
 const activeConversationId = ref(conversations.value[0].conversation_id)
 const chatMessages = ref(conversations.value[0].messages)
 const chatSettings = ref({ max_conversations: DEFAULT_MAX_CONVERSATIONS })
+const clearingConversations = ref(false)
 const chatRuntime = ref({
   ready: false,
   status: 'initializing',
@@ -893,7 +989,38 @@ async function bootstrapAuth() {
 
   try {
     currentUser.value = await getCurrentUser()
-    replaceConversations(loadConversationsForUser(currentUser.value))
+    const localConversations = loadConversationsForUser(currentUser.value)
+    let serverConversations = []
+    let serverConversationLoadFailed = false
+    try {
+      const result = await listConversations()
+      serverConversations = Array.isArray(result?.conversations)
+        ? result.conversations
+        : []
+    } catch (error) {
+      serverConversationLoadFailed = true
+      authError.value = error.message || '对话列表同步失败，已使用本地缓存。'
+    }
+
+    const serverConversationIds = new Set(
+      serverConversations.map((item) => item?.conversation_id).filter(Boolean),
+    )
+    const syncedBefore = hasSyncedConversations(currentUser.value)
+    const shouldMergeLocalCache = !syncedBefore || serverConversationLoadFailed
+    const unsyncedLocalConversations = shouldMergeLocalCache
+      ? localConversations.filter((item) => (
+      conversationHasContent(item)
+      && !serverConversationIds.has(item.conversation_id)
+    ))
+      : []
+    const mergedConversations = [...serverConversations, ...unsyncedLocalConversations]
+    replaceConversations(mergedConversations)
+    if (!serverConversationLoadFailed && syncedBefore && !serverConversations.length) {
+      // 服务端已被清空时，旧浏览器缓存不能自动重新上传。
+      clearLocalConversationCache(currentUser.value)
+    } else if (!serverConversationLoadFailed && unsyncedLocalConversations.length) {
+      scheduleConversationPersist()
+    }
     isAuthenticated.value = true
     return true
   } catch (error) {
@@ -1041,6 +1168,42 @@ function requestConversationDeletion(conversation) {
   }
 }
 
+function requestClearAllConversations() {
+  if (Object.keys(streamingConversationIds.value).length) {
+    errorText.value = '当前仍有对话在输出，完成后再清空历史。'
+    return
+  }
+  if (!conversations.value.some(conversationHasContent)) {
+    errorText.value = '当前账号没有可清空的对话历史。'
+    return
+  }
+  pendingDeletion.value = {
+    type: 'conversations',
+    target: null,
+    title: '全部对话历史',
+  }
+}
+
+async function clearAllConversationHistory() {
+  if (clearingConversations.value) return
+  clearingConversations.value = true
+  errorText.value = ''
+  try {
+    await clearAllConversations()
+    clearLocalConversationCache(currentUser.value)
+    conversations.value = [createConversation()]
+    syncActiveConversation(conversations.value[0])
+    expandedSources.value = {}
+    autoScrollEnabled.value = true
+    await nextTick()
+    scrollToBottom(true)
+  } catch (error) {
+    errorText.value = error.message || '清空对话历史失败'
+  } finally {
+    clearingConversations.value = false
+  }
+}
+
 async function removeConversation(conversation) {
   if (!conversation?.conversation_id) return
   const id = conversation.conversation_id
@@ -1084,6 +1247,8 @@ function persistConversations() {
   const storageKey = getConversationStorageKey(currentUser.value)
   if (!storageKey) return
   localStorage.setItem(storageKey, JSON.stringify(conversations.value))
+  // 服务端是跨浏览器共享的最终副本，本地存储只作临时缓存和迁移来源。
+  syncConversationsToServer().catch(() => {})
 }
 
 function scheduleConversationPersist() {
@@ -1525,6 +1690,10 @@ async function confirmPendingDeletion() {
 
   if (pending.type === 'conversation') {
     await removeConversation(pending.target)
+    return
+  }
+  if (pending.type === 'conversations') {
+    await clearAllConversationHistory()
     return
   }
   await handleDelete(pending.target)
@@ -2313,7 +2482,19 @@ watch(conversations, () => {
                 <div class="eyebrow">Conversation</div>
                 <h3>对话列表</h3>
               </div>
-              <span class="count-badge">{{ conversations.length }} / {{ maxConversations }}</span>
+              <div class="conversation-panel__header-actions">
+                <span class="count-badge">{{ conversations.length }} / {{ maxConversations }}</span>
+                <button
+                  class="icon-button danger"
+                  type="button"
+                  title="清空全部对话历史"
+                  :disabled="clearingConversations"
+                  @click="requestClearAllConversations"
+                >
+                  <Loader2 v-if="clearingConversations" :size="14" class="spin" />
+                  <Trash2 v-else :size="14" />
+                </button>
+              </div>
             </div>
 
             <div class="conversation-list">
@@ -2416,7 +2597,8 @@ watch(conversations, () => {
               <div>
                 <div class="eyebrow">确认操作</div>
                 <h3 id="deletion-confirmation-title">
-                  {{ pendingDeletion.type === 'conversation' ? '删除对话' : '删除文档' }}
+                  {{ pendingDeletion.type === 'conversation' ? '删除对话'
+                    : (pendingDeletion.type === 'conversations' ? '清空对话历史' : '删除文档') }}
                 </h3>
               </div>
               <button class="icon-button" type="button" title="取消" @click="pendingDeletion = null">
@@ -2427,12 +2609,15 @@ watch(conversations, () => {
             <p class="deletion-confirmation__message">
               确定删除「{{ pendingDeletion.title }}」吗？
               <span v-if="pendingDeletion.type === 'conversation'">关联的长期记忆也会一并清除。</span>
+              <span v-else-if="pendingDeletion.type === 'conversations'">服务端记录、长期记忆和当前浏览器缓存都会一并清空，不会再次从本地自动恢复。</span>
               <span v-else>删除请求会立即生效，后台将继续清理向量数据和本地文件。</span>
             </p>
 
             <div class="modal-actions">
               <button class="ghost-button" type="button" @click="pendingDeletion = null">取消</button>
-              <button class="primary-button danger-button" type="button" @click="confirmPendingDeletion">确认删除</button>
+              <button class="primary-button danger-button" type="button" @click="confirmPendingDeletion">
+                {{ pendingDeletion.type === 'conversations' ? '确认清空' : '确认删除' }}
+              </button>
             </div>
           </section>
         </div>

@@ -68,23 +68,6 @@ STRUCTURED_QUERY_HINT_TERMS = (
     "编码",
     "编号",
 )
-STRUCTURED_SUMMARY_TERMS = (
-    "统计",
-    "总数",
-    "总人数",
-    "数量",
-    "多少",
-    "共有",
-    "一共",
-    "名单",
-    "列表",
-    "清单",
-    "明细",
-    "构成",
-    "分别",
-    "哪些",
-    "有谁",
-)
 STRUCTURED_META_SCHEMA_TERMS = (
     "说明",
     "填表说明",
@@ -770,15 +753,6 @@ def _is_structured_result(result: RetrievalResult) -> bool:
     return file_type in {"csv", "tsv", "xls", "xlsx"} or str(result.content or "").lstrip().startswith("[Sheet]")
 
 
-def _is_structured_summary_query(query: str) -> bool:
-    """判断是否需要跨多行表格证据来回答。"""
-    normalized = re.sub(r"\s+", "", (query or "").strip())
-    return _is_structured_lookup_query(normalized) and any(
-        term in normalized
-        for term in STRUCTURED_SUMMARY_TERMS
-    )
-
-
 def _structured_section_marker_from_text(text: str) -> str:
     """从结构化 chunk/parent 中提取 sheet 名。"""
     for raw_line in str(text or "").splitlines():
@@ -792,16 +766,6 @@ def _structured_section_marker_from_text(text: str) -> str:
 
 def _structured_section_marker(result: RetrievalResult) -> str:
     return _structured_section_marker_from_text(result.content)
-
-
-def _structured_schema_text(result: RetrievalResult) -> str:
-    """取结构化结果的 sheet 名和表头，用于判断表格是否对题。"""
-    lines = [
-        line.strip()
-        for line in str(result.content or "").splitlines()
-        if line.strip()
-    ]
-    return "\n".join(lines[:2])
 
 
 def _structured_schema_parts(result: RetrievalResult) -> tuple[str, str]:

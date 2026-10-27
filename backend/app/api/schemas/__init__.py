@@ -112,6 +112,30 @@ class ConversationDeleteResponse(BaseModel):
     memory_deleted: bool = False
 
 
+class ConversationRecordResponse(BaseModel):
+    conversation_id: str
+    session_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ConversationListResponse(BaseModel):
+    conversations: List[ConversationRecordResponse] = Field(default_factory=list)
+
+
+class ConversationClearResponse(BaseModel):
+    deleted_count: int = 0
+    memory_deleted_count: int = 0
+
+
+class ConversationUpsertRequest(BaseModel):
+    session_id: Optional[str] = Field(default=None, max_length=64)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class ChatWarmupResponse(BaseModel):
     status: str = "initializing"
     llm_warmed: bool = False
@@ -206,6 +230,10 @@ __all__ = [
     "ChatSettingsResponse",
     "ConversationDeleteResponse",
     "ChatWarmupResponse",
+    "ConversationClearResponse",
+    "ConversationListResponse",
+    "ConversationRecordResponse",
+    "ConversationUpsertRequest",
     "DocumentDeleteResponse",
     "DocumentContentResponse",
     "DocumentListResponse",

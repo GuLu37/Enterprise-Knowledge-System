@@ -1,7 +1,9 @@
-"""Adaptive-RAG 的轻量决策层。
+"""常规检索的轻量规划层。
 
-该模块只做可解释的策略决策，不负责真正的文档检索。检索仍由
-``search_knowledge_base`` Function Calling 工具完成。
+该模块只做可解释的检索策略决策（第一轮检索怎么查、证据够不够、
+不足时怎么补），不负责真正的文档检索。真正的自适应检索编排
+（按证据动态决策）由 ReAct Agent 在更高层完成。检索仍由
+``search_knowledge_base`` Function Calling 工具执行。
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ SUPPORTED_RETRIEVAL_METHODS = {
     RETRIEVAL_METHOD_SPARSE,
 }
 
-MAX_ADAPTIVE_ATTEMPTS = 2
+MAX_PLAN_ATTEMPTS = 2
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 50
 MIN_EVIDENCE_SCORE = 0.28
@@ -43,19 +45,19 @@ LOW_EVIDENCE_SCORE = 0.15
 HIGH_KEYWORD_COVERAGE = 0.50
 LOW_KEYWORD_COVERAGE = 0.10
 
-_ADAPTIVE_SELECT_SYSTEM_PROMPT = (
+_SELECT_SYSTEM_PROMPT = (
     "你是企业知识库检索策略决策器。规则未给出强信号时，由你做最终决策。"
     "可选检索方式：hybrid（混合，默认稳妥）、dense（纯语义召回）、sparse（纯关键词/精确匹配）。"
     "只输出严格 JSON，格式：{\"retrieval_method\":\"hybrid|dense|sparse\",\"top_k\":整数,\"strategy\":\"简短策略名\",\"reason\":\"简短中文理由\"}"
 )
 
-_ADAPTIVE_ASSESS_SYSTEM_PROMPT = (
+_ASSESS_SYSTEM_PROMPT = (
     "你是检索证据评估器。根据用户问题与给定检索信号，判断现有检索结果是否足以回答问题。"
     "只依据提供的信号做判断，不要臆测知识库内容。"
     "只输出严格 JSON，格式：{\"sufficient\":true|false,\"reason\":\"简短中文理由\"}"
 )
 
-_ADAPTIVE_REWRITE_SYSTEM_PROMPT = (
+_REWRITE_SYSTEM_PROMPT = (
     "你是企业知识库检索查询改写器。证据不足时，改写查询用于二次检索。"
     "必须原样保留编号、工号、产品号、人名、文档名等专名，不得丢失问题焦点。"
     "只输出严格 JSON，格式：{\"query\":\"改写后的检索查询\"}"
@@ -95,7 +97,7 @@ _PROCEDURAL_QUERY_TERMS = (
 
 
 @dataclass(frozen=True)
-class AdaptiveRAGDecision:
+class RetrievalPlan:
     """一次 RAG 尝试的结构化计划。"""
 
     query: str
@@ -130,7 +132,7 @@ class EvidenceAssessment:
 
 
 @dataclass(frozen=True)
-class AdaptiveSignals:
+class QuerySignals:
     """规则层产出的软信号，只描述事实，不下结论。"""
 
     is_identifier: bool = False
@@ -262,18 +264,18 @@ def _invoke_llm_decision(llm: Any, system_prompt: str, human_prompt: str) -> Dic
     return _parse_json_payload(_extract_text(response))
 
 
-def _extract_query_signals(query: str) -> AdaptiveSignals:
+def _extract_query_signals(query: str) -> QuerySignals:
     """从查询中提取规则软信号。"""
     normalized = re.sub(r"\s+", " ", (query or "").strip())
-    return AdaptiveSignals(
+    return QuerySignals(
         is_identifier=is_identifier_query(normalized),
         structured_hit=_contains_any(normalized, _STRUCTURED_QUERY_TERMS),
         procedural_hit=_contains_any(normalized, _PROCEDURAL_QUERY_TERMS),
     )
 
 
-class AdaptiveRAGController:
-    """基于规则的 Adaptive-RAG 控制器。
+class RetrievalPlanner:
+    """基于规则的检索规划器。
 
     第一版优先保证可解释性和确定性。后续如果引入模型评分，只需要替换
     ``assess_evidence`` 或 ``plan_follow_up``，不会改变工具接口。
@@ -285,7 +287,7 @@ class AdaptiveRAGController:
         top_k: Optional[int] = None,
         retrieval_method: str = RETRIEVAL_METHOD_HYBRID,
         llm: Optional[Any] = None,
-    ) -> AdaptiveRAGDecision:
+    ) -> RetrievalPlan:
         normalized_query = re.sub(r"\s+", " ", (query or "").strip())
         resolved_method = _normalize_method(retrieval_method)
         resolved_top_k = _normalize_top_k(top_k)
@@ -300,7 +302,7 @@ class AdaptiveRAGController:
             try:
                 return self._llm_select(normalized_query, signals, resolved_top_k, llm)
             except Exception as exc:
-                logger.warning("Adaptive-RAG 策略选择 LLM 决策失败，回退规则: %s", exc)
+                logger.warning("常规检索策略选择 LLM 决策失败，回退规则: %s", exc)
 
         # 第三层：LLM 失败或未提供，回退规则兜底。
         return self._rule_select(normalized_query, resolved_method, resolved_top_k, signals)
@@ -310,8 +312,8 @@ class AdaptiveRAGController:
         query: str,
         resolved_method: str,
         resolved_top_k: int,
-        signals: AdaptiveSignals,
-    ) -> AdaptiveRAGDecision:
+        signals: QuerySignals,
+    ) -> RetrievalPlan:
         """规则直判：按强信号选择检索策略。"""
         if signals.is_identifier:
             strategy = "identifier_exact"
@@ -333,7 +335,7 @@ class AdaptiveRAGController:
             if resolved_method not in SUPPORTED_RETRIEVAL_METHODS:
                 resolved_method = RETRIEVAL_METHOD_HYBRID
 
-        return AdaptiveRAGDecision(
+        return RetrievalPlan(
             query=query,
             retrieval_method=resolved_method,
             top_k=resolved_top_k,
@@ -345,10 +347,10 @@ class AdaptiveRAGController:
     def _llm_select(
         self,
         query: str,
-        signals: AdaptiveSignals,
+        signals: QuerySignals,
         resolved_top_k: int,
         llm: Any,
-    ) -> AdaptiveRAGDecision:
+    ) -> RetrievalPlan:
         """LLM 决策：无强信号时，让模型选择检索方式与 top_k。"""
         human_prompt = (
             f"用户问题：{query}\n"
@@ -356,12 +358,12 @@ class AdaptiveRAGController:
             f"默认 top_k={resolved_top_k}\n"
             "请输出最终检索策略 JSON。"
         )
-        payload = _invoke_llm_decision(llm, _ADAPTIVE_SELECT_SYSTEM_PROMPT, human_prompt)
+        payload = _invoke_llm_decision(llm, _SELECT_SYSTEM_PROMPT, human_prompt)
         method = _normalize_method(str(payload.get("retrieval_method") or RETRIEVAL_METHOD_HYBRID))
         top_k = _normalize_top_k(payload.get("top_k") or resolved_top_k)
         strategy = str(payload.get("strategy") or "llm_hybrid").strip() or "llm_hybrid"
         reason = str(payload.get("reason") or "LLM 决策选择检索策略").strip()
-        return AdaptiveRAGDecision(
+        return RetrievalPlan(
             query=query,
             retrieval_method=method,
             top_k=top_k,
@@ -424,7 +426,7 @@ class AdaptiveRAGController:
                 if assessment is not None:
                     return assessment
             except Exception as exc:
-                logger.warning("Adaptive-RAG 证据评估 LLM 决策失败，回退规则: %s", exc)
+                logger.warning("常规检索证据评估 LLM 决策失败，回退规则: %s", exc)
 
         # 第三层：LLM 失败或未提供，回退规则兜底。
         return self._rule_assess(
@@ -505,7 +507,7 @@ class AdaptiveRAGController:
             f"命中片段示例：{snippet}\n"
             "请判断现有检索结果是否足以回答用户问题。"
         )
-        payload = _invoke_llm_decision(llm, _ADAPTIVE_ASSESS_SYSTEM_PROMPT, human_prompt)
+        payload = _invoke_llm_decision(llm, _ASSESS_SYSTEM_PROMPT, human_prompt)
         raw_sufficient = payload.get("sufficient")
         if raw_sufficient is None:
             return None
@@ -529,12 +531,12 @@ class AdaptiveRAGController:
     def plan_follow_up(
         self,
         original_query: str,
-        decision: AdaptiveRAGDecision,
+        decision: RetrievalPlan,
         assessment: EvidenceAssessment,
         llm: Optional[Any] = None,
-    ) -> Optional[AdaptiveRAGDecision]:
+    ) -> Optional[RetrievalPlan]:
         """证据不足时生成最多一次不同策略的补检索计划。"""
-        if assessment.sufficient or decision.attempt >= MAX_ADAPTIVE_ATTEMPTS:
+        if assessment.sufficient or decision.attempt >= MAX_PLAN_ATTEMPTS:
             return None
 
         # 第一层：策略切换用规则（确定性高，无需 LLM）。
@@ -568,9 +570,9 @@ class AdaptiveRAGController:
                 if rewritten:
                     next_query = rewritten
             except Exception as exc:
-                logger.warning("Adaptive-RAG 补检索改写 LLM 失败，回退模板: %s", exc)
+                logger.warning("常规检索补检索改写 LLM 失败，回退模板: %s", exc)
 
-        return AdaptiveRAGDecision(
+        return RetrievalPlan(
             query=next_query,
             retrieval_method=next_method,
             top_k=max(decision.top_k, 8 if assessment.result_count == 0 else decision.top_k),
@@ -593,17 +595,17 @@ class AdaptiveRAGController:
             f"缺失编号：{'、'.join(assessment.missing_identifiers) if assessment.missing_identifiers else '无'}\n"
             "请输出改写后的二次检索查询。"
         )
-        payload = _invoke_llm_decision(llm, _ADAPTIVE_REWRITE_SYSTEM_PROMPT, human_prompt)
+        payload = _invoke_llm_decision(llm, _REWRITE_SYSTEM_PROMPT, human_prompt)
         rewritten = re.sub(r"\s+", " ", str(payload.get("query") or "")).strip()
         return rewritten or None
 
 
 __all__ = [
-    "AdaptiveRAGController",
-    "AdaptiveRAGDecision",
-    "AdaptiveSignals",
+    "RetrievalPlanner",
+    "RetrievalPlan",
+    "QuerySignals",
     "EvidenceAssessment",
-    "MAX_ADAPTIVE_ATTEMPTS",
+    "MAX_PLAN_ATTEMPTS",
     "MIN_EVIDENCE_SCORE",
     "MIN_KEYWORD_COVERAGE",
 ]

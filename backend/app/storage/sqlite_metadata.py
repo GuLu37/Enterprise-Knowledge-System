@@ -136,6 +136,8 @@ class MemoryRecord(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     conversation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
     session_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    turn_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    turn_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     base_importance_score: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
     importance_score: Mapped[float] = mapped_column(Float, nullable=False, default=50.0)
     confidence_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
@@ -171,6 +173,37 @@ class MemoryConsolidationRecord(Base):
     last_merged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class UserConversationRecord(Base):
+    """按用户保存的跨浏览器对话记录。
+
+    前端对话列表不再只依赖浏览器 localStorage；同一账号换浏览器登录后，
+    从这里读取此前保存的会话消息列表。
+    """
+
+    __tablename__ = "user_conversations"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "conversation_id",
+            name="uq_user_conversations_user_conversation",
+        ),
+        Index("ix_user_conversations_user_updated", "user_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    session_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+
 def init_metadata_db():
     """创建或校验关系型元数据表结构。"""
     if settings.DATABASE_URL.startswith("sqlite:///"):
@@ -200,6 +233,17 @@ def init_metadata_db():
             ).rowcount
         if migrated:
             logger.info("SQLite document_chunks 已补齐历史 Parent ID: %s", migrated)
+
+    memory_columns = {
+        str(column.get("name"))
+        for column in inspect(engine).get_columns("memory_records")
+    }
+    with engine.begin() as connection:
+        if "turn_start" not in memory_columns:
+            connection.execute(text("ALTER TABLE memory_records ADD COLUMN turn_start INTEGER"))
+        if "turn_end" not in memory_columns:
+            connection.execute(text("ALTER TABLE memory_records ADD COLUMN turn_end INTEGER"))
+
     try:
         from app.services.auth_service import seed_bootstrap_admin_user
 

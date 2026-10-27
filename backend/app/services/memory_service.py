@@ -3,7 +3,10 @@ import json
 import logging
 import math
 import re
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -32,6 +35,11 @@ from app.utils.chunking import (
 from app.utils.exceptions import RetrievalException, VectorStoreException
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_ACCESS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="memory-access",
+)
 
 MEMORY_TYPE_PROFILE = "profile"
 MEMORY_TYPE_EVENT = "event"
@@ -184,6 +192,13 @@ def _clamp_confidence(value: Any, default: float = 0.5) -> float:
 
 def _normalize_memory_content(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _normalize_event_content(value: Any) -> str:
+    """保留对话角色换行，便于后续摘要合并重新解析用户/助手消息。"""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
 def _calculate_event_importance(content: str) -> tuple[float, float]:
@@ -399,7 +414,7 @@ def register_event_memory_records(
     try:
         for row in rows:
             memory_id = str(row.get("memory_id") or "").strip()
-            content = _normalize_memory_content(row.get("chunk_text") or row.get("text"))
+            content = _normalize_event_content(row.get("chunk_text") or row.get("text"))
             if not memory_id or not content:
                 continue
             base_score, confidence = _calculate_event_importance(content)
@@ -446,10 +461,20 @@ def register_event_memory_records(
                     user_id=user_key,
                     memory_type=MEMORY_TYPE_EVENT,
                     memory_key=logical_key,
-                    content=content,
-                    conversation_id=row_conversation_id,
-                    session_id=row_session_id,
-                    base_importance_score=base_score,
+                content=content,
+                conversation_id=row_conversation_id,
+                session_id=row_session_id,
+                turn_start=(
+                    int(row.get("turn_start"))
+                    if row.get("turn_start") is not None
+                    else None
+                ),
+                turn_end=(
+                    int(row.get("turn_end"))
+                    if row.get("turn_end") is not None
+                    else None
+                ),
+                base_importance_score=base_score,
                     importance_score=base_score,
                     confidence_score=confidence,
                     access_count=0,
@@ -528,6 +553,24 @@ def _mark_memory_accessed(user_id: str, memory_ids: Sequence[str]) -> None:
         logger.warning("更新长期记忆访问统计失败", exc_info=True)
     finally:
         db.close()
+
+
+def _mark_memory_accessed_async(user_id: str, memory_ids: Sequence[str]) -> None:
+    """后台更新访问统计，不阻塞当前记忆检索结果返回。"""
+    normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
+    if not normalized_ids:
+        return
+
+    def update() -> None:
+        try:
+            _mark_memory_accessed(user_id, normalized_ids)
+        except Exception:
+            logger.warning("异步更新长期记忆访问统计失败", exc_info=True)
+
+    try:
+        _MEMORY_ACCESS_EXECUTOR.submit(update)
+    except Exception:
+        logger.warning("提交长期记忆访问统计任务失败", exc_info=True)
 
 
 def _delete_event_vectors(memory_ids: Sequence[str]) -> None:
@@ -697,6 +740,7 @@ def _build_insert_rows(
     source_name: str,
     chunk_type: str,
     topic: str,
+    turn_offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """组装 Milvus 插入行。"""
     created_at = datetime.now(timezone.utc).isoformat()
@@ -713,7 +757,7 @@ def _build_insert_rows(
                 "text": chunk.text,
                 "vector": list(vectors[chunk.chunk_index]),
                 "memory_id": versioned_memory_id,
-                "chunk_index": chunk.chunk_index,
+                "chunk_index": int(chunk.chunk_index) + int(turn_offset),
                 "source_name": source_name,
                 "chunk_text": chunk.text,
                 "user_id": user_id,
@@ -721,12 +765,96 @@ def _build_insert_rows(
                 "session_id": session_id,
                 "chunk_type": chunk_type,
                 "topic": chunk_topic,
-                "turn_start": chunk.turn_start,
-                "turn_end": chunk.turn_end,
+                "turn_start": int(chunk.turn_start) + int(turn_offset),
+                "turn_end": int(chunk.turn_end) + int(turn_offset),
                 "created_at": created_at,
             }
         )
     return rows
+
+
+def _prepare_memory_collection(
+    *,
+    require_loaded: bool = False,
+    create: bool = False,
+) -> Optional[Any]:
+    """统一准备 memory collection，返回不可用时的空客户端。"""
+    from app.storage.milvus_store import (
+        _ensure_memory_collection,
+        _validate_vector_dimension,
+        get_milvus_client,
+        is_collection_loaded,
+    )
+
+    client = get_milvus_client()
+    collection_name = settings.MILVUS_MEMORY_COLLECTION_NAME
+    if not create and not client.has_collection(collection_name):
+        return None
+    _ensure_memory_collection(client)
+    _validate_vector_dimension(client, collection_name)
+    if require_loaded and not is_collection_loaded(client, collection_name):
+        logger.warning("长期记忆 collection 尚未加载完成，跳过本次操作")
+        return None
+    return client
+
+
+def _write_memory_chunks(
+    *,
+    chunks: Sequence[Any],
+    user_id: str,
+    conversation_id: str,
+    session_id: str,
+    source_name: str,
+    chunk_type: str,
+    topic: str,
+    turn_offset: int = 0,
+    normalize_dialogue_turns: bool = False,
+) -> List[str]:
+    """统一完成记忆块 embedding、Milvus 写入和 SQL 生命周期登记。"""
+    if not chunks:
+        return []
+
+    from app.core.embeddings import get_default_embeddings
+    from app.storage.milvus_store import insert_rows_with_retry
+
+    client = _prepare_memory_collection(create=True)
+    if client is None:
+        raise VectorStoreException("长期记忆 collection 不可用")
+    vectors = get_default_embeddings().embed_documents([chunk.text for chunk in chunks])
+    rows = _build_insert_rows(
+        chunks=chunks,
+        vectors=vectors,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        source_name=source_name,
+        chunk_type=chunk_type,
+        topic=topic,
+        turn_offset=turn_offset,
+    )
+    if normalize_dialogue_turns and chunk_type == "dialogue":
+        for row, chunk in zip(rows, chunks):
+            row["turn_start"] = turn_offset + int(getattr(chunk, "turn_start", 0))
+            row["turn_end"] = turn_offset + int(getattr(chunk, "turn_end", 0))
+
+    inserted_ids = insert_rows_with_retry(
+        client=client,
+        collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
+        rows=rows,
+    )
+    register_event_memory_records(
+        user_id=user_id,
+        rows=rows,
+        conversation_id=conversation_id,
+        session_id=session_id,
+    )
+    logger.info(
+        "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
+        user_id,
+        conversation_id,
+        len(inserted_ids),
+    )
+    return inserted_ids
 
 
 def store_semantic_long_term_memory(
@@ -743,6 +871,8 @@ def store_semantic_long_term_memory(
     llm: Optional[Any] = None,
     chunk_size: int = CHAT_CHUNK_SIZE,
     chunk_overlap: int = CHAT_CHUNK_OVERLAP,
+    turn_offset: int = 0,
+    detect_topic_change: bool = True,
 ) -> List[str]:
     """把长期记忆写入 Milvus 的 `memory_chunks` collection。"""
     try:
@@ -777,7 +907,11 @@ def store_semantic_long_term_memory(
             semantic_messages = _flatten_turn_messages(older_turns)
             chunks = build_semantic_memory_chunks(
                 semantic_messages,
-                should_split_topic=_build_topic_change_detector(llm),
+                should_split_topic=(
+                    _build_topic_change_detector(llm)
+                    if detect_topic_change
+                    else lambda _current_text, _next_text: False
+                ),
                 summarize_chunk=_build_chunk_summarizer(llm),
                 token_limit=token_limit,
                 include_system=include_system,
@@ -791,49 +925,17 @@ def store_semantic_long_term_memory(
         session_key = session_id or conversation_key
         topic_value = topic.strip()
 
-        from app.core.embeddings import get_default_embeddings
-        from app.storage.milvus_store import (
-            _ensure_memory_collection,
-            _validate_vector_dimension,
-            get_milvus_client,
-            insert_rows_with_retry,
-        )
-
-        client = get_milvus_client()
-        _ensure_memory_collection(client)
-        _validate_vector_dimension(client, settings.MILVUS_MEMORY_COLLECTION_NAME)
-
-        embeddings = get_default_embeddings()
-        vectors = embeddings.embed_documents([chunk.text for chunk in chunks])
-        rows = _build_insert_rows(
+        return _write_memory_chunks(
             chunks=chunks,
-            vectors=vectors,
             user_id=user_key,
             conversation_id=conversation_key,
             session_id=session_key,
             source_name=source_name,
             chunk_type=chunk_type,
             topic=topic_value,
+            turn_offset=turn_offset,
+            normalize_dialogue_turns=True,
         )
-
-        inserted_ids = insert_rows_with_retry(
-            client=client,
-            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
-            rows=rows,
-        )
-        register_event_memory_records(
-            user_id=user_key,
-            rows=rows,
-            conversation_id=conversation_key,
-            session_id=session_key,
-        )
-        logger.info(
-            "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
-            user_key,
-            conversation_key,
-            len(inserted_ids),
-        )
-        return inserted_ids
     except Exception as error:
         logger.error(f"长期记忆写入失败: {str(error)}")
         raise VectorStoreException(f"长期记忆写入失败: {str(error)}")
@@ -886,51 +988,20 @@ def store_conversation_memory(
         conversation_key = conversation_id or session_id or uuid.uuid4().hex
         session_key = session_id or conversation_key
         topic_value = topic.strip()
+        # 每次 API 请求通常只写入一个 user/assistant 对话块；把本批次的
+        # 局部轮次偏移到会话全局，后续摘要才能按 turn_start/turn_end 精确展开原文。
+        turn_offset = _count_dialogue_turns(user_key, conversation_key)
 
-        from app.storage.milvus_store import (
-            _ensure_memory_collection,
-            _validate_vector_dimension,
-            get_milvus_client,
-            insert_rows_with_retry,
-        )
-
-        client = get_milvus_client()
-        _ensure_memory_collection(client)
-        _validate_vector_dimension(client, settings.MILVUS_MEMORY_COLLECTION_NAME)
-
-        from app.core.embeddings import get_default_embeddings
-
-        embeddings = get_default_embeddings()
-        vectors = embeddings.embed_documents([chunk.text for chunk in chunks])
-        rows = _build_insert_rows(
+        return _write_memory_chunks(
             chunks=chunks,
-            vectors=vectors,
             user_id=user_key,
             conversation_id=conversation_key,
             session_id=session_key,
             source_name=source_name,
             chunk_type=chunk_type,
             topic=topic_value,
+            turn_offset=turn_offset,
         )
-
-        inserted_ids = insert_rows_with_retry(
-            client=client,
-            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
-            rows=rows,
-        )
-        register_event_memory_records(
-            user_id=user_key,
-            rows=rows,
-            conversation_id=conversation_key,
-            session_id=session_key,
-        )
-        logger.info(
-            "✓ 长期记忆写入成功 (user_id=%s, conversation_id=%s, chunks=%s)",
-            user_key,
-            conversation_key,
-            len(inserted_ids),
-        )
-        return inserted_ids
     except Exception as error:
         logger.error(f"长期记忆写入失败: {str(error)}")
         raise VectorStoreException(f"长期记忆写入失败: {str(error)}")
@@ -953,21 +1024,9 @@ def search_long_term_memory(
         user_key = _require_user_id(user_id)
 
         from app.core.embeddings import get_default_embeddings
-        from app.storage.milvus_store import (
-            _ensure_memory_collection,
-            _validate_vector_dimension,
-            get_milvus_client,
-            is_collection_loaded,
-        )
 
-        client = get_milvus_client()
-        if not client.has_collection(settings.MILVUS_MEMORY_COLLECTION_NAME):
-            return []
-
-        _ensure_memory_collection(client)
-        _validate_vector_dimension(client, settings.MILVUS_MEMORY_COLLECTION_NAME)
-        if not is_collection_loaded(client, settings.MILVUS_MEMORY_COLLECTION_NAME):
-            logger.warning("长期记忆 collection 尚未加载完成，跳过本次检索")
+        client = _prepare_memory_collection(require_loaded=True)
+        if client is None:
             return []
 
         embeddings = get_default_embeddings()
@@ -986,21 +1045,7 @@ def search_long_term_memory(
             "collection_name": settings.MILVUS_MEMORY_COLLECTION_NAME,
             "data": [query_vector],
             "limit": max(top_k * 3, top_k),
-            "output_fields": [
-                "text",
-                "memory_id",
-                "chunk_index",
-                "source_name",
-                "chunk_text",
-                "user_id",
-                "conversation_id",
-                "session_id",
-                "chunk_type",
-                "topic",
-                "turn_start",
-                "turn_end",
-                "created_at",
-            ],
+            "output_fields": _memory_output_fields(),
         }
         if filter_expr:
             search_kwargs["filter"] = filter_expr
@@ -1060,7 +1105,7 @@ def search_long_term_memory(
             )
 
         final_results = results[:top_k]
-        _mark_memory_accessed(
+        _mark_memory_accessed_async(
             user_key,
             [str(item.metadata.get("memory_id") or "") for item in final_results],
         )
@@ -1091,6 +1136,354 @@ def search_conversation_memory(
         chunk_type=chunk_type,
         topic=topic,
     )
+
+
+def _memory_output_fields() -> List[str]:
+    """返回读取记忆向量时需要的业务字段。"""
+    return [
+        "text",
+        "memory_id",
+        "chunk_index",
+        "source_name",
+        "chunk_text",
+        "user_id",
+        "conversation_id",
+        "session_id",
+        "chunk_type",
+        "topic",
+        "turn_start",
+        "turn_end",
+        "created_at",
+    ]
+
+
+def _query_memory_entities(
+    client: Any,
+    filter_expr: str,
+    limit: int = 100,
+) -> List[Any]:
+    """按元数据读取记忆向量实体，兼容 Milvus Lite 与服务端返回格式。"""
+    try:
+        result = client.query(
+            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=_memory_output_fields(),
+            limit=max(1, min(int(limit), 1000)),
+        )
+    except TypeError:
+        # 部分旧 pymilvus 版本不接受 limit 关键字，保留兼容路径。
+        result = client.query(
+            collection_name=settings.MILVUS_MEMORY_COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=_memory_output_fields(),
+        )
+    return list(result or [])
+
+
+def _serialize_memory_entity(entity: Any, active_records: Dict[str, MemoryRecord]) -> Optional[Dict[str, Any]]:
+    """把 Milvus 实体转成已通过 SQL 生命周期校验的结构。"""
+    memory_id = str(_get_field(entity, "memory_id", "") or "").strip()
+    record = active_records.get(memory_id)
+    if not memory_id or record is None:
+        return None
+    return {
+        "memory_id": memory_id,
+        "content": str(
+            _get_field(entity, "chunk_text")
+            or _get_field(entity, "text")
+            or ""
+        ),
+        "chunk_index": _get_field(entity, "chunk_index"),
+        "source_name": _get_field(entity, "source_name"),
+        "user_id": _get_field(entity, "user_id"),
+        "conversation_id": _get_field(entity, "conversation_id") or record.conversation_id,
+        "session_id": _get_field(entity, "session_id") or record.session_id,
+        "chunk_type": _get_field(entity, "chunk_type"),
+        "topic": _get_field(entity, "topic"),
+        "turn_start": _get_field(entity, "turn_start"),
+        "turn_end": _get_field(entity, "turn_end"),
+        "created_at": _get_field(entity, "created_at"),
+        "status": record.status,
+    }
+
+
+def retrieve_original_conversation(
+    user_id: Optional[str],
+    *,
+    memory_ids: Optional[Sequence[str]] = None,
+    query: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    turn_start: Optional[int] = None,
+    turn_end: Optional[int] = None,
+    include_neighbors: int = 0,
+    include_all_conversation: bool = False,
+    top_k: int = 8,
+    max_chars: int = 12000,
+) -> Dict[str, Any]:
+    """按摘要引用渐进式展开当前用户的原始对话。"""
+    user_key = _require_user_id(user_id)
+    normalized_ids = [str(item).strip() for item in (memory_ids or []) if str(item).strip()]
+    normalized_query = str(query or "").strip()
+    normalized_conversation = str(conversation_id or "").strip()
+    if not normalized_ids and not normalized_query and not normalized_conversation:
+        return {
+            "mode": "original_conversation",
+            "summary": "请提供摘要 memory_id、检索提示或 conversation_id。",
+            "summary_references": [],
+            "original_chunks": [],
+        }
+
+    top_k = max(1, min(int(top_k or 8), 50))
+    max_chars = max(500, min(int(max_chars or 12000), 50000))
+    include_neighbors = max(0, min(int(include_neighbors or 0), 5))
+    if turn_start is not None:
+        turn_start = max(0, int(turn_start))
+    if turn_end is not None:
+        turn_end = max(0, int(turn_end))
+    if turn_start is not None and turn_end is not None and turn_end < turn_start:
+        turn_start, turn_end = turn_end, turn_start
+
+    client = _prepare_memory_collection(require_loaded=True)
+    if client is None:
+        return {
+            "mode": "original_conversation",
+            "summary": "长期记忆向量库当前不可用或尚未加载完成。",
+            "summary_references": [],
+            "original_chunks": [],
+        }
+
+    summary_references: List[Dict[str, Any]] = []
+    if normalized_ids:
+        escaped_ids = ", ".join(f'"{_escape_filter_value(item)}"' for item in normalized_ids)
+        entities = _query_memory_entities(
+            client,
+            filter_expr=(
+                f'user_id == "{_escape_filter_value(user_key)}" '
+                f"and memory_id in [{escaped_ids}]"
+            ),
+            limit=len(normalized_ids),
+        )
+        active_records = _get_active_event_records(user_key, normalized_ids)
+        for entity in entities:
+            serialized = _serialize_memory_entity(entity, active_records)
+            if serialized is not None:
+                summary_references.append(serialized)
+    elif include_all_conversation and normalized_conversation:
+        raw_entities = _query_memory_entities(
+            client,
+            filter_expr=(
+                f'user_id == "{_escape_filter_value(user_key)}" '
+                f'and conversation_id == "{_escape_filter_value(normalized_conversation)}" '
+                'and chunk_type == "dialogue"'
+            ),
+            limit=1000,
+        )
+        raw_ids = [
+            str(_get_field(item, "memory_id", "") or "").strip()
+            for item in raw_entities
+        ]
+        active_raw_records = _get_active_event_records(user_key, raw_ids)
+        raw_chunks: List[Dict[str, Any]] = []
+        for entity in raw_entities:
+            serialized = _serialize_memory_entity(entity, active_raw_records)
+            if serialized is not None:
+                raw_chunks.append(serialized)
+        raw_chunks.sort(
+            key=lambda item: (
+                int(item.get("turn_start") or 0),
+                int(item.get("chunk_index") or 0),
+            )
+        )
+        total_chars = 0
+        bounded_chunks: List[Dict[str, Any]] = []
+        for chunk in raw_chunks:
+            remaining = max_chars - total_chars
+            if remaining <= 0:
+                break
+            content = str(chunk.get("content") or "")
+            if len(content) > remaining:
+                chunk = {**chunk, "content": content[:remaining]}
+            bounded_chunks.append(chunk)
+            total_chars += len(str(chunk.get("content") or ""))
+        _mark_memory_accessed_async(
+            user_key,
+            [str(item.get("memory_id") or "") for item in bounded_chunks],
+        )
+        return {
+            "mode": "original_conversation",
+            "summary": f"已展开当前会话的 {len(bounded_chunks)} 个原始对话块。",
+            "summary_references": [],
+            "original_chunks": bounded_chunks,
+            "truncated": total_chars >= max_chars,
+        }
+    elif normalized_query:
+        summary_hits = search_long_term_memory(
+            query=normalized_query,
+            top_k=top_k,
+            user_id=user_key,
+            conversation_id=normalized_conversation or None,
+            chunk_types=["semantic_memory_l3", "semantic_memory_l2", "semantic_memory_l1"],
+        )
+        for hit in summary_hits:
+            metadata = dict(hit.metadata or {})
+            summary_references.append(
+                {
+                    "memory_id": str(metadata.get("memory_id") or ""),
+                    "content": str(hit.content or ""),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "session_id": metadata.get("session_id"),
+                    "chunk_type": metadata.get("chunk_type"),
+                    "topic": metadata.get("topic"),
+                    "turn_start": metadata.get("turn_start"),
+                    "turn_end": metadata.get("turn_end"),
+                    "score": float(hit.score or 0.0),
+                }
+            )
+
+    # 若用户直接指定会话但没有摘要 ID，仍允许从该会话的原文块中取回上下文。
+    if not summary_references and normalized_query:
+        raw_hits = search_long_term_memory(
+            query=normalized_query,
+            top_k=top_k,
+            user_id=user_key,
+            conversation_id=normalized_conversation or None,
+            chunk_type="dialogue",
+        )
+        raw_chunks = []
+        for hit in raw_hits:
+            metadata = dict(hit.metadata or {})
+            raw_chunks.append(
+                {
+                    "memory_id": metadata.get("memory_id"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "turn_start": metadata.get("turn_start"),
+                    "turn_end": metadata.get("turn_end"),
+                    "content": str(hit.content or ""),
+                    "score": float(hit.score or 0.0),
+                }
+            )
+        return {
+            "mode": "original_conversation",
+            "summary": f"已按语义找到 {len(raw_chunks)} 个原始对话块。",
+            "summary_references": [],
+            "original_chunks": raw_chunks,
+        }
+
+    original_chunks: List[Dict[str, Any]] = []
+    seen_raw_ids: set[str] = set()
+    for reference in summary_references[:top_k]:
+        reference_conversation = str(reference.get("conversation_id") or "").strip()
+        if (
+            normalized_conversation
+            and reference_conversation
+            and reference_conversation != normalized_conversation
+        ):
+            continue
+        ref_conversation = str(reference_conversation or normalized_conversation).strip()
+        if not ref_conversation:
+            continue
+        ref_start = reference.get("turn_start") if turn_start is None else turn_start
+        ref_end = reference.get("turn_end") if turn_end is None else turn_end
+        try:
+            ref_start = int(ref_start) if ref_start is not None else None
+        except (TypeError, ValueError):
+            ref_start = None
+        try:
+            ref_end = int(ref_end) if ref_end is not None else None
+        except (TypeError, ValueError):
+            ref_end = None
+        if ref_start is not None:
+            ref_start = max(0, ref_start - include_neighbors)
+        if ref_end is not None:
+            ref_end += include_neighbors
+
+        clauses = [
+            f'user_id == "{_escape_filter_value(user_key)}"',
+            f'conversation_id == "{_escape_filter_value(ref_conversation)}"',
+            'chunk_type == "dialogue"',
+        ]
+        if ref_start is not None:
+            clauses.append(f"turn_end >= {ref_start}")
+        if ref_end is not None:
+            clauses.append(f"turn_start <= {ref_end}")
+        raw_entities = _query_memory_entities(
+            client,
+            filter_expr=" and ".join(clauses),
+            limit=top_k * 4,
+        )
+        raw_ids = [str(_get_field(item, "memory_id", "") or "").strip() for item in raw_entities]
+        active_raw_records = _get_active_event_records(user_key, raw_ids)
+        for entity in raw_entities:
+            serialized = _serialize_memory_entity(entity, active_raw_records)
+            if serialized is None or serialized["memory_id"] in seen_raw_ids:
+                continue
+            seen_raw_ids.add(serialized["memory_id"])
+            serialized["source_summary_memory_id"] = reference.get("memory_id")
+            serialized["score"] = reference.get("score", 0.0)
+            original_chunks.append(serialized)
+
+        # 兼容历史摘要：早期记录的 dialogue 坐标可能不完整，但摘要向量本身
+        # 持有【原文】段，仍可在不扩大召回范围的前提下恢复对应上下文。
+        if not raw_entities:
+            summary_content = str(reference.get("content") or "")
+            if "【原文】" in summary_content:
+                transcript = summary_content.split("【原文】", 1)[1].strip()
+                if transcript:
+                    original_chunks.append(
+                        {
+                            "memory_id": reference.get("memory_id"),
+                            "conversation_id": ref_conversation,
+                            "session_id": reference.get("session_id"),
+                            "chunk_type": "dialogue_recovered",
+                            "turn_start": ref_start,
+                            "turn_end": ref_end,
+                            "content": transcript,
+                            "source_summary_memory_id": reference.get("memory_id"),
+                            "score": reference.get("score", 0.0),
+                        }
+                    )
+
+    original_chunks.sort(
+        key=lambda item: (
+            str(item.get("conversation_id") or ""),
+            int(item.get("turn_start") or 0),
+            int(item.get("chunk_index") or 0),
+        )
+    )
+    total_chars = 0
+    bounded_chunks: List[Dict[str, Any]] = []
+    for chunk in original_chunks:
+        content = str(chunk.get("content") or "")
+        remaining = max_chars - total_chars
+        if remaining <= 0:
+            break
+        if len(content) > remaining:
+            chunk = {**chunk, "content": content[:remaining]}
+        bounded_chunks.append(chunk)
+        total_chars += len(str(chunk.get("content") or ""))
+
+    _mark_memory_accessed_async(
+        user_key,
+        [str(item.get("memory_id") or "") for item in summary_references]
+        + [str(item.get("memory_id") or "") for item in bounded_chunks],
+    )
+    return {
+        "mode": "original_conversation",
+        "summary": f"已展开 {len(bounded_chunks)} 个原始对话块。",
+        "summary_references": [
+            {
+                "memory_id": item.get("memory_id"),
+                "conversation_id": item.get("conversation_id"),
+                "chunk_type": item.get("chunk_type"),
+                "topic": item.get("topic"),
+                "turn_start": item.get("turn_start"),
+                "turn_end": item.get("turn_end"),
+            }
+            for item in summary_references[:top_k]
+        ],
+        "original_chunks": bounded_chunks,
+        "truncated": total_chars >= max_chars,
+    }
 
 
 def delete_long_term_memory(conversation_id: str, user_id: Optional[str] = None) -> bool:
@@ -1264,14 +1657,53 @@ def delete_profile_memories(
 
 # ==================== 递进摘要合并（memory consolidation）====================
 
-# 三层递进摘要阈值：每满 5 轮合并 L1，满 10 轮合并 L2，满 20 轮合并 L3。
+# 三层递进摘要阈值：每满 10 轮合并 L1，满 20 轮合并 L2，满 40 轮合并 L3。
 # 每层是上一层的 2 倍，L2 输入恰好 2 个 L1，L3 输入恰好 2 个 L2，层级自洽。
-CONSOLIDATION_LEVELS: tuple[tuple[int, int], ...] = ((5, 1), (10, 2), (20, 3))
+CONSOLIDATION_LEVELS: tuple[tuple[int, int], ...] = ((10, 1), (20, 2), (40, 3))
+
+LOW_INFORMATION_DIALOGUE = {
+    "好",
+    "好的",
+    "收到",
+    "明白",
+    "了解",
+    "知道了",
+    "可以",
+    "行",
+    "嗯",
+    "嗯嗯",
+    "谢谢",
+    "感谢",
+    "ok",
+    "okay",
+    "thanks",
+    "thankyou",
+}
+_CONSOLIDATION_LOCK = threading.Lock()
+_CONSOLIDATION_IN_FLIGHT: set[tuple[str, str]] = set()
+_CONSOLIDATION_RETRY_STATE: Dict[tuple[str, str, int], tuple[float, int]] = {}
+_CONSOLIDATION_RETRY_DELAYS = (60.0, 300.0, 1800.0)
 MERGE_SUMMARY_SYSTEM_PROMPT = (
     "你是长期记忆递进摘要器。把以下多个摘要块压缩成一段更精炼的高层摘要。"
     "保留跨块共有的主题、结论、偏好和待办；丢弃单块琐碎细节。"
     "只输出严格 JSON，格式：{\"topic\":\"主题\",\"summary\":\"一段摘要\"}"
 )
+
+
+def _is_substantive_dialogue(messages: Sequence[Dict[str, str]]) -> bool:
+    """判断一段对话是否包含值得生成长期摘要的用户信息。"""
+    for message in messages:
+        if str(message.get("role") or "").strip().lower() != "user":
+            continue
+        normalized = re.sub(r"\s+", "", str(message.get("content") or "").strip().lower())
+        normalized = re.sub(
+            r"[，。！？、,.!?：:；;‘’“”\"'（）()\[\]{}]",
+            "",
+            normalized,
+        )
+        if normalized and normalized not in LOW_INFORMATION_DIALOGUE:
+            return True
+    return False
 
 
 def _require_user_key(value: Optional[str]) -> str:
@@ -1337,12 +1769,12 @@ def _update_consolidation_cursor(
 
 
 def _count_dialogue_turns(user_id: str, conversation_id: str) -> int:
-    """统计当前对话已写入的 dialogue 块数量，作为轮次计数。"""
+    """统计当前会话已覆盖的逻辑轮次，兼容旧的无轮次元数据记录。"""
     prefix = f"event:{user_id}:{conversation_id}:dialogue:"
     db = SessionLocal()
     try:
-        return int(
-            db.query(MemoryRecord)
+        records = (
+            db.query(MemoryRecord.turn_start, MemoryRecord.turn_end)
             .filter(
                 MemoryRecord.user_id == user_id,
                 MemoryRecord.conversation_id == conversation_id,
@@ -1350,8 +1782,18 @@ def _count_dialogue_turns(user_id: str, conversation_id: str) -> int:
                 MemoryRecord.memory_key.like(prefix + "%"),
                 MemoryRecord.status == MEMORY_STATUS_ACTIVE,
             )
-            .count()
+            .all()
         )
+        if not records:
+            return 0
+
+        known_end = [
+            int(turn_end)
+            for _turn_start, turn_end in records
+            if turn_end is not None
+        ]
+        unknown_count = len(records) - len(known_end)
+        return (max(known_end) + 1 if known_end else 0) + unknown_count
     except Exception:
         return 0
     finally:
@@ -1377,8 +1819,10 @@ def _load_summary_chunks(
                 MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
                 MemoryRecord.memory_key.like(prefix + "%"),
                 MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                or_(MemoryRecord.turn_end.is_(None), MemoryRecord.turn_end >= start_turn),
+                or_(MemoryRecord.turn_start.is_(None), MemoryRecord.turn_start < end_turn),
             )
-            .order_by(MemoryRecord.id.asc())
+            .order_by(MemoryRecord.turn_start.asc(), MemoryRecord.id.asc())
             .all()
         )
         chunks: List[Dict[str, str]] = []
@@ -1417,10 +1861,10 @@ def _load_dialogue_turn_range_by_prefix(
                 MemoryRecord.memory_type == MEMORY_TYPE_EVENT,
                 MemoryRecord.memory_key.like(prefix + "%"),
                 MemoryRecord.status == MEMORY_STATUS_ACTIVE,
+                or_(MemoryRecord.turn_end.is_(None), MemoryRecord.turn_end >= start_turn),
+                or_(MemoryRecord.turn_start.is_(None), MemoryRecord.turn_start < end_turn),
             )
-            .order_by(MemoryRecord.id.asc())
-            .offset(start_turn)
-            .limit(max(0, end_turn - start_turn))
+            .order_by(MemoryRecord.turn_start.asc(), MemoryRecord.id.asc())
             .all()
         )
         messages: List[Dict[str, str]] = []
@@ -1557,7 +2001,7 @@ def _consolidate_level(
     segment_start = (cursor // threshold) * threshold
 
     if level == 1:
-        # L1：输入新增 dialogue 原文 → 复用语义切块（话题检测 + 摘要 + 原文）
+        # L1：输入新增 dialogue 原文，按固定轮次批量摘要并保留原文。
         messages = _load_dialogue_turn_range_by_prefix(
             user_key,
             conversation_id,
@@ -1565,6 +2009,22 @@ def _consolidate_level(
             end_turn=segment_start + threshold,
         )
         if not messages:
+            return 0
+        if not _is_substantive_dialogue(messages):
+            logger.info(
+                "L1 摘要跳过低信息对话 (user_id=%s, conversation_id=%s, turns=%s-%s)",
+                user_key,
+                conversation_id,
+                segment_start,
+                segment_start + threshold - 1,
+            )
+            # 这是有意跳过而非失败；推进游标，避免低信息段阻塞后续摘要窗口。
+            _update_consolidation_cursor(
+                user_key,
+                conversation_id,
+                level,
+                segment_start + threshold,
+            )
             return 0
         try:
             inserted = store_semantic_long_term_memory(
@@ -1577,6 +2037,11 @@ def _consolidate_level(
                 include_system=False,
                 # 合并的就是窗口外历史，不能再排除最近 N 轮，否则全部轮次被丢弃
                 short_window_n=0,
+                # dialogue 记录按会话全局轮次编号，摘要引用沿用同一坐标系。
+                # L1 的 chunks 是本段内局部轮次，需要平移到 segment_start。
+                turn_offset=segment_start,
+                # L1 已按固定轮次批量处理，避免每个相邻轮次额外调用话题判断 LLM。
+                detect_topic_change=False,
             )
         except Exception as exc:
             logger.warning("L1 合并失败，下次触发点重试: %s", exc)
@@ -1600,15 +2065,19 @@ def _consolidate_level(
             turn_end=segment_start + threshold,
         )
 
+    # store_semantic_long_term_memory 返回 List，merge_summary_level 返回 int，
+    # 统一归一为写入块数，避免 consolidate_check 里 merged += list 报错。
+    inserted_count = len(inserted) if isinstance(inserted, (list, tuple)) else int(inserted or 0)
+    if inserted_count <= 0:
+        return 0
+
     _update_consolidation_cursor(
         user_key,
         conversation_id,
         level,
         segment_start + threshold,
     )
-    # store_semantic_long_term_memory 返回 List，merge_summary_level 返回 int，
-    # 统一归一为写入块数，避免 consolidate_check 里 merged += list 报错。
-    return len(inserted) if isinstance(inserted, (list, tuple)) else int(inserted or 0)
+    return inserted_count
 
 
 def consolidate_check(
@@ -1626,24 +2095,62 @@ def consolidate_check(
     if not normalized_conversation:
         return 0
 
-    current_turn = _count_dialogue_turns(user_key, normalized_conversation)
-    if current_turn <= 0:
-        return 0
+    lock_key = (user_key, normalized_conversation)
+    with _CONSOLIDATION_LOCK:
+        if lock_key in _CONSOLIDATION_IN_FLIGHT:
+            return 0
+        _CONSOLIDATION_IN_FLIGHT.add(lock_key)
 
-    merged = 0
-    for threshold, level in CONSOLIDATION_LEVELS:
-        if current_turn < threshold:
-            continue
-        cursor = _get_consolidation_cursor(user_key, normalized_conversation, level)
-        if current_turn // threshold > cursor // threshold:
-            merged += _consolidate_level(
+    try:
+        current_turn = _count_dialogue_turns(user_key, normalized_conversation)
+        if current_turn <= 0:
+            return 0
+
+        merged = 0
+        now = time.monotonic()
+        for threshold, level in CONSOLIDATION_LEVELS:
+            if current_turn < threshold:
+                continue
+            cursor = _get_consolidation_cursor(user_key, normalized_conversation, level)
+            if current_turn // threshold <= cursor // threshold:
+                continue
+
+            retry_key = (user_key, normalized_conversation, level)
+            with _CONSOLIDATION_LOCK:
+                retry_state = _CONSOLIDATION_RETRY_STATE.get(retry_key)
+            if retry_state is not None and now < retry_state[0]:
+                continue
+
+            inserted = _consolidate_level(
                 user_key,
                 normalized_conversation,
                 level=level,
                 threshold=threshold,
                 llm=llm,
             )
-    return merged
+            updated_cursor = _get_consolidation_cursor(
+                user_key,
+                normalized_conversation,
+                level,
+            )
+            if inserted > 0 or updated_cursor > cursor:
+                merged += inserted
+                with _CONSOLIDATION_LOCK:
+                    _CONSOLIDATION_RETRY_STATE.pop(retry_key, None)
+            else:
+                with _CONSOLIDATION_LOCK:
+                    previous_attempts = (
+                        retry_state[1] if retry_state is not None else 0
+                    )
+                    delay_index = min(previous_attempts, len(_CONSOLIDATION_RETRY_DELAYS) - 1)
+                    _CONSOLIDATION_RETRY_STATE[retry_key] = (
+                        time.monotonic() + _CONSOLIDATION_RETRY_DELAYS[delay_index],
+                        previous_attempts + 1,
+                    )
+        return merged
+    finally:
+        with _CONSOLIDATION_LOCK:
+            _CONSOLIDATION_IN_FLIGHT.discard(lock_key)
 
 
 def consolidate_conversation_memory(
@@ -1676,6 +2183,7 @@ __all__ = [
     "delete_long_term_memory",
     "store_conversation_memory",
     "search_conversation_memory",
+    "retrieve_original_conversation",
     "delete_conversation_memory",
     "get_active_profile_memories",
     "upsert_profile_memory_candidates",

@@ -67,7 +67,15 @@ def _coerce_parameters(manifest: Dict[str, Any]) -> Dict[str, Any]:
 def _build_execution_error_message(manifest: Dict[str, Any]) -> str:
     tool_name = _first_non_empty(manifest, ("tool_name", "remote_tool_name", "name"), "unknown")
     server_name = _first_non_empty(manifest, ("server_name", "server", "provider"), "remote_mcp")
-    return f"远程 MCP 占位符已注册，但尚未接入实际执行器: {server_name}/{tool_name}"
+    return (
+        f"远程 MCP 工具 {server_name}/{tool_name} 尚未接入实际执行器，当前不可用。"
+        f"不要重试该工具，请改用其他可用工具或直接回答。"
+    )
+
+
+def is_remote_mcp_ready(manifest: Dict[str, Any]) -> bool:
+    """判断远程 MCP 是否已接入真实执行器（配置了 endpoint 才算就绪）。"""
+    return bool(_first_non_empty(manifest, ("endpoint", "url", "server_url", "serverUrl"), ""))
 
 
 def build_remote_mcp_skill_definition(manifest: Dict[str, Any]) -> SkillDefinition:
@@ -76,11 +84,15 @@ def build_remote_mcp_skill_definition(manifest: Dict[str, Any]) -> SkillDefiniti
     if not name:
         raise ValueError("远程 MCP manifest 缺少 name/skill_name/tool_name")
 
-    description = _first_non_empty(
+    raw_description = _first_non_empty(
         manifest,
         ("description", "summary", "title"),
         f"远程 MCP 工具 {name}",
     )
+    # 未接入执行器的工具在描述里显式标记：即便将来某个入口把它暴露给模型，
+    # 模型也能一眼看出不可用，不会白调一轮。
+    ready = is_remote_mcp_ready(manifest)
+    description = raw_description if ready else f"[未接入执行器·当前不可用] {raw_description}"
     category = _first_non_empty(manifest, ("category",), "mcp")
     provider = _first_non_empty(manifest, ("provider", "server_name", "server"), None)
     tags = _normalize_string_list(manifest.get("tags"))
@@ -88,6 +100,7 @@ def build_remote_mcp_skill_definition(manifest: Dict[str, Any]) -> SkillDefiniti
     metadata.update(
         {
             "source": "remote_mcp",
+            "executor_ready": ready,
             "server_name": _first_non_empty(manifest, ("server_name", "server", "provider"), ""),
             "tool_name": _first_non_empty(manifest, ("tool_name", "remote_tool_name", "name"), name),
             "manifest": {

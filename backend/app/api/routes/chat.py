@@ -10,7 +10,11 @@ from app.api.schemas import (
     ChatResponse,
     ChatRuntimeStatusResponse,
     ChatSettingsResponse,
+    ConversationClearResponse,
     ConversationDeleteResponse,
+    ConversationListResponse,
+    ConversationRecordResponse,
+    ConversationUpsertRequest,
     ChatWarmupResponse,
 )
 from app.config import settings
@@ -70,23 +74,111 @@ async def warmup_chat_runtime():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.delete("/conversations", response_model=ConversationClearResponse)
+async def clear_conversations(current_user=Depends(require_current_user)):
+    """清空当前用户的全部对话记录和关联长期记忆。"""
+    try:
+        from app.services.conversation_service import (
+            clear_user_conversations,
+            list_user_conversation_ids,
+        )
+        from app.services.memory_service import delete_long_term_memory
+
+        conversation_ids = await run_in_threadpool(
+            list_user_conversation_ids,
+            current_user["user_id"],
+        )
+        deleted_count = await run_in_threadpool(
+            clear_user_conversations,
+            current_user["user_id"],
+        )
+        memory_deleted_count = 0
+        for conversation_id in conversation_ids:
+            try:
+                if await run_in_threadpool(
+                    delete_long_term_memory,
+                    conversation_id,
+                    current_user["user_id"],
+                ):
+                    memory_deleted_count += 1
+            except VectorStoreException:
+                continue
+        return ConversationClearResponse(
+            deleted_count=deleted_count,
+            memory_deleted_count=memory_deleted_count,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+async def list_conversations(current_user=Depends(require_current_user)):
+    """返回当前用户在服务端保存的对话列表。"""
+    try:
+        from app.services.conversation_service import list_user_conversations
+
+        conversations = await run_in_threadpool(
+            list_user_conversations,
+            current_user["user_id"],
+        )
+        return ConversationListResponse(conversations=conversations)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.put(
+    "/conversations/{conversation_id}",
+    response_model=ConversationRecordResponse,
+)
+async def upsert_conversation(
+    conversation_id: str,
+    request: ConversationUpsertRequest,
+    current_user=Depends(require_current_user),
+):
+    """保存某个用户的单个对话记录。"""
+    try:
+        from app.services.conversation_service import upsert_user_conversation
+
+        result = await run_in_threadpool(
+            upsert_user_conversation,
+            user_id=current_user["user_id"],
+            conversation_id=conversation_id,
+            session_id=request.session_id,
+            messages=request.messages,
+            created_at=request.created_at,
+            updated_at=request.updated_at,
+        )
+        return ConversationRecordResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
 async def delete_conversation(conversation_id: str, current_user=Depends(require_current_user)):
     """删除一个 conversation_id 关联的长期记忆。"""
     try:
+        from app.services.conversation_service import delete_user_conversation
         from app.services.memory_service import delete_long_term_memory
 
-        memory_deleted = await run_in_threadpool(
-            delete_long_term_memory,
-            conversation_id,
+        await run_in_threadpool(
+            delete_user_conversation,
             current_user["user_id"],
+            conversation_id,
         )
+        try:
+            memory_deleted = await run_in_threadpool(
+                delete_long_term_memory,
+                conversation_id,
+                current_user["user_id"],
+            )
+        except VectorStoreException:
+            memory_deleted = False
         return ConversationDeleteResponse(
             conversation_id=conversation_id,
             memory_deleted=memory_deleted,
         )
-    except VectorStoreException as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
