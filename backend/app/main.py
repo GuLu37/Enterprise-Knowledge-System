@@ -112,6 +112,15 @@ def _initialize_milvus_in_background(app: FastAPI) -> None:
         app.state.milvus_ready = False
         logger.warning("Milvus 后台初始化出错: %s", exc)
 
+    # 持久稀疏索引预热: 复用该后台线程，首次构建后检索不再发 LIKE 全表扫。
+    if app.state.milvus_ready:
+        try:
+            from app.rag.retrieval.sparse_index import warm_build_sparse_index
+
+            warm_build_sparse_index()
+        except Exception as exc:
+            logger.warning("稀疏持久索引预热失败，将回退 LIKE 路径: %s", exc)
+
 
 def _memory_maintenance_loop(app: FastAPI) -> None:
     """定期刷新记忆重要性并清理过期数据。"""

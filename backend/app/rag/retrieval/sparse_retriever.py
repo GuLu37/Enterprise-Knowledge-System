@@ -234,69 +234,41 @@ class SparseRetriever(BaseRetriever):
             if not self._is_collection_ready(client):
                 return []
 
-            filter_terms = _build_filter_terms(query)
-            if not filter_terms:
-                return []
-
-            filter_expr = _build_filter_expression(filter_terms)
-            if not filter_expr:
-                return []
-
-            rows = client.query(
-                collection_name=collection_name,
-                filter=filter_expr,
-                output_fields=[
-                    "text",
-                    "child_id",
-                    "document_id",
-                    "parent_id",
-                    "parent_index",
-                    "chunk_index",
-                    "source_name",
-                    "chunk_text",
-                    "child_text",
-                    "file_type",
-                    "content_type",
-                ],
-                limit=max(top_k * 30, 80),
-            )
-
-            if not rows and len(filter_terms) > 1:
-                fallback_filter = _build_filter_expression(filter_terms[:4])
-                if fallback_filter and fallback_filter != filter_expr:
-                    rows = client.query(
-                        collection_name=collection_name,
-                        filter=fallback_filter,
-                        output_fields=[
-                            "text",
-                            "child_id",
-                            "document_id",
-                            "parent_id",
-                            "parent_index",
-                            "chunk_index",
-                            "source_name",
-                            "chunk_text",
-                            "child_text",
-                            "file_type",
-                            "content_type",
-                        ],
-                        limit=max(top_k * 30, 80),
-                    )
-
-            if not rows:
-                return []
-
-            corpus = [_tokenize(_build_searchable_row_text(row)) for row in rows]
-            bm25 = BM25Okapi(corpus)
             query_tokens = _tokenize(query)
-            bm25_scores = bm25.get_scores(query_tokens)
+            candidate_limit = max(top_k * 30, 80)
+
+            scored_rows: Optional[List[tuple]] = None
+            if (settings.SPARSE_INDEX_MODE or "cached").strip().lower() == "cached":
+                # 进程内持久索引: 无 LIKE 全表扫、无重复分词/建索引，不可用时回退旧路径。
+                from .sparse_index import get_sparse_index
+
+                scored_rows = get_sparse_index().search(
+                    client,
+                    collection_name,
+                    query_tokens,
+                    candidate_limit,
+                )
+
+            if scored_rows is None:
+                scored_rows = self._legacy_like_search(
+                    client,
+                    collection_name,
+                    query,
+                    top_k,
+                )
+            if not scored_rows:
+                return []
 
             ranked_rows = []
-            for bm25_score, row, row_tokens in zip(bm25_scores, rows, corpus):
+            for row, raw_bm25_score, row_tokens in scored_rows:
                 row_text = _build_searchable_row_text(row)
-                lexical_score = _lexical_match_score(query_tokens, row_tokens, query, row_text)
-                raw_bm25_score = float(bm25_score)
-                final_score = max(0.0, raw_bm25_score) + lexical_score
+                lexical_score = _lexical_match_score(
+                    query_tokens,
+                    row_tokens,
+                    query,
+                    row_text,
+                )
+                final_score = max(0.0, float(raw_bm25_score)) + lexical_score
                 if final_score > 0.0:
                     ranked_rows.append((final_score, row))
             ranked_rows.sort(
@@ -333,3 +305,61 @@ class SparseRetriever(BaseRetriever):
         except Exception as e:
             logger.error(f"稀疏检索失败: {str(e)}")
             raise
+
+    def _legacy_like_search(
+        self,
+        client: Any,
+        collection_name: str,
+        query: str,
+        top_k: int,
+    ) -> List[tuple]:
+        """旧路径: 前缀 LIKE 候选 + 候选集内重建 BM25（持久索引不可用时的回退）。"""
+        filter_terms = _build_filter_terms(query)
+        if not filter_terms:
+            return []
+
+        filter_expr = _build_filter_expression(filter_terms)
+        if not filter_expr:
+            return []
+
+        candidate_limit = max(top_k * 30, 80)
+        output_fields = [
+            "text",
+            "child_id",
+            "document_id",
+            "parent_id",
+            "parent_index",
+            "chunk_index",
+            "source_name",
+            "chunk_text",
+            "child_text",
+            "file_type",
+            "content_type",
+        ]
+        rows = client.query(
+            collection_name=collection_name,
+            filter=filter_expr,
+            output_fields=output_fields,
+            limit=candidate_limit,
+        )
+
+        if not rows and len(filter_terms) > 1:
+            fallback_filter = _build_filter_expression(filter_terms[:4])
+            if fallback_filter and fallback_filter != filter_expr:
+                rows = client.query(
+                    collection_name=collection_name,
+                    filter=fallback_filter,
+                    output_fields=output_fields,
+                    limit=candidate_limit,
+                )
+
+        if not rows:
+            return []
+
+        corpus = [_tokenize(_build_searchable_row_text(row)) for row in rows]
+        bm25 = BM25Okapi(corpus)
+        bm25_scores = bm25.get_scores(_tokenize(query))
+        return [
+            (row, float(score), corpus[index])
+            for index, (row, score) in enumerate(zip(rows, bm25_scores))
+        ]

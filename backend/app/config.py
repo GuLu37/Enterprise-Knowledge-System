@@ -296,6 +296,15 @@ class Settings:
     USE_DENSE_RETRIEVER: bool = os.getenv("USE_DENSE_RETRIEVER").lower() == "true"
     USE_SPARSE_RETRIEVER: bool = os.getenv("USE_SPARSE_RETRIEVER").lower() == "true"
     USE_HYBRID_RETRIEVER: bool = os.getenv("USE_HYBRID_RETRIEVER").lower() == "true"
+    # 稀疏检索候选来源: cached=进程内持久 BM25 索引（无 LIKE 全表扫，默认）;
+    # legacy=每次查询 LIKE 候选 + 重建 BM25（回退路径）。
+    SPARSE_INDEX_MODE: str = (
+        os.getenv("SPARSE_INDEX_MODE", "cached").strip().lower()
+    )
+    # 持久索引的 child 行数上限，超限自动回退 legacy 路径防止内存失控。
+    SPARSE_INDEX_MAX_ROWS: int = max(
+        1000, int(os.getenv("SPARSE_INDEX_MAX_ROWS", "50000"))
+    )
 
     DENSE_WEIGHT: float = float(os.getenv("DENSE_WEIGHT"))
     SPARSE_WEIGHT: float = float(os.getenv("SPARSE_WEIGHT"))
