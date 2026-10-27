@@ -77,7 +77,123 @@ def _is_hit(result_meta: dict, relevant_sources: list) -> bool:
     )
 
 
+def run_bench_http(args: argparse.Namespace) -> dict:
+    """HTTP 模式：打 /api/v1/retrieval/rag（Rust 或 Python 后端），逐查询清缓存计时。"""
+    import http.client
+    from urllib.parse import urlparse
+
+    parsed = urlparse(args.base_url)
+    host, port = parsed.hostname, parsed.port or 80
+    prefix = args.base_url.rstrip("/").split(host)[-1].lstrip(":0123456789") or ""
+    base_prefix = prefix or "/api/v1"
+
+    conn = http.client.HTTPConnection(host, port, timeout=120)
+
+    def call(method, path, body=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        conn.request(method, base_prefix + path, json.dumps(body) if body else None, headers)
+        resp = conn.getresponse()
+        payload = resp.read().decode()
+        return resp.status, json.loads(payload) if payload else {}
+
+    pw = ""
+    for env_path in (".env", "../backend/.env"):
+        try:
+            for line in open(env_path, encoding="utf-8"):
+                if line.startswith("BOOTSTRAP_ADMIN_PASSWORD="):
+                    pw = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            continue
+        if pw:
+            break
+    assert pw, "未找到 BOOTSTRAP_ADMIN_PASSWORD"
+    status, login = call("POST", "/auth/login", {"username": "admin", "password": pw})
+    assert status == 200, f"登录失败: {status} {login}"
+    token = login["access_token"]
+    print(f"[bench-http] 目标 {host}:{port}{base_prefix} 登录成功，预热一次请求...")
+    call("POST", "/retrieval/cache-clear", {}, token)
+    call("POST", "/retrieval/rag", {"query": "预热", "top_k": args.top_k}, token)
+
+    dataset = EVAL_QUERIES[: args.limit or None]
+    records, rerank_stage_counter = [], {}
+    for index, (item_id, query, relevant_sources) in enumerate(dataset, start=1):
+        call("POST", "/retrieval/cache-clear", {}, token)
+        t0 = time.perf_counter()
+        status, rag = call("POST", "/retrieval/rag", {"query": query, "top_k": args.top_k}, token)
+        elapsed = time.perf_counter() - t0
+        results = rag.get("results") or []
+        hit_rank = None
+        for rank, entry in enumerate(results, start=1):
+            if _is_hit(entry.get("metadata") or {}, relevant_sources):
+                hit_rank = rank
+                break
+            if rank >= 10:
+                break
+        for entry in results:
+            stage = (entry.get("metadata") or {}).get("rerank_stage")
+            if stage:
+                rerank_stage_counter[stage] = rerank_stage_counter.get(stage, 0) + 1
+        records.append({
+            "id": item_id, "query": query, "seconds": round(elapsed, 4),
+            "result_count": len(results), "hit_rank": hit_rank,
+            "top_sources": [(e.get("metadata") or {}).get("source_name") for e in results[:3]],
+        })
+        print(f"[bench-http] {index}/{len(dataset)} {elapsed*1000:8.1f}ms "
+              f"hit@{args.top_k}={'Y' if hit_rank else 'N'} q={query[:24]}")
+
+    summary = _summarize(records, rerank_stage_counter, args)
+    print("\n[bench-http] ===== 汇总 =====")
+    print(json.dumps({k: v for k, v in summary.items() if k != "records"},
+                     ensure_ascii=False, indent=2))
+    return summary
+
+
+def _summarize(records, rerank_stage_counter, args) -> dict:
+    seconds = [item["seconds"] for item in records]
+    sorted_seconds = sorted(seconds)
+    total = len(records)
+    hits = sum(1 for item in records if item["hit_rank"] is not None)
+
+    def percentile(fraction: float) -> float:
+        if not sorted_seconds:
+            return 0.0
+        position = min(
+            len(sorted_seconds) - 1,
+            max(0, round(fraction * (len(sorted_seconds) - 1))),
+        )
+        return sorted_seconds[position]
+
+    return {
+        "config": {
+            "cross_encoder_enabled": False,
+            "query_count": total,
+            "top_k": args.top_k,
+            "method": args.method,
+        },
+        "latency": {
+            "mean_seconds": round(statistics.mean(seconds), 4) if seconds else 0.0,
+            "p50_seconds": round(percentile(0.50), 4),
+            "p95_seconds": round(percentile(0.95), 4),
+            "total_seconds": round(sum(seconds), 3),
+        },
+        "quality": {
+            f"recall@{args.top_k}": round(hits / total, 4) if total else 0.0,
+            "mrr@10": round(
+                sum(1.0 / item["hit_rank"] for item in records if item["hit_rank"]) / total,
+                4,
+            ) if total else 0.0,
+        },
+        "rerank_stages": rerank_stage_counter,
+        "records": records,
+    }
+
+
 def run_bench(args: argparse.Namespace) -> dict:
+    if args.base_url:
+        return run_bench_http(args)
     from app.config import settings
     from app.storage.sqlite_metadata import init_metadata_db
     from app.storage.milvus_store import initialize_collections, warmup_collections
@@ -198,6 +314,12 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--method", type=str, default="hybrid")
     parser.add_argument("--no-cross-encoder", action="store_true")
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default="",
+        help="HTTP 模式：如 http://127.0.0.1:8001（打 /api/v1/retrieval/rag）",
+    )
     run_bench(parser.parse_args())
 
 

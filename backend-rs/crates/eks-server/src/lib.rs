@@ -4,6 +4,8 @@ pub mod config;
 pub mod db;
 pub mod embedder;
 pub mod milvus_lite;
+pub mod retrieval;
+pub mod retrieval_engine;
 pub mod routes;
 pub mod state;
 

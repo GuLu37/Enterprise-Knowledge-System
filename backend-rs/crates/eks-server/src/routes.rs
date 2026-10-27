@@ -256,5 +256,97 @@ pub fn router(state: AppState) -> axum::Router {
             post(change_password),
         )
         .route(&format!("{prefix}/auth/me"), get(me))
+        // 检索路由（与 Python 一样需要登录态）
+        .route(
+            &format!("{prefix}/retrieval/search/hybrid"),
+            post(retrieval_hybrid),
+        )
+        .route(&format!("{prefix}/retrieval/rag"), post(retrieval_rag))
+        .route(
+            &format!("{prefix}/retrieval/cache-clear"),
+            post(retrieval_cache_clear),
+        )
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+pub struct RetrievalRequest {
+    pub query: String,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+pub async fn retrieval_hybrid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RetrievalRequest>,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let query = request.query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Json(json!({
+            "query": query, "retrieval_method": "hybrid", "results": [], "top_k": top_k,
+        })));
+    }
+    let recalled = state
+        .engine
+        .retrieve_documents_multi_query(&query, top_k)
+        .await
+        .map_err(internal_error)?;
+    let results = state
+        .engine
+        .post_process(&query, recalled, top_k)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({
+        "query": query,
+        "retrieval_method": "hybrid",
+        "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
+        "top_k": top_k,
+    })))
+}
+
+pub async fn retrieval_rag(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RetrievalRequest>,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let query = request.query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Json(json!({
+            "query": "", "results": [], "context": "", "message": "未检索到相关内容"
+        })));
+    }
+    let (results, context) = state
+        .engine
+        .run_rag_workflow(&query, top_k)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({
+        "query": query,
+        "retrieval_method": "hybrid",
+        "expanded_queries": crate::retrieval::expand_multi_query(&query),
+        "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
+        "context": context,
+        "message": if results.is_empty() { "当前知识库未检索到足够相关资料" } else { "检索完成" },
+    })))
+}
+
+pub async fn retrieval_cache_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    state.engine.invalidate().await;
+    Ok(Json(json!({ "cleared": true })))
+}
+
+fn internal_error(detail: String) -> AuthError {
+    AuthError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail,
+    }
 }

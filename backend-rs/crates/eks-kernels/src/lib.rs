@@ -4,6 +4,7 @@
 //! `eks-server`（Rust 后端）共用同一份实现，由 Python 侧 parity 测试钉死语义。
 
 pub mod bm25;
+pub mod fuse;
 pub mod lexical;
 pub mod rerank;
 pub mod text;

@@ -27,6 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pragma("journal_mode", "WAL");
     let pool = sqlx::SqlitePool::connect_with(db_options).await?;
 
+    // 检索引擎（Milvus Lite 直读 + ONNX embedder + SQLite 父块）
+    let embedder = eks_server::embedder::shared_embedder(&config)
+        .map_err(|e| format!("Embedding 内核初始化失败: {e}"))?;
+    let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
+    let engine = std::sync::Arc::new(eks_server::retrieval_engine::RetrievalEngine::new(
+        store, embedder, pool.clone(),
+    ));
+
     tracing::info!(
         "eks-server 启动: {addr} | sqlite={} | prefix={}",
         config.sqlite_path,
@@ -36,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = routes::router(AppState {
         pool,
         config: Arc::new(config),
+        engine,
     });
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
