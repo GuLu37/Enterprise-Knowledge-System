@@ -1,0 +1,50 @@
+# ==================== 构建阶段 ====================
+FROM rust:1.83-slim AS builder
+
+WORKDIR /build
+
+# 先拷贝 Cargo 文件利用层缓存
+COPY backend-rs/Cargo.toml backend-rs/Cargo.lock ./
+COPY backend-rs/crates/eks-kernels/Cargo.toml crates/eks-kernels/
+COPY backend-rs/crates/eks-server/Cargo.toml crates/eks-server/
+
+# 桩文件让 cargo 能解析依赖
+RUN mkdir -p crates/eks-kernels/src crates/eks-server/src && \
+    echo "pub fn placeholder() {}" > crates/eks-kernels/src/lib.rs && \
+    echo "fn main() {}" > crates/eks-server/src/main.rs
+
+# 下载依赖
+RUN cargo build --release 2>/dev/null || true
+
+# 拷贝源码并构建
+COPY backend-rs/crates/ crates/
+RUN touch crates/eks-kernels/src/lib.rs crates/eks-server/src/main.rs && \
+    cargo build --release --bin eks-server
+
+# ==================== 运行阶段 ====================
+FROM python:3.13-slim
+
+# 安装 tini 用于信号处理
+RUN apt-get update && apt-get install -y --no-install-recommends tini && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 拷贝二进制
+COPY --from=builder /build/target/release/eks-server /app/eks-server
+
+# 模型和数据目录（通过 volume 挂载）
+VOLUME ["/app/models", "/app/data"]
+
+# 环境变量默认值
+ENV EKS_HOST=0.0.0.0 \
+    EKS_PORT=8000 \
+    EKS_ENV_FILE=/app/.env \
+    EKS_BGE_MODEL_DIR=/app/models/bge-base-zh-v1.5 \
+    EKS_MILVUS_LITE_PATH=/app/data/milvus_lite.db \
+    EKS_SQLITE_PATH=/app/data/rag_metadata.db
+
+EXPOSE 8000
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/app/eks-server"]

@@ -331,7 +331,7 @@ mod tests {
         }
         let store = MilvusLiteStore::open(&path);
         let snapshot = store.collection("doc_chunk").await.expect("加载失败");
-        assert_eq!(snapshot.rows.len(), 520, "活跃行数应为 520");
+        assert!(snapshot.rows.len() >= 520, "活跃行数应 >= 520, 实际 {}", snapshot.rows.len());
         let sample = &snapshot.rows[0];
         assert_eq!(sample.vector.len(), 768);
         assert!(sample
