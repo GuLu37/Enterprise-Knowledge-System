@@ -60,6 +60,14 @@ fn normalize_messages(messages: &Value) -> String {
     serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// 对齐 Python `upsert_user_conversation`：`_parse_client_datetime(created_at) or now`。
+fn resolve_created_at(client: Option<&str>, now: &str) -> String {
+    client
+        .and_then(db::parse_client_datetime)
+        .map(|dt| db::fmt_dt(&dt))
+        .unwrap_or_else(|| now.to_string())
+}
+
 fn record_to_json(row: &ConversationRow) -> Value {
     let messages: Value =
         serde_json::from_str(&row.payload).unwrap_or_else(|_| json!([]));
@@ -121,9 +129,7 @@ pub async fn upsert_conversation(
         .as_deref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let created_at = request.created_at.as_deref().and_then(db::parse_dt)
-        .map(|dt| db::fmt_dt(&dt))
-        .unwrap_or_else(|| now.clone());
+    let created_at = resolve_created_at(request.created_at.as_deref(), &now);
 
     // upsert: INSERT OR REPLACE 保持与 Python 的 first-then-update 等价
     sqlx::query(
@@ -298,6 +304,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining_other, 1);
+    }
+
+    #[test]
+    fn created_at_keeps_frontend_iso_z_like_python() {
+        let now = "2026-11-04 12:00:00.000000";
+        assert_eq!(
+            resolve_created_at(Some("2026-03-15T08:30:00.123Z"), now),
+            "2026-03-15 08:30:00.123000"
+        );
+        assert_eq!(
+            resolve_created_at(Some("2026-03-15T16:30:00+08:00"), now),
+            "2026-03-15 08:30:00.000000"
+        );
+        assert_eq!(resolve_created_at(Some(""), now), now);
+        assert_eq!(resolve_created_at(None, now), now);
+        assert_eq!(resolve_created_at(Some("bad"), now), now);
     }
 
     #[test]

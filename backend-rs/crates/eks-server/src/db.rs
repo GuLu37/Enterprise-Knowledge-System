@@ -1,6 +1,6 @@
 //! SQLite 访问层：与 Python 版共用同一个 rag_metadata.db（WAL 已开启）。
 //! 时间列沿用 SQLAlchemy 的 naive-UTC 文本格式 "YYYY-MM-DD HH:MM:SS.ffffff"。
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 
 pub fn now_naive() -> NaiveDateTime {
     Utc::now().naive_utc()
@@ -15,6 +15,34 @@ pub fn fmt_dt(dt: &NaiveDateTime) -> String {
 pub fn parse_dt(text: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok()
         .or_else(|| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+/// 对齐 Python `conversation_service._parse_client_datetime`：
+/// `fromisoformat(str(value).replace("Z", "+00:00"))`，带时区则转到 naive UTC。
+pub fn parse_client_datetime(value: &str) -> Option<NaiveDateTime> {
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('Z', "+00:00");
+    parse_client_aware(&normalized)
+        .map(|dt| dt.with_timezone(&Utc).naive_utc())
+        .or_else(|| parse_client_naive(&normalized))
+}
+
+fn parse_client_aware(text: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .or_else(|| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f%:z").ok())
+        .or_else(|| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%:z").ok())
+        .or_else(|| DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%:z").ok())
+        .or_else(|| DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%:z").ok())
+}
+
+fn parse_client_naive(text: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .or_else(|| NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S").ok())
+        .or_else(|| parse_dt(text))
 }
 
 /// JSON 序列化格式与 pydantic v2 一致：naive ISO（空格→T），None → null。
@@ -412,6 +440,23 @@ pub async fn revoke_session(pool: &sqlx::SqlitePool, session_id: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_client_datetime_accepts_frontend_iso_z_like_python() {
+        let parsed = parse_client_datetime("2026-03-15T08:30:00.123Z").unwrap();
+        assert_eq!(fmt_dt(&parsed), "2026-03-15 08:30:00.123000");
+        let offset = parse_client_datetime("2026-03-15T16:30:00+08:00").unwrap();
+        assert_eq!(fmt_dt(&offset), "2026-03-15 08:30:00.000000");
+        let plus = parse_client_datetime("2026-03-15T08:30:00+00:00").unwrap();
+        assert_eq!(fmt_dt(&plus), "2026-03-15 08:30:00.000000");
+        let naive = parse_client_datetime("2026-03-15T08:30:00").unwrap();
+        assert_eq!(fmt_dt(&naive), "2026-03-15 08:30:00.000000");
+        let sqlite = parse_client_datetime("2026-03-15 08:30:00.123000").unwrap();
+        assert_eq!(fmt_dt(&sqlite), "2026-03-15 08:30:00.123000");
+        assert!(parse_client_datetime("").is_none());
+        assert!(parse_client_datetime("not-a-date").is_none());
+        assert!(parse_dt("2026-03-15T08:30:00.123Z").is_none());
+    }
 
     #[tokio::test]
     async fn conversation_schema_supports_upsert_conflict() {
