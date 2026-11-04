@@ -558,14 +558,14 @@ impl Config {
             llm_max_tokens: env_i64("LLM_MAX_TOKENS", 4096).max(1) as u32,
             llm_max_fallback_attempts: env_i64("LLM_MAX_FALLBACK_ATTEMPTS", 2).max(1) as usize,
             deepseek_api_key: env_or("DEEPSEEK_API_KEY", ""),
-            deepseek_base_url: env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-            deepseek_model: env_or("DEEPSEEK_MODEL", "deepseek-chat"),
+            deepseek_base_url: env_or("DEEPSEEK_BASE_URL", ""),
+            deepseek_model: env_or("DEEPSEEK_MODEL", ""),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             openrouter_api_base: env_or("OPENROUTER_API_BASE", ""),
             openrouter_model: env_or("OPENROUTER_MODEL", ""),
             openai_api_key: env_or("OPENAI_API_KEY", ""),
-            openai_model: env_or("OPENAI_MODEL", "gpt-4o-mini"),
-            openai_base_url: env_or("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            openai_model: env_or("OPENAI_MODEL", ""),
+            openai_base_url: env_or("OPENAI_BASE_URL", ""),
             anthropic_api_key: env_or("ANTHROPIC_API_KEY", ""),
             anthropic_model: env_or("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             ollama_base_url: env_or("OLLAMA_BASE_URL", ""),
@@ -691,7 +691,7 @@ impl Config {
             openrouter_model: String::new(),
             openai_api_key: String::new(),
             openai_model: String::new(),
-            openai_base_url: "https://api.openai.com/v1".into(),
+            openai_base_url: String::new(),
             anthropic_api_key: String::new(),
             anthropic_model: "claude-sonnet-4-6".into(),
             ollama_base_url: String::new(),
@@ -843,6 +843,10 @@ mod tests {
         assert_eq!(Config::jwt_test().sparse_index_max_rows, 50_000);
         assert_eq!(Config::jwt_test().embedding_dimension, 768);
         assert_eq!(Config::jwt_test().vector_store_type, "milvus_lite");
+        assert!(Config::jwt_test().openai_model.is_empty());
+        assert!(Config::jwt_test().openai_base_url.is_empty());
+        assert!(Config::jwt_test().deepseek_base_url.is_empty());
+        assert!(Config::jwt_test().deepseek_model.is_empty());
     }
 
     #[test]

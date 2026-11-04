@@ -2744,6 +2744,7 @@ mod tests {
     fn configured_llm_passes_require_gate() {
         let mut cfg = crate::config::Config::jwt_test();
         cfg.openai_api_key = "sk-test".into();
+        cfg.openai_model = "gpt-4o-mini".into();
         let llm = LlmClient::from_env(&cfg);
         assert!(require_configured_llm(&llm).is_ok());
     }
@@ -2827,6 +2828,7 @@ mod tests {
     async fn startup_llm_marks_warmed_when_provider_configured() {
         let mut cfg = crate::config::Config::jwt_test();
         cfg.openai_api_key = "sk-test".into();
+        cfg.openai_model = "gpt-4o-mini".into();
         let llm = LlmClient::from_env(&cfg);
         let mut warmup = RuntimeWarmup::initializing(&cfg);
         assert!(warmup.apply_startup_llm(&llm).await.is_ok());

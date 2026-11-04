@@ -95,29 +95,36 @@ impl LlmConfig {
         let preferred = normalize_provider(provider).unwrap_or_else(|| normalize_provider(Some(&cfg.llm_provider)).unwrap_or_default());
         let model_override = model.map(str::trim).filter(|item| !item.is_empty());
         let mut providers = Vec::new();
-        if !cfg.deepseek_api_key.is_empty() && !cfg.deepseek_base_url.is_empty() {
-            providers.push(openai_compat_provider(
-                "deepseek",
-                &cfg.deepseek_api_key,
-                &cfg.deepseek_base_url,
-                model_override.unwrap_or(&cfg.deepseek_model),
-            ));
+        // 对齐 Python `_provider_is_configured`：缺 model/base_url 时不把 provider 当可用。
+        if !cfg.deepseek_api_key.is_empty() && !cfg.deepseek_base_url.trim().is_empty() {
+            if let Some(model) = resolved_provider_model(model_override, &cfg.deepseek_model) {
+                providers.push(openai_compat_provider(
+                    "deepseek",
+                    &cfg.deepseek_api_key,
+                    cfg.deepseek_base_url.trim(),
+                    model,
+                ));
+            }
         }
-        if !cfg.openrouter_api_key.is_empty() && !cfg.openrouter_api_base.is_empty() {
-            providers.push(openai_compat_provider(
-                "openrouter",
-                &cfg.openrouter_api_key,
-                &cfg.openrouter_api_base,
-                model_override.unwrap_or(&cfg.openrouter_model),
-            ));
+        if !cfg.openrouter_api_key.is_empty() && !cfg.openrouter_api_base.trim().is_empty() {
+            if let Some(model) = resolved_provider_model(model_override, &cfg.openrouter_model) {
+                providers.push(openai_compat_provider(
+                    "openrouter",
+                    &cfg.openrouter_api_key,
+                    cfg.openrouter_api_base.trim(),
+                    model,
+                ));
+            }
         }
         if !cfg.openai_api_key.is_empty() {
-            providers.push(openai_compat_provider(
-                "openai",
-                &cfg.openai_api_key,
-                &cfg.openai_base_url,
-                model_override.unwrap_or(&cfg.openai_model),
-            ));
+            if let Some(model) = resolved_provider_model(model_override, &cfg.openai_model) {
+                providers.push(openai_compat_provider(
+                    "openai",
+                    &cfg.openai_api_key,
+                    openai_base_url(&cfg.openai_base_url),
+                    model,
+                ));
+            }
         }
         if !cfg.anthropic_api_key.is_empty() {
             providers.push(ProviderConfig {
@@ -157,6 +164,26 @@ impl LlmConfig {
             }
         }
         self.providers.first().map(|item| item.name.clone())
+    }
+}
+
+fn resolved_provider_model<'a>(model_override: Option<&'a str>, configured: &'a str) -> Option<&'a str> {
+    model_override.or_else(|| {
+        let trimmed = configured.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn openai_base_url(configured: &str) -> &str {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        "https://api.openai.com/v1"
+    } else {
+        trimmed
     }
 }
 
@@ -1200,6 +1227,35 @@ mod tests {
     }
 
     #[test]
+    fn provider_requires_python_configured_fields() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        assert!(LlmConfig::from_env(&cfg).providers.is_empty());
+        cfg.openai_model = "gpt-4o-mini".into();
+        let openai = LlmConfig::from_env(&cfg);
+        assert_eq!(openai.providers.len(), 1);
+        assert_eq!(openai.providers[0].name, "openai");
+        assert_eq!(openai.providers[0].model, "gpt-4o-mini");
+        assert_eq!(openai.providers[0].base_url, "https://api.openai.com/v1");
+
+        cfg.openai_api_key.clear();
+        cfg.openai_model.clear();
+        cfg.deepseek_api_key = "ds-test".into();
+        assert!(LlmConfig::from_env(&cfg).providers.is_empty());
+        cfg.deepseek_base_url = "https://api.deepseek.com".into();
+        assert!(LlmConfig::from_env(&cfg).providers.is_empty());
+        cfg.deepseek_model = "deepseek-chat".into();
+        assert_eq!(LlmConfig::from_env(&cfg).providers[0].name, "deepseek");
+
+        let override_cfg = crate::config::Config::jwt_test();
+        let mut override_cfg = override_cfg;
+        override_cfg.openai_api_key = "sk-test".into();
+        let with_request_model =
+            LlmConfig::from_env_with_overrides(&override_cfg, None, Some("gpt-4o"), None);
+        assert_eq!(with_request_model.providers[0].model, "gpt-4o");
+    }
+
+    #[test]
     fn preferred_provider_leads_fallback_order() {
         assert_eq!(
             build_provider_order("anthropic"),
@@ -1597,6 +1653,7 @@ mod tests {
     fn default_request_reuses_process_client() {
         let mut cfg = crate::config::Config::jwt_test();
         cfg.openai_api_key = "sk-test".into();
+        cfg.openai_model = "gpt-4o-mini".into();
         cfg.anthropic_api_key = "ak-test".into();
         let default = LlmClient::from_env(&cfg);
         let reused = resolve_llm_client(&default, &cfg, None, None, None);
@@ -1611,6 +1668,7 @@ mod tests {
     async fn process_client_keeps_sticky_across_resolves() {
         let mut cfg = crate::config::Config::jwt_test();
         cfg.openai_api_key = "sk-test".into();
+        cfg.openai_model = "gpt-4o-mini".into();
         cfg.anthropic_api_key = "ak-test".into();
         cfg.llm_provider = "openai".into();
         let default = LlmClient::from_env(&cfg);
