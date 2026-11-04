@@ -57,6 +57,9 @@ pub struct Config {
     pub memory_profile_stale_days: i64,
     pub memory_score_threshold: f64,
     pub memory_purge_retention_days: i64,
+    pub bootstrap_admin_username: String,
+    pub bootstrap_admin_password: String,
+    pub bootstrap_admin_role: String,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -221,6 +224,9 @@ impl Config {
             memory_profile_stale_days: env_i64("MEMORY_PROFILE_STALE_DAYS", 180).max(1),
             memory_score_threshold: env_f64("MEMORY_SCORE_THRESHOLD", 20.0).clamp(0.0, 100.0),
             memory_purge_retention_days: env_i64("MEMORY_PURGE_RETENTION_DAYS", 30).max(1),
+            bootstrap_admin_username: env_or("BOOTSTRAP_ADMIN_USERNAME", "admin"),
+            bootstrap_admin_password: env_or("BOOTSTRAP_ADMIN_PASSWORD", "123456"),
+            bootstrap_admin_role: env_or("BOOTSTRAP_ADMIN_ROLE", "admin"),
         }
     }
 
@@ -281,6 +287,9 @@ impl Config {
             memory_profile_stale_days: 180,
             memory_score_threshold: 20.0,
             memory_purge_retention_days: 30,
+            bootstrap_admin_username: "admin".into(),
+            bootstrap_admin_password: "123456".into(),
+            bootstrap_admin_role: "admin".into(),
         }
     }
 }
@@ -321,5 +330,7 @@ mod tests {
         assert_eq!(Config::jwt_test().memory_cleanup_interval_seconds, 3600);
         assert_eq!(Config::jwt_test().memory_event_expiry_days, 90);
         assert_eq!(Config::jwt_test().memory_score_threshold, 20.0);
+        assert_eq!(Config::jwt_test().bootstrap_admin_username, "admin");
+        assert_eq!(Config::jwt_test().bootstrap_admin_role, "admin");
     }
 }

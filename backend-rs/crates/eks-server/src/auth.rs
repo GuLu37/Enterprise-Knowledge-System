@@ -142,6 +142,51 @@ pub fn new_uuid_hex() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+pub fn normalize_username(username: &str) -> String {
+    username.trim().to_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapAdminOutcome {
+    Skipped,
+    Exists,
+    Created,
+}
+
+/// 对齐 Python `seed_bootstrap_admin_user`：用户名或密码为空则跳过，已存在则不覆盖。
+pub async fn seed_bootstrap_admin(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    password: &str,
+    role: &str,
+) -> Result<BootstrapAdminOutcome, sqlx::Error> {
+    db::ensure_auth_schema(pool).await?;
+    let username = normalize_username(username);
+    let password = password.trim();
+    if username.is_empty() || password.is_empty() {
+        return Ok(BootstrapAdminOutcome::Skipped);
+    }
+    if db::get_user_by_username(pool, &username).await?.is_some() {
+        return Ok(BootstrapAdminOutcome::Exists);
+    }
+    let (salt_hex, password_hash) = hash_password(password, None);
+    let role = if role.trim().is_empty() {
+        "admin"
+    } else {
+        role.trim()
+    };
+    db::insert_user(
+        pool,
+        &new_uuid_hex(),
+        &username,
+        &password_hash,
+        &salt_hex,
+        role,
+    )
+    .await?;
+    Ok(BootstrapAdminOutcome::Created)
+}
+
 fn build_token(
     user: &db::UserRow,
     session_id: &str,
@@ -359,5 +404,68 @@ mod http_layer_tests {
             .unwrap_or("")
             .to_ascii_lowercase();
         assert!(exposed.contains("x-access-token"), "{exposed}");
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    async fn pool() -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn skips_empty_username_or_password() {
+        let pool = pool().await;
+        assert_eq!(
+            seed_bootstrap_admin(&pool, "  ", "secret", "admin")
+                .await
+                .unwrap(),
+            BootstrapAdminOutcome::Skipped
+        );
+        assert_eq!(
+            seed_bootstrap_admin(&pool, "admin", "", "admin")
+                .await
+                .unwrap(),
+            BootstrapAdminOutcome::Skipped
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn creates_admin_once_and_keeps_existing_password() {
+        let pool = pool().await;
+        assert_eq!(
+            seed_bootstrap_admin(&pool, " Admin ", "123456", "admin")
+                .await
+                .unwrap(),
+            BootstrapAdminOutcome::Created
+        );
+        assert_eq!(
+            seed_bootstrap_admin(&pool, "admin", "other-password", "admin")
+                .await
+                .unwrap(),
+            BootstrapAdminOutcome::Exists
+        );
+        let user = db::get_user_by_username(&pool, "admin").await.unwrap().unwrap();
+        assert_eq!(user.username, "admin");
+        assert_eq!(user.role, "admin");
+        assert!(verify_password("123456", &user.password_salt, &user.password_hash));
+        assert!(!verify_password(
+            "other-password",
+            &user.password_salt,
+            &user.password_hash
+        ));
+    }
+
+    #[test]
+    fn normalizes_username_like_python() {
+        assert_eq!(normalize_username(" Admin "), "admin");
+        assert_eq!(normalize_username(""), "");
     }
 }

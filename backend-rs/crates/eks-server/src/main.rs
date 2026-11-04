@@ -26,6 +26,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .busy_timeout(std::time::Duration::from_secs(15))
         .pragma("journal_mode", "WAL");
     let pool = sqlx::SqlitePool::connect_with(db_options).await?;
+    eks_server::db::ensure_auth_schema(&pool).await?;
+    match eks_server::auth::seed_bootstrap_admin(
+        &pool,
+        &config.bootstrap_admin_username,
+        &config.bootstrap_admin_password,
+        &config.bootstrap_admin_role,
+    )
+    .await
+    {
+        Ok(eks_server::auth::BootstrapAdminOutcome::Created) => {
+            tracing::info!(
+                username = eks_server::auth::normalize_username(&config.bootstrap_admin_username),
+                "已创建 bootstrap 管理员账号"
+            );
+        }
+        Ok(eks_server::auth::BootstrapAdminOutcome::Exists) => {}
+        Ok(eks_server::auth::BootstrapAdminOutcome::Skipped) => {
+            tracing::info!("未配置 bootstrap 管理员，跳过账号初始化");
+        }
+        Err(err) => tracing::error!("初始化 bootstrap 管理员失败: {err}"),
+    }
     eks_server::memory::ensure_schema(&pool).await?;
 
     // 检索引擎（Milvus Lite 直读 + ONNX embedder + SQLite 父块）

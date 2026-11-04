@@ -22,6 +22,52 @@ pub fn dt_to_iso(text: &str) -> Option<String> {
     parse_dt(text).map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
 }
 
+/// 对齐 Python `init_metadata_db` 中的 users / auth_sessions 表。
+pub async fn ensure_auth_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS auth_sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            refresh_token_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_auth_sessions_refresh_token_hash \
+         ON auth_sessions (refresh_token_hash)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS ix_auth_sessions_user_id ON auth_sessions (user_id)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRow {
     pub user_id: String,
