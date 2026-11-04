@@ -116,12 +116,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("远程 MCP 已注册: {}", names.join(", "));
     }
 
+    tracing::info!("==================================================");
+    tracing::info!("🚀 启动 {} (v{})", config.app_name, config.app_version);
+    tracing::info!("环境: {}", config.environment);
+    tracing::info!("调试模式: {}", config.debug);
+    tracing::info!("系统正在初始化各类设置...请稍等...");
     tracing::info!(
-        "eks-server 启动: {addr} | sqlite={} | prefix={} | 调试模式={}",
+        "eks-server 监听: {addr} | sqlite={} | prefix={}",
         config.sqlite_path,
-        config.api_prefix,
-        config.debug
+        config.api_prefix
     );
+    tracing::info!("核心服务已就绪，模型与 Milvus 正在后台初始化。");
+    tracing::info!("==================================================");
 
     let default_llm = eks_server::llm::LlmClient::from_env(&config);
     let mut warmup = RuntimeWarmup::initializing(&config);
@@ -129,9 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let llm_started_at = std::time::Instant::now();
         match warmup.apply_startup_llm(&default_llm).await {
             Ok(()) => tracing::info!(
-                provider = ?warmup.provider,
-                duration_ms = llm_started_at.elapsed().as_secs_f64() * 1000.0,
-                "启动阶段 LLM 初始化完成"
+                "{}",
+                format!(
+                    "启动阶段 LLM 初始化完成: provider={} duration={:.2}ms",
+                    warmup.provider.as_deref().unwrap_or("None"),
+                    llm_started_at.elapsed().as_secs_f64() * 1000.0
+                )
             ),
             Err(exc) => tracing::warn!("启动阶段 LLM 初始化失败，将回退到后台预热: {exc}"),
         }
@@ -153,5 +162,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
+    tracing::info!("🛑 关闭应用...");
     Ok(())
 }
