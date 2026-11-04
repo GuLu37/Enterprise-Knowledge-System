@@ -171,18 +171,6 @@ fn memory_options(request: &ChatStreamRequest) -> crate::short_memory::ShortMemo
     }
 }
 
-fn llm_config_for_request(
-    cfg: &crate::config::Config,
-    request: &ChatStreamRequest,
-) -> crate::llm::LlmConfig {
-    crate::llm::LlmConfig::from_env_with_overrides(
-        cfg,
-        request.provider.as_deref(),
-        request.model.as_deref(),
-        request.temperature,
-    )
-}
-
 fn clarify_text(intent: &crate::intent::QueryIntent) -> String {
     let text = intent.clarify_question.trim();
     if text.is_empty() {
@@ -1149,11 +1137,10 @@ pub async fn consolidate_chat(
     if conversation_id.is_empty() {
         return Err(crate::auth::AuthError::bad_request("conversation_id 不能为空"));
     }
-    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
-    if llm_config.providers.is_empty() {
+    if !state.default_llm.has_configured_providers() {
         return Err(llm_unavailable());
     }
-    let llm_client = LlmClient::new(llm_config);
+    let llm_client = state.default_llm.clone();
     let consolidated = crate::memory::consolidate_conversation_memory(
         &state.pool,
         Some(&llm_client),
@@ -1197,11 +1184,17 @@ pub async fn generate_chat(
     let session_id = request.session_id.clone().unwrap_or_default();
     let event_expiry_days = state.config.memory_event_expiry_days;
     let options = memory_options(&request);
-    let llm_config = llm_config_for_request(&state.config, &request);
-    let llm_client = if llm_config.providers.is_empty() {
-        None
+    let llm_client = crate::llm::resolve_llm_client(
+        &state.default_llm,
+        &state.config,
+        request.provider.as_deref(),
+        request.model.as_deref(),
+        request.temperature,
+    );
+    let llm_client = if llm_client.has_configured_providers() {
+        Some(llm_client)
     } else {
-        Some(Arc::new(LlmClient::new(llm_config)))
+        None
     };
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
 
@@ -1378,9 +1371,14 @@ pub async fn stream_chat(
     let request_provider = request.provider.clone();
     let request_model = request.model.clone();
     let request_retrieval_method = retrieval_method;
-    let llm_config = llm_config_for_request(&state.config, &request);
-    let llm_missing = llm_config.providers.is_empty();
-    let llm_client = Arc::new(LlmClient::new(llm_config));
+    let llm_client = crate::llm::resolve_llm_client(
+        &state.default_llm,
+        &state.config,
+        request.provider.as_deref(),
+        request.model.as_deref(),
+        request.temperature,
+    );
+    let llm_missing = !llm_client.has_configured_providers();
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
     let config = state.config.clone();
     let event_expiry_days = config.memory_event_expiry_days;

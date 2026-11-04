@@ -135,10 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let default_llm = eks_server::llm::LlmClient::from_env(&config);
     let state = AppState {
         pool,
         config: Arc::new(config),
         engine,
+        default_llm,
         runtime_warmup: Arc::new(Mutex::new(warmup)),
     };
     eks_server::chat_stream::spawn_background_warmup(state.clone());

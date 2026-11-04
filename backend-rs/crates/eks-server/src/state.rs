@@ -73,6 +73,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub engine: Arc<RetrievalEngine>,
     pub runtime_warmup: Arc<Mutex<RuntimeWarmup>>,
+    /// 对齐 Python `get_default_llm()`：进程级 FallbackLLM，冷却与粘滞跨请求保留。
+    pub default_llm: Arc<crate::llm::LlmClient>,
 }
 
 impl AppState {

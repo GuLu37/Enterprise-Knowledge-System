@@ -237,6 +237,29 @@ impl LlmClient {
         }
     }
 
+    /// 对齐 Python `get_default_llm()`：进程级默认实例。
+    pub fn from_env(cfg: &crate::config::Config) -> Arc<Self> {
+        Arc::new(Self::new(LlmConfig::from_env(cfg)))
+    }
+
+    pub fn from_env_with_overrides(
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model: Option<&str>,
+        temperature: Option<f64>,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(LlmConfig::from_env_with_overrides(
+            cfg,
+            provider,
+            model,
+            temperature,
+        )))
+    }
+
+    pub fn has_configured_providers(&self) -> bool {
+        !self.config.providers.is_empty()
+    }
+
     /// 按兜底顺序返回当前可用 provider（过滤冷却中的）。
     /// 对齐 Python `_fallback_call` / `stream`：粘滞 `active_provider` 提到队首。
     async fn candidate_providers(&self) -> Vec<ProviderConfig> {
@@ -581,6 +604,21 @@ impl LlmClient {
             return Err(format!("流式 LLM HTTP {status}: {text}"));
         }
         Ok(response)
+    }
+}
+
+/// 对齐 Python `get_default_llm` / `get_llm`：无 provider/model/temperature 覆盖时复用进程级实例。
+pub fn resolve_llm_client(
+    default_llm: &Arc<LlmClient>,
+    cfg: &crate::config::Config,
+    provider: Option<&str>,
+    model: Option<&str>,
+    temperature: Option<f64>,
+) -> Arc<LlmClient> {
+    if provider.is_none() && model.is_none() && temperature.is_none() {
+        default_llm.clone()
+    } else {
+        LlmClient::from_env_with_overrides(cfg, provider, model, temperature)
     }
 }
 
@@ -1447,6 +1485,47 @@ mod tests {
         );
         fail_handle.abort();
         ok_handle.abort();
+    }
+
+    #[test]
+    fn default_request_reuses_process_client() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        cfg.anthropic_api_key = "ak-test".into();
+        let default = LlmClient::from_env(&cfg);
+        let reused = resolve_llm_client(&default, &cfg, None, None, None);
+        assert!(std::sync::Arc::ptr_eq(&default, &reused));
+        let isolated = resolve_llm_client(&default, &cfg, Some("anthropic"), None, None);
+        assert!(!std::sync::Arc::ptr_eq(&default, &isolated));
+        let by_temperature = resolve_llm_client(&default, &cfg, None, None, Some(0.2));
+        assert!(!std::sync::Arc::ptr_eq(&default, &by_temperature));
+    }
+
+    #[tokio::test]
+    async fn process_client_keeps_sticky_across_resolves() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        cfg.anthropic_api_key = "ak-test".into();
+        cfg.llm_provider = "openai".into();
+        let default = LlmClient::from_env(&cfg);
+        *default.active_provider.lock().await = Some("anthropic".into());
+        let reused = resolve_llm_client(&default, &cfg, None, None, None);
+        let names: Vec<_> = reused
+            .candidate_providers()
+            .await
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(names[0], "anthropic");
+        let isolated = resolve_llm_client(&default, &cfg, Some("openai"), None, None);
+        let names: Vec<_> = isolated
+            .candidate_providers()
+            .await
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(names[0], "openai");
+        assert!(isolated.active_provider.lock().await.is_none());
     }
 
     #[tokio::test]
