@@ -59,9 +59,8 @@ pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
 
     match ext.as_str() {
         "txt" | "md" => decode_text_bytes(data),
-        "csv" | "tsv" => {
-            String::from_utf8(data.to_vec()).map_err(|e| format!("UTF-8 解码失败: {e}"))
-        }
+        "csv" | "tsv" => decode_text_bytes(data),
+        "html" | "htm" => extract_html_text(data),
         "docx" => extract_docx_text(data),
         "xlsx" | "xls" => extract_xlsx_text(data),
         "pdf" => extract_pdf_text(data),
@@ -179,10 +178,12 @@ fn iter_xml_children(xml: &str) -> Vec<(String, String)> {
     items
 }
 
-fn extract_wt_text(xml: &str) -> String {
+fn extract_tagged_text(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
     let mut text = String::new();
     let mut rest = xml;
-    while let Some(pos) = find_named_tag(rest, "<w:t") {
+    while let Some(pos) = find_named_tag(rest, &open) {
         let after = &rest[pos..];
         let Some((_, after_open, self_closing)) = parse_open_tag(after) else {
             break;
@@ -191,14 +192,22 @@ fn extract_wt_text(xml: &str) -> String {
             rest = &after[after_open..];
             continue;
         }
-        if let Some(close) = after[after_open..].find("</w:t>") {
-            text.push_str(&after[after_open..after_open + close]);
-            rest = &after[after_open + close + 6..];
+        if let Some(close_at) = after[after_open..].find(&close) {
+            text.push_str(&after[after_open..after_open + close_at]);
+            rest = &after[after_open + close_at + close.len()..];
         } else {
             break;
         }
     }
     xml_unescape(&text)
+}
+
+fn extract_wt_text(xml: &str) -> String {
+    extract_tagged_text(xml, "w:t")
+}
+
+fn extract_at_text(xml: &str) -> String {
+    extract_tagged_text(xml, "a:t")
 }
 
 fn xml_body(xml: &str) -> &str {
@@ -622,32 +631,117 @@ fn extract_pdf_text(data: &[u8]) -> Result<String, String> {
     }
 }
 
-/// pptx: zip 中的 ppt/slides/slideN.xml。
+fn pptx_slide_number(name: &str) -> Option<u32> {
+    let name = name.replace('\\', "/");
+    if !name.contains("ppt/slides/slide") || name.contains("slideLayout") {
+        return None;
+    }
+    let file = name.rsplit('/').next()?;
+    let rest = file.strip_prefix("slide")?.strip_suffix(".xml")?;
+    if rest.is_empty() || !rest.bytes().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn collect_paragraph_texts(xml: &str, tag: &str, out: &mut Vec<String>) {
+    for (name, inner) in iter_xml_children(xml) {
+        if name == tag {
+            let text = extract_at_text(&inner);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        } else {
+            collect_paragraph_texts(&inner, tag, out);
+        }
+    }
+}
+
+fn extract_slide_text(xml: &str) -> String {
+    let mut paragraphs = Vec::new();
+    collect_paragraph_texts(xml, "a:p", &mut paragraphs);
+    paragraphs.join("\n")
+}
+
+/// 对齐 Python `_extract_text_from_pptx`：按幻灯片序号抽取，页与页之间空一行。
 fn extract_pptx_text(data: &[u8]) -> Result<String, String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| format!("pptx zip 打开失败: {e}"))?;
-    let mut text = String::new();
+    let mut slides = Vec::new();
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = file.name().to_string();
-        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
-            let mut xml = String::new();
-            std::io::Read::read_to_string(&mut file, &mut xml)
-                .map_err(|e| e.to_string())?;
-            // 提取 <a:t> 标签
-            let mut rest = xml.as_str();
-            while let Some(pos) = rest.find("<a:t>") {
-                let after = &rest[pos + 5..];
-                if let Some(close) = after.find("</a:t>") {
-                    text.push_str(&after[..close]);
-                    text.push('\n');
-                }
-                rest = &after[after.find("</a:t>").map(|i| i + 6).unwrap_or(after.len())..];
-            }
-        }
+        let Some(number) = pptx_slide_number(&name) else {
+            continue;
+        };
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut file, &mut xml).map_err(|e| e.to_string())?;
+        slides.push((number, extract_slide_text(&xml)));
     }
-    Ok(text)
+    slides.sort_by_key(|(number, _)| *number);
+    Ok(slides
+        .into_iter()
+        .map(|(_, text)| text)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn strip_html(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut text = String::new();
+    let mut i = 0usize;
+    while i < html.len() {
+        let rest = &html[i..];
+        let Some(rel) = rest.find('<') else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..rel]);
+        let tag_start = i + rel;
+        let lowered = &lower[tag_start..];
+        let skip_until = if lowered.starts_with("<script") {
+            lower[tag_start..].find("</script>").map(|end| tag_start + end + 9)
+        } else if lowered.starts_with("<style") {
+            lower[tag_start..].find("</style>").map(|end| tag_start + end + 8)
+        } else {
+            None
+        };
+        if let Some(end) = skip_until {
+            i = end;
+            continue;
+        }
+        let tag_end = rest[rel..].find('>').map(|end| tag_start + end + 1).unwrap_or(html.len());
+        let tag = &lower[tag_start..tag_end];
+        if tag.starts_with("<p")
+            || tag.starts_with("<br")
+            || tag.starts_with("<div")
+            || tag.starts_with("<h")
+            || tag.starts_with("<li")
+            || tag.starts_with("<tr")
+            || tag.starts_with("</p")
+            || tag.starts_with("</div")
+            || tag.starts_with("</h")
+            || tag.starts_with("</li")
+            || tag.starts_with("</tr")
+        {
+            text.push('\n');
+        }
+        i = tag_end;
+    }
+    xml_unescape(&text)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_html_text(data: &[u8]) -> Result<String, String> {
+    let raw = decode_text_bytes(data)?;
+    Ok(strip_html(&raw))
 }
 
 // ==================== 切块 ====================
@@ -1227,6 +1321,7 @@ mod tests {
         assert_eq!(extract_text("手册.txt", "你好".as_bytes()).unwrap(), "你好");
         let (gbk, _, _) = encoding_rs::GBK.encode("差旅报销");
         assert_eq!(extract_text("手册.md", &gbk).unwrap(), "差旅报销");
+        assert_eq!(extract_text("花名册.csv", &gbk).unwrap(), "差旅报销");
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice("带BOM".as_bytes());
         assert_eq!(extract_text("a.txt", &bom).unwrap(), "\u{feff}带BOM");
@@ -1298,6 +1393,22 @@ mod tests {
         zip.start_file("word/document.xml", options).unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
         zip.finish().unwrap().into_inner()
+    }
+
+    fn make_pptx(slides: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, xml) in slides {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn slide_xml(text: &str) -> String {
+        format!(
+            r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+        )
     }
 
     #[test]
@@ -1406,5 +1517,26 @@ mod tests {
         assert!(default_chunks.iter().all(|item| item.chars().count() <= DOCUMENT_ARTICLE_CHUNK_SIZE + 80));
         let plain = build_parent_child_chunks("doc-b", "没有标题的普通说明文字。", "md");
         assert!(!plain.parents[0].parent_text.contains("[章节]"));
+    }
+
+    #[test]
+    fn pptx_extracts_slides_in_number_order() {
+        assert_eq!(pptx_slide_number("ppt/slides/slide2.xml"), Some(2));
+        assert_eq!(pptx_slide_number("ppt/slideLayouts/slideLayout1.xml"), None);
+        let bytes = make_pptx(&[
+            ("ppt/slides/slide2.xml", &slide_xml("第二页")),
+            ("ppt/slides/slide1.xml", &slide_xml("第一页")),
+        ]);
+        assert_eq!(extract_text("介绍.pptx", &bytes).unwrap(), "第一页\n\n第二页");
+    }
+
+    #[test]
+    fn html_strips_tags_and_skips_script() {
+        let html = "<html><head><style>p{color:red}</style></head><body><h1>制度</h1><p>出差需<b>提前</b>申请。</p><script>alert(1)</script></body></html>";
+        let text = extract_text("制度.html", html.as_bytes()).unwrap();
+        assert!(text.contains("制度"));
+        assert!(text.contains("出差需提前申请。"));
+        assert!(!text.contains("alert"));
+        assert!(!text.contains("color:red"));
     }
 }
