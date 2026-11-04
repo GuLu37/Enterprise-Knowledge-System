@@ -73,6 +73,13 @@ pub struct Config {
     pub upload_dir: String,
     pub search_top_k: usize,
     pub similarity_threshold: f64,
+    pub milvus_child_collection: String,
+    pub dense_weight: f64,
+    pub sparse_weight: f64,
+    pub use_dense_retriever: bool,
+    pub use_sparse_retriever: bool,
+    pub use_hybrid_retriever: bool,
+    pub sparse_index_max_rows: usize,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -218,6 +225,104 @@ fn env_i64_first(keys: &[&str], default: i64) -> i64 {
     default
 }
 
+/// 对齐 Python `_resolve_sqlite_url`：从 `DATABASE_URL` 抽出 sqlite 文件路径。
+pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
+    let path = raw.trim().strip_prefix("sqlite:///")?;
+    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        return Some(if path.is_empty() {
+            ":memory:".into()
+        } else {
+            path.to_string()
+        });
+    }
+    let parsed = Path::new(path);
+    if parsed.is_absolute() {
+        return Some(path.to_string());
+    }
+    parsed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("../backend/app/data/{name}"))
+}
+
+/// 对齐 Python `_resolve_backend_model_path`：相对路径相对 backend 目录解析。
+pub fn resolve_backend_model_path(raw: &str, default: &str) -> String {
+    let value = raw.trim();
+    if value.is_empty() {
+        return default.to_string();
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+    let looks_like_path = value.starts_with('.')
+        || value.starts_with("app/")
+        || value.contains("/models/")
+        || value.ends_with(".onnx");
+    let relative = value.strip_prefix("./").unwrap_or(value);
+    let candidate = PathBuf::from("../backend").join(relative);
+    if looks_like_path || candidate.exists() {
+        return candidate.to_string_lossy().into_owned();
+    }
+    value.to_string()
+}
+
+/// 对齐 Python `_resolve_app_path`：相对路径相对 `backend/app` 解析。
+pub fn resolve_app_path(raw: &str, default: &str) -> String {
+    let value = if raw.trim().is_empty() {
+        default
+    } else {
+        raw.trim()
+    };
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+    let relative = value.strip_prefix("./").unwrap_or(value);
+    PathBuf::from("../backend/app")
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn load_sqlite_path() -> String {
+    if let Ok(value) = env::var("EKS_SQLITE_PATH") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    if let Ok(value) = env::var("DATABASE_URL") {
+        if let Some(path) = sqlite_path_from_database_url(&value) {
+            return path;
+        }
+    }
+    "../backend/app/data/rag_metadata.db".into()
+}
+
+fn load_bge_model_dir() -> String {
+    if let Ok(value) = env::var("EKS_BGE_MODEL_DIR") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    resolve_backend_model_path(
+        &env::var("BGE_MODEL_NAME").unwrap_or_default(),
+        "../backend/app/models/bge-base-zh-v1.5",
+    )
+}
+
+fn load_milvus_lite_path() -> String {
+    if let Ok(value) = env::var("EKS_MILVUS_LITE_PATH") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    resolve_app_path(
+        &env::var("MILVUS_LITE_PATH").unwrap_or_default(),
+        "data/milvus_lite.db",
+    )
+}
+
 /// 对齐 Python `UPLOAD_DIR`：相对路径相对 sqlite 所在 app 目录解析。
 pub fn resolve_upload_dir(upload_dir: &str, sqlite_path: &str) -> PathBuf {
     let data_dir = Path::new(sqlite_path).parent().unwrap_or(Path::new("."));
@@ -256,28 +361,19 @@ impl Config {
             api_prefix: env_or("API_PREFIX", "/api/v1"),
             host: env_first(&["EKS_HOST", "SERVER_HOST"], "127.0.0.1"),
             port: env_i64_first(&["EKS_PORT", "SERVER_PORT"], 8000) as u16,
-            sqlite_path: env_or(
-                "EKS_SQLITE_PATH",
-                "../backend/app/data/rag_metadata.db",
-            ),
+            sqlite_path: load_sqlite_path(),
             jwt_secret_key: env_or("JWT_SECRET_KEY", "change-me-in-production"),
             access_token_expire_minutes: env_i64("ACCESS_TOKEN_EXPIRE_MINUTES", 60),
             refresh_token_expire_minutes: env_i64("REFRESH_TOKEN_EXPIRE_MINUTES", 60),
             session_idle_timeout_minutes: env_i64("SESSION_IDLE_TIMEOUT_MINUTES", 60),
-            bge_model_dir: env_or(
-                "EKS_BGE_MODEL_DIR",
-                "../backend/app/models/bge-base-zh-v1.5",
-            ),
+            bge_model_dir: load_bge_model_dir(),
             bge_query_instruction: env_or(
                 "BGE_QUERY_INSTRUCTION",
                 "为这个句子生成表示以用于检索相关文章：",
             ),
             bge_max_length: env_i64("BGE_MAX_LENGTH", 512),
-            milvus_lite_path: env_or(
-                "EKS_MILVUS_LITE_PATH",
-                "../backend/app/data/milvus_lite.db",
-            ),
-            cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", true),
+            milvus_lite_path: load_milvus_lite_path(),
+            cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", false),
             cross_encoder_onnx: env_or("EKS_CROSS_ENCODER_ONNX", ""),
             cross_encoder_tokenizer: env_or("EKS_CROSS_ENCODER_TOKENIZER", ""),
             cross_encoder_candidate_k: env_i64("CROSS_ENCODER_CANDIDATE_K", 30).max(1) as usize,
@@ -339,6 +435,16 @@ impl Config {
             upload_dir: env_or("UPLOAD_DIR", ""),
             search_top_k: env_i64("SEARCH_TOP_K", 5).clamp(1, 50) as usize,
             similarity_threshold: env_f64("SIMILARITY_THRESHOLD", 0.5).clamp(0.0, 1.0),
+            milvus_child_collection: env_first(
+                &["MILVUS_CHILD_COLLECTION_NAME", "MILVUS_DOC_COLLECTION_NAME"],
+                "doc_chunk",
+            ),
+            dense_weight: env_f64("DENSE_WEIGHT", 0.5).clamp(0.0, 1.0),
+            sparse_weight: env_f64("SPARSE_WEIGHT", 0.5).clamp(0.0, 1.0),
+            use_dense_retriever: env_bool("USE_DENSE_RETRIEVER", true),
+            use_sparse_retriever: env_bool("USE_SPARSE_RETRIEVER", true),
+            use_hybrid_retriever: env_bool("USE_HYBRID_RETRIEVER", true),
+            sparse_index_max_rows: env_i64("SPARSE_INDEX_MAX_ROWS", 50_000).max(1000) as usize,
         };
         if let Err(err) = validate_runtime_security(
             config.debug,
@@ -422,6 +528,13 @@ impl Config {
             upload_dir: String::new(),
             search_top_k: 5,
             similarity_threshold: 0.5,
+            milvus_child_collection: "doc_chunk".into(),
+            dense_weight: 0.5,
+            sparse_weight: 0.5,
+            use_dense_retriever: true,
+            use_sparse_retriever: true,
+            use_hybrid_retriever: true,
+            sparse_index_max_rows: 50_000,
         }
     }
 }
@@ -477,6 +590,43 @@ mod tests {
         assert_eq!(Config::jwt_test().search_top_k, 5);
         assert_eq!(Config::jwt_test().similarity_threshold, 0.5);
         assert!(Config::jwt_test().upload_dir.is_empty());
+        assert!(!Config::jwt_test().cross_encoder_enabled);
+        assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
+        assert_eq!(Config::jwt_test().dense_weight, 0.5);
+        assert_eq!(Config::jwt_test().sparse_weight, 0.5);
+        assert!(Config::jwt_test().use_dense_retriever);
+        assert!(Config::jwt_test().use_sparse_retriever);
+        assert!(Config::jwt_test().use_hybrid_retriever);
+        assert_eq!(Config::jwt_test().sparse_index_max_rows, 50_000);
+    }
+
+    #[test]
+    fn parses_python_env_path_aliases() {
+        assert_eq!(
+            sqlite_path_from_database_url("sqlite:///./app/data/rag_metadata.db").as_deref(),
+            Some("../backend/app/data/rag_metadata.db")
+        );
+        assert_eq!(
+            sqlite_path_from_database_url("sqlite:////var/eks/rag_metadata.db").as_deref(),
+            Some("/var/eks/rag_metadata.db")
+        );
+        assert!(sqlite_path_from_database_url("postgresql://localhost/rag").is_none());
+        assert_eq!(
+            resolve_backend_model_path("./app/models/bge-base-zh-v1.5", "def"),
+            "../backend/app/models/bge-base-zh-v1.5"
+        );
+        assert_eq!(
+            resolve_backend_model_path("BAAI/bge-base-zh-v1.5", "def"),
+            "BAAI/bge-base-zh-v1.5"
+        );
+        assert_eq!(
+            resolve_app_path("./data/milvus_lite.db", "data/milvus_lite.db"),
+            "../backend/app/data/milvus_lite.db"
+        );
+        assert_eq!(
+            resolve_app_path("", "data/milvus_lite.db"),
+            "../backend/app/data/milvus_lite.db"
+        );
     }
 
     #[test]
