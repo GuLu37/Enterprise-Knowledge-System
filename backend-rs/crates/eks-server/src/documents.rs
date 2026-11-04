@@ -125,6 +125,16 @@ pub fn guess_content_type(file_type: &str) -> &'static str {
     }
 }
 
+/// 对齐 Python `UploadFile.content_type`：原样保留 multipart 声明，缺省为 None，不按扩展名猜测。
+pub fn upload_content_type(declared: Option<&str>) -> Option<String> {
+    declared.map(str::to_string)
+}
+
+/// 对齐 Python milvus 写入 `content_type or ""`。
+pub fn milvus_content_type(declared: Option<&str>) -> String {
+    declared.unwrap_or("").to_string()
+}
+
 async fn list_documents_page(
     state: &AppState,
     headers: &HeaderMap,
@@ -441,7 +451,7 @@ async fn insert_processing_document(
     original_filename: &str,
     stored_filename: &str,
     file_path: &str,
-    content_type: &str,
+    content_type: Option<&str>,
     file_type: &str,
     file_size: i64,
 ) -> Result<DocumentRow, AuthError> {
@@ -687,6 +697,7 @@ pub async fn upload_document(
 
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
+    let mut declared_content_type: Option<String> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -694,6 +705,7 @@ pub async fn upload_document(
     {
         if field.name() == Some("file") {
             filename = field.file_name().unwrap_or("unknown").to_string();
+            declared_content_type = field.content_type().map(str::to_string);
             file_data = field
                 .bytes()
                 .await
@@ -718,7 +730,7 @@ pub async fn upload_document(
 
     let document_id = uuid::Uuid::new_v4().simple().to_string();
     tracing::info!(document_id = %document_id, "[文档上传][1/3] 开始接收上传文件: {filename}");
-    let content_type = guess_content_type(&file_type).to_string();
+    let content_type = upload_content_type(declared_content_type.as_deref());
     let stored_filename = format!("{document_id}.{file_type}");
     let upload_dir = crate::config::resolve_upload_dir(
         &state.config.upload_dir,
@@ -738,7 +750,7 @@ pub async fn upload_document(
         &filename,
         &stored_filename,
         &file_path_text,
-        &content_type,
+        content_type.as_deref(),
         &file_type,
         file_size,
     )
@@ -763,7 +775,7 @@ pub async fn upload_document(
         file_path_text,
         filename,
         file_type,
-        content_type,
+        milvus_content_type(content_type.as_deref()),
     ));
     Ok(Json(doc_to_json(&row)))
 }
@@ -935,6 +947,22 @@ mod tests {
     }
 
     #[test]
+    fn upload_keeps_multipart_content_type_like_python() {
+        assert_eq!(
+            upload_content_type(Some("text/x-markdown")).as_deref(),
+            Some("text/x-markdown")
+        );
+        assert_eq!(upload_content_type(None), None);
+        assert_eq!(upload_content_type(Some("")).as_deref(), Some(""));
+        assert_ne!(
+            upload_content_type(Some("text/x-markdown")).as_deref(),
+            Some(guess_content_type("md"))
+        );
+        assert_eq!(milvus_content_type(Some("text/x-markdown")), "text/x-markdown");
+        assert_eq!(milvus_content_type(None), "");
+    }
+
+    #[test]
     fn rejects_unsupported_type_and_oversized_upload() {
         let allowed = vec!["pdf".into(), "md".into(), "txt".into()];
         assert_eq!(
@@ -986,7 +1014,7 @@ mod tests {
             "手册.md",
             "doc-up.md",
             "/tmp/doc-up.md",
-            "text/markdown",
+            Some("text/markdown"),
             "md",
             12,
         )
@@ -994,7 +1022,35 @@ mod tests {
         .unwrap();
         assert_eq!(row.status, "processing");
         assert_eq!(row.chunk_count, 0);
+        assert_eq!(row.content_type.as_deref(), Some("text/markdown"));
         assert!(row.error_message.is_none());
+
+        let missing_type = insert_processing_document(
+            &pool,
+            "doc-up-none",
+            "手册.md",
+            "doc-up-none.md",
+            "/tmp/doc-up-none.md",
+            None,
+            "md",
+            12,
+        )
+        .await
+        .unwrap();
+        assert!(missing_type.content_type.is_none());
+        let custom_type = insert_processing_document(
+            &pool,
+            "doc-up-custom",
+            "手册.md",
+            "doc-up-custom.md",
+            "/tmp/doc-up-custom.md",
+            Some("text/x-markdown"),
+            "md",
+            12,
+        )
+        .await
+        .unwrap();
+        assert_eq!(custom_type.content_type.as_deref(), Some("text/x-markdown"));
         let payload = doc_to_json(&row);
         assert_eq!(payload["status"], json!("processing"));
         assert_eq!(payload["chunk_count"], json!(0));
