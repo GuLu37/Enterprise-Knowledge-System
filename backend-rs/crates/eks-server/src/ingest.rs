@@ -1,11 +1,12 @@
 //! 文档入库：上传 → 文本提取 → Parent-Child 切块 → 向量化 → milvus_lite 追加 + SQLite 元数据。
 //!
-//! 支持格式: txt, md (直接读取); docx (zip+xml); xlsx (calamine); pdf (pdf-extract)。
+//! 支持格式: txt, md (直接读取); docx (段落+表格顺序); xlsx (calamine); pdf (pdf-extract + lopdf)。
 //! milvus_lite 写入: 新 Parquet data 文件 + manifest 版本更新（对齐 milvus_lite 存储格式）。
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
@@ -13,9 +14,6 @@ use arrow_array::{
 use arrow::datatypes::{DataType, Field, Schema, Fields};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
-
-use crate::auth::AuthError;
-use crate::state::AppState;
 
 /// 对齐 Python `_extract_text_from_txt`：utf-8 → utf-8-sig → gbk → gb18030。
 fn decode_text_bytes(data: &[u8]) -> Result<String, String> {
@@ -40,7 +38,14 @@ const PARENT_CHUNK_SIZE: usize = 500;
 const PARENT_CHUNK_OVERLAP: usize = 60;
 const CHILD_CHUNK_SIZE: usize = 150;
 const CHILD_CHUNK_OVERLAP: usize = 30;
+const DOCUMENT_CHUNK_SIZE: usize = 600;
+const DOCUMENT_CHUNK_OVERLAP: usize = 100;
+const DOCUMENT_ARTICLE_CHUNK_SIZE: usize = 280;
+const DOCUMENT_ARTICLE_CHUNK_OVERLAP: usize = 50;
 const STRUCTURED_FILE_TYPES: [&str; 4] = ["csv", "tsv", "xls", "xlsx"];
+const ARTICLE_FILE_TYPES: [&str; 9] = [
+    "pdf", "doc", "docx", "md", "txt", "html", "htm", "rtf", "markdown",
+];
 const EMBEDDING_DIM: usize = 768;
 
 // ==================== 文本提取 ====================
@@ -65,7 +70,189 @@ pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
     }
 }
 
-/// docx: zip 中的 word/document.xml，提取 <w:t> 文本。
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_xml_name_boundary(ch: u8) -> bool {
+    matches!(ch, b' ' | b'>' | b'/' | b'\n' | b'\r' | b'\t')
+}
+
+fn parse_open_tag(xml: &str) -> Option<(String, usize, bool)> {
+    if !xml.starts_with('<') || xml.starts_with("</") {
+        return None;
+    }
+    let end = xml.find('>')?;
+    let raw = &xml[1..end];
+    let self_closing = raw.trim_end().ends_with('/');
+    let name = raw
+        .trim_end_matches('/')
+        .split_whitespace()
+        .next()?
+        .to_string();
+    Some((name, end + 1, self_closing))
+}
+
+fn find_named_tag(haystack: &str, prefix: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = haystack[search..].find(prefix) {
+        let abs = search + rel;
+        let next = haystack
+            .as_bytes()
+            .get(abs + prefix.len())
+            .copied()
+            .unwrap_or(b'>');
+        if is_xml_name_boundary(next) {
+            return Some(abs);
+        }
+        search = abs + prefix.len();
+    }
+    None
+}
+
+fn find_matching_close(xml: &str, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while i < xml.len() {
+        let rest = &xml[i..];
+        let open_at = find_named_tag(rest, &open);
+        let close_at = rest.find(&close);
+        match (open_at, close_at) {
+            (Some(open_idx), Some(close_idx)) if open_idx < close_idx => {
+                depth += 1;
+                i += open_idx + open.len();
+            }
+            (_, Some(close_idx)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + close_idx);
+                }
+                i += close_idx + close.len();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn iter_xml_children(xml: &str) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    let mut pos = 0;
+    while pos < xml.len() {
+        let rest = &xml[pos..];
+        let Some(rel) = rest.find('<') else {
+            break;
+        };
+        pos += rel;
+        let rest = &xml[pos..];
+        if rest.starts_with("</") || rest.starts_with("<?") || rest.starts_with("<!") {
+            pos += rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
+            continue;
+        }
+        let Some((name, after_open, self_closing)) = parse_open_tag(rest) else {
+            break;
+        };
+        if self_closing {
+            items.push((name, String::new()));
+            pos += after_open;
+            continue;
+        }
+        let inner_start = pos + after_open;
+        let Some(close_at) = find_matching_close(&xml[inner_start..], &name) else {
+            break;
+        };
+        let inner = xml[inner_start..inner_start + close_at].to_string();
+        let close_len = name.len() + 3;
+        items.push((name, inner));
+        pos = inner_start + close_at + close_len;
+    }
+    items
+}
+
+fn extract_wt_text(xml: &str) -> String {
+    let mut text = String::new();
+    let mut rest = xml;
+    while let Some(pos) = find_named_tag(rest, "<w:t") {
+        let after = &rest[pos..];
+        let Some((_, after_open, self_closing)) = parse_open_tag(after) else {
+            break;
+        };
+        if self_closing {
+            rest = &after[after_open..];
+            continue;
+        }
+        if let Some(close) = after[after_open..].find("</w:t>") {
+            text.push_str(&after[after_open..after_open + close]);
+            rest = &after[after_open + close + 6..];
+        } else {
+            break;
+        }
+    }
+    xml_unescape(&text)
+}
+
+fn xml_body(xml: &str) -> &str {
+    let Some(start_tag) = find_named_tag(xml, "<w:body") else {
+        return xml;
+    };
+    let after = &xml[start_tag..];
+    let Some((_, after_open, self_closing)) = parse_open_tag(after) else {
+        return xml;
+    };
+    if self_closing {
+        return "";
+    }
+    let inner_start = start_tag + after_open;
+    find_matching_close(&xml[inner_start..], "w:body")
+        .map(|close_at| &xml[inner_start..inner_start + close_at])
+        .unwrap_or(&xml[inner_start..])
+}
+
+fn extract_table_block(tbl_xml: &str) -> Option<String> {
+    let mut rows = Vec::new();
+    for (name, tr_xml) in iter_xml_children(tbl_xml) {
+        if name != "w:tr" {
+            continue;
+        }
+        let mut cells = Vec::new();
+        for (cell_name, tc_xml) in iter_xml_children(&tr_xml) {
+            if cell_name != "w:tc" {
+                continue;
+            }
+            let mut parts = Vec::new();
+            for (para_name, p_xml) in iter_xml_children(&tc_xml) {
+                if para_name != "w:p" {
+                    continue;
+                }
+                let text = collapse_ws(&extract_wt_text(&p_xml));
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+            cells.push(parts.join(" "));
+        }
+        if cells.iter().any(|cell| !cell.is_empty()) {
+            rows.push(cells.join(" | "));
+        }
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        Some(format!("[表格]\n{}", rows.join("\n")))
+    }
+}
+
+/// 对齐 Python `_extract_text_from_docx`：按 body 顺序抽取段落与表格。
 fn extract_docx_text(data: &[u8]) -> Result<String, String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
@@ -77,29 +264,20 @@ fn extract_docx_text(data: &[u8]) -> Result<String, String> {
     std::io::Read::read_to_string(&mut file, &mut xml)
         .map_err(|e| format!("docx xml 读取失败: {e}"))?;
 
-    // 简易 XML 文本提取: <w:t> 标签内容 + <w:p> 换行
-    let mut text = String::new();
-    let mut in_paragraph = false;
-    let mut rest = xml.as_str();
-    while let Some(pos) = rest.find('<') {
-        let tag_end = rest[pos..].find('>').map(|i| pos + i + 1).unwrap_or(rest.len());
-        let tag = &rest[pos..tag_end];
-        if tag.starts_with("<w:p ") || tag == "<w:p>" || tag.starts_with("<w:p/") {
-            in_paragraph = true;
-        } else if tag.starts_with("</w:p>") {
-            if in_paragraph {
-                text.push('\n');
+    let mut blocks = Vec::new();
+    for (name, inner) in iter_xml_children(xml_body(&xml)) {
+        if name == "w:p" {
+            let text = collapse_ws(&extract_wt_text(&inner));
+            if !text.is_empty() {
+                blocks.push(text);
             }
-            in_paragraph = false;
-        } else if tag.starts_with("<w:t") {
-            // 提取 <w:t>...</w:t> 之间的文本
-            if let Some(close) = rest[tag_end..].find("</w:t>") {
-                text.push_str(&rest[tag_end..tag_end + close]);
+        } else if name == "w:tbl" {
+            if let Some(table) = extract_table_block(&inner) {
+                blocks.push(table);
             }
         }
-        rest = &rest[tag_end..];
     }
-    Ok(text)
+    Ok(blocks.join("\n\n"))
 }
 
 const EXCEL_FILL_COLUMN_HINTS: [&str; 22] = [
@@ -408,16 +586,40 @@ fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
     Ok(blocks.join("\n"))
 }
 
-/// pdf: 用 pdf-extract 从内容流提取文字。扫描件没有文本层时会失败。
-fn extract_pdf_text(data: &[u8]) -> Result<String, String> {
-    let text = pdf_extract::extract_text_from_mem(data)
-        .map_err(|err| format!("PDF 解析失败: {err}"))?;
+fn clean_pdf_text(text: String) -> Result<String, String> {
     let cleaned = text.replace('\0', "");
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return Err("PDF 未提取到文本，可能是扫描件".into());
     }
     Ok(trimmed.to_string())
+}
+
+fn extract_pdf_with_pdf_extract(data: &[u8]) -> Result<String, String> {
+    let text = pdf_extract::extract_text_from_mem(data)
+        .map_err(|err| format!("PDF 解析失败: {err}"))?;
+    clean_pdf_text(text)
+}
+
+fn extract_pdf_with_lopdf(data: &[u8]) -> Result<String, String> {
+    let document = lopdf::Document::load_mem(data)
+        .map_err(|err| format!("PDF 解析失败: {err}"))?;
+    let page_numbers: Vec<u32> = document.get_pages().keys().copied().collect();
+    let text = document
+        .extract_text(&page_numbers)
+        .map_err(|err| format!("PDF 解析失败: {err}"))?;
+    clean_pdf_text(text)
+}
+
+/// 对齐 Python `_extract_text_from_pdf`：主解析失败后走第二解析器（跳过 unstructured）。
+fn extract_pdf_text(data: &[u8]) -> Result<String, String> {
+    match extract_pdf_with_pdf_extract(data) {
+        Ok(text) => Ok(text),
+        Err(err) => {
+            tracing::warn!("pdf-extract 解析失败，尝试 lopdf 兜底: {err}");
+            extract_pdf_with_lopdf(data)
+        }
+    }
 }
 
 /// pptx: zip 中的 ppt/slides/slideN.xml。
@@ -450,6 +652,13 @@ fn extract_pptx_text(data: &[u8]) -> Result<String, String> {
 
 // ==================== 切块 ====================
 
+fn is_break_char(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '。' | '.' | '；' | ';' | '！' | '？' | '!' | '?' | '：' | ':' | '，' | ','
+    )
+}
+
 /// 简化版递归文本切分（对齐 split_text_chunks 的核心逻辑）。
 fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
@@ -466,7 +675,7 @@ fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
             let window = &chars[(end - 50).max(start)..end];
             let mut best = end;
             for (i, c) in window.iter().enumerate().rev() {
-                if *c == '\n' || *c == '。' || *c == '.' || *c == '；' || *c == ';' {
+                if is_break_char(*c) {
                     best = (end - 50).max(start) + i + 1;
                     break;
                 }
@@ -492,6 +701,174 @@ fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
         };
     }
     chunks
+}
+
+struct HeadingRegexes {
+    markdown: Regex,
+    numbered: Regex,
+    chapter: Regex,
+    chinese: Regex,
+    paren: Regex,
+    hashes: Regex,
+}
+
+fn heading_regexes() -> &'static HeadingRegexes {
+    static RE: OnceLock<HeadingRegexes> = OnceLock::new();
+    RE.get_or_init(|| HeadingRegexes {
+        markdown: Regex::new(r"^(#{1,6})\s+(\S.{0,80})$").expect("markdown heading"),
+        numbered: Regex::new(r"^(?P<number>\d+(?:\.\d+)*)(?:、|[.．])\s*(?P<title>\S.{0,70})$")
+            .expect("numbered heading"),
+        chapter: Regex::new(r"^第[一二三四五六七八九十百千万0-9]+[章节条部分][、.．\s:：-]*\S.{0,70}$")
+            .expect("chapter heading"),
+        chinese: Regex::new(r"^[一二三四五六七八九十]+[、.．]\s*\S.{0,70}$").expect("chinese heading"),
+        paren: Regex::new(r"^[（(][一二三四五六七八九十0-9]+[）)]\s*\S.{0,70}$").expect("paren heading"),
+        hashes: Regex::new(r"^#{1,6}\s*").expect("heading hashes"),
+    })
+}
+
+fn normalize_heading_line(line: &str) -> String {
+    collapse_ws(line)
+}
+
+fn parse_section_heading(line: &str) -> Option<(usize, String)> {
+    let normalized = normalize_heading_line(line);
+    if normalized.is_empty() || normalized.chars().count() > 140 {
+        return None;
+    }
+    let sentence_marks = normalized
+        .chars()
+        .filter(|c| matches!(*c, '。' | '；' | ';'))
+        .count();
+    if sentence_marks > 0 {
+        return None;
+    }
+    let regexes = heading_regexes();
+    if let Some(captures) = regexes.markdown.captures(&normalized) {
+        return Some((captures[1].chars().count(), captures[2].trim().to_string()));
+    }
+    if let Some(captures) = regexes.numbered.captures(&normalized) {
+        let level = captures.name("number").map(|m| m.as_str().matches('.').count() + 1).unwrap_or(1);
+        return Some((level, normalized));
+    }
+    if regexes.chapter.is_match(&normalized) {
+        return Some((1, normalized));
+    }
+    if regexes.chinese.is_match(&normalized) {
+        return Some((1, normalized));
+    }
+    if regexes.paren.is_match(&normalized) {
+        return Some((2, normalized));
+    }
+    None
+}
+
+fn clean_section_heading(line: &str) -> String {
+    let heading = normalize_heading_line(line);
+    heading_regexes().hashes.replace(&heading, "").trim().to_string()
+}
+
+fn split_text_into_sections(text: &str) -> Vec<(String, String)> {
+    let mut sections = Vec::new();
+    let mut heading_stack: Vec<(usize, String)> = Vec::new();
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut heading_count = 0usize;
+
+    let mut flush = |force: bool, heading_stack: &[(usize, String)], current_lines: &mut Vec<String>| {
+        let body = current_lines.join("\n").trim().to_string();
+        if !body.is_empty() || (force && !heading_stack.is_empty()) {
+            let heading = heading_stack
+                .iter()
+                .map(|item| item.1.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            sections.push((heading, body));
+        }
+        current_lines.clear();
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if current_lines.last().is_some_and(|item| !item.is_empty()) {
+                current_lines.push(String::new());
+            }
+            continue;
+        }
+        if let Some((level, heading)) = parse_section_heading(line) {
+            if !current_lines.is_empty() {
+                flush(false, &heading_stack, &mut current_lines);
+            }
+            heading_stack.retain(|item| item.0 < level);
+            heading_stack.push((level, clean_section_heading(&heading)));
+            heading_count += 1;
+            continue;
+        }
+        current_lines.push(line.to_string());
+    }
+    flush(true, &heading_stack, &mut current_lines);
+    if heading_count == 0 {
+        Vec::new()
+    } else {
+        sections
+    }
+}
+
+fn split_section_chunks(heading: &str, body: &str, chunk_size: usize, chunk_overlap: usize) -> Vec<String> {
+    let prefix = if heading.trim().is_empty() {
+        String::new()
+    } else {
+        format!("[章节] {}", heading.trim())
+    };
+    let normalized_body = body.trim();
+    if !prefix.is_empty() && normalized_body.is_empty() {
+        return Vec::new();
+    }
+    if prefix.is_empty() {
+        return split_text(normalized_body, chunk_size, chunk_overlap);
+    }
+    let available_size = 120.max(chunk_size.saturating_sub(prefix.chars().count().saturating_add(1)));
+    let overlap = chunk_overlap.min(available_size / 3);
+    split_text(normalized_body, available_size, overlap)
+        .into_iter()
+        .map(|chunk| format!("{prefix}\n{chunk}").trim().to_string())
+        .collect()
+}
+
+fn split_document_text_by_sections(text: &str, chunk_size: usize, chunk_overlap: usize) -> Option<Vec<String>> {
+    let sections = split_text_into_sections(text);
+    if sections.is_empty() {
+        return None;
+    }
+    let mut chunks = Vec::new();
+    for (heading, body) in sections {
+        chunks.extend(split_section_chunks(&heading, &body, chunk_size, chunk_overlap));
+    }
+    chunks.retain(|chunk| !chunk.trim().is_empty());
+    Some(chunks)
+}
+
+fn is_article_file_type(file_type: &str) -> bool {
+    ARTICLE_FILE_TYPES.contains(&file_type.trim().trim_start_matches('.').to_lowercase().as_str())
+}
+
+fn split_document_text(text: &str, chunk_size: usize, chunk_overlap: usize, file_type: &str) -> Vec<String> {
+    if is_article_file_type(file_type) {
+        let resolved_size = if chunk_size == DOCUMENT_CHUNK_SIZE {
+            DOCUMENT_ARTICLE_CHUNK_SIZE
+        } else {
+            chunk_size
+        };
+        let resolved_overlap = if chunk_overlap == DOCUMENT_CHUNK_OVERLAP {
+            DOCUMENT_ARTICLE_CHUNK_OVERLAP
+        } else {
+            chunk_overlap
+        };
+        if let Some(chunks) = split_document_text_by_sections(text, resolved_size, resolved_overlap) {
+            return chunks;
+        }
+        return split_text(text, resolved_size, resolved_overlap);
+    }
+    split_text(text, chunk_size, chunk_overlap)
 }
 
 fn parse_structured_sections(text: &str) -> Vec<(String, Vec<String>)> {
@@ -652,7 +1029,8 @@ pub fn build_parent_child_chunks(
     text: &str,
     file_type: &str,
 ) -> ChunkResult {
-    let is_structured = STRUCTURED_FILE_TYPES.contains(&file_type.to_lowercase().as_str());
+    let normalized_type = file_type.trim().trim_start_matches('.').to_lowercase();
+    let is_structured = STRUCTURED_FILE_TYPES.contains(&normalized_type.as_str());
     let parent_texts = if is_structured {
         let structured = split_structured_text_chunks(text, PARENT_CHUNK_SIZE);
         if structured.is_empty() {
@@ -661,7 +1039,7 @@ pub fn build_parent_child_chunks(
             structured
         }
     } else {
-        split_text(text, PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP)
+        split_document_text(text, PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP, &normalized_type)
     };
 
     let mut parents = Vec::new();
@@ -685,7 +1063,12 @@ pub fn build_parent_child_chunks(
             }
         } else {
             let overlap = CHILD_CHUNK_OVERLAP.min(CHILD_CHUNK_SIZE / 3);
-            split_text(parent_text, CHILD_CHUNK_SIZE, overlap)
+            let children = split_document_text(parent_text, CHILD_CHUNK_SIZE, overlap, &normalized_type);
+            if children.is_empty() {
+                vec![parent_text.clone()]
+            } else {
+                children
+            }
         };
 
         for child_text in child_texts {
@@ -837,6 +1220,7 @@ pub async fn append_to_milvus_lite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn decodes_utf8_and_gbk_text_files() {
@@ -906,5 +1290,121 @@ mod tests {
         let chunks = build_parent_child_chunks("doc-x", text, "xlsx");
         assert_eq!(chunks.children.len(), 2);
         assert!(chunks.children[1].child_text.contains("市场,李四"));
+    }
+
+    fn make_docx(document_xml: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("word/document.xml", options).unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn docx_extracts_paragraphs_and_tables_in_order() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>前言  段落</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>部门</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>负责人</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>研发</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>张三</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>结尾</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let text = extract_text("手册.docx", &make_docx(xml)).unwrap();
+        assert_eq!(
+            text,
+            "前言 段落\n\n[表格]\n部门 | 负责人\n研发 | 张三\n\n结尾"
+        );
+    }
+
+    fn sample_pdf_bytes(text: &str) -> Vec<u8> {
+        use lopdf::{Dictionary, Document, Object, Stream};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let mut font = Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "Type1");
+        font.set("BaseFont", "Helvetica");
+        let font_id = doc.add_object(font);
+
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", font_id);
+        let mut resources = Dictionary::new();
+        resources.set("Font", fonts);
+        let resources_id = doc.add_object(resources);
+
+        let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", pages_id);
+        page.set("Contents", content_id);
+        page.set("Resources", resources_id);
+        page.set(
+            "MediaBox",
+            vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ],
+        );
+        let page_id = doc.add_object(page);
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", vec![Object::from(page_id)]);
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn pdf_extract_falls_back_to_lopdf() {
+        let bytes = sample_pdf_bytes("HelloPDF");
+        let from_lopdf = extract_pdf_with_lopdf(&bytes).unwrap();
+        assert!(from_lopdf.contains("HelloPDF"), "{from_lopdf}");
+        let extracted = extract_pdf_text(&bytes).unwrap();
+        assert!(extracted.contains("HelloPDF"), "{extracted}");
+        let err = extract_pdf_text(b"not-a-pdf").unwrap_err();
+        assert!(err.contains("PDF 解析失败"), "{err}");
+    }
+
+    #[test]
+    fn article_sections_prefix_parent_chunks() {
+        let text = "# 差旅制度\n出差需提前申请。\n## 报销\n票据必须原件。\n第一章 总则\n本规定适用于全公司。\n一、适用范围\n全体员工。\n（一）例外\n实习生除外。";
+        assert_eq!(parse_section_heading("# 差旅制度"), Some((1, "差旅制度".into())));
+        assert_eq!(parse_section_heading("第一章 总则").unwrap().0, 1);
+        assert_eq!(parse_section_heading("一、适用范围").unwrap().0, 1);
+        assert_eq!(parse_section_heading("（一）例外").unwrap().0, 2);
+        let chunks = build_parent_child_chunks("doc-a", text, "md");
+        assert!(chunks.parents.iter().any(|item| item.parent_text.contains("[章节] 差旅制度")));
+        assert!(chunks.parents.iter().any(|item| item.parent_text.contains("[章节] 差旅制度 / 报销")));
+        assert!(chunks.parents.iter().any(|item| item.parent_text.contains("[章节] 总则")
+            || item.parent_text.contains("[章节] 第一章 总则")));
+        let default_chunks = split_document_text(text, DOCUMENT_CHUNK_SIZE, DOCUMENT_CHUNK_OVERLAP, "md");
+        assert!(default_chunks.iter().all(|item| item.chars().count() <= DOCUMENT_ARTICLE_CHUNK_SIZE + 80));
+        let plain = build_parent_child_chunks("doc-b", "没有标题的普通说明文字。", "md");
+        assert!(!plain.parents[0].parent_text.contains("[章节]"));
     }
 }

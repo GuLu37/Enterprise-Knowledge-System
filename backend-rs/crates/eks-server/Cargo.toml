@@ -32,6 +32,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 calamine = "0.24"
 zip = "1"
 pdf-extract = "0.7"
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
+regex = "1"
 parquet = { version = "53", features = ["arrow"] }
 arrow = "53"
 arrow-array = "53"
