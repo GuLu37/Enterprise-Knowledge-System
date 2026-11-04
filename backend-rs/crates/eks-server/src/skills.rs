@@ -211,19 +211,25 @@ fn matched_memory_ids(result: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub async fn maybe_disclose_original_memory(
+/// 对齐 Python `_run_agent_tool_turn` 的第二次工具：独立 `memory_retrieve_original`。
+pub struct ProgressiveDisclosure {
+    pub arguments: Value,
+    pub result: Value,
+}
+
+pub async fn maybe_run_progressive_disclosure(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     query: &str,
     conversation_id: Option<&str>,
-    memory_query_result: Value,
+    memory_query_result: &Value,
     manifests: &[Value],
     allow_conversation_fallback: bool,
-) -> Result<Value, String> {
+) -> Result<Option<ProgressiveDisclosure>, String> {
     if !should_disclose_original_memory(query) {
-        return Ok(memory_query_result);
+        return Ok(None);
     }
-    let memory_ids = matched_memory_ids(&memory_query_result);
+    let memory_ids = matched_memory_ids(memory_query_result);
     let disclosure_arguments = if !memory_ids.is_empty() {
         json!({
             "memory_ids": memory_ids,
@@ -234,7 +240,7 @@ pub async fn maybe_disclose_original_memory(
     } else if allow_conversation_fallback {
         let conversation_id = conversation_id.unwrap_or("").trim();
         if conversation_id.is_empty() {
-            return Ok(memory_query_result);
+            return Ok(None);
         }
         json!({
             "conversation_id": conversation_id,
@@ -243,9 +249,9 @@ pub async fn maybe_disclose_original_memory(
             "max_chars": 12000,
         })
     } else {
-        return Ok(memory_query_result);
+        return Ok(None);
     };
-    let original = execute_named_from(
+    let result = execute_named_from(
         pool,
         user_id,
         "memory_retrieve_original",
@@ -257,11 +263,39 @@ pub async fn maybe_disclose_original_memory(
         None,
     )
     .await?;
-    Ok(json!({
-        "memory_query": memory_query_result,
-        "original_conversation": original,
-        "progressive_disclosure": true,
+    Ok(Some(ProgressiveDisclosure {
+        arguments: disclosure_arguments,
+        result,
     }))
+}
+
+pub async fn maybe_disclose_original_memory(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    memory_query_result: Value,
+    manifests: &[Value],
+    allow_conversation_fallback: bool,
+) -> Result<Value, String> {
+    match maybe_run_progressive_disclosure(
+        pool,
+        user_id,
+        query,
+        conversation_id,
+        &memory_query_result,
+        manifests,
+        allow_conversation_fallback,
+    )
+    .await?
+    {
+        Some(disclosure) => Ok(json!({
+            "memory_query": memory_query_result,
+            "original_conversation": disclosure.result,
+            "progressive_disclosure": true,
+        })),
+        None => Ok(memory_query_result),
+    }
 }
 
 pub async fn execute_named(
@@ -2584,6 +2618,38 @@ mod tests {
         assert_eq!(
             queried.pointer("/matched_memories/0/memory_id").and_then(Value::as_str),
             Some(summary_id.as_str())
+        );
+        let disclosure = maybe_run_progressive_disclosure(
+            &pool,
+            "u1",
+            "请展开刚才摘要对应的完整对话",
+            Some("c1"),
+            &queried,
+            &[],
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("independent disclosure tool");
+        let disclosed_ids = disclosure
+            .arguments
+            .get("memory_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            disclosed_ids
+                .iter()
+                .any(|id| id.as_str() == Some(summary_id.as_str()))
+        );
+        assert_eq!(disclosure.arguments.get("include_neighbors").and_then(Value::as_u64), Some(1));
+        assert!(
+            disclosure
+                .result
+                .pointer("/original_chunks/0/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("Alpha 上线计划")
         );
         let merged = maybe_disclose_original_memory(
             &pool,

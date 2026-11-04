@@ -198,12 +198,44 @@ struct SkillActionInput<'a> {
     llm: Option<Arc<LlmClient>>,
 }
 
+struct PreparedDisclosure {
+    arguments: serde_json::Value,
+    wrapped: serde_json::Value,
+}
+
 struct PreparedSkill {
     name: String,
     wrapped: serde_json::Value,
     fallback: String,
     messages: Option<Vec<ChatMessage>>,
     sufficient: bool,
+    disclosure: Option<PreparedDisclosure>,
+}
+
+const PROGRESSIVE_DISCLOSURE_REASON: &str = "progressive_disclosure";
+
+/// 对齐 Python `_run_agent_tool_turn`：披露后直接 complete，不再用合并结果判定不足。
+fn agent_turn_complete_after_disclosure(disclosed: bool, query_sufficient: bool) -> bool {
+    disclosed || query_sufficient
+}
+
+fn wrap_prepared_skill(
+    input: &SkillActionInput<'_>,
+    name: &str,
+    arguments: &serde_json::Value,
+    result: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::skills::wrap_skill_execution(
+        name,
+        arguments,
+        input.user_id,
+        nonempty(input.conversation_id),
+        nonempty(input.session_id),
+        Some(input.query),
+        None,
+        json!({}),
+        result,
+    )
 }
 
 async fn prepare_skill_action(
@@ -215,7 +247,7 @@ async fn prepare_skill_action(
         return Err("skill 路由缺少 skill_name".into());
     }
     let history_messages = memory_history(input.history);
-    let mut result = crate::skills::execute_named_from(
+    let result = crate::skills::execute_named_from(
         input.pool,
         input.user_id,
         name,
@@ -227,30 +259,40 @@ async fn prepare_skill_action(
         Some(input.embedder),
     )
     .await?;
+    let query_sufficient = tool_result_has_signal(name, &result);
+    let wrapped = wrap_prepared_skill(input, name, &intent.skill_arguments, result.clone())?;
+    let mut answer_name = name.to_string();
+    let mut answer_result = result.clone();
+    let mut answer_wrapped = wrapped.clone();
+    let mut disclosure = None;
     if name == "memory_query" {
-        result = crate::skills::maybe_disclose_original_memory(
+        if let Some(item) = crate::skills::maybe_run_progressive_disclosure(
             input.pool,
             input.user_id,
             input.query,
             nonempty(input.conversation_id),
-            result,
+            &result,
             input.mcp_manifests,
             true,
         )
-        .await?;
+        .await?
+        {
+            let disclosure_wrapped = wrap_prepared_skill(
+                input,
+                "memory_retrieve_original",
+                &item.arguments,
+                item.result.clone(),
+            )?;
+            answer_name = "memory_retrieve_original".into();
+            answer_result = item.result.clone();
+            answer_wrapped = disclosure_wrapped.clone();
+            disclosure = Some(PreparedDisclosure {
+                arguments: item.arguments,
+                wrapped: disclosure_wrapped,
+            });
+        }
     }
-    let wrapped = crate::skills::wrap_skill_execution(
-        name,
-        &intent.skill_arguments,
-        input.user_id,
-        nonempty(input.conversation_id),
-        nonempty(input.session_id),
-        Some(input.query),
-        None,
-        json!({}),
-        result.clone(),
-    )?;
-    let fallback = crate::skills::format_skill_answer(name, &result);
+    let fallback = crate::skills::format_skill_answer(&answer_name, &answer_result);
     let messages = if input.llm.is_some() {
         let long_term = crate::memory::build_long_term_memory_messages(
             input.pool,
@@ -271,20 +313,20 @@ async fn prepare_skill_action(
         )?;
         Some(crate::skills::build_skill_messages(
             input.query,
-            &wrapped,
+            &answer_wrapped,
             &long_term,
             history_messages,
         ))
     } else {
         None
     };
-    let sufficient = tool_result_has_signal(name, &result);
     Ok(PreparedSkill {
         name: name.to_string(),
         wrapped,
         fallback,
         messages,
-        sufficient,
+        sufficient: agent_turn_complete_after_disclosure(disclosure.is_some(), query_sufficient),
+        disclosure,
     })
 }
 
@@ -1574,6 +1616,21 @@ pub async fn stream_chat(
                     Ok(prepared) => {
                         yield Ok(sse_json("tool_result", skill_tool_result_payload(&prepared.wrapped)));
                         last_skill_name = prepared.name.clone();
+                        if let Some(disclosure) = &prepared.disclosure {
+                            yield Ok(sse_json(
+                                "tool_call",
+                                sse_tool_call_payload(
+                                    "memory_retrieve_original",
+                                    disclosure.arguments.clone(),
+                                    PROGRESSIVE_DISCLOSURE_REASON,
+                                ),
+                            ));
+                            yield Ok(sse_json(
+                                "tool_result",
+                                skill_tool_result_payload(&disclosure.wrapped),
+                            ));
+                            last_skill_name = "memory_retrieve_original".into();
+                        }
                         if prepared.sufficient {
                             if let Some(messages) = prepared.messages.clone() {
                                 match llm_client.stream(&messages).await {
@@ -2378,6 +2435,31 @@ mod tests {
             &json!({"tools": []})
         ));
         assert!(!tool_result_has_signal("list_available_tools", &json!({})));
+    }
+
+    #[test]
+    fn progressive_disclosure_completes_agent_turn_like_python() {
+        let query_payload = json!({
+            "summary": {"profile_count": 0, "matched_count": 2},
+            "matched_memories": [{"memory_id": "m1"}],
+        });
+        assert!(tool_result_has_signal("memory_query", &query_payload));
+        let merged = json!({
+            "memory_query": query_payload,
+            "original_conversation": {"original_chunks": [{"content": "原文"}]},
+            "progressive_disclosure": true,
+        });
+        assert!(
+            !tool_result_has_signal("memory_query", &merged),
+            "合并结果不再带顶层 summary，不能用来判定足够"
+        );
+        assert!(agent_turn_complete_after_disclosure(
+            true,
+            tool_result_has_signal("memory_query", &query_payload)
+        ));
+        assert!(agent_turn_complete_after_disclosure(true, false));
+        assert!(!agent_turn_complete_after_disclosure(false, false));
+        assert_eq!(PROGRESSIVE_DISCLOSURE_REASON, "progressive_disclosure");
     }
 
     #[test]
