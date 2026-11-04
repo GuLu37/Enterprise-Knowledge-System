@@ -76,6 +76,7 @@ fn default_short_memory_m() -> usize {
 }
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 2;
+const LLM_UNAVAILABLE_MESSAGE: &str = "系统暂时无法处理，请稍后重试。";
 
 fn tool_budget_exhausted_message(query: &str, last_tool_name: &str) -> String {
     match last_tool_name {
@@ -303,10 +304,7 @@ async fn resolve_skill_answer(
     llm: Option<&Arc<LlmClient>>,
 ) -> (String, String) {
     if let (Some(messages), Some(llm)) = (prepared.messages.as_ref(), llm) {
-        match llm.invoke(messages).await {
-            Ok(result) => return (clean_rag_response_text(&result.content), result.model),
-            Err(err) => tracing::warn!("Skill LLM 回答失败，回退规则模板: {err}"),
-        }
+        return invoke_llm_safely(llm, messages).await;
     }
     (prepared.fallback.clone(), prepared.name.clone())
 }
@@ -712,6 +710,25 @@ fn clean_rag_response_text(text: &str) -> String {
         spaced_lines.push(line);
     }
     collapse_extra_newlines(&spaced_lines.join("\n")).trim().to_string()
+}
+
+fn finalize_llm_answer(text: &str) -> String {
+    let cleaned = clean_rag_response_text(text);
+    if cleaned.is_empty() {
+        LLM_UNAVAILABLE_MESSAGE.into()
+    } else {
+        cleaned
+    }
+}
+
+async fn invoke_llm_safely(llm: &LlmClient, messages: &[ChatMessage]) -> (String, String) {
+    match llm.invoke(messages).await {
+        Ok(result) => (finalize_llm_answer(&result.content), result.model),
+        Err(err) => {
+            tracing::warn!("LLM 回答生成失败，使用静态繁忙兜底: {err}");
+            (LLM_UNAVAILABLE_MESSAGE.into(), String::new())
+        }
+    }
 }
 
 struct RagTurn {
@@ -1300,11 +1317,7 @@ pub async fn generate_chat(
     )
     .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
     let messages = build_messages(&profile, &event_memory, &turn.context, history_messages, &query);
-    let result = llm_client.invoke(&messages).await.map_err(|detail| crate::auth::AuthError {
-        status: axum::http::StatusCode::BAD_GATEWAY,
-        detail,
-    })?;
-    let answer = clean_rag_response_text(&result.content);
+    let (answer, model) = invoke_llm_safely(llm_client.as_ref(), &messages).await;
     spawn_persist_turn(
         state.pool.clone(),
         Some(llm_client),
@@ -1319,7 +1332,7 @@ pub async fn generate_chat(
         "query": query,
         "response": answer,
         "sources": source_payload(&turn.sources),
-        "model": result.model,
+        "model": model,
         "retrieval_method": turn.retrieval_method,
     })))
 }
@@ -1440,8 +1453,8 @@ pub async fn stream_chat(
                                         })));
                                     }
                                     Err(exc) => {
-                                        tracing::warn!("Skill 流式调用失败，尝试非流式: {exc}");
-                                        let (answer, _) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
+                                        tracing::warn!("LLM 流式生成失败，使用静态繁忙兜底: {exc}");
+                                        let answer = LLM_UNAVAILABLE_MESSAGE.to_string();
                                         spawn_persist_turn(
                                             pool.clone(),
                                             Some(llm_client.clone()),
@@ -1714,33 +1727,26 @@ pub async fn stream_chat(
                 })));
             }
             Err(exc) => {
-                tracing::warn!("流式调用失败，尝试非流式: {exc}");
-                match llm_client.invoke(&messages).await {
-                    Ok(result) => {
-                        let answer = clean_rag_response_text(&result.content);
-                        spawn_persist_turn(
-                            pool.clone(),
-                            Some(llm_client.clone()),
-                            user_id.clone(),
-                            conversation_id.clone(),
-                            session_id.clone(),
-                            query.clone(),
-                            answer.clone(),
-                            event_expiry_days,
-                        );
-                        yield Ok(sse_json("message", json!({"content": answer})));
-                        yield Ok(sse_json("token", json!({"content": answer})));
-                        yield Ok(sse_json("done", json!({
-                            "content": answer,
-                            "response": answer,
-                            "sources": sources,
-                            "retrieval_method": turn.retrieval_method,
-                        })));
-                    }
-                    Err(exc2) => {
-                        yield Ok(sse_json("error", json!({"message": format!("LLM 调用失败: {exc2}")})));
-                    }
-                }
+                tracing::warn!("LLM 流式生成失败，使用静态繁忙兜底: {exc}");
+                let answer = LLM_UNAVAILABLE_MESSAGE.to_string();
+                spawn_persist_turn(
+                    pool.clone(),
+                    Some(llm_client.clone()),
+                    user_id.clone(),
+                    conversation_id.clone(),
+                    session_id.clone(),
+                    query.clone(),
+                    answer.clone(),
+                    event_expiry_days,
+                );
+                yield Ok(sse_json("message", json!({"content": answer})));
+                yield Ok(sse_json("token", json!({"content": answer})));
+                yield Ok(sse_json("done", json!({
+                    "content": answer,
+                    "response": answer,
+                    "sources": sources,
+                    "retrieval_method": turn.retrieval_method,
+                })));
             }
         }
     };
@@ -1955,6 +1961,22 @@ mod tests {
             &json!({"tools": []})
         ));
         assert!(!tool_result_has_signal("list_available_tools", &json!({})));
+    }
+
+    #[test]
+    fn finalize_llm_answer_uses_busy_copy_for_empty() {
+        assert_eq!(LLM_UNAVAILABLE_MESSAGE, "系统暂时无法处理，请稍后重试。");
+        assert_eq!(finalize_llm_answer("  \n\n"), LLM_UNAVAILABLE_MESSAGE);
+        assert_eq!(finalize_llm_answer("可以报销"), "可以报销");
+    }
+
+    #[tokio::test]
+    async fn invoke_llm_safely_returns_busy_without_providers() {
+        let cfg = crate::config::Config::jwt_test();
+        let llm = LlmClient::new(crate::llm::LlmConfig::from_env(&cfg));
+        let (answer, model) = invoke_llm_safely(&llm, &[ChatMessage::new("user", "你好")]).await;
+        assert_eq!(answer, LLM_UNAVAILABLE_MESSAGE);
+        assert!(model.is_empty());
     }
 
     #[test]
