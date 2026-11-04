@@ -220,6 +220,91 @@ pub async fn route_query_action(
     route_query_action_with(query, use_retrieval, llm, history, mcp_manifests, true).await
 }
 
+fn py_optional_float(value: Option<f64>) -> String {
+    match value {
+        None => "None".into(),
+        Some(value) if value.fract() == 0.0 && value.is_finite() => format!("{value:.1}"),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn skill_log_value(skill_name: &Option<String>) -> &str {
+    skill_name.as_deref().unwrap_or("None")
+}
+
+fn format_intent_route_result(intent: &QueryIntent, with_confidence: bool) -> String {
+    let route = if intent.needs_retrieval { "rag" } else { "direct" };
+    if with_confidence {
+        format!(
+            "意图路由结果: source={} route={} confidence={} reason={}",
+            intent.source,
+            route,
+            py_optional_float(intent.confidence),
+            intent.reason
+        )
+    } else {
+        format!(
+            "意图路由结果: source={} route={} reason={}",
+            intent.source, route, intent.reason
+        )
+    }
+}
+
+fn format_action_route_result(intent: &QueryIntent, with_confidence: bool) -> String {
+    if with_confidence {
+        format!(
+            "动作路由结果: source={} route={} confidence={} reason={} skill={}",
+            intent.source,
+            intent.route,
+            py_optional_float(intent.confidence),
+            intent.reason,
+            skill_log_value(&intent.skill_name)
+        )
+    } else {
+        format!(
+            "动作路由结果: source={} route={} reason={} skill={}",
+            intent.source,
+            intent.route,
+            intent.reason,
+            skill_log_value(&intent.skill_name)
+        )
+    }
+}
+
+fn log_action_route(intent: QueryIntent, with_confidence: bool) -> QueryIntent {
+    tracing::info!("{}", format_action_route_result(&intent, with_confidence));
+    intent
+}
+
+/// 对齐 Python `route_query_intent(..., llm=None)`：规则早退打无 confidence 日志，
+/// 冲突/默认直答走 fallback 并带 confidence。
+fn route_query_intent_without_llm(query: &str, use_retrieval: bool) -> QueryIntent {
+    let normalized = query.trim();
+    if !use_retrieval {
+        return QueryIntent::direct("retrieval_disabled", "rule");
+    }
+    if normalized.is_empty() {
+        return QueryIntent::direct("empty_query", "rule");
+    }
+    if eks_kernels::rerank::is_identifier_query(normalized) && !has_signal_conflict(normalized) {
+        let intent = QueryIntent::rag("identifier_query", "rule", normalized);
+        tracing::info!("{}", format_intent_route_result(&intent, false));
+        return intent;
+    }
+    let rule_intent = rule_route_query_intent(normalized, use_retrieval);
+    if rule_intent.reason == "direct_keyword" {
+        tracing::info!("{}", format_intent_route_result(&rule_intent, false));
+        return rule_intent;
+    }
+    if rule_intent.needs_retrieval && rule_intent.reason != "signal_conflict" {
+        tracing::info!("{}", format_intent_route_result(&rule_intent, false));
+        return rule_intent;
+    }
+    let fallback = fallback_route_query_intent(normalized, use_retrieval);
+    tracing::info!("{}", format_intent_route_result(&fallback, true));
+    fallback
+}
+
 pub async fn route_query_action_with(
     query: &str,
     use_retrieval: bool,
@@ -235,11 +320,11 @@ pub async fn route_query_action_with(
     let rule_skill = skills::route_local_skill(normalized);
     if prefer_rule_skill {
         if let Some(skill) = &rule_skill {
-            return intent_from_routed_skill(skill);
+            return log_action_route(intent_from_routed_skill(skill), false);
         }
     }
 
-    let fallback = rule_route_query_intent(normalized, use_retrieval);
+    let fallback = route_query_intent_without_llm(normalized, use_retrieval);
     if let Some(llm) = llm {
         match llm_select_action(llm, normalized, history, mcp_manifests).await {
             Ok(Some(mut action)) => {
@@ -267,21 +352,15 @@ pub async fn route_query_action_with(
                     if action.route == "direct" {
                         if prefer_rule_skill {
                             if let Some(skill) = &rule_skill {
-                                return intent_from_routed_skill(skill);
+                                action = intent_from_routed_skill(skill);
                             }
                         }
-                        if fallback.needs_retrieval {
-                            return finalize_fallback(fallback);
+                        if action.route == "direct" && fallback.needs_retrieval {
+                            action = fallback.clone();
+                            action = finalize_fallback(action);
                         }
                     }
-                    tracing::info!(
-                        "动作路由结果: source={} route={} reason={} skill={:?}",
-                        action.source,
-                        action.route,
-                        action.reason,
-                        action.skill_name
-                    );
-                    return action;
+                    return log_action_route(action, true);
                 }
             }
             Ok(None) => {}
@@ -290,9 +369,9 @@ pub async fn route_query_action_with(
     }
 
     if let Some(skill) = &rule_skill {
-        return intent_from_routed_skill(skill);
+        return log_action_route(intent_from_routed_skill(skill), false);
     }
-    finalize_fallback(fallback)
+    log_action_route(finalize_fallback(fallback), true)
 }
 
 fn finalize_fallback(mut intent: QueryIntent) -> QueryIntent {
@@ -600,5 +679,43 @@ mod tests {
         .unwrap();
         assert_eq!(tool.route, "rag");
         assert_eq!(tool.rewritten_query, "差旅报销");
+    }
+
+    #[test]
+    fn action_and_intent_logs_match_python() {
+        let skill = intent_from_routed_skill(&skills::route_local_skill("列出你的工具").unwrap());
+        assert_eq!(
+            format_action_route_result(&skill, false),
+            "动作路由结果: source=rule route=skill reason=rule_skill:list_available_tools skill=list_available_tools"
+        );
+        let mut rag = QueryIntent::rag("knowledge_keyword", "rule", "差旅报销");
+        assert_eq!(
+            format_intent_route_result(&rag, false),
+            "意图路由结果: source=rule route=rag reason=knowledge_keyword"
+        );
+        rag.confidence = Some(0.0);
+        assert_eq!(
+            format_action_route_result(&rag, true),
+            "动作路由结果: source=rule route=rag confidence=0.0 reason=knowledge_keyword skill=None"
+        );
+        let fallback = fallback_route_query_intent("翻译这段报销制度", true);
+        assert_eq!(
+            format_intent_route_result(&fallback, true),
+            "意图路由结果: source=fallback route=rag confidence=0.0 reason=fallback:signal_conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_llm_conflict_uses_python_fallback_intent() {
+        let intent = route_query_action("翻译这段报销制度", true, None, &[], &[]).await;
+        assert_eq!(intent.route, "rag");
+        assert_eq!(intent.source, "fallback");
+        assert_eq!(intent.reason, "fallback:signal_conflict");
+        assert_eq!(intent.confidence, Some(0.0));
+
+        let poem = route_query_action("写一首诗", true, None, &[], &[]).await;
+        assert_eq!(poem.route, "direct");
+        assert_eq!(poem.source, "fallback");
+        assert_eq!(poem.reason, "fallback:ambiguous_llm_default");
     }
 }
