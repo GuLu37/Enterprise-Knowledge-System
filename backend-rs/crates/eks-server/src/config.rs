@@ -47,6 +47,7 @@ pub struct Config {
     pub mcp_remote_tool_manifests: Vec<serde_json::Value>,
     pub unified_react_enabled: bool,
     pub unified_react_max_iterations: usize,
+    pub unified_react_parallel_workers: usize,
     pub react_max_iterations: usize,
     pub retrieval_planner_llm_decision_enabled: bool,
 }
@@ -198,6 +199,8 @@ impl Config {
             ),
             unified_react_enabled: env_bool("UNIFIED_REACT_ENABLED", true),
             unified_react_max_iterations: env_i64("UNIFIED_REACT_MAX_ITERATIONS", 3).max(1) as usize,
+            unified_react_parallel_workers: env_i64("UNIFIED_REACT_PARALLEL_WORKERS", 4).max(1)
+                as usize,
             react_max_iterations: env_i64("REACT_MAX_ITERATIONS", 3).max(1) as usize,
             retrieval_planner_llm_decision_enabled: env_bool(
                 "RETRIEVAL_PLANNER_LLM_DECISION_ENABLED",
@@ -253,6 +256,7 @@ impl Config {
             mcp_remote_tool_manifests: Vec::new(),
             unified_react_enabled: true,
             unified_react_max_iterations: 3,
+            unified_react_parallel_workers: 4,
             react_max_iterations: 3,
             retrieval_planner_llm_decision_enabled: true,
         }
@@ -285,5 +289,10 @@ mod tests {
         assert_eq!(many.len(), 2);
         assert!(parse_dict_list("not-json").is_empty());
         assert!(parse_dict_list("").is_empty());
+    }
+
+    #[test]
+    fn jwt_test_keeps_react_parallel_workers() {
+        assert_eq!(Config::jwt_test().unified_react_parallel_workers, 4);
     }
 }

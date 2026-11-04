@@ -409,6 +409,7 @@ async fn collect_rag(
         mcp_manifests,
         config.unified_react_enabled,
         config.unified_react_max_iterations,
+        config.unified_react_parallel_workers,
     )
     .await;
     if matches!(attempt, crate::react::ReactAttempt::Unavailable) {
@@ -423,6 +424,7 @@ async fn collect_rag(
             plan.top_k,
             working.clone(),
             config.react_max_iterations,
+            config.unified_react_parallel_workers,
         )
         .await;
     }

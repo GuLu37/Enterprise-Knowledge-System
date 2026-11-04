@@ -1,5 +1,6 @@
 //! ReAct 检索升级：统一编排（RAG + Skill + MCP）失败或关闭时回退 rag 专用循环。
 
+use futures_util::stream::{self, StreamExt};
 use serde_json::{Value, json};
 
 use crate::llm::{ChatMessage, LlmClient, ToolCall};
@@ -56,6 +57,7 @@ pub async fn run_unified_react(
     mcp_manifests: &[Value],
     enabled: bool,
     max_iterations: usize,
+    max_workers: usize,
 ) -> ReactAttempt {
     if !enabled {
         tracing::info!("统一 ReAct 编排已关闭，回退 rag 专用循环");
@@ -74,6 +76,7 @@ pub async fn run_unified_react(
         UNIFIED_REACT_SYSTEM_PROMPT,
         mcp_manifests,
         max_iterations,
+        max_workers,
         "unified_react",
     )
     .await
@@ -89,6 +92,7 @@ pub async fn run_rag_react(
     top_k: usize,
     first_results: Vec<RetrievalItem>,
     max_iterations: usize,
+    max_workers: usize,
 ) -> ReactAttempt {
     run_react_loop(
         engine,
@@ -103,6 +107,7 @@ pub async fn run_rag_react(
         RAG_REACT_SYSTEM_PROMPT,
         &[],
         max_iterations,
+        max_workers,
         "rag_react",
     )
     .await
@@ -121,6 +126,7 @@ async fn run_react_loop(
     system_prompt: &str,
     mcp_manifests: &[Value],
     max_iterations: usize,
+    max_workers: usize,
     kind: &str,
 ) -> ReactAttempt {
     let mut sources = first_results;
@@ -160,54 +166,71 @@ async fn run_react_loop(
             break;
         }
         used_react = true;
-        let raw_calls: Vec<Value> = completion.tool_calls.iter().map(|call| call.raw.clone()).collect();
+        let calls = completion.tool_calls;
+        let raw_calls: Vec<Value> = calls.iter().map(|call| call.raw.clone()).collect();
         messages.push(ChatMessage {
             role: "assistant".into(),
             content: completion.content,
             tool_calls: Some(json!(raw_calls)),
             tool_call_id: None,
         });
-        for call in completion.tool_calls {
-            let query_key = if call.name == "search_knowledge_base" {
-                eks_kernels::normalize_text(
-                    call.arguments
-                        .get("query")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(""),
-                )
-            } else {
-                String::new()
-            };
-            let dedupe = if call.name == "search_knowledge_base" && !query_key.is_empty() {
-                format!("search_knowledge_base:{query_key}")
-            } else {
-                format!("{}:{}", call.name, compact_args(&call.arguments))
-            };
-            if !seen.insert(dedupe) {
-                messages.push(tool_message(&call, json!({"skipped": "duplicate"})));
+        let tool_names = calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join("、");
+        let mut observations = vec![json!({"error": "missing_execution"}); calls.len()];
+        let mut extras: Vec<Vec<RetrievalItem>> = vec![Vec::new(); calls.len()];
+        let mut pending = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            if !seen.insert(call_dedupe_key(call)) {
+                observations[index] = json!({"skipped": "duplicate"});
                 continue;
             }
-            tracing::info!(
-                kind,
-                iteration = iteration + 1,
-                max_iterations = max_iterations.max(1),
-                tool = call.name.as_str(),
-                method = call
-                    .arguments
-                    .get("retrieval_method")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("默认"),
-                "ReAct 工具调用"
-            );
-            let observation =
-                execute_tool(engine, pool, user_id, query, top_k, &call, &mut sources, mcp_manifests).await;
-            notes.push(format!("{}: {}", call.name, truncate(&observation.to_string(), 240)));
-            messages.push(tool_message(&call, observation));
-            if call.name == "search_knowledge_base"
-                && planner::assess_evidence_rule(query, &sources).sufficient
-            {
-                return ReactAttempt::Ran(finish(sources, notes, used_react, kind));
+            pending.push(index);
+        }
+        let workers = parallel_worker_limit(pending.len(), max_workers);
+        tracing::info!(
+            kind,
+            iteration = iteration + 1,
+            max_iterations = max_iterations.max(1),
+            tools = tool_names.as_str(),
+            pending = pending.len(),
+            workers,
+            "ReAct 本轮工具调用"
+        );
+        if !pending.is_empty() {
+            let mut stream = stream::iter(pending).map(|index| {
+                let call = calls[index].clone();
+                async move {
+                    tracing::info!(
+                        kind,
+                        iteration = iteration + 1,
+                        tool = call.name.as_str(),
+                        method = call
+                            .arguments
+                            .get("retrieval_method")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("默认"),
+                        "ReAct 工具执行"
+                    );
+                    let (observation, extra) =
+                        execute_tool(engine, pool, user_id, query, top_k, &call, mcp_manifests).await;
+                    (index, observation, extra)
+                }
+            }).buffer_unordered(workers);
+            while let Some((index, observation, extra)) = stream.next().await {
+                observations[index] = observation;
+                extras[index] = extra;
             }
+        }
+        let mut searched = false;
+        for (index, call) in calls.iter().enumerate() {
+            let observation = std::mem::take(&mut observations[index]);
+            notes.push(format!("{}: {}", call.name, truncate(&observation.to_string(), 240)));
+            messages.push(tool_message(call, observation));
+            merge_sources(&mut sources, std::mem::take(&mut extras[index]));
+            searched |= call.name == "search_knowledge_base";
+        }
+        if searched && planner::assess_evidence_rule(query, &sources).sufficient {
+            tracing::info!(kind, "证据评估充分，提前结束 ReAct");
+            return ReactAttempt::Ran(finish(sources, notes, used_react, kind));
         }
     }
     ReactAttempt::Ran(finish(sources, notes, used_react, kind))
@@ -246,6 +269,25 @@ fn tool_message(call: &ToolCall, observation: Value) -> ChatMessage {
     }
 }
 
+fn parallel_worker_limit(pending: usize, configured: usize) -> usize {
+    pending.min(configured.max(1)).max(1)
+}
+
+fn call_dedupe_key(call: &ToolCall) -> String {
+    if call.name == "search_knowledge_base" {
+        let query_key = eks_kernels::normalize_text(
+            call.arguments
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+        );
+        if !query_key.is_empty() {
+            return format!("search_knowledge_base:{query_key}");
+        }
+    }
+    format!("{}:{}", call.name, compact_args(&call.arguments))
+}
+
 async fn execute_tool(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
@@ -253,9 +295,8 @@ async fn execute_tool(
     original_query: &str,
     default_top_k: usize,
     call: &ToolCall,
-    sources: &mut Vec<RetrievalItem>,
     mcp_manifests: &[Value],
-) -> Value {
+) -> (Value, Vec<RetrievalItem>) {
     if call.name == "search_knowledge_base" {
         let query = call
             .arguments
@@ -275,19 +316,20 @@ async fn execute_tool(
             .get("retrieval_method")
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
-        let result = engine.retrieve_planned(query, method, top_k).await;
-        return match result {
+        return match engine.retrieve_planned(query, method, top_k).await {
             Ok((items, _)) => {
                 let payload: Vec<Value> = items.iter().take(8).map(|item| item.to_json()).collect();
-                merge_sources(sources, items);
-                json!({"ok": true, "count": payload.len(), "results": payload})
+                (
+                    json!({"ok": true, "count": payload.len(), "results": payload}),
+                    items,
+                )
             }
-            Err(err) => json!({"error": err}),
+            Err(err) => (json!({"error": err}), Vec::new()),
         };
     }
     match skills::execute_named_from(pool, user_id, &call.name, &call.arguments, mcp_manifests).await {
-        Ok(result) => json!({"ok": true, "result": result}),
-        Err(err) => json!({"error": err}),
+        Ok(result) => (json!({"ok": true, "result": result}), Vec::new()),
+        Err(err) => (json!({"error": err}), Vec::new()),
     }
 }
 
@@ -325,6 +367,48 @@ mod tests {
     fn truncates_and_dedupes_args() {
         assert_eq!(truncate("abcdef", 3), "abc…");
         assert_eq!(compact_args(&json!({"query":"a"})), "{\"query\":\"a\"}");
+    }
+
+    #[test]
+    fn parallel_workers_cap_to_pending_and_config() {
+        assert_eq!(parallel_worker_limit(1, 4), 1);
+        assert_eq!(parallel_worker_limit(3, 4), 3);
+        assert_eq!(parallel_worker_limit(8, 4), 4);
+        assert_eq!(parallel_worker_limit(8, 0), 1);
+    }
+
+    #[test]
+    fn search_dedupe_key_ignores_method_and_keeps_skill_args() {
+        let search = ToolCall {
+            id: "1".into(),
+            name: "search_knowledge_base".into(),
+            arguments: json!({"query": " 差旅报销 ", "retrieval_method": "dense"}),
+            raw: json!({}),
+        };
+        let search_again = ToolCall {
+            id: "2".into(),
+            name: "search_knowledge_base".into(),
+            arguments: json!({"query": "差旅报销", "retrieval_method": "sparse"}),
+            raw: json!({}),
+        };
+        assert_eq!(call_dedupe_key(&search), call_dedupe_key(&search_again));
+        let skill = ToolCall {
+            id: "3".into(),
+            name: "memory_query".into(),
+            arguments: json!({"query": "偏好", "top_k": 5}),
+            raw: json!({}),
+        };
+        assert!(call_dedupe_key(&skill).starts_with("memory_query:"));
+    }
+
+    #[test]
+    fn restores_original_order_from_unordered_completions() {
+        let mut slots = vec![None, None, None];
+        for (index, value) in [(2, "c"), (0, "a"), (1, "b")] {
+            slots[index] = Some(value);
+        }
+        let ordered: Vec<_> = slots.into_iter().map(Option::unwrap).collect();
+        assert_eq!(ordered, ["a", "b", "c"]);
     }
 
     #[test]
