@@ -654,12 +654,22 @@ pub async fn persist_turn(
         return;
     };
     match extract_profile_candidates(llm, query, answer).await {
-        Ok(candidates) => {
-            if let Err(err) = upsert_profile_candidates(pool, user_id, conversation_id, session_id, &candidates).await {
-                tracing::warn!("画像记忆写入失败: {err}");
+        Ok(candidates) => match upsert_profile_candidates(
+            pool,
+            user_id,
+            conversation_id,
+            session_id,
+            &candidates,
+        )
+        .await
+        {
+            Ok(updated) if updated > 0 => {
+                tracing::info!("{}", format_profile_update_success(user_id, updated));
             }
-        }
-        Err(err) => tracing::warn!("画像记忆抽取失败: {err}"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!("个性化记忆写入失败，已跳过: {err}"),
+        },
+        Err(err) => tracing::warn!("个性化记忆写入失败，已跳过: {err}"),
     }
 }
 
@@ -1539,6 +1549,10 @@ fn format_summary_write_success(
     format!(
         "✓ 递进摘要 L{level} 写入成功 (user_id={user_id}, conversation_id={conversation_id}, turns={turn_start}-{turn_end})"
     )
+}
+
+fn format_profile_update_success(user_id: &str, updated: usize) -> String {
+    format!("个性化记忆更新完成 (user_id={user_id}, updated={updated})")
 }
 
 /// 对齐 Python `delete_long_term_memory`：collection 可写时删除成功即 True，不看行数。
@@ -3132,6 +3146,10 @@ mod tests {
         assert_eq!(
             format_summary_write_success(1, "u1", "c1", 0, 10),
             "✓ 递进摘要 L1 写入成功 (user_id=u1, conversation_id=c1, turns=0-10)"
+        );
+        assert_eq!(
+            format_profile_update_success("u1", 2),
+            "个性化记忆更新完成 (user_id=u1, updated=2)"
         );
     }
 
