@@ -68,6 +68,48 @@ pub async fn ensure_auth_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// 对齐 Python `init_metadata_db` 中的 documents / document_chunks 表。
+pub async fn ensure_document_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS documents (
+            document_id TEXT PRIMARY KEY,
+            original_filename TEXT NOT NULL,
+            stored_filename TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            content_type TEXT,
+            file_type TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'processing',
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS document_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            parent_id TEXT,
+            chunk_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS ix_document_chunks_document_order \
+         ON document_chunks (document_id, chunk_index)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRow {
     pub user_id: String,

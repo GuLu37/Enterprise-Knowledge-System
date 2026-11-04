@@ -367,6 +367,288 @@ pub async fn get_document_content(
     })))
 }
 
+fn document_delete_requested(status: Option<&str>) -> bool {
+    match status.map(str::trim) {
+        None => true,
+        Some("deleting" | "deleted") => true,
+        Some(_) => false,
+    }
+}
+
+fn delete_local_uploaded_file(file_path: &str, document_id: &str, reason: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    let existed = path.exists();
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(
+                document_id,
+                existed,
+                reason,
+                path = file_path,
+                "本地上传原始文件清理完成"
+            );
+            existed
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                document_id,
+                existed = false,
+                reason,
+                path = file_path,
+                "本地上传原始文件清理完成"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                document_id,
+                reason,
+                path = file_path,
+                "本地上传原始文件清理失败: {err}"
+            );
+            false
+        }
+    }
+}
+
+async fn insert_processing_document(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+    original_filename: &str,
+    stored_filename: &str,
+    file_path: &str,
+    content_type: &str,
+    file_type: &str,
+    file_size: i64,
+) -> Result<DocumentRow, AuthError> {
+    let now = db::fmt_dt(&db::now_naive());
+    sqlx::query(
+        "INSERT INTO documents (
+            document_id, original_filename, stored_filename, file_path, content_type,
+            file_type, file_size, status, chunk_count, error_message, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 0, NULL, ?, ?)",
+    )
+    .bind(document_id)
+    .bind(original_filename)
+    .bind(stored_filename)
+    .bind(file_path)
+    .bind(content_type)
+    .bind(file_type)
+    .bind(file_size)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(AuthError::from)?;
+    load_document(pool, document_id)
+        .await?
+        .ok_or_else(|| AuthError::from("文档元数据写入失败".to_string()))
+}
+
+async fn mark_document_failed(pool: &sqlx::SqlitePool, document_id: &str, err: &str) {
+    let now = db::fmt_dt(&db::now_naive());
+    if let Err(restore_err) = sqlx::query(
+        "UPDATE documents SET status = 'failed', error_message = ?, updated_at = ? \
+         WHERE document_id = ?",
+    )
+    .bind(err)
+    .bind(&now)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(document_id, "文档失败状态回写失败: {restore_err}");
+    }
+}
+
+async fn replace_document_chunk_records(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+    parents: &[crate::ingest::ParentRow],
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM document_chunks WHERE document_id = ?")
+        .bind(document_id)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    let now = db::fmt_dt(&db::now_naive());
+    for parent in parents {
+        if parent.parent_text.trim().is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&parent.document_id)
+        .bind(parent.parent_index)
+        .bind(&parent.parent_id)
+        .bind(&parent.parent_text)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn mark_document_ready(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+    chunk_count: i64,
+) -> Result<(), String> {
+    let now = db::fmt_dt(&db::now_naive());
+    sqlx::query(
+        "UPDATE documents SET status = 'ready', chunk_count = ?, error_message = NULL, updated_at = ? \
+         WHERE document_id = ?",
+    )
+    .bind(chunk_count)
+    .bind(&now)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn current_document_status(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(load_document(pool, document_id)
+        .await
+        .map_err(|err| err.detail)?
+        .map(|row| row.status))
+}
+
+async fn process_document_upload(
+    state: AppState,
+    document_id: String,
+    stored_path: String,
+    original_name: String,
+    file_type: String,
+    content_type: String,
+) {
+    tracing::info!(
+        document_id = %document_id,
+        file = %original_name,
+        path = %stored_path,
+        "后台处理开始"
+    );
+    let result = process_document_upload_inner(
+        &state,
+        &document_id,
+        &stored_path,
+        &original_name,
+        &file_type,
+        &content_type,
+    )
+    .await;
+    if let Err(err) = result {
+        tracing::error!(document_id = %document_id, "文档后台处理失败: {err}");
+        if !document_delete_requested(
+            current_document_status(&state.pool, &document_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref(),
+        ) {
+            mark_document_failed(&state.pool, &document_id, &err).await;
+        }
+    }
+    delete_local_uploaded_file(&stored_path, &document_id, "background_processed");
+}
+
+async fn process_document_upload_inner(
+    state: &AppState,
+    document_id: &str,
+    stored_path: &str,
+    original_name: &str,
+    file_type: &str,
+    content_type: &str,
+) -> Result<(), String> {
+    let stored_path_buf = std::path::PathBuf::from(stored_path);
+    let extract_name = original_name.to_string();
+    let extract_type = file_type.to_string();
+    let extract_id = document_id.to_string();
+    tracing::info!(document_id, "开始抽取文本");
+    let chunks = tokio::task::spawn_blocking(move || {
+        let data = std::fs::read(&stored_path_buf).map_err(|err| err.to_string())?;
+        crate::ingest::prepare_upload_chunks(&extract_id, &extract_name, &data, &extract_type)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    tracing::info!(
+        document_id,
+        parents = chunks.parents.len(),
+        children = chunks.children.len(),
+        "切块完成"
+    );
+
+    if document_delete_requested(
+        current_document_status(&state.pool, document_id)
+            .await?
+            .as_deref(),
+    ) {
+        tracing::info!(document_id, "文档已请求删除，跳过后台向量写入");
+        return Ok(());
+    }
+
+    tracing::info!(
+        document_id,
+        "[文档上传][3/3] 开始写入 Milvus (parents={}, children={})",
+        chunks.parents.len(),
+        chunks.children.len()
+    );
+    let embedder = state.engine.embedder.clone();
+    let child_texts: Vec<String> = chunks
+        .children
+        .iter()
+        .map(|child| child.child_text.clone())
+        .collect();
+    let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents(&child_texts))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| format!("向量化失败: {err}"))?;
+
+    crate::ingest::append_to_milvus_lite(
+        &state.engine.store,
+        "doc_chunk",
+        &chunks.children,
+        original_name,
+        file_type,
+        content_type,
+        &vectors,
+    )
+    .await
+    .map_err(|err| format!("向量库写入失败: {err}"))?;
+    tracing::info!(
+        document_id,
+        children = chunks.children.len(),
+        "[文档上传][3/3] Milvus 写入成功"
+    );
+
+    if document_delete_requested(
+        current_document_status(&state.pool, document_id)
+            .await?
+            .as_deref(),
+    ) {
+        let _ = state.engine.delete_document_chunks(document_id).await;
+        tracing::info!(document_id, "文档已在向量写入期间删除，已清理向量块");
+        return Ok(());
+    }
+
+    replace_document_chunk_records(&state.pool, document_id, &chunks.parents).await?;
+    mark_document_ready(&state.pool, document_id, chunks.children.len() as i64).await?;
+    state.engine.invalidate().await;
+    tracing::info!(
+        document_id,
+        children = chunks.children.len(),
+        "文档后台处理完成"
+    );
+    Ok(())
+}
+
 // POST /api/v1/documents/upload (multipart)
 pub async fn upload_document(
     State(state): State<AppState>,
@@ -374,8 +656,10 @@ pub async fn upload_document(
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
+    db::ensure_document_schema(&state.pool)
+        .await
+        .map_err(AuthError::from)?;
 
-    // 读取第一个文件字段
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
     while let Some(field) = multipart
@@ -406,12 +690,10 @@ pub async fn upload_document(
     if let Some(detail) = reject_oversized_upload(file_data.len(), state.config.max_upload_size) {
         return Err(AuthError::bad_request(detail));
     }
-    if file_data.is_empty() {
-        return Err(AuthError::bad_request("文档内容为空，无法生成向量"));
-    }
 
     let document_id = uuid::Uuid::new_v4().simple().to_string();
-    let content_type = guess_content_type(&file_type);
+    tracing::info!(document_id = %document_id, "[文档上传][1/3] 开始接收上传文件: {filename}");
+    let content_type = guess_content_type(&file_type).to_string();
     let stored_filename = format!("{document_id}.{file_type}");
     let upload_dir = std::path::Path::new(&state.config.sqlite_path)
         .parent()
@@ -422,107 +704,43 @@ pub async fn upload_document(
     std::fs::write(&file_path, &file_data)
         .map_err(|err| AuthError::bad_request(&format!("保存上传文件失败: {err}")))?;
     let file_path_text = file_path.display().to_string();
+    let file_size = file_data.len() as i64;
+    drop(file_data);
 
-    // 1) 文本提取
-    let text = match crate::ingest::extract_text(&filename, &file_data) {
-        Ok(text) => text,
+    let row = match insert_processing_document(
+        &state.pool,
+        &document_id,
+        &filename,
+        &stored_filename,
+        &file_path_text,
+        &content_type,
+        &file_type,
+        file_size,
+    )
+    .await
+    {
+        Ok(row) => row,
         Err(err) => {
             let _ = std::fs::remove_file(&file_path);
-            return Err(AuthError::bad_request(&format!("文档解析失败: {err}")));
+            return Err(err);
         }
     };
+    tracing::info!(
+        document_id = %document_id,
+        file_size,
+        "[文档上传][2/3] SQLite 元数据写入成功: status=processing"
+    );
 
-    if text.trim().is_empty() {
-        return Err(AuthError::bad_request("文档内容为空，无法生成向量"));
-    }
-
-    // 2) Parent-Child 切块
-    let chunks = crate::ingest::build_parent_child_chunks(&document_id, &text, &file_type);
-    if chunks.children.is_empty() {
-        return Err(AuthError::bad_request("文档切块失败，未生成有效内容"));
-    }
-
-    // 3) 向量化
-    let child_texts: Vec<String> = chunks
-        .children
-        .iter()
-        .map(|c| c.child_text.clone())
-        .collect();
-    let vectors = state
-        .engine
-        .embedder
-        .embed_documents(&child_texts)
-        .map_err(|e| AuthError {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            detail: format!("向量化失败: {e}"),
-        })?;
-
-    // 4) milvus_lite 追加写入
-    crate::ingest::append_to_milvus_lite(
-        &state.engine.store,
-        "doc_chunk",
-        &chunks.children,
-        &filename,
-        &file_type,
+    let state = state.clone();
+    tokio::spawn(process_document_upload(
+        state,
+        document_id,
+        file_path_text,
+        filename,
+        file_type,
         content_type,
-        &vectors,
-    )
-    .await
-    .map_err(|e| AuthError {
-        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        detail: format!("向量库写入失败: {e}"),
-    })?;
-
-    // 5) SQLite 元数据
-    let now = crate::db::fmt_dt(&crate::db::now_naive());
-    sqlx::query(
-        "INSERT INTO documents (document_id, original_filename, stored_filename, file_path,          content_type, file_type, file_size, status, chunk_count, error_message, created_at, updated_at)          VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, NULL, ?, ?)",
-    )
-    .bind(&document_id)
-    .bind(&filename)
-    .bind(&stored_filename)
-    .bind(&file_path_text)
-    .bind(content_type)
-    .bind(&file_type)
-    .bind(file_data.len() as i64)
-    .bind(chunks.children.len() as i64)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.pool)
-    .await
-    .map_err(AuthError::from)?;
-
-    // parent 行写入 document_chunks
-    for parent in &chunks.parents {
-        sqlx::query(
-            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at)              VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&parent.document_id)
-        .bind(parent.parent_index)
-        .bind(&parent.parent_id)
-        .bind(&parent.parent_text)
-        .bind(&now)
-        .execute(&state.pool)
-        .await
-        .map_err(AuthError::from)?;
-    }
-
-    state.engine.invalidate().await;
-
-    Ok(Json(json!({
-        "document_id": document_id,
-        "original_filename": filename,
-        "stored_filename": stored_filename,
-        "file_path": file_path_text,
-        "content_type": content_type,
-        "file_type": file_type,
-        "file_size": file_data.len(),
-        "status": "ready",
-        "chunk_count": chunks.children.len(),
-        "error_message": null,
-        "created_at": db::dt_to_iso(&now),
-        "updated_at": db::dt_to_iso(&now),
-    })))
+    ));
+    Ok(Json(doc_to_json(&row)))
 }
 
 #[cfg(test)]
@@ -549,25 +767,7 @@ mod tests {
 
     async fn memory_pool() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE documents (
-                document_id TEXT PRIMARY KEY,
-                original_filename TEXT NOT NULL,
-                stored_filename TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                content_type TEXT,
-                file_type TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                chunk_count INTEGER NOT NULL,
-                error_message TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        db::ensure_document_schema(&pool).await.unwrap();
         pool
     }
 
@@ -718,5 +918,83 @@ mod tests {
         );
         assert!(reject_oversized_upload(104_857_600, 104_857_600).is_none());
         assert!(reject_oversized_upload(0, 104_857_600).is_none());
+    }
+
+    #[test]
+    fn delete_requested_matches_python() {
+        assert!(document_delete_requested(None));
+        assert!(document_delete_requested(Some("deleting")));
+        assert!(document_delete_requested(Some("deleted")));
+        assert!(!document_delete_requested(Some("processing")));
+        assert!(!document_delete_requested(Some("ready")));
+        assert!(!document_delete_requested(Some("failed")));
+    }
+
+    #[tokio::test]
+    async fn insert_processing_then_ready_or_failed() {
+        let pool = memory_pool().await;
+        let row = insert_processing_document(
+            &pool,
+            "doc-up",
+            "手册.md",
+            "doc-up.md",
+            "/tmp/doc-up.md",
+            "text/markdown",
+            "md",
+            12,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.status, "processing");
+        assert_eq!(row.chunk_count, 0);
+        assert!(row.error_message.is_none());
+        let payload = doc_to_json(&row);
+        assert_eq!(payload["status"], json!("processing"));
+        assert_eq!(payload["chunk_count"], json!(0));
+
+        mark_document_ready(&pool, "doc-up", 4).await.unwrap();
+        let ready = load_document(&pool, "doc-up").await.unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.chunk_count, 4);
+        assert!(ready.error_message.is_none());
+
+        mark_document_failed(&pool, "doc-up", "文档内容为空，无法生成向量").await;
+        let failed = load_document(&pool, "doc-up").await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("文档内容为空，无法生成向量")
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_ready_persist_when_delete_requested() {
+        let pool = memory_pool().await;
+        insert_row(&pool, &sample_row("deleting")).await;
+        assert!(document_delete_requested(
+            current_document_status(&pool, "doc-1")
+                .await
+                .unwrap()
+                .as_deref()
+        ));
+        let chunks = crate::ingest::prepare_upload_chunks(
+            "doc-1",
+            "手册.md",
+            "差旅报销流程如下。".as_bytes(),
+            "md",
+        )
+        .unwrap();
+        assert!(!chunks.children.is_empty());
+        if !document_delete_requested(
+            current_document_status(&pool, "doc-1")
+                .await
+                .unwrap()
+                .as_deref(),
+        ) {
+            panic!("deleting 文档不应继续写入 ready");
+        }
+        let row = load_document(&pool, "doc-1").await.unwrap().unwrap();
+        assert_eq!(row.status, "deleting");
+        assert_eq!(row.chunk_count, 3);
     }
 }

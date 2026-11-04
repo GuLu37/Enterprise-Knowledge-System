@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pragma("journal_mode", "WAL");
     let pool = sqlx::SqlitePool::connect_with(db_options).await?;
     eks_server::db::ensure_auth_schema(&pool).await?;
+    eks_server::db::ensure_document_schema(&pool).await?;
     match eks_server::auth::seed_bootstrap_admin(
         &pool,
         &config.bootstrap_admin_username,

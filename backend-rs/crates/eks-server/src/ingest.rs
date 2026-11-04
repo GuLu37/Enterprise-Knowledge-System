@@ -247,6 +247,7 @@ fn split_structured_rows(text: &str, _chunk_size: usize) -> Vec<String> {
     children
 }
 
+#[derive(Debug)]
 pub struct ChunkResult {
     pub parents: Vec<ParentRow>,
     pub children: Vec<ChildRow>,
@@ -311,6 +312,24 @@ pub fn build_parent_child_chunks(
     }
 
     ChunkResult { parents, children }
+}
+
+/// 抽取文本并切块；空正文或无 child 时返回与 Python 相同的错误文案。
+pub fn prepare_upload_chunks(
+    document_id: &str,
+    filename: &str,
+    data: &[u8],
+    file_type: &str,
+) -> Result<ChunkResult, String> {
+    let text = extract_text(filename, data)?;
+    if text.trim().is_empty() {
+        return Err("文档内容为空，无法生成向量".into());
+    }
+    let chunks = build_parent_child_chunks(document_id, &text, file_type);
+    if chunks.children.is_empty() {
+        return Err("文档切块失败，未生成有效内容".into());
+    }
+    Ok(chunks)
 }
 
 // ==================== milvus_lite 写入 ====================
@@ -443,5 +462,16 @@ mod tests {
     fn rejects_unrecognized_text_encoding() {
         let err = extract_text("bad.txt", &[0xFF, 0xFE, 0x00]).unwrap_err();
         assert_eq!(err, "TXT 文件编码无法识别");
+    }
+
+    #[test]
+    fn prepare_upload_chunks_rejects_empty_text() {
+        let err = prepare_upload_chunks("doc-1", "empty.txt", b"   \n", "txt").unwrap_err();
+        assert_eq!(err, "文档内容为空，无法生成向量");
+        let chunks =
+            prepare_upload_chunks("doc-1", "手册.md", "差旅报销需要提前申请。".as_bytes(), "md")
+                .unwrap();
+        assert!(!chunks.parents.is_empty());
+        assert!(!chunks.children.is_empty());
     }
 }
