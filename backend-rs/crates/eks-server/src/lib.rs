@@ -11,6 +11,7 @@ pub mod embedder;
 pub mod ingest;
 pub mod intent;
 pub mod llm;
+pub mod logging;
 pub mod memory;
 pub mod milvus_lite;
 pub mod planner;

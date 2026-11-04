@@ -9,14 +9,8 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let config = Config::load();
+    eks_server::logging::init_tracing(&config.log_dir, &config.log_level);
     let addr = format!("{}:{}", config.host, config.port);
 
     // 与 Python 共用同一 SQLite 文件（WAL 模式，读写共存）

@@ -67,6 +67,8 @@ pub struct Config {
     pub startup_init_llm: bool,
     pub max_upload_size: i64,
     pub allowed_file_types: Vec<String>,
+    pub log_dir: String,
+    pub log_level: String,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -290,6 +292,8 @@ impl Config {
             allowed_file_types: parse_allowed_file_types(
                 &env::var("ALLOWED_FILE_TYPES").unwrap_or_default(),
             ),
+            log_dir: env_or("LOG_DIR", "logs"),
+            log_level: env_or("LOG_LEVEL", "INFO"),
         };
         if let Err(err) = validate_runtime_security(
             config.debug,
@@ -368,6 +372,8 @@ impl Config {
             startup_init_llm: true,
             max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
             allowed_file_types: parse_allowed_file_types(""),
+            log_dir: "logs".into(),
+            log_level: "INFO".into(),
         }
     }
 }
@@ -418,6 +424,8 @@ mod tests {
         assert_eq!(Config::jwt_test().max_upload_size, 104_857_600);
         assert!(Config::jwt_test().allowed_file_types.contains(&"pdf".into()));
         assert!(Config::jwt_test().allowed_file_types.contains(&"xlsx".into()));
+        assert_eq!(Config::jwt_test().log_dir, "logs");
+        assert_eq!(Config::jwt_test().log_level, "INFO");
     }
 
     #[test]
