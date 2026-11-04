@@ -153,6 +153,8 @@ pub async fn upsert_conversation(
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     crate::validate::session_id_field(request.session_id.as_deref())?;
+    crate::validate::optional_datetime_field(request.created_at.as_deref())?;
+    crate::validate::optional_datetime_field(request.updated_at.as_deref())?;
     let cid = conversation_id.trim().to_string();
     if user.user_id.is_empty() || cid.is_empty() {
         return Err(AuthError::bad_request(empty_conversation_identity_error()));
@@ -436,9 +438,7 @@ mod tests {
             resolve_created_at(Some("2026-03-15T16:30:00+08:00"), now),
             "2026-03-15 08:30:00.000000"
         );
-        assert_eq!(resolve_created_at(Some(""), now), now);
         assert_eq!(resolve_created_at(None, now), now);
-        assert_eq!(resolve_created_at(Some("bad"), now), now);
     }
 
     #[test]

@@ -122,6 +122,15 @@ pub fn session_id_field(session_id: Option<&str>) -> Result<(), AuthError> {
     Ok(())
 }
 
+/// 对齐 Pydantic `Optional[datetime]`：缺省/null 通过，非法字符串 422。
+pub fn optional_datetime_field(value: Option<&str>) -> Result<(), AuthError> {
+    match value {
+        None => Ok(()),
+        Some(text) if crate::db::parse_client_datetime(text).is_some() => Ok(()),
+        Some(_) => Err(AuthError::unprocessable("Input should be a valid datetime")),
+    }
+}
+
 /// 对齐 `RetrievalRequest.top_k`：缺省 5，越界 422，不夹取。
 pub fn retrieval_top_k(top_k: Option<usize>) -> Result<usize, AuthError> {
     let value = top_k.unwrap_or(5);
@@ -327,6 +336,17 @@ mod tests {
         assert_eq!(
             detail(skill_name_field("").unwrap_err()).1,
             "String should have at least 1 character"
+        );
+        assert!(optional_datetime_field(None).is_ok());
+        assert!(optional_datetime_field(Some("2026-03-15T08:30:00.123Z")).is_ok());
+        assert!(optional_datetime_field(Some("2026-03-15T16:30:00+08:00")).is_ok());
+        assert_eq!(
+            detail(optional_datetime_field(Some("")).unwrap_err()).1,
+            "Input should be a valid datetime"
+        );
+        assert_eq!(
+            detail(optional_datetime_field(Some("bad")).unwrap_err()).1,
+            "Input should be a valid datetime"
         );
     }
 }
