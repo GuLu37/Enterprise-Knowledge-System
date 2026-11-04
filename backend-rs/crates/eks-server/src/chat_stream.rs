@@ -1371,9 +1371,10 @@ pub async fn consolidate_chat(
     axum::extract::Query(query): axum::extract::Query<ConsolidateQuery>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
-    let conversation_id = query.conversation_id.trim().to_string();
-    if conversation_id.is_empty() {
-        return Err(crate::auth::AuthError::bad_request("conversation_id 不能为空"));
+    let conversation_id = query.conversation_id;
+    // 对齐 Python：空白 conversation_id 不 400，服务层返回 0；响应回显原始 query。
+    if conversation_id.trim().is_empty() {
+        return Ok(axum::Json(empty_consolidate_payload(&conversation_id)));
     }
     require_configured_llm(&state.default_llm)?;
     let llm_client = state.default_llm.clone();
@@ -1381,7 +1382,7 @@ pub async fn consolidate_chat(
         &state.pool,
         Some(&llm_client),
         &user.user_id,
-        &conversation_id,
+        conversation_id.trim(),
         state.config.memory_event_expiry_days,
     )
     .await
@@ -1393,6 +1394,14 @@ pub async fn consolidate_chat(
         "conversation_id": conversation_id,
         "consolidated": consolidated,
     })))
+}
+
+/// 对齐 Python `consolidate_conversation_memory` 空 ID：HTTP 200 且 `consolidated=0`。
+fn empty_consolidate_payload(conversation_id: &str) -> serde_json::Value {
+    json!({
+        "conversation_id": conversation_id,
+        "consolidated": 0,
+    })
 }
 
 pub async fn chat_warmup(
@@ -2682,6 +2691,18 @@ mod tests {
         assert_eq!(LLM_UNAVAILABLE_MESSAGE, "系统暂时无法处理，请稍后重试。");
         assert_eq!(finalize_llm_answer("  \n\n"), LLM_UNAVAILABLE_MESSAGE);
         assert_eq!(finalize_llm_answer("可以报销"), "可以报销");
+    }
+
+    #[test]
+    fn empty_consolidate_returns_zero_like_python() {
+        assert_eq!(
+            empty_consolidate_payload(""),
+            json!({"conversation_id": "", "consolidated": 0})
+        );
+        assert_eq!(
+            empty_consolidate_payload("   "),
+            json!({"conversation_id": "   ", "consolidated": 0})
+        );
     }
 
     #[test]
