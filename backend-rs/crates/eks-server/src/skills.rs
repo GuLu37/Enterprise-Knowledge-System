@@ -1254,15 +1254,26 @@ struct SkillDocument {
     updated_at: String,
 }
 
+/// 对齐 Python `_skill_list_knowledge_base_files`：默认 ready、limit 1–100，
+/// 支持 filename/status 别名，filters 含 document_ids/file_types。
 async fn list_knowledge_base_files(pool: &sqlx::SqlitePool, arguments: &Value) -> Result<Value, String> {
-    let file_name = arg_str(arguments, "file_name");
+    let file_name = skill_file_name(arguments);
     let limit = arg_usize(arguments, "limit", 20, 1, 100);
-    let summarize = arguments.get("summarize").and_then(|value| value.as_bool()).unwrap_or(true);
+    let summarize = arg_bool(arguments, "summarize", true);
     let preview_chars = arg_usize(arguments, "preview_chars", 1500, 200, 6000);
-    let statuses = arg_strings(arguments, "statuses");
-    let statuses = if statuses.is_empty() { vec!["ready".to_string()] } else { statuses };
+    let mut statuses = skill_status_filters(arguments);
+    if statuses.is_empty() {
+        statuses = vec!["ready".to_string()];
+    }
     let file_types = arg_strings(arguments, "file_types");
     let document_ids = arg_strings(arguments, "document_ids");
+    let filters = json!({
+        "document_ids": document_ids,
+        "file_types": file_types,
+        "statuses": statuses,
+        "file_name": file_name,
+        "limit": limit,
+    });
 
     let mut sql = String::from(
         "SELECT document_id, original_filename, stored_filename, file_type, status, \
@@ -1290,25 +1301,25 @@ async fn list_knowledge_base_files(pool: &sqlx::SqlitePool, arguments: &Value) -
         return Ok(json!({
             "summary": {"document_count": 0, "message": "未找到匹配的已上传文档，请确认文件名或状态。"},
             "documents": [],
-            "filters": {"file_name": file_name, "statuses": statuses, "limit": limit},
+            "filters": filters,
         }));
     }
 
+    let ids: Vec<String> = documents.iter().map(|record| record.document_id.clone()).collect();
+    let chunks_by_document = if summarize {
+        load_chunks_for_documents(pool, &ids).await?
+    } else {
+        HashMap::new()
+    };
+
     let mut documents_out = Vec::new();
     for record in &documents {
-        let mut doc = json!({
-            "document_id": record.document_id,
-            "original_filename": record.original_filename,
-            "stored_filename": record.stored_filename,
-            "file_type": record.file_type,
-            "status": record.status,
-            "file_size": record.file_size,
-            "chunk_count": record.chunk_count,
-            "created_at": crate::db::dt_to_iso(&record.created_at),
-            "updated_at": crate::db::dt_to_iso(&record.updated_at),
-        });
+        let mut doc = skill_document_json(record);
         if summarize {
-            let chunks = load_chunk_texts(pool, &record.document_id).await?;
+            let chunks = chunks_by_document
+                .get(&record.document_id)
+                .cloned()
+                .unwrap_or_default();
             let combined = chunks.join("\n");
             let outline: Vec<String> = combined
                 .lines()
@@ -1328,7 +1339,7 @@ async fn list_knowledge_base_files(pool: &sqlx::SqlitePool, arguments: &Value) -
     Ok(json!({
         "summary": {"document_count": documents_out.len(), "chunk_count": chunk_count},
         "documents": documents_out,
-        "filters": {"file_name": file_name, "statuses": statuses, "limit": limit},
+        "filters": filters,
     }))
 }
 
@@ -1809,17 +1820,6 @@ async fn load_memories(
         query.bind(limit)
     };
     query.fetch_all(pool).await.map_err(|err| err.to_string())
-}
-
-async fn load_chunk_texts(pool: &sqlx::SqlitePool, document_id: &str) -> Result<Vec<String>, String> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT chunk_text FROM document_chunks WHERE document_id = ? ORDER BY chunk_index ASC",
-    )
-    .bind(document_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|err| err.to_string())?;
-    Ok(rows.into_iter().map(|text| text.trim().to_string()).filter(|text| !text.is_empty()).collect())
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2327,6 +2327,71 @@ mod tests {
         let by_filename = hot_words(&pool, &json!({"filename": "报销.md"})).await.unwrap();
         assert_eq!(by_filename["summary"]["document_count"], 1);
         assert_eq!(by_filename["filters"]["file_name"], "报销.md");
+    }
+
+    #[tokio::test]
+    async fn lists_ready_files_and_returns_python_filters() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::ensure_document_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO documents (document_id, original_filename, stored_filename, file_path, \
+             file_type, file_size, status, chunk_count, created_at, updated_at) VALUES \
+             ('d-ready','报销.md','d-ready.md','/tmp/a','md',10,'ready',1, \
+              '2026-01-01 00:00:00.000000','2026-01-02 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (document_id, original_filename, stored_filename, file_path, \
+             file_type, file_size, status, chunk_count, created_at, updated_at) VALUES \
+             ('d-proc','发布.md','d-proc.md','/tmp/b','md',10,'processing',1, \
+              '2026-01-01 00:00:00.000000','2026-01-03 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at) \
+             VALUES ('d-ready',0,'d-ready:p000000','[章节] 差旅\n差旅报销需要发票','2026-01-01 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listed = list_knowledge_base_files(&pool, &json!({})).await.unwrap();
+        assert_eq!(listed["summary"]["document_count"], 1);
+        assert_eq!(listed["filters"]["statuses"][0], "ready");
+        assert!(listed["filters"]["document_ids"].as_array().unwrap().is_empty());
+        assert!(listed["filters"]["file_types"].as_array().unwrap().is_empty());
+        assert_eq!(listed["filters"]["file_name"], "");
+        assert_eq!(listed["filters"]["limit"], 20);
+        assert_eq!(listed["documents"][0]["document_id"], "d-ready");
+        assert_eq!(listed["documents"][0]["outline"][0], "差旅");
+        assert!(listed["documents"][0]["content_preview"]
+            .as_str()
+            .unwrap()
+            .contains("差旅报销需要发票"));
+
+        let processing = list_knowledge_base_files(&pool, &json!({"status": "processing"}))
+            .await
+            .unwrap();
+        assert_eq!(processing["summary"]["document_count"], 1);
+        assert_eq!(processing["filters"]["statuses"][0], "processing");
+        assert_eq!(processing["documents"][0]["document_id"], "d-proc");
+
+        let by_filename = list_knowledge_base_files(&pool, &json!({"filename": "报销.md"}))
+            .await
+            .unwrap();
+        assert_eq!(by_filename["summary"]["document_count"], 1);
+        assert_eq!(by_filename["filters"]["file_name"], "报销.md");
+
+        let empty = list_knowledge_base_files(&pool, &json!({"filename": "不存在.xlsx"}))
+            .await
+            .unwrap();
+        assert_eq!(empty["summary"]["document_count"], 0);
+        assert!(empty["filters"].get("document_ids").is_some());
+        assert!(empty["filters"].get("file_types").is_some());
     }
 
     #[tokio::test]
