@@ -195,6 +195,19 @@ fn log_delete_step(document_id: &str, step: &str, message: &str) {
     tracing::info!("{}", format_delete_step(document_id, step, message));
 }
 
+/// 对齐 Python `_log_upload_step`：`[文档上传][n/3] {message} (document_id=…)`。
+fn format_upload_step(document_id: &str, step: &str, message: &str) -> String {
+    format!("[文档上传][{step}] {message} (document_id={document_id})")
+}
+
+fn log_upload_step(document_id: &str, step: &str, message: &str) {
+    tracing::info!("{}", format_upload_step(document_id, step, message));
+}
+
+fn format_upload_task_submitted(document_id: &str) -> String {
+    format!("[文档上传] 后台处理任务已提交 (document_id={document_id})")
+}
+
 fn deletion_rejected(status: &str) -> Option<String> {
     match status.trim() {
         "deleting" | "deleted" => Some(format!("文档当前状态为 {status}，无法重复删除")),
@@ -613,10 +626,7 @@ async fn process_document_upload(
     content_type: String,
 ) {
     tracing::info!(
-        document_id = %document_id,
-        file = %original_name,
-        path = %stored_path,
-        "后台处理开始"
+        "后台处理开始 (document_id={document_id}, file={original_name}, path={stored_path})"
     );
     let result = process_document_upload_inner(
         &state,
@@ -654,7 +664,7 @@ async fn process_document_upload_inner(
     let extract_name = original_name.to_string();
     let extract_type = file_type.to_string();
     let extract_id = document_id.to_string();
-    tracing::info!(document_id, "开始抽取文本");
+    tracing::info!("开始抽取文本 (document_id={document_id})");
     let chunks = tokio::task::spawn_blocking(move || {
         let data = std::fs::read(&stored_path_buf).map_err(|err| err.to_string())?;
         crate::ingest::prepare_upload_chunks(&extract_id, &extract_name, &data, &extract_type)
@@ -662,10 +672,9 @@ async fn process_document_upload_inner(
     .await
     .map_err(|err| err.to_string())??;
     tracing::info!(
-        document_id,
-        parents = chunks.parents.len(),
-        children = chunks.children.len(),
-        "切块完成"
+        "切块完成 (document_id={document_id}, parents={}, children={})",
+        chunks.parents.len(),
+        chunks.children.len()
     );
 
     if document_delete_requested(
@@ -677,11 +686,14 @@ async fn process_document_upload_inner(
         return Ok(());
     }
 
-    tracing::info!(
+    log_upload_step(
         document_id,
-        "[文档上传][3/3] 开始写入 Milvus (parents={}, children={})",
-        chunks.parents.len(),
-        chunks.children.len()
+        "3/3",
+        &format!(
+            "开始写入 Milvus (parents={}, children={})",
+            chunks.parents.len(),
+            chunks.children.len()
+        ),
     );
     let embedder = state.engine.embedder.clone();
     let child_texts: Vec<String> = chunks
@@ -706,10 +718,10 @@ async fn process_document_upload_inner(
     )
     .await
     .map_err(|err| format!("向量库写入失败: {err}"))?;
-    tracing::info!(
+    log_upload_step(
         document_id,
-        children = chunks.children.len(),
-        "[文档上传][3/3] Milvus 写入成功"
+        "3/3",
+        &format!("Milvus 写入成功: children={}", chunks.children.len()),
     );
 
     if document_delete_requested(
@@ -726,9 +738,8 @@ async fn process_document_upload_inner(
     mark_document_ready(&state.pool, document_id, chunks.children.len() as i64).await?;
     state.engine.invalidate().await;
     tracing::info!(
-        document_id,
-        children = chunks.children.len(),
-        "文档后台处理完成"
+        "✓ 文档后台处理完成 (document_id={document_id}, children={})",
+        chunks.children.len()
     );
     Ok(())
 }
@@ -778,7 +789,11 @@ pub async fn upload_document(
     }
 
     let document_id = uuid::Uuid::new_v4().simple().to_string();
-    tracing::info!(document_id = %document_id, "[文档上传][1/3] 开始接收上传文件: {filename}");
+    log_upload_step(
+        &document_id,
+        "1/3",
+        &format!("开始接收上传文件: {filename}"),
+    );
     let content_type = upload_content_type(declared_content_type.as_deref());
     let stored_filename = format!("{document_id}.{file_type}");
     let upload_dir = crate::config::resolve_upload_dir(
@@ -790,6 +805,11 @@ pub async fn upload_document(
     std::fs::write(&file_path, &file_data)
         .map_err(|err| AuthError::bad_request(&format!("保存上传文件失败: {err}")))?;
     let file_path_text = file_path.display().to_string();
+    log_upload_step(
+        &document_id,
+        "1/3",
+        &format!("本地文件保存成功: {filename} -> {file_path_text}"),
+    );
     let file_size = file_data.len() as i64;
     drop(file_data);
 
@@ -811,21 +831,22 @@ pub async fn upload_document(
             return Err(err);
         }
     };
-    tracing::info!(
-        document_id = %document_id,
-        file_size,
-        "[文档上传][2/3] SQLite 元数据写入成功: status=processing"
+    log_upload_step(
+        &document_id,
+        "2/3",
+        &format!("SQLite 元数据写入成功: status=processing, file_size={file_size}"),
     );
 
     let state = state.clone();
     tokio::spawn(process_document_upload(
         state,
-        document_id,
+        document_id.clone(),
         file_path_text,
         filename,
         file_type,
         milvus_content_type(content_type.as_deref()),
     ));
+    tracing::info!("{}", format_upload_task_submitted(&document_id));
     Ok(Json(doc_to_json(&row)))
 }
 
@@ -920,6 +941,38 @@ mod tests {
         assert_eq!(
             format_delete_step("doc-1", "4/4", "SQLite 文档记录删除完成"),
             "[文档删除][4/4] SQLite 文档记录删除完成 (document_id=doc-1)"
+        );
+    }
+
+    #[test]
+    fn upload_step_log_matches_python() {
+        assert_eq!(
+            format_upload_step("doc-1", "1/3", "开始接收上传文件: 手册.md"),
+            "[文档上传][1/3] 开始接收上传文件: 手册.md (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_upload_step(
+                "doc-1",
+                "1/3",
+                "本地文件保存成功: 手册.md -> /tmp/doc-1.md"
+            ),
+            "[文档上传][1/3] 本地文件保存成功: 手册.md -> /tmp/doc-1.md (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_upload_step(
+                "doc-1",
+                "2/3",
+                "SQLite 元数据写入成功: status=processing, file_size=12"
+            ),
+            "[文档上传][2/3] SQLite 元数据写入成功: status=processing, file_size=12 (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_upload_step("doc-1", "3/3", "Milvus 写入成功: children=4"),
+            "[文档上传][3/3] Milvus 写入成功: children=4 (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_upload_task_submitted("doc-1"),
+            "[文档上传] 后台处理任务已提交 (document_id=doc-1)"
         );
     }
 
