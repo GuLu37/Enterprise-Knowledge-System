@@ -225,7 +225,7 @@ async fn resolve_skill_answer(
 ) -> (String, String) {
     if let (Some(messages), Some(llm)) = (prepared.messages.as_ref(), llm) {
         match llm.invoke(messages).await {
-            Ok(result) => return (result.content, result.model),
+            Ok(result) => return (clean_rag_response_text(&result.content), result.model),
             Err(err) => tracing::warn!("Skill LLM 回答失败，回退规则模板: {err}"),
         }
     }
@@ -523,6 +523,116 @@ fn no_result_answer(query: &str) -> String {
     } else {
         rag_no_result_answer(query, "")
     }
+}
+
+const RESPONSE_LABEL_TERMS: &[&str] = &[
+    "结论", "答案", "流程", "步骤", "操作", "条件", "材料", "注意", "补充", "依据", "建议", "处理方式",
+];
+
+fn collapse_horizontal_spaces(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == ' ' || chars[index] == '\t' {
+            let start = index;
+            while index < chars.len() && (chars[index] == ' ' || chars[index] == '\t') {
+                index += 1;
+            }
+            if index - start >= 2 {
+                out.push(' ');
+            } else {
+                out.push(chars[start]);
+            }
+        } else {
+            out.push(chars[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn is_list_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.first().is_some_and(|item| matches!(item, b'-' | b'*' | b'+')) {
+        return bytes.get(1).is_some_and(u8::is_ascii_whitespace);
+    }
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let rest: String = line.chars().skip(digits).collect();
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('.') | Some('、') | Some(')'))
+        && chars.next().is_some_and(char::is_whitespace)
+}
+
+fn is_heading_line(line: &str) -> bool {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&hashes) && line.chars().nth(hashes).is_some_and(char::is_whitespace)
+}
+
+fn is_label_line(line: &str) -> bool {
+    let rest = line.strip_prefix("**").unwrap_or(line);
+    for term in RESPONSE_LABEL_TERMS {
+        if let Some(after) = rest.strip_prefix(term) {
+            let after = after.strip_prefix("**").unwrap_or(after);
+            return after.starts_with(':') || after.starts_with('：');
+        }
+    }
+    false
+}
+
+fn collapse_extra_newlines(text: &str) -> String {
+    let mut out = String::new();
+    let mut newline_run = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newline_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 对齐 Python `clean_rag_response_text`：整理空白，保留 Markdown 结构。
+fn clean_rag_response_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut spaced_lines: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+    for raw_line in normalized.split('\n') {
+        let stripped_line = raw_line.trim();
+        let line = collapse_horizontal_spaces(stripped_line);
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            spaced_lines.push(line);
+            continue;
+        }
+        if in_code_block {
+            spaced_lines.push(raw_line.trim_end().to_string());
+            continue;
+        }
+        if line.is_empty() {
+            if spaced_lines.last().is_some_and(|item| !item.is_empty()) {
+                spaced_lines.push(String::new());
+            }
+            continue;
+        }
+        let previous = spaced_lines.last().cloned().unwrap_or_default();
+        if (is_heading_line(&line) || is_list_line(&line) || is_label_line(&line))
+            && !previous.is_empty()
+            && !is_list_line(&previous)
+        {
+            spaced_lines.push(String::new());
+        }
+        spaced_lines.push(line);
+    }
+    collapse_extra_newlines(&spaced_lines.join("\n")).trim().to_string()
 }
 
 /// 合并两轮检索结果（按 citation key 去重，保留高分）。
@@ -1058,6 +1168,7 @@ pub async fn generate_chat(
         status: axum::http::StatusCode::BAD_GATEWAY,
         detail,
     })?;
+    let answer = clean_rag_response_text(&result.content);
     spawn_persist_turn(
         state.pool.clone(),
         Some(llm_client),
@@ -1065,12 +1176,12 @@ pub async fn generate_chat(
         conversation_id,
         session_id,
         query.clone(),
-        result.content.clone(),
+        answer.clone(),
         event_expiry_days,
     );
     Ok(axum::Json(json!({
         "query": query,
-        "response": result.content,
+        "response": answer,
         "sources": source_payload(&turn.sources),
         "model": result.model,
         "retrieval_method": turn.retrieval_method,
@@ -1166,6 +1277,7 @@ pub async fn stream_chat(
                                     yield Ok(sse_json("message", json!({"content": chunk.delta})));
                                     yield Ok(sse_json("token", json!({"content": chunk.delta})));
                                 }
+                                let answer = clean_rag_response_text(&full_response);
                                 spawn_persist_turn(
                                     pool.clone(),
                                     Some(llm_client.clone()),
@@ -1173,12 +1285,12 @@ pub async fn stream_chat(
                                     conversation_id.clone(),
                                     session_id.clone(),
                                     query.clone(),
-                                    full_response.clone(),
+                                    answer.clone(),
                                     event_expiry_days,
                                 );
                                 yield Ok(sse_json("done", json!({
-                                    "content": full_response,
-                                    "response": full_response,
+                                    "content": answer,
+                                    "response": answer,
                                     "sources": [],
                                 })));
                             }
@@ -1368,6 +1480,7 @@ pub async fn stream_chat(
                     yield Ok(sse_json("message", json!({"content": chunk.delta})));
                     yield Ok(sse_json("token", json!({"content": chunk.delta})));
                 }
+                let answer = clean_rag_response_text(&full_response);
                 spawn_persist_turn(
                     pool.clone(),
                     Some(llm_client.clone()),
@@ -1375,12 +1488,12 @@ pub async fn stream_chat(
                     conversation_id.clone(),
                     session_id.clone(),
                     query.clone(),
-                    full_response.clone(),
+                    answer.clone(),
                     event_expiry_days,
                 );
                 yield Ok(sse_json("done", json!({
-                    "content": full_response,
-                    "response": full_response,
+                    "content": answer,
+                    "response": answer,
                     "sources": sources,
                     "retrieval_method": turn.retrieval_method,
                 })));
@@ -1389,6 +1502,7 @@ pub async fn stream_chat(
                 tracing::warn!("流式调用失败，尝试非流式: {exc}");
                 match llm_client.invoke(&messages).await {
                     Ok(result) => {
+                        let answer = clean_rag_response_text(&result.content);
                         spawn_persist_turn(
                             pool.clone(),
                             Some(llm_client.clone()),
@@ -1396,14 +1510,14 @@ pub async fn stream_chat(
                             conversation_id.clone(),
                             session_id.clone(),
                             query.clone(),
-                            result.content.clone(),
+                            answer.clone(),
                             event_expiry_days,
                         );
-                        yield Ok(sse_json("message", json!({"content": result.content})));
-                        yield Ok(sse_json("token", json!({"content": result.content})));
+                        yield Ok(sse_json("message", json!({"content": answer})));
+                        yield Ok(sse_json("token", json!({"content": answer})));
                         yield Ok(sse_json("done", json!({
-                            "content": result.content,
-                            "response": result.content,
+                            "content": answer,
+                            "response": answer,
                             "sources": sources,
                             "retrieval_method": turn.retrieval_method,
                         })));
@@ -1554,5 +1668,26 @@ mod tests {
         )
         .await;
         assert_eq!(llm_over_general, original);
+    }
+
+    #[test]
+    fn cleans_response_whitespace_and_keeps_markdown() {
+        let raw = "结论：可以报销。\n## 流程\n1. 提交申请\n2. 部门审批\n\n\n\n补充：保留发票。";
+        let cleaned = clean_rag_response_text(raw);
+        assert_eq!(
+            cleaned,
+            "结论：可以报销。\n\n## 流程\n\n1. 提交申请\n2. 部门审批\n\n补充：保留发票。"
+        );
+
+        let spaced = "差旅   报销\t\t标准";
+        assert_eq!(clean_rag_response_text(spaced), "差旅 报销 标准");
+
+        let code = "说明如下：\n```\nkeep   spaces\n```\n结束";
+        assert_eq!(
+            clean_rag_response_text(code),
+            "说明如下：\n```\nkeep   spaces\n```\n结束"
+        );
+
+        assert_eq!(clean_rag_response_text("  \n\n  hello  \n\n\n"), "hello");
     }
 }
