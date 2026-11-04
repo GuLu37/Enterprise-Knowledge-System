@@ -1000,6 +1000,15 @@ fn llm_unavailable() -> crate::auth::AuthError {
     }
 }
 
+/// 对齐 Python `run_chat` / `stream_chat`：无可用 provider 时在意图路由前失败。
+fn require_configured_llm(client: &LlmClient) -> Result<(), crate::auth::AuthError> {
+    if client.has_configured_providers() {
+        Ok(())
+    } else {
+        Err(llm_unavailable())
+    }
+}
+
 fn status_for_runtime(warmup: &RuntimeWarmup) -> String {
     if warmup.is_ready() {
         "ready".into()
@@ -1137,9 +1146,7 @@ pub async fn consolidate_chat(
     if conversation_id.is_empty() {
         return Err(crate::auth::AuthError::bad_request("conversation_id 不能为空"));
     }
-    if !state.default_llm.has_configured_providers() {
-        return Err(llm_unavailable());
-    }
+    require_configured_llm(&state.default_llm)?;
     let llm_client = state.default_llm.clone();
     let consolidated = crate::memory::consolidate_conversation_memory(
         &state.pool,
@@ -1191,17 +1198,13 @@ pub async fn generate_chat(
         request.model.as_deref(),
         request.temperature,
     );
-    let llm_client = if llm_client.has_configured_providers() {
-        Some(llm_client)
-    } else {
-        None
-    };
+    require_configured_llm(&llm_client)?;
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
 
     let intent = crate::intent::route_query_action(
         &query,
         request.use_retrieval,
-        llm_client.as_deref(),
+        Some(llm_client.as_ref()),
         &history_pairs(&request.history, request.short_memory_n),
         &mcp_manifests,
     )
@@ -1218,16 +1221,16 @@ pub async fn generate_chat(
                 history: &request.history,
                 options: &options,
                 mcp_manifests: &mcp_manifests,
-                llm: llm_client.clone(),
+                llm: Some(llm_client.clone()),
             },
             &intent,
         )
         .await
         .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
-        let (answer, model) = resolve_skill_answer(&prepared, llm_client.as_ref()).await;
+        let (answer, model) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
         spawn_persist_turn(
             state.pool.clone(),
-            llm_client,
+            Some(llm_client),
             user.user_id.clone(),
             conversation_id,
             session_id,
@@ -1247,7 +1250,7 @@ pub async fn generate_chat(
         let answer = clarify_text(&intent);
         spawn_persist_turn(
             state.pool.clone(),
-            llm_client,
+            Some(llm_client),
             user.user_id.clone(),
             conversation_id,
             session_id,
@@ -1263,10 +1266,6 @@ pub async fn generate_chat(
             "retrieval_method": null,
         })));
     }
-
-    let Some(llm_client) = llm_client else {
-        return Err(llm_unavailable());
-    };
     let retrieval_query =
         resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &request.history).await;
     let turn = collect_rag(
@@ -1378,7 +1377,6 @@ pub async fn stream_chat(
         request.model.as_deref(),
         request.temperature,
     );
-    let llm_missing = !llm_client.has_configured_providers();
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
     let config = state.config.clone();
     let event_expiry_days = config.memory_event_expiry_days;
@@ -1398,10 +1396,15 @@ pub async fn stream_chat(
             "short_memory_m": options.summary_m,
         })));
 
+        if !llm_client.has_configured_providers() {
+            yield Ok(sse_json("error", json!({"message": crate::llm::LLM_NO_PROVIDER_MESSAGE})));
+            return;
+        }
+
         let mut intent = crate::intent::route_query_action(
             &query,
             requested_retrieval,
-            if llm_missing { None } else { Some(llm_client.as_ref()) },
+            Some(llm_client.as_ref()),
             &history_pairs(&history, window_n),
             &mcp_manifests,
         )
@@ -1432,7 +1435,7 @@ pub async fn stream_chat(
                         history: &working_history,
                         options: &options,
                         mcp_manifests: &mcp_manifests,
-                        llm: if llm_missing { None } else { Some(llm_client.clone()) },
+                        llm: Some(llm_client.clone()),
                     },
                     &intent,
                 )
@@ -1493,7 +1496,7 @@ pub async fn stream_chat(
                             } else {
                                 spawn_persist_turn(
                                     pool.clone(),
-                                    None,
+                                    Some(llm_client.clone()),
                                     user_id.clone(),
                                     conversation_id.clone(),
                                     session_id.clone(),
@@ -1524,7 +1527,7 @@ pub async fn stream_chat(
                         intent = crate::intent::route_query_action_with(
                             &query,
                             requested_retrieval,
-                            if llm_missing { None } else { Some(llm_client.as_ref()) },
+                            Some(llm_client.as_ref()),
                             &history_pairs(&working_history, window_n),
                             &mcp_manifests,
                             false,
@@ -1538,7 +1541,7 @@ pub async fn stream_chat(
                             };
                             spawn_persist_turn(
                                 pool.clone(),
-                                if llm_missing { None } else { Some(llm_client.clone()) },
+                                Some(llm_client.clone()),
                                 user_id.clone(),
                                 conversation_id.clone(),
                                 session_id.clone(),
@@ -1569,7 +1572,7 @@ pub async fn stream_chat(
                 let answer = tool_budget_exhausted_message(&query, &last_skill_name);
                 spawn_persist_turn(
                     pool.clone(),
-                    if llm_missing { None } else { Some(llm_client.clone()) },
+                    Some(llm_client.clone()),
                     user_id.clone(),
                     conversation_id.clone(),
                     session_id.clone(),
@@ -1591,7 +1594,7 @@ pub async fn stream_chat(
             let answer = clarify_text(&intent);
             spawn_persist_turn(
                 pool.clone(),
-                if llm_missing { None } else { Some(llm_client.clone()) },
+                Some(llm_client.clone()),
                 user_id.clone(),
                 conversation_id.clone(),
                 session_id.clone(),
@@ -1605,11 +1608,6 @@ pub async fn stream_chat(
                 "response": answer,
                 "sources": [],
             })));
-            return;
-        }
-
-        if llm_missing {
-            yield Ok(sse_json("error", json!({"message": crate::llm::LLM_NO_PROVIDER_MESSAGE})));
             return;
         }
 
@@ -1709,7 +1707,7 @@ pub async fn stream_chat(
         let history_messages = match crate::short_memory::assemble(
             &memory_history,
             &options,
-            if llm_missing { None } else { Some(llm_client.clone()) },
+            Some(llm_client.clone()),
         ) {
             Ok(messages) => messages,
             Err(detail) => {
@@ -2137,6 +2135,27 @@ mod tests {
             err.detail,
             "没有可用的 LLM 提供商，请检查配置: 无可用 provider"
         );
+    }
+
+    #[test]
+    fn missing_llm_fails_before_skill_or_clarify_like_python() {
+        let cfg = crate::config::Config::jwt_test();
+        let llm = LlmClient::from_env(&cfg);
+        let err = require_configured_llm(&llm).expect_err("jwt_test has no providers");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.detail, crate::llm::LLM_NO_PROVIDER_MESSAGE);
+
+        let skill = crate::intent::rule_route_query_action("列出可用工具", true);
+        assert_eq!(skill.route, "skill");
+        assert_eq!(skill.skill_name.as_deref(), Some("list_available_tools"));
+    }
+
+    #[test]
+    fn configured_llm_passes_require_gate() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        let llm = LlmClient::from_env(&cfg);
+        assert!(require_configured_llm(&llm).is_ok());
     }
 
     #[tokio::test]
