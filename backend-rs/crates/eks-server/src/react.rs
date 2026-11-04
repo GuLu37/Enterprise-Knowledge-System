@@ -37,10 +37,11 @@ pub async fn run_unified_react(
     history: &[(String, String)],
     top_k: usize,
     first_results: Vec<RetrievalItem>,
+    mcp_manifests: &[Value],
 ) -> Result<ReactOutcome, String> {
     let mut sources = first_results;
     let mut notes = Vec::new();
-    let tools = skills::function_calling_tools();
+    let tools = skills::function_calling_tools_from(mcp_manifests);
     let mut messages = vec![ChatMessage::new(
         "system",
         SYSTEM_PROMPT
@@ -84,7 +85,7 @@ pub async fn run_unified_react(
                 messages.push(tool_message(&call, json!({"skipped": "duplicate"})));
                 continue;
             }
-            let observation = execute_tool(engine, pool, user_id, query, top_k, &call, &mut sources).await;
+            let observation = execute_tool(engine, pool, user_id, query, top_k, &call, &mut sources, mcp_manifests).await;
             notes.push(format!("{}: {}", call.name, truncate(&observation.to_string(), 240)));
             messages.push(tool_message(&call, observation));
             if retrieval_quality_ok(&sources) && call.name == "search_knowledge_base" {
@@ -135,6 +136,7 @@ async fn execute_tool(
     default_top_k: usize,
     call: &ToolCall,
     sources: &mut Vec<RetrievalItem>,
+    mcp_manifests: &[Value],
 ) -> Value {
     if call.name == "search_knowledge_base" {
         let query = call
@@ -169,7 +171,7 @@ async fn execute_tool(
             Err(err) => json!({"error": err}),
         };
     }
-    match skills::execute_named(pool, user_id, &call.name, &call.arguments).await {
+    match skills::execute_named_from(pool, user_id, &call.name, &call.arguments, mcp_manifests).await {
         Ok(result) => json!({"ok": true, "result": result}),
         Err(err) => json!({"error": err}),
     }

@@ -453,7 +453,9 @@ pub async fn list_skills(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    Ok(Json(Value::Array(crate::skills::list_skill_definitions())))
+    Ok(Json(Value::Array(crate::skills::list_skill_definitions_from(
+        &state.config.mcp_remote_tool_manifests,
+    ))))
 }
 
 pub async fn list_skill_function_calling(
@@ -462,7 +464,7 @@ pub async fn list_skill_function_calling(
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     Ok(Json(json!({
-        "tools": crate::skills::function_calling_tools(),
+        "tools": crate::skills::function_calling_tools_from(&state.config.mcp_remote_tool_manifests),
     })))
 }
 
@@ -471,7 +473,9 @@ pub async fn skill_capabilities(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    Ok(Json(crate::skills::skill_capabilities_payload()))
+    Ok(Json(crate::skills::skill_capabilities_payload_from(
+        &state.config.mcp_remote_tool_manifests,
+    )))
 }
 
 pub async fn execute_skill(
@@ -481,17 +485,25 @@ pub async fn execute_skill(
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     let name = request.name.trim();
-    if crate::skills::get_skill_definition(name).is_none() {
+    let manifests = &state.config.mcp_remote_tool_manifests;
+    let Some(definition) = crate::skills::get_skill_definition_from(name, manifests) else {
         return Err(AuthError {
             status: StatusCode::NOT_FOUND,
             detail: format!("未找到技能: {name}"),
         });
+    };
+    if definition.kind == "remote_mcp" {
+        return Err(AuthError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: crate::remote_mcp::execution_error_message(&definition),
+        });
     }
-    let result = crate::skills::execute_named(
+    let result = crate::skills::execute_named_from(
         &state.pool,
         &user.user_id,
         name,
         &request.arguments,
+        manifests,
     )
     .await
     .map_err(|detail| AuthError::bad_request(&detail))?;

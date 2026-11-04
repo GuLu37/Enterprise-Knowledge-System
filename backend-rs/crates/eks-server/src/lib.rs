@@ -14,6 +14,7 @@ pub mod llm;
 pub mod memory;
 pub mod milvus_lite;
 pub mod react;
+pub mod remote_mcp;
 pub mod retrieval;
 pub mod retrieval_engine;
 pub mod routes;

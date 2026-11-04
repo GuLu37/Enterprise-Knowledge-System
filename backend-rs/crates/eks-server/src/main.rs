@@ -65,6 +65,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let engine = std::sync::Arc::new(engine);
 
+    let mcp_skills = eks_server::remote_mcp::skills_from_manifests(&config.mcp_remote_tool_manifests);
+    if mcp_skills.is_empty() {
+        tracing::info!("远程 MCP 未配置 manifest");
+    } else {
+        let names: Vec<&str> = mcp_skills.iter().map(|item| item.name.as_str()).collect();
+        tracing::info!("远程 MCP 已注册: {}", names.join(", "));
+    }
+
     tracing::info!(
         "eks-server 启动: {addr} | sqlite={} | prefix={}",
         config.sqlite_path,

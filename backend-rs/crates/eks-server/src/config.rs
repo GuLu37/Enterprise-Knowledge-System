@@ -44,6 +44,7 @@ pub struct Config {
     pub ollama_model: String,
     pub chat_max_conversations: i64,
     pub cors_origins: Vec<String>,
+    pub mcp_remote_tool_manifests: Vec<serde_json::Value>,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -79,6 +80,23 @@ pub fn parse_cors_origins(raw: &str) -> Vec<String> {
         .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// 对齐 Python `_parse_dict_list`：JSON 对象数组，失败或非对象则跳过。
+pub fn parse_dict_list(raw: &str) -> Vec<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let parsed = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    match parsed {
+        serde_json::Value::Object(_) => vec![parsed],
+        serde_json::Value::Array(items) => items.into_iter().filter(serde_json::Value::is_object).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -171,6 +189,9 @@ impl Config {
             ollama_model: env_or("OLLAMA_MODEL", ""),
             chat_max_conversations: env_i64("CHAT_MAX_CONVERSATIONS", 20).clamp(1, 200),
             cors_origins: parse_cors_origins(&env::var("CORS_ORIGINS").unwrap_or_default()),
+            mcp_remote_tool_manifests: parse_dict_list(
+                &env::var("MCP_REMOTE_TOOL_MANIFESTS").unwrap_or_default(),
+            ),
         }
     }
 
@@ -218,6 +239,7 @@ impl Config {
             ollama_model: String::new(),
             chat_max_conversations: 20,
             cors_origins: parse_cors_origins(""),
+            mcp_remote_tool_manifests: Vec::new(),
         }
     }
 }
@@ -237,5 +259,16 @@ mod tests {
             vec!["http://localhost:3000", "http://localhost:8080"]
         );
         assert!(parse_cors_origins("").contains(&"http://localhost:5173".to_string()));
+    }
+
+    #[test]
+    fn parses_mcp_manifest_object_or_array() {
+        let single = parse_dict_list(r#"{"name":"crm_lookup"}"#);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0]["name"], "crm_lookup");
+        let many = parse_dict_list(r#"[{"name":"a"},"skip",{"name":"b"}]"#);
+        assert_eq!(many.len(), 2);
+        assert!(parse_dict_list("not-json").is_empty());
+        assert!(parse_dict_list("").is_empty());
     }
 }

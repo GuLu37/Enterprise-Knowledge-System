@@ -1,9 +1,10 @@
 //! 本地 Skill：规则路由 + SQLite 执行。
 //!
 //! 覆盖前端会直接碰到的工具目录、知识库文件、热词和画像记忆。
-//! 远程 MCP 与向量记忆召回仍由检索链路承担，不在这里模拟。
+//! 远程 MCP 通过 `MCP_REMOTE_TOOL_MANIFESTS` 注册进同一套目录；未就绪工具
+//! 只出现在 capabilities，不进入 Function Calling。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
@@ -233,8 +234,23 @@ pub async fn execute_named(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
+    execute_named_from(pool, user_id, name, arguments, &[]).await
+}
+
+pub async fn execute_named_from(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    name: &str,
+    arguments: &Value,
+    manifests: &[Value],
+) -> Result<Value, String> {
+    if let Some(definition) = get_skill_definition_from(name, manifests) {
+        if definition.kind == "remote_mcp" {
+            return Err(crate::remote_mcp::execution_error_message(&definition));
+        }
+    }
     match name {
-        "list_available_tools" => Ok(list_available_tools()),
+        "list_available_tools" => Ok(list_available_tools(manifests)),
         "list_knowledge_base_files" => list_knowledge_base_files(pool, arguments).await,
         "document_hot_word_statistics" => hot_words(pool, arguments).await,
         "memory_query" => memory_query(pool, user_id, arguments).await,
@@ -388,6 +404,13 @@ pub struct SkillDefinition {
 }
 
 impl SkillDefinition {
+    pub fn executor_ready(&self) -> bool {
+        self.metadata
+            .get("executor_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
     fn to_function_calling(&self) -> Value {
         json!({
             "type": "function",
@@ -569,34 +592,62 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
     skills
 }
 
+fn merged_skill_catalog(manifests: &[Value]) -> Vec<SkillDefinition> {
+    let mut by_name = BTreeMap::new();
+    for skill in local_skill_catalog() {
+        by_name.insert(skill.name.clone(), skill);
+    }
+    for skill in crate::remote_mcp::skills_from_manifests(manifests) {
+        by_name.insert(skill.name.clone(), skill);
+    }
+    by_name.into_values().collect()
+}
+
 pub fn get_skill_definition(name: &str) -> Option<SkillDefinition> {
+    get_skill_definition_from(name, &[])
+}
+
+pub fn get_skill_definition_from(name: &str, manifests: &[Value]) -> Option<SkillDefinition> {
     let normalized = name.trim();
-    local_skill_catalog()
+    merged_skill_catalog(manifests)
         .into_iter()
         .find(|item| item.name == normalized)
 }
 
 /// GET /skills：技能定义数组（不含 RAG 工具）。
 pub fn list_skill_definitions() -> Vec<Value> {
-    local_skill_catalog()
+    list_skill_definitions_from(&[])
+}
+
+pub fn list_skill_definitions_from(manifests: &[Value]) -> Vec<Value> {
+    merged_skill_catalog(manifests)
         .iter()
         .map(SkillDefinition::to_public_dict)
         .collect()
 }
 
-/// GET /skills/function-calling：RAG + 本地 Skill 的 Function Calling schema。
+/// GET /skills/function-calling：RAG + 已就绪 Skill 的 Function Calling schema。
 pub fn function_calling_tools() -> Vec<Value> {
+    function_calling_tools_from(&[])
+}
+
+pub fn function_calling_tools_from(manifests: &[Value]) -> Vec<Value> {
     let mut tools = vec![rag_tool_definition()];
     tools.extend(
-        local_skill_catalog()
+        merged_skill_catalog(manifests)
             .iter()
+            .filter(|skill| skill.executor_ready())
             .map(SkillDefinition::to_function_calling),
     );
     tools
 }
 
-/// GET /skills/capabilities：统一能力目录（含 RAG）。
+/// GET /skills/capabilities：统一能力目录（含 RAG，未就绪 MCP 标 available=false）。
 pub fn list_agent_capabilities() -> Vec<Value> {
+    list_agent_capabilities_from(&[])
+}
+
+pub fn list_agent_capabilities_from(manifests: &[Value]) -> Vec<Value> {
     let rag = rag_tool_definition();
     let mut capabilities = vec![json!({
         "name": "search_knowledge_base",
@@ -608,11 +659,11 @@ pub fn list_agent_capabilities() -> Vec<Value> {
         "location": "app.tools.rag.run_rag_tool",
         "function_calling": rag,
     })];
-    for skill in local_skill_catalog() {
+    for skill in merged_skill_catalog(manifests) {
         let mut item = skill.to_public_dict();
         if let Some(object) = item.as_object_mut() {
             object.insert("source".into(), json!("skill"));
-            object.insert("available".into(), json!(true));
+            object.insert("available".into(), json!(skill.executor_ready()));
             object.insert(
                 "location".into(),
                 json!(format!("backend/app/skills/{0}/{0}.md", skill.name)),
@@ -624,9 +675,13 @@ pub fn list_agent_capabilities() -> Vec<Value> {
 }
 
 pub fn skill_capabilities_payload() -> Value {
-    let tools = function_calling_tools();
+    skill_capabilities_payload_from(&[])
+}
+
+pub fn skill_capabilities_payload_from(manifests: &[Value]) -> Value {
+    let tools = function_calling_tools_from(manifests);
     json!({
-        "capabilities": list_agent_capabilities(),
+        "capabilities": list_agent_capabilities_from(manifests),
         "tools": tools,
         "function_calling": tools,
     })
@@ -664,9 +719,9 @@ pub fn wrap_skill_execution(
     }))
 }
 
-fn list_available_tools() -> Value {
-    let schemas = function_calling_tools();
-    let capabilities: HashMap<String, Value> = list_agent_capabilities()
+fn list_available_tools(manifests: &[Value]) -> Value {
+    let schemas = function_calling_tools_from(manifests);
+    let capabilities: HashMap<String, Value> = list_agent_capabilities_from(manifests)
         .into_iter()
         .filter_map(|item| {
             let name = item.get("name").and_then(|value| value.as_str())?.to_string();
@@ -1384,6 +1439,79 @@ mod tests {
             Some("c1")
         );
         assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_catalog_filters_unready_from_function_calling() {
+        let manifests = vec![
+            json!({
+                "skill_name": "crm_lookup",
+                "server_name": "crm",
+                "description": "查询客户"
+            }),
+            json!({
+                "name": "ticket_create",
+                "endpoint": "https://mcp.example.internal/ticket",
+                "provider": "itsm"
+            }),
+        ];
+        let definitions = list_skill_definitions_from(&manifests);
+        let names: Vec<&str> = definitions
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"crm_lookup"));
+        assert!(names.contains(&"ticket_create"));
+        assert!(names.contains(&"memory_query"));
+        let crm = definitions.iter().find(|item| item["name"] == "crm_lookup").unwrap();
+        assert_eq!(crm["kind"], "remote_mcp");
+        assert_eq!(crm["metadata"]["executor_ready"], false);
+
+        let tools = function_calling_tools_from(&manifests);
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert!(tool_names.contains(&"ticket_create"));
+        assert!(!tool_names.contains(&"crm_lookup"));
+        assert_eq!(tool_names[0], "search_knowledge_base");
+
+        let capabilities = list_agent_capabilities_from(&manifests);
+        let crm_cap = capabilities.iter().find(|item| item["name"] == "crm_lookup").unwrap();
+        assert_eq!(crm_cap["available"], false);
+        let ticket_cap = capabilities.iter().find(|item| item["name"] == "ticket_create").unwrap();
+        assert_eq!(ticket_cap["available"], true);
+
+        let listed = list_available_tools(&manifests);
+        let listed_names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(listed_names.contains(&"ticket_create"));
+        assert!(!listed_names.contains(&"crm_lookup"));
+
+        let err = execute_named_from(
+            &sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
+            "u1",
+            "crm_lookup",
+            &json!({}),
+            &manifests,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("尚未接入实际执行器"));
+        let ready_err = execute_named_from(
+            &sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
+            "u1",
+            "ticket_create",
+            &json!({}),
+            &manifests,
+        )
+        .await
+        .unwrap_err();
+        assert!(ready_err.contains("itsm/ticket_create"));
     }
 
     #[test]

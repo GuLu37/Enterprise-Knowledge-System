@@ -211,6 +211,7 @@ pub async fn route_query_action(
     use_retrieval: bool,
     llm: Option<&LlmClient>,
     history: &[(String, String)],
+    mcp_manifests: &[Value],
 ) -> QueryIntent {
     let normalized = query.trim();
     if normalized.is_empty() {
@@ -232,7 +233,7 @@ pub async fn route_query_action(
 
     let fallback = rule_route_query_intent(normalized, use_retrieval);
     if let Some(llm) = llm {
-        match llm_select_action(llm, normalized, history).await {
+        match llm_select_action(llm, normalized, history, mcp_manifests).await {
             Ok(Some(mut action)) => {
                 if action.route == "skill" && action.skill_name.as_deref() == Some("search_knowledge_base") {
                     let retrieval_query = action
@@ -291,8 +292,9 @@ async fn llm_select_action(
     llm: &LlmClient,
     query: &str,
     history: &[(String, String)],
+    mcp_manifests: &[Value],
 ) -> Result<Option<QueryIntent>, String> {
-    let tools = skills::function_calling_tools();
+    let tools = skills::function_calling_tools_from(mcp_manifests);
     let catalog: Vec<Value> = tools
         .iter()
         .map(|tool| {

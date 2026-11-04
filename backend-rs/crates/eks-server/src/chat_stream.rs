@@ -117,12 +117,20 @@ async fn answer_skill_intent(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     intent: &crate::intent::QueryIntent,
+    mcp_manifests: &[serde_json::Value],
 ) -> Result<String, String> {
     let name = intent.skill_name.as_deref().unwrap_or("").trim();
     if name.is_empty() {
         return Err("skill 路由缺少 skill_name".into());
     }
-    let result = crate::skills::execute_named(pool, user_id, name, &intent.skill_arguments).await?;
+    let result = crate::skills::execute_named_from(
+        pool,
+        user_id,
+        name,
+        &intent.skill_arguments,
+        mcp_manifests,
+    )
+    .await?;
     Ok(crate::skills::format_skill_answer(name, &result))
 }
 
@@ -331,6 +339,7 @@ async fn collect_rag(
     top_k: usize,
     use_retrieval: bool,
     window_n: usize,
+    mcp_manifests: &[serde_json::Value],
 ) -> Result<RagTurn, String> {
     if !use_retrieval {
         return Ok(RagTurn {
@@ -367,6 +376,7 @@ async fn collect_rag(
         &history_pairs(history, window_n),
         top_k,
         working.clone(),
+        mcp_manifests,
     )
     .await
     {
@@ -542,16 +552,18 @@ pub async fn generate_chat(
     } else {
         Some(Arc::new(LlmClient::new(llm_config)))
     };
+    let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
 
     let intent = crate::intent::route_query_action(
         &query,
         request.use_retrieval,
         llm_client.as_deref(),
         &history_pairs(&request.history, request.short_memory_n),
+        &mcp_manifests,
     )
     .await;
     if intent.route == "skill" {
-        let answer = answer_skill_intent(&state.pool, &user.user_id, &intent)
+        let answer = answer_skill_intent(&state.pool, &user.user_id, &intent, &mcp_manifests)
             .await
             .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
         spawn_persist_turn(
@@ -605,6 +617,7 @@ pub async fn generate_chat(
         request.top_k,
         intent.needs_retrieval,
         request.short_memory_n,
+        &mcp_manifests,
     )
     .await
     .map_err(|detail| crate::auth::AuthError {
@@ -695,6 +708,7 @@ pub async fn stream_chat(
     let llm_config = llm_config_for_request(&state.config, &request);
     let llm_missing = llm_config.providers.is_empty();
     let llm_client = Arc::new(LlmClient::new(llm_config));
+    let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
 
     let stream = async_stream::stream! {
         yield Ok(sse_json("start", json!({
@@ -716,6 +730,7 @@ pub async fn stream_chat(
             requested_retrieval,
             if llm_missing { None } else { Some(llm_client.as_ref()) },
             &history_pairs(&history, window_n),
+            &mcp_manifests,
         )
         .await;
         yield Ok(sse_json("intent", intent.to_json()));
@@ -726,7 +741,7 @@ pub async fn stream_chat(
                 "name": skill_name,
                 "arguments": intent.skill_arguments,
             })));
-            match answer_skill_intent(&pool, &user_id, &intent).await {
+            match answer_skill_intent(&pool, &user_id, &intent, &mcp_manifests).await {
                 Ok(answer) => {
                     spawn_persist_turn(
                         pool.clone(),
@@ -796,6 +811,7 @@ pub async fn stream_chat(
             top_k,
             use_retrieval,
             window_n,
+            &mcp_manifests,
         )
         .await
         {
