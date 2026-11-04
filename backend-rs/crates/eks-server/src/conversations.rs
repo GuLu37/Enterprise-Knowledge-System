@@ -166,23 +166,25 @@ pub async fn delete_conversation(
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     let cid = conversation_id.trim().to_string();
-    let result = sqlx::query(
-        "DELETE FROM user_conversations WHERE user_id = ? AND conversation_id = ?",
-    )
-    .bind(&user.user_id)
-    .bind(&cid)
-    .execute(&state.pool)
-    .await
-    .map_err(AuthError::from)?;
+    sqlx::query("DELETE FROM user_conversations WHERE user_id = ? AND conversation_id = ?")
+        .bind(&user.user_id)
+        .bind(&cid)
+        .execute(&state.pool)
+        .await
+        .map_err(AuthError::from)?;
     let memory_deleted = crate::memory::delete_conversation_memory(&state.pool, &user.user_id, &cid)
         .await
         .map_err(AuthError::from)?
         > 0;
-    Ok(Json(json!({
-        "conversation_id": cid,
-        "deleted": result.rows_affected() > 0,
+    Ok(Json(conversation_delete_payload(&cid, memory_deleted)))
+}
+
+/// 对齐 Python `ConversationDeleteResponse`：只返回 conversation_id 与 memory_deleted。
+fn conversation_delete_payload(conversation_id: &str, memory_deleted: bool) -> Value {
+    json!({
+        "conversation_id": conversation_id,
         "memory_deleted": memory_deleted,
-    })))
+    })
 }
 
 async fn list_user_conversation_ids(
@@ -296,5 +298,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining_other, 1);
+    }
+
+    #[test]
+    fn delete_payload_matches_python_conversation_delete_response() {
+        let payload = conversation_delete_payload("c1", true);
+        assert_eq!(
+            payload,
+            json!({
+                "conversation_id": "c1",
+                "memory_deleted": true,
+            })
+        );
+        assert!(payload.get("deleted").is_none());
+        let missing = conversation_delete_payload("c-missing", false);
+        assert_eq!(missing["conversation_id"], "c-missing");
+        assert_eq!(missing["memory_deleted"], false);
+        assert_eq!(missing.as_object().map(|item| item.len()), Some(2));
     }
 }
