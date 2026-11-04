@@ -332,10 +332,7 @@ pub async fn get_document_content(
     .await
     .map_err(AuthError::from)?;
     let Some(row) = row else {
-        return Err(AuthError {
-            status: axum::http::StatusCode::NOT_FOUND,
-            detail: "文档不存在".into(),
-        });
+        return Err(document_content_exception("文档不存在"));
     };
 
     let chunks: Vec<String> = sqlx::query_scalar(
@@ -369,7 +366,7 @@ pub async fn get_document_content(
         }
     }
     if content.trim().is_empty() {
-        return Err(AuthError::bad_request("文档正文不存在或尚未处理完成"));
+        return Err(document_content_exception("文档正文不存在或尚未处理完成"));
     }
     Ok(Json(json!({
         "document_id": row.document_id,
@@ -380,6 +377,18 @@ pub async fn get_document_content(
         "content_type": row.content_type,
         "updated_at": db::dt_to_iso(&row.updated_at),
     })))
+}
+
+/// 对齐 Python `/documents/content`：detail 含「不存在」时 404，其余 400。
+fn document_content_exception(detail: &str) -> AuthError {
+    AuthError {
+        status: if detail.contains("不存在") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        detail: detail.to_string(),
+    }
 }
 
 fn document_delete_requested(status: Option<&str>) -> bool {
@@ -808,6 +817,17 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn empty_document_body_is_not_found_like_python() {
+        let empty = document_content_exception("文档正文不存在或尚未处理完成");
+        assert_eq!(empty.status, StatusCode::NOT_FOUND);
+        assert_eq!(empty.detail, "文档正文不存在或尚未处理完成");
+        let missing = document_content_exception("文档不存在");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        let other = document_content_exception("文档切块失败，未生成有效内容");
+        assert_eq!(other.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
