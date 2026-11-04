@@ -434,19 +434,25 @@ async fn retrieval_simple(
     method: &str,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let top_k = request
+        .top_k
+        .unwrap_or(state.config.search_top_k)
+        .clamp(1, 50);
     let query = request.query.trim().to_string();
     if query.is_empty() {
         return Ok(Json(json!({
             "query": query, "retrieval_method": method, "results": [], "top_k": top_k,
         })));
     }
-    let results = if method == "dense" {
+    let mut results = if method == "dense" {
         state.engine.search_dense(&query, top_k).await
     } else {
         state.engine.search_sparse(&query, top_k).await
     }
     .map_err(internal_error)?;
+    if method == "dense" && state.config.similarity_threshold > 0.0 {
+        results.retain(|item| item.score >= state.config.similarity_threshold);
+    }
     Ok(Json(json!({
         "query": query,
         "retrieval_method": method,
@@ -563,7 +569,10 @@ pub async fn retrieval_hybrid(
     Json(request): Json<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let top_k = request
+        .top_k
+        .unwrap_or(state.config.search_top_k)
+        .clamp(1, 50);
     let query = request.query.trim().to_string();
     if query.is_empty() {
         return Ok(Json(json!({
@@ -594,7 +603,10 @@ pub async fn retrieval_rag(
     Json(request): Json<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let top_k = request
+        .top_k
+        .unwrap_or(state.config.search_top_k)
+        .clamp(1, 50);
     let query = request.query.trim().to_string();
     if query.is_empty() {
         return Ok(Json(json!({

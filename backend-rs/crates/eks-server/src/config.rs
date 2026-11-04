@@ -1,5 +1,6 @@
 //! 配置：复用 backend/.env 的同名键，附加 EKS_* 前缀的 Rust 侧专属配置。
 use std::env;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -69,6 +70,9 @@ pub struct Config {
     pub allowed_file_types: Vec<String>,
     pub log_dir: String,
     pub log_level: String,
+    pub upload_dir: String,
+    pub search_top_k: usize,
+    pub similarity_threshold: f64,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -191,6 +195,44 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn env_first(keys: &[&str], default: &str) -> String {
+    for key in keys {
+        if let Ok(value) = env::var(key) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+    default.to_string()
+}
+
+fn env_i64_first(keys: &[&str], default: i64) -> i64 {
+    for key in keys {
+        if let Some(value) = env::var(key)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+        {
+            return value;
+        }
+    }
+    default
+}
+
+/// 对齐 Python `UPLOAD_DIR`：相对路径相对 sqlite 所在 app 目录解析。
+pub fn resolve_upload_dir(upload_dir: &str, sqlite_path: &str) -> PathBuf {
+    let data_dir = Path::new(sqlite_path).parent().unwrap_or(Path::new("."));
+    let raw = upload_dir.trim();
+    if raw.is_empty() {
+        return data_dir.join("uploads");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        data_dir.parent().unwrap_or(data_dir).join(path)
+    }
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -212,8 +254,8 @@ impl Config {
             environment: env_or("ENVIRONMENT", "开发版"),
             debug: env_bool("DEBUG", true),
             api_prefix: env_or("API_PREFIX", "/api/v1"),
-            host: env_or("EKS_HOST", "127.0.0.1"),
-            port: env_i64("EKS_PORT", 8000) as u16,
+            host: env_first(&["EKS_HOST", "SERVER_HOST"], "127.0.0.1"),
+            port: env_i64_first(&["EKS_PORT", "SERVER_PORT"], 8000) as u16,
             sqlite_path: env_or(
                 "EKS_SQLITE_PATH",
                 "../backend/app/data/rag_metadata.db",
@@ -294,6 +336,9 @@ impl Config {
             ),
             log_dir: env_or("LOG_DIR", "logs"),
             log_level: env_or("LOG_LEVEL", "INFO"),
+            upload_dir: env_or("UPLOAD_DIR", ""),
+            search_top_k: env_i64("SEARCH_TOP_K", 5).clamp(1, 50) as usize,
+            similarity_threshold: env_f64("SIMILARITY_THRESHOLD", 0.5).clamp(0.0, 1.0),
         };
         if let Err(err) = validate_runtime_security(
             config.debug,
@@ -374,6 +419,9 @@ impl Config {
             allowed_file_types: parse_allowed_file_types(""),
             log_dir: "logs".into(),
             log_level: "INFO".into(),
+            upload_dir: String::new(),
+            search_top_k: 5,
+            similarity_threshold: 0.5,
         }
     }
 }
@@ -426,6 +474,26 @@ mod tests {
         assert!(Config::jwt_test().allowed_file_types.contains(&"xlsx".into()));
         assert_eq!(Config::jwt_test().log_dir, "logs");
         assert_eq!(Config::jwt_test().log_level, "INFO");
+        assert_eq!(Config::jwt_test().search_top_k, 5);
+        assert_eq!(Config::jwt_test().similarity_threshold, 0.5);
+        assert!(Config::jwt_test().upload_dir.is_empty());
+    }
+
+    #[test]
+    fn resolves_upload_dir_next_to_sqlite_data() {
+        let sqlite = "/workspace/backend/app/data/rag_metadata.db";
+        assert_eq!(
+            resolve_upload_dir("", sqlite),
+            PathBuf::from("/workspace/backend/app/data/uploads")
+        );
+        assert_eq!(
+            resolve_upload_dir("./data/uploads", sqlite),
+            PathBuf::from("/workspace/backend/app/data/uploads")
+        );
+        assert_eq!(
+            resolve_upload_dir("/var/eks/uploads", sqlite),
+            PathBuf::from("/var/eks/uploads")
+        );
     }
 
     #[test]
