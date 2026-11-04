@@ -192,6 +192,10 @@ pub fn clamp_score(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
 }
 
+pub fn clamp_confidence(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+
 pub fn decay_importance_score(
     memory_type: &str,
     base_importance: f64,
@@ -432,6 +436,29 @@ pub fn should_extract_profile(query: &str) -> bool {
     !normalized.is_empty() && PROFILE_TRIGGER_TERMS.iter().any(|term| normalized.contains(term))
 }
 
+const EVENT_STRONG_MARKERS: &[&str] = &["必须", "明确", "决定", "结论", "长期", "偏好", "目标", "完成"];
+const EVENT_TEMPORARY_MARKERS: &[&str] = &["今天", "明天", "刚才", "临时", "这次", "当前"];
+
+fn marker_weighted_count(text: &str, markers: &[&str], weight: f64) -> f64 {
+    markers
+        .iter()
+        .map(|marker| text.matches(marker).count() as f64 * weight)
+        .sum()
+}
+
+/// 对齐 Python `_calculate_event_importance`：按稳定/临时标记生成初始分。
+pub(crate) fn calculate_event_importance(content: &str) -> (f64, f64) {
+    let normalized = crate::retrieval::collapse_spaces(content);
+    let mut importance = 45.0;
+    let mut confidence = 0.65;
+    importance += marker_weighted_count(&normalized, EVENT_STRONG_MARKERS, 5.0).min(25.0);
+    importance -= marker_weighted_count(&normalized, EVENT_TEMPORARY_MARKERS, 4.0).min(20.0);
+    if normalized.chars().count() < 20 {
+        confidence -= 0.1;
+    }
+    (clamp_score(importance), clamp_confidence(confidence))
+}
+
 pub async fn persist_turn(
     pool: &sqlx::SqlitePool,
     llm: Option<&LlmClient>,
@@ -448,14 +475,16 @@ pub async fn persist_turn(
     let _ = ensure_schema(pool).await;
     let content = format!("用户: {}\n助手: {}", query.trim(), answer.trim());
     let turn = count_dialogue_turns(pool, user_id, conversation_id).await;
-    if let Err(err) = insert_event_memory_at(
+    let (importance, confidence) = calculate_event_importance(&content);
+    if let Err(err) = insert_event_memory_with_confidence(
         pool,
         user_id,
         conversation_id,
         session_id,
         "dialogue",
         &content,
-        55.0,
+        importance,
+        confidence,
         expiry_days,
         Some(turn),
         Some(turn),
@@ -1531,14 +1560,16 @@ async fn write_semantic_summary(
     expiry_days: i64,
 ) -> Result<String, sqlx::Error> {
     let content = format_memory_chunk(topic, summary, transcript);
-    insert_event_memory_at(
+    let (importance, confidence) = calculate_event_importance(&content);
+    insert_event_memory_with_confidence(
         pool,
         user_id,
         conversation_id,
         conversation_id,
         &format!("semantic_memory_l{level}"),
         &content,
-        70.0,
+        importance,
+        confidence,
         expiry_days,
         Some(turn_start),
         Some(turn_end),
@@ -1849,6 +1880,35 @@ pub(crate) async fn insert_event_memory_at(
     turn_start: Option<i64>,
     turn_end: Option<i64>,
 ) -> Result<String, sqlx::Error> {
+    insert_event_memory_with_confidence(
+        pool,
+        user_id,
+        conversation_id,
+        session_id,
+        memory_key,
+        content,
+        importance,
+        0.7,
+        expiry_days,
+        turn_start,
+        turn_end,
+    )
+    .await
+}
+
+async fn insert_event_memory_with_confidence(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    session_id: &str,
+    memory_key: &str,
+    content: &str,
+    importance: f64,
+    confidence: f64,
+    expiry_days: i64,
+    turn_start: Option<i64>,
+    turn_end: Option<i64>,
+) -> Result<String, sqlx::Error> {
     let now = crate::db::now_naive();
     let now_text = crate::db::fmt_dt(&now);
     let expires_at = crate::db::fmt_dt(&(now + chrono::Duration::days(expiry_days.max(1))));
@@ -1863,7 +1923,7 @@ pub(crate) async fn insert_event_memory_at(
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
             turn_start, turn_end, importance_score, base_importance_score, confidence_score,
             access_count, status, version, created_at, updated_at, expires_at
-        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, ?, ?, 0.7, 0, 'active', 1, ?, ?, ?)",
+        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', 1, ?, ?, ?)",
     )
     .bind(&memory_id)
     .bind(user_id)
@@ -1873,8 +1933,9 @@ pub(crate) async fn insert_event_memory_at(
     .bind(empty_to_none(session_id))
     .bind(turn_start)
     .bind(turn_end)
-    .bind(importance)
-    .bind(importance)
+    .bind(clamp_score(importance))
+    .bind(clamp_score(importance))
+    .bind(clamp_confidence(confidence))
     .bind(&now_text)
     .bind(&now_text)
     .bind(&expires_at)
@@ -2193,6 +2254,27 @@ mod tests {
     }
 
     #[test]
+    fn event_importance_matches_python_rules() {
+        assert_eq!(calculate_event_importance(""), (45.0, 0.55));
+        assert_eq!(calculate_event_importance("你好"), (45.0, 0.55));
+
+        let (strong, strong_conf) =
+            calculate_event_importance("必须明确这是长期目标，一定要完成后续相关安排和检查事项。");
+        assert_eq!(strong, 70.0);
+        assert_eq!(strong_conf, 0.65);
+
+        let (temporary, _) = calculate_event_importance("今天明天刚才临时这次当前都要看一下情况");
+        assert_eq!(temporary, 25.0);
+
+        let (mixed, mixed_conf) = calculate_event_importance("必须今天完成");
+        assert_eq!(mixed, 51.0);
+        assert_eq!(mixed_conf, 0.55);
+
+        let (capped, _) = calculate_event_importance("必须必须必须必须必须必须");
+        assert_eq!(capped, 70.0);
+    }
+
+    #[test]
     fn decay_matches_python_formula() {
         assert_eq!(decay_importance_score("event", 50.0, 0.5, 0, 0.0), 25.0);
         let aged = decay_importance_score("event", 50.0, 1.0, 0, 90.0);
@@ -2490,6 +2572,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(turns, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn persist_turn_uses_content_importance() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        persist_turn(
+            &pool,
+            None,
+            "u1",
+            "c-imp",
+            "s1",
+            "必须明确这是长期目标",
+            "已经完成后续相关安排和检查事项。",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await;
+        let row: (f64, f64, f64) = sqlx::query_as(
+            "SELECT importance_score, base_importance_score, confidence_score \
+             FROM memory_records WHERE conversation_id = 'c-imp' AND memory_key = 'dialogue'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let content = "用户: 必须明确这是长期目标\n助手: 已经完成后续相关安排和检查事项。";
+        let expected = calculate_event_importance(content);
+        assert_eq!(row, (expected.0, expected.0, expected.1));
+        assert_eq!(expected.0, 70.0);
+        assert_eq!(expected.1, 0.65);
     }
 
     #[tokio::test]
