@@ -50,6 +50,17 @@ const ARTICLE_FILE_TYPES: [&str; 9] = [
 // ==================== 文本提取 ====================
 
 pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
+    match extract_text_inner(filename, data) {
+        Ok(text) => Ok(text),
+        Err(err) if is_declared_extract_error(&err) => Err(err),
+        Err(err) => {
+            tracing::error!("{}", format_extract_text_fail(&err));
+            Err(format_extract_text_fail(&err))
+        }
+    }
+}
+
+fn extract_text_inner(filename: &str, data: &[u8]) -> Result<String, String> {
     let ext = filename
         .rsplit('.')
         .next()
@@ -66,6 +77,19 @@ pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
         "pptx" => extract_pptx_text(data),
         _ => Err(format!("不支持的文件类型: .{ext}")),
     }
+}
+
+/// 对齐 Python `extract_text_from_file`：DocumentException 原文上抛，其余包一层「提取文本失败」。
+fn is_declared_extract_error(err: &str) -> bool {
+    err == "TXT 文件编码无法识别"
+        || err == "PDF 未提取到文本，可能是扫描件"
+        || err.starts_with("不支持的文件类型")
+        || err.starts_with("文档解析失败")
+        || err.starts_with("PDF 解析失败")
+}
+
+fn format_extract_text_fail(err: &str) -> String {
+    format!("提取文本失败: {err}")
 }
 
 /// 当前内核可抽取的后缀（不含需 unstructured/OCR 的 .doc/.ppt/.rtf）。
@@ -1428,6 +1452,23 @@ mod tests {
     fn rejects_unrecognized_text_encoding() {
         let err = extract_text("bad.txt", &[0xFF, 0xFE, 0x00]).unwrap_err();
         assert_eq!(err, "TXT 文件编码无法识别");
+    }
+
+    #[test]
+    fn unexpected_extract_errors_wrap_python_prefix() {
+        assert_eq!(
+            format_extract_text_fail("Excel 打开失败: boom"),
+            "提取文本失败: Excel 打开失败: boom"
+        );
+        assert!(is_declared_extract_error("TXT 文件编码无法识别"));
+        assert!(is_declared_extract_error("不支持的文件类型: .doc"));
+        assert!(is_declared_extract_error("PDF 解析失败: truncated"));
+        assert!(!is_declared_extract_error("Excel 打开失败: boom"));
+        let err = extract_text("手册.xls", b"not-an-excel").unwrap_err();
+        assert!(
+            err.starts_with("提取文本失败: Excel 打开失败:"),
+            "{err}"
+        );
     }
 
     #[test]
