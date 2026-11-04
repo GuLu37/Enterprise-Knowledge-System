@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::llm::ChatMessage;
+
 const TOOL_CATALOG_HINTS: &[&str] = &[
     "列出你的工具",
     "列出工具",
@@ -834,6 +836,52 @@ pub fn wrap_skill_execution(
     }))
 }
 
+pub const SKILL_SYSTEM_PROMPT: &str = "\
+你是企业知识库问答助手。当前问题已经调用了一个技能工具。\
+如果消息中提供了当前 Skill 的详细规则，必须把它当作当前 Skill 的补充执行规范。\
+只能依据技能返回结果回答，不要编造未返回的信息。\
+如果技能结果为空，直接说明当前没有查到可用结果。\
+默认用简洁中文回答，可以用短标题或列表，但不要重复原始 JSON。";
+
+pub fn skill_result_message(skill_result: &Value) -> ChatMessage {
+    let payload = json!({
+        "skill": skill_result.get("skill"),
+        "category": skill_result.get("category"),
+        "kind": skill_result.get("kind"),
+        "provider": skill_result.get("provider"),
+        "result": skill_result.get("result").cloned().unwrap_or(json!({})),
+        "executed_at": skill_result.get("executed_at"),
+    });
+    let serialized = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
+    ChatMessage::new("system", format!("技能执行结果：\n{serialized}"))
+}
+
+/// 对齐 Python `build_skill_messages`：系统规范 + Skill 文档 + 执行结果 + 记忆 + 历史 + 用户问题。
+pub fn build_skill_messages(
+    query: &str,
+    skill_result: &Value,
+    long_term_memory: &[ChatMessage],
+    history: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage::new("system", SKILL_SYSTEM_PROMPT)];
+    if let Some(instructions) = skill_result
+        .get("skill_instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        messages.push(ChatMessage::new(
+            "system",
+            format!("当前 Skill 的详细规则（仅适用于本次已选中的 Skill）：\n{instructions}"),
+        ));
+    }
+    messages.push(skill_result_message(skill_result));
+    messages.extend(long_term_memory.iter().cloned());
+    messages.extend(history);
+    messages.push(ChatMessage::new("user", query.trim()));
+    messages
+}
+
 fn list_available_tools(manifests: &[Value]) -> Value {
     let schemas = function_calling_tools_from(manifests);
     let capabilities: HashMap<String, Value> = list_agent_capabilities_from(manifests)
@@ -1561,6 +1609,39 @@ mod tests {
         assert!(instructions.contains("记忆查询"));
         assert!(instructions.contains("不能跨用户"));
         assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
+
+        let messages = build_skill_messages(
+            " 我叫什么 ",
+            &wrapped,
+            &[ChatMessage::new("system", "画像：张三")],
+            vec![
+                ChatMessage::new("user", "上次问题"),
+                ChatMessage::new("assistant", "上次回答"),
+            ],
+        );
+        assert_eq!(messages[0].content, SKILL_SYSTEM_PROMPT);
+        assert!(messages[1].content.contains("当前 Skill 的详细规则"));
+        assert!(messages[1].content.contains("# 记忆查询 Skill"));
+        assert!(messages[2].content.starts_with("技能执行结果："));
+        assert!(messages[2].content.contains("\"skill\":\"memory_query\""));
+        assert!(!messages[2].content.contains("skill_instructions"));
+        assert_eq!(messages[3].content, "画像：张三");
+        assert_eq!(messages[4].content, "上次问题");
+        assert_eq!(messages[5].content, "上次回答");
+        assert_eq!(messages[6].role, "user");
+        assert_eq!(messages[6].content, "我叫什么");
+        assert_eq!(messages.len(), 7);
+
+        let empty_instructions = json!({
+            "skill": "list_available_tools",
+            "result": {"ok": true},
+            "skill_instructions": "  \n",
+        });
+        let compact = build_skill_messages("列出工具", &empty_instructions, &[], vec![]);
+        assert_eq!(compact.len(), 3);
+        assert_eq!(compact[0].content, SKILL_SYSTEM_PROMPT);
+        assert!(!compact[1].content.contains("详细规则"));
+        assert_eq!(compact[2].content, "列出工具");
     }
 
     #[test]

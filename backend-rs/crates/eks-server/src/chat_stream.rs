@@ -2,6 +2,8 @@
 //!
 //! 事件序列: start → (intent/query_rewrite 事件可选) → sources → token* → done | error
 //! 首轮检索质量不足时先走统一 ReAct 工具循环，bind_tools 失败再回退 query 改写。
+//! Skill 路由执行后走 LLM 最终回答，并把 `skill_instructions` 注入系统消息；
+//! 未配置 LLM 或调用失败时回退规则模板。
 
 use axum::{
     extract::State,
@@ -113,25 +115,116 @@ fn clarify_text(intent: &crate::intent::QueryIntent) -> String {
     }
 }
 
-async fn answer_skill_intent(
-    pool: &sqlx::SqlitePool,
-    user_id: &str,
+struct SkillActionInput<'a> {
+    pool: &'a sqlx::SqlitePool,
+    embedder: &'a crate::embedder::Embedder,
+    user_id: &'a str,
+    query: &'a str,
+    conversation_id: &'a str,
+    session_id: &'a str,
+    history: &'a [HistoryMessage],
+    options: &'a crate::short_memory::ShortMemoryOptions,
+    mcp_manifests: &'a [serde_json::Value],
+    llm: Option<Arc<LlmClient>>,
+}
+
+struct PreparedSkill {
+    name: String,
+    wrapped: serde_json::Value,
+    fallback: String,
+    messages: Option<Vec<ChatMessage>>,
+}
+
+async fn prepare_skill_action(
+    input: &SkillActionInput<'_>,
     intent: &crate::intent::QueryIntent,
-    mcp_manifests: &[serde_json::Value],
-) -> Result<String, String> {
+) -> Result<PreparedSkill, String> {
     let name = intent.skill_name.as_deref().unwrap_or("").trim();
     if name.is_empty() {
         return Err("skill 路由缺少 skill_name".into());
     }
     let result = crate::skills::execute_named_from(
-        pool,
-        user_id,
+        input.pool,
+        input.user_id,
         name,
         &intent.skill_arguments,
-        mcp_manifests,
+        input.mcp_manifests,
     )
     .await?;
-    Ok(crate::skills::format_skill_answer(name, &result))
+    let wrapped = crate::skills::wrap_skill_execution(
+        name,
+        &intent.skill_arguments,
+        input.user_id,
+        nonempty(input.conversation_id),
+        nonempty(input.session_id),
+        Some(input.query),
+        None,
+        json!({}),
+        result.clone(),
+    )?;
+    let fallback = crate::skills::format_skill_answer(name, &result);
+    let messages = if input.llm.is_some() {
+        let profile = crate::memory::profile_prompt(input.pool, input.user_id).await;
+        let event_memory = event_memory_prompt(
+            input.pool,
+            input.embedder,
+            input.user_id,
+            input.query,
+            input.conversation_id,
+            input.session_id,
+            "skill",
+        )
+        .await;
+        let mut long_term = Vec::new();
+        if !profile.is_empty() {
+            long_term.push(ChatMessage::new("system", profile));
+        }
+        if !event_memory.is_empty() {
+            long_term.push(ChatMessage::new("system", event_memory));
+        }
+        let history_messages = crate::short_memory::assemble(
+            &memory_history(input.history),
+            input.options,
+            input.llm.clone(),
+        )?;
+        Some(crate::skills::build_skill_messages(
+            input.query,
+            &wrapped,
+            &long_term,
+            history_messages,
+        ))
+    } else {
+        None
+    };
+    Ok(PreparedSkill {
+        name: name.to_string(),
+        wrapped,
+        fallback,
+        messages,
+    })
+}
+
+async fn resolve_skill_answer(
+    prepared: &PreparedSkill,
+    llm: Option<&Arc<LlmClient>>,
+) -> (String, String) {
+    if let (Some(messages), Some(llm)) = (prepared.messages.as_ref(), llm) {
+        match llm.invoke(messages).await {
+            Ok(result) => return (result.content, result.model),
+            Err(err) => tracing::warn!("Skill LLM 回答失败，回退规则模板: {err}"),
+        }
+    }
+    (prepared.fallback.clone(), prepared.name.clone())
+}
+
+fn skill_tool_result_payload(wrapped: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "skill": wrapped.get("skill"),
+        "kind": wrapped.get("kind"),
+        "result": wrapped.get("result").cloned().unwrap_or(json!({})),
+        "executed_at": wrapped.get("executed_at"),
+        "sources": [],
+    })
 }
 
 fn planner_llm<'a>(config: &crate::config::Config, llm: &'a LlmClient) -> Option<&'a LlmClient> {
@@ -619,9 +712,24 @@ pub async fn generate_chat(
     )
     .await;
     if intent.route == "skill" {
-        let answer = answer_skill_intent(&state.pool, &user.user_id, &intent, &mcp_manifests)
-            .await
-            .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+        let prepared = prepare_skill_action(
+            &SkillActionInput {
+                pool: &state.pool,
+                embedder: &state.engine.embedder,
+                user_id: &user.user_id,
+                query: &query,
+                conversation_id: &conversation_id,
+                session_id: &session_id,
+                history: &request.history,
+                options: &options,
+                mcp_manifests: &mcp_manifests,
+                llm: llm_client.clone(),
+            },
+            &intent,
+        )
+        .await
+        .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+        let (answer, model) = resolve_skill_answer(&prepared, llm_client.as_ref()).await;
         spawn_persist_turn(
             state.pool.clone(),
             llm_client,
@@ -636,7 +744,7 @@ pub async fn generate_chat(
             "query": query,
             "response": answer,
             "sources": [],
-            "model": intent.skill_name.unwrap_or_default(),
+            "model": model,
             "retrieval_method": null,
         })));
     }
@@ -804,25 +912,91 @@ pub async fn stream_chat(
                 "name": skill_name,
                 "arguments": intent.skill_arguments,
             })));
-            match answer_skill_intent(&pool, &user_id, &intent, &mcp_manifests).await {
-                Ok(answer) => {
-                    spawn_persist_turn(
-                        pool.clone(),
-                        if llm_missing { None } else { Some(llm_client.clone()) },
-                        user_id.clone(),
-                        conversation_id.clone(),
-                        session_id.clone(),
-                        query.clone(),
-                        answer.clone(),
-                        event_expiry_days,
-                    );
-                    yield Ok(sse_json("tool_result", json!({"skill": skill_name, "sources": []})));
-                    yield Ok(sse_json("message", json!({"content": answer})));
-                    yield Ok(sse_json("done", json!({
-                        "content": answer,
-                        "response": answer,
-                        "sources": [],
-                    })));
+            match prepare_skill_action(
+                &SkillActionInput {
+                    pool: &pool,
+                    embedder: &engine.embedder,
+                    user_id: &user_id,
+                    query: &query,
+                    conversation_id: &conversation_id,
+                    session_id: &session_id,
+                    history: &history,
+                    options: &options,
+                    mcp_manifests: &mcp_manifests,
+                    llm: if llm_missing { None } else { Some(llm_client.clone()) },
+                },
+                &intent,
+            )
+            .await
+            {
+                Ok(prepared) => {
+                    yield Ok(sse_json("tool_result", skill_tool_result_payload(&prepared.wrapped)));
+                    if let Some(messages) = prepared.messages.clone() {
+                        match llm_client.stream(&messages).await {
+                            Ok(mut rx) => {
+                                let mut full_response = String::new();
+                                while let Some(chunk) = rx.recv().await {
+                                    full_response.push_str(&chunk.delta);
+                                    yield Ok(sse_json("message", json!({"content": chunk.delta})));
+                                    yield Ok(sse_json("token", json!({"content": chunk.delta})));
+                                }
+                                spawn_persist_turn(
+                                    pool.clone(),
+                                    Some(llm_client.clone()),
+                                    user_id.clone(),
+                                    conversation_id.clone(),
+                                    session_id.clone(),
+                                    query.clone(),
+                                    full_response.clone(),
+                                    event_expiry_days,
+                                );
+                                yield Ok(sse_json("done", json!({
+                                    "content": full_response,
+                                    "response": full_response,
+                                    "sources": [],
+                                })));
+                            }
+                            Err(exc) => {
+                                tracing::warn!("Skill 流式调用失败，尝试非流式: {exc}");
+                                let (answer, _) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
+                                spawn_persist_turn(
+                                    pool.clone(),
+                                    Some(llm_client.clone()),
+                                    user_id.clone(),
+                                    conversation_id.clone(),
+                                    session_id.clone(),
+                                    query.clone(),
+                                    answer.clone(),
+                                    event_expiry_days,
+                                );
+                                yield Ok(sse_json("message", json!({"content": answer})));
+                                yield Ok(sse_json("token", json!({"content": answer})));
+                                yield Ok(sse_json("done", json!({
+                                    "content": answer,
+                                    "response": answer,
+                                    "sources": [],
+                                })));
+                            }
+                        }
+                    } else {
+                        spawn_persist_turn(
+                            pool.clone(),
+                            None,
+                            user_id.clone(),
+                            conversation_id.clone(),
+                            session_id.clone(),
+                            query.clone(),
+                            prepared.fallback.clone(),
+                            event_expiry_days,
+                        );
+                        yield Ok(sse_json("message", json!({"content": prepared.fallback})));
+                        yield Ok(sse_json("token", json!({"content": prepared.fallback})));
+                        yield Ok(sse_json("done", json!({
+                            "content": prepared.fallback,
+                            "response": prepared.fallback,
+                            "sources": [],
+                        })));
+                    }
                 }
                 Err(detail) => {
                     yield Ok(sse_json("error", json!({"message": detail})));
