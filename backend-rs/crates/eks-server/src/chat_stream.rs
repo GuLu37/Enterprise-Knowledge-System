@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -922,7 +923,30 @@ fn sse_rag_tool_result_payload(
 }
 
 fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
-    items.iter().map(|item| item.to_json()).collect()
+    deduplicate_sources(items)
+        .iter()
+        .map(|item| item.to_json())
+        .collect()
+}
+
+/// 对齐 Python `_deduplicate_sources`：按 document_id + chunk_index + content 去重。
+fn source_dedup_key(item: &RetrievalItem) -> (String, i64, String) {
+    (
+        item.document_id.clone(),
+        item.chunk_index,
+        item.content.clone(),
+    )
+}
+
+fn deduplicate_sources(items: &[RetrievalItem]) -> Vec<RetrievalItem> {
+    let mut seen = HashSet::new();
+    let mut deduplicated = Vec::new();
+    for item in items {
+        if seen.insert(source_dedup_key(item)) {
+            deduplicated.push(item.clone());
+        }
+    }
+    deduplicated
 }
 
 /// 对齐 Python `build_chat_messages`：RAG/DIRECT 系统提示 + 长期记忆 + 检索上下文 + 短期历史。
@@ -2282,6 +2306,44 @@ mod tests {
         assert_eq!(empty["message"], "当前知识库未检索到足够相关资料");
         assert_eq!(empty["sources"], json!([]));
         assert!(empty["retrieval_method"].is_null());
+    }
+
+    fn source_item(document_id: &str, chunk_index: i64, content: &str) -> RetrievalItem {
+        RetrievalItem {
+            content: content.into(),
+            score: 0.9,
+            source: "hybrid".into(),
+            document_id: document_id.into(),
+            source_name: "差旅.md".into(),
+            chunk_index,
+            child_id: "c".into(),
+            parent_id: "p".into(),
+            parent_index: 0,
+            file_type: "md".into(),
+            content_type: "text".into(),
+            signals: None,
+            parent_context_text: None,
+            rerank_stage: None,
+            cross_encoder_score: None,
+            rerank_trace: Default::default(),
+            structured_aggregation: false,
+            section_name: None,
+            chunk_indices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn source_payload_deduplicates_document_chunk_content() {
+        let first = source_item("doc-1", 0, "差旅标准");
+        let duplicate = source_item("doc-1", 0, "差旅标准");
+        let other_chunk = source_item("doc-1", 1, "差旅标准");
+        let other_doc = source_item("doc-2", 0, "差旅标准");
+        let payload = source_payload(&[first, duplicate, other_chunk, other_doc]);
+        assert_eq!(payload.len(), 3);
+        assert_eq!(payload[0]["metadata"]["document_id"], "doc-1");
+        assert_eq!(payload[0]["metadata"]["chunk_index"], 0);
+        assert_eq!(payload[1]["metadata"]["chunk_index"], 1);
+        assert_eq!(payload[2]["metadata"]["document_id"], "doc-2");
     }
 
     #[test]
