@@ -48,17 +48,29 @@ pub struct PasswordChangeRequest {
     pub new_password: String,
 }
 
-pub async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "service": "eks-rs" }))
+pub fn health_payload(config: &crate::config::Config) -> Value {
+    json!({
+        "status": "ok",
+        "app": config.app_name,
+        "version": config.app_version,
+        "environment": config.environment,
+    })
 }
 
-pub async fn root() -> impl IntoResponse {
-    Json(json!({
-        "name": "Enterprise Knowledge System",
-        "version": env!("CARGO_PKG_VERSION"),
-        "service": "eks-rs",
-        "health": "/health",
-    }))
+pub fn root_payload(config: &crate::config::Config) -> Value {
+    json!({
+        "name": config.app_name,
+        "version": config.app_version,
+        "docs": "/docs",
+    })
+}
+
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(health_payload(&state.config))
+}
+
+pub async fn root(State(state): State<AppState>) -> impl IntoResponse {
+    Json(root_payload(&state.config))
 }
 
 /// 从请求头解析 Bearer 令牌（与 Python `HTTPBearer(auto_error=False)` + scheme 检查一致）。
@@ -600,6 +612,29 @@ fn internal_error(detail: String) -> AuthError {
     AuthError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn health_and_root_payloads_match_python() {
+        let config = crate::config::Config::jwt_test();
+        let health = health_payload(&config);
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["app"], "Enterprise Knowledge System");
+        assert_eq!(health["version"], "1.0.0");
+        assert_eq!(health["environment"], "开发版");
+        assert!(health.get("service").is_none());
+
+        let root = root_payload(&config);
+        assert_eq!(root["name"], "Enterprise Knowledge System");
+        assert_eq!(root["version"], "1.0.0");
+        assert_eq!(root["docs"], "/docs");
+        assert!(root.get("service").is_none());
+        assert!(root.get("health").is_none());
     }
 }
 

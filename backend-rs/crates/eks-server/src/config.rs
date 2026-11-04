@@ -3,6 +3,9 @@ use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub app_name: String,
+    pub app_version: String,
+    pub environment: String,
     pub api_prefix: String,
     pub host: String,
     pub port: u16,
@@ -152,6 +155,9 @@ impl Config {
         let env_file = env_or("EKS_ENV_FILE", "../backend/.env");
         let _ = dotenvy::from_filename(&env_file);
         Config {
+            app_name: env_or("APP_NAME", "Enterprise Knowledge System"),
+            app_version: env_or("APP_VERSION", "1.0.0"),
+            environment: env_or("ENVIRONMENT", "开发版"),
             api_prefix: env_or("API_PREFIX", "/api/v1"),
             host: env_or("EKS_HOST", "127.0.0.1"),
             port: env_i64("EKS_PORT", 8000) as u16,
@@ -235,6 +241,9 @@ impl Config {
     #[cfg(test)]
     pub fn jwt_test() -> Self {
         Config {
+            app_name: "Enterprise Knowledge System".into(),
+            app_version: "1.0.0".into(),
+            environment: "开发版".into(),
             api_prefix: "/api/v1".into(),
             host: "127.0.0.1".into(),
             port: 8000,
@@ -336,5 +345,8 @@ mod tests {
         assert_eq!(Config::jwt_test().bootstrap_admin_username, "admin");
         assert_eq!(Config::jwt_test().bootstrap_admin_role, "admin");
         assert!(Config::jwt_test().startup_init_llm);
+        assert_eq!(Config::jwt_test().app_name, "Enterprise Knowledge System");
+        assert_eq!(Config::jwt_test().app_version, "1.0.0");
+        assert_eq!(Config::jwt_test().environment, "开发版");
     }
 }
