@@ -1567,6 +1567,7 @@ mod tests {
             "dialogue",
             "用户: 报销时限几天？\n助手: 3 天内提交。",
             55.0,
+            90,
         )
         .await
         .unwrap();
@@ -1578,6 +1579,7 @@ mod tests {
             "semantic_memory_l1",
             "差旅报销时限是发生后 3 天。",
             70.0,
+            90,
         )
         .await
         .unwrap();

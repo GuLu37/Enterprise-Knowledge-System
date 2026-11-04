@@ -33,6 +33,53 @@ const LONG_TERM_MEMORY_HINTS: &[&str] = &[
 
 const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "这件事", "该问题"];
 
+const MEMORY_TYPE_EVENT: &str = "event";
+const MEMORY_STATUS_ACTIVE: &str = "active";
+const DEFAULT_EVENT_EXPIRY_DAYS: i64 = 90;
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryCleanupSettings {
+    pub event_expiry_days: i64,
+    pub profile_stale_days: i64,
+    pub score_threshold: f64,
+    pub purge_retention_days: i64,
+}
+
+impl MemoryCleanupSettings {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        MemoryCleanupSettings {
+            event_expiry_days: config.memory_event_expiry_days.max(1),
+            profile_stale_days: config.memory_profile_stale_days.max(1),
+            score_threshold: config.memory_score_threshold.clamp(0.0, 100.0),
+            purge_retention_days: config.memory_purge_retention_days.max(1),
+        }
+    }
+}
+
+impl Default for MemoryCleanupSettings {
+    fn default() -> Self {
+        MemoryCleanupSettings {
+            event_expiry_days: DEFAULT_EVENT_EXPIRY_DAYS,
+            profile_stale_days: 180,
+            score_threshold: 20.0,
+            purge_retention_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryCleanupStats {
+    pub rescored: i64,
+    pub expired: i64,
+    pub purged: i64,
+}
+
+impl MemoryCleanupStats {
+    pub fn any(&self) -> bool {
+        self.rescored > 0 || self.expired > 0 || self.purged > 0
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EventMemoryRow {
     memory_id: String,
@@ -103,6 +150,148 @@ pub async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+pub fn clamp_score(value: f64) -> f64 {
+    value.clamp(0.0, 100.0)
+}
+
+pub fn decay_importance_score(
+    memory_type: &str,
+    base_importance: f64,
+    confidence: f64,
+    access_count: i64,
+    age_days: f64,
+) -> f64 {
+    let recency_days = if memory_type == MEMORY_TYPE_EVENT { 90.0 } else { 365.0 };
+    let decayed = base_importance * confidence * (-age_days.max(0.0) / recency_days).exp();
+    let access_bonus = 15.0_f64.min(((access_count.max(0) as f64) + 1.0).ln() * 2.5);
+    (clamp_score(decayed + access_bonus) * 100.0).round() / 100.0
+}
+
+pub fn should_expire_memory(
+    memory_type: &str,
+    importance_score: f64,
+    age_days: f64,
+    expires_at: Option<&str>,
+    now: chrono::NaiveDateTime,
+    settings: &MemoryCleanupSettings,
+) -> bool {
+    if expires_at
+        .and_then(crate::db::parse_dt)
+        .is_some_and(|expiry| expiry <= now)
+    {
+        return true;
+    }
+    importance_score < settings.score_threshold
+        && (memory_type == MEMORY_TYPE_EVENT || age_days >= settings.profile_stale_days as f64)
+}
+
+fn age_days_since(reference: Option<&str>, created_at: &str, now: chrono::NaiveDateTime) -> f64 {
+    let reference_time = reference
+        .and_then(crate::db::parse_dt)
+        .or_else(|| crate::db::parse_dt(created_at))
+        .unwrap_or(now);
+    (now - reference_time).num_seconds().max(0) as f64 / 86400.0
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveMemoryRow {
+    memory_id: String,
+    memory_type: String,
+    base_importance_score: f64,
+    confidence_score: f64,
+    access_count: i64,
+    last_accessed_at: Option<String>,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+pub async fn cleanup_memory_records(
+    pool: &sqlx::SqlitePool,
+    settings: &MemoryCleanupSettings,
+) -> Result<MemoryCleanupStats, sqlx::Error> {
+    let _ = ensure_schema(pool).await?;
+    let now = crate::db::now_naive();
+    let now_text = crate::db::fmt_dt(&now);
+    let rows: Vec<ActiveMemoryRow> = sqlx::query_as(
+        "SELECT memory_id, memory_type, base_importance_score, confidence_score, access_count, \
+         last_accessed_at, created_at, expires_at \
+         FROM memory_records WHERE status = 'active'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut stats = MemoryCleanupStats::default();
+    for row in rows {
+        let age_days = age_days_since(row.last_accessed_at.as_deref(), &row.created_at, now);
+        let score = decay_importance_score(
+            &row.memory_type,
+            row.base_importance_score,
+            row.confidence_score,
+            row.access_count,
+            age_days,
+        );
+        let expire = should_expire_memory(
+            &row.memory_type,
+            score,
+            age_days,
+            row.expires_at.as_deref(),
+            now,
+            settings,
+        );
+        let status = if expire {
+            stats.expired += 1;
+            "expired"
+        } else {
+            MEMORY_STATUS_ACTIVE
+        };
+        sqlx::query(
+            "UPDATE memory_records SET importance_score = ?, status = ?, updated_at = ? \
+             WHERE memory_id = ?",
+        )
+        .bind(score)
+        .bind(status)
+        .bind(&now_text)
+        .bind(&row.memory_id)
+        .execute(pool)
+        .await?;
+        stats.rescored += 1;
+    }
+
+    let purge_before = crate::db::fmt_dt(&(now - chrono::Duration::days(settings.purge_retention_days.max(1))));
+    let purged = sqlx::query(
+        "DELETE FROM memory_records \
+         WHERE status IN ('expired', 'superseded', 'deleted') AND updated_at < ?",
+    )
+    .bind(&purge_before)
+    .execute(pool)
+    .await?;
+    stats.purged = purged.rows_affected() as i64;
+    Ok(stats)
+}
+
+pub fn spawn_memory_maintenance(
+    pool: sqlx::SqlitePool,
+    settings: MemoryCleanupSettings,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(interval_secs.max(60));
+        loop {
+            match cleanup_memory_records(&pool, &settings).await {
+                Ok(stats) if stats.any() => tracing::info!(
+                    rescored = stats.rescored,
+                    expired = stats.expired,
+                    purged = stats.purged,
+                    "长期记忆维护完成"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("长期记忆维护失败: {err}"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 pub fn should_extract_profile(query: &str) -> bool {
     let normalized = query.replace(char::is_whitespace, "");
     !normalized.is_empty() && PROFILE_TRIGGER_TERMS.iter().any(|term| normalized.contains(term))
@@ -116,6 +305,7 @@ pub async fn persist_turn(
     session_id: &str,
     query: &str,
     answer: &str,
+    expiry_days: i64,
 ) {
     if answer.trim().is_empty() || user_id.trim().is_empty() {
         return;
@@ -130,6 +320,7 @@ pub async fn persist_turn(
         "dialogue",
         &content,
         55.0,
+        expiry_days,
     )
     .await
     {
@@ -503,6 +694,7 @@ pub async fn consolidate_conversation(
     llm: &LlmClient,
     user_id: &str,
     conversation_id: &str,
+    expiry_days: i64,
 ) -> Result<bool, String> {
     let _ = ensure_schema(pool).await.map_err(|err| err.to_string())?;
     let rows: Vec<String> = sqlx::query_scalar(
@@ -538,6 +730,7 @@ pub async fn consolidate_conversation(
         "semantic_memory_l1",
         &summary,
         70.0,
+        expiry_days,
     )
     .await
     .map_err(|err| err.to_string())?;
@@ -552,8 +745,11 @@ pub(crate) async fn insert_event_memory(
     memory_key: &str,
     content: &str,
     importance: f64,
+    expiry_days: i64,
 ) -> Result<(), sqlx::Error> {
-    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    let now = crate::db::now_naive();
+    let now_text = crate::db::fmt_dt(&now);
+    let expires_at = crate::db::fmt_dt(&(now + chrono::Duration::days(expiry_days.max(1))));
     let memory_id = format!(
         "event:{}:{}:{}",
         user_id,
@@ -564,8 +760,8 @@ pub(crate) async fn insert_event_memory(
         "INSERT INTO memory_records (
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
             importance_score, base_importance_score, confidence_score, access_count, status,
-            version, created_at, updated_at
-        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, 0.7, 0, 'active', 1, ?, ?)",
+            version, created_at, updated_at, expires_at
+        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, 0.7, 0, 'active', 1, ?, ?, ?)",
     )
     .bind(&memory_id)
     .bind(user_id)
@@ -575,8 +771,9 @@ pub(crate) async fn insert_event_memory(
     .bind(empty_to_none(session_id))
     .bind(importance)
     .bind(importance)
-    .bind(&now)
-    .bind(&now)
+    .bind(&now_text)
+    .bind(&now_text)
+    .bind(&expires_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -713,7 +910,7 @@ mod tests {
     async fn writes_and_deletes_event_memory() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         ensure_schema(&pool).await.unwrap();
-        persist_turn(&pool, None, "u1", "c1", "s1", "你好", "你好，我在。").await;
+        persist_turn(&pool, None, "u1", "c1", "s1", "你好", "你好，我在。", DEFAULT_EVENT_EXPIRY_DAYS).await;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM memory_records WHERE user_id = 'u1' AND status = 'active'",
         )
@@ -788,6 +985,7 @@ mod tests {
             "dialogue",
             "用户: 报销时限是几天？\n助手: 差旅报销需要在发生后 3 天内提交。",
             55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
         )
         .await
         .unwrap();
@@ -799,6 +997,7 @@ mod tests {
             "semantic_memory_l1",
             "【主题】差旅报销\n【摘要】差旅费用须在发生后 3 天内提交报销申请。",
             70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
         )
         .await
         .unwrap();
@@ -810,6 +1009,7 @@ mod tests {
             "semantic_memory_l1",
             "【主题】天气闲聊\n【摘要】今天下午可能下雨，出门记得带伞。",
             90.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
         )
         .await
         .unwrap();
@@ -821,6 +1021,7 @@ mod tests {
             "semantic_memory_l1",
             "【主题】差旅报销\n【摘要】另一名用户的报销时限是 7 天。",
             99.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
         )
         .await
         .unwrap();
@@ -867,7 +1068,7 @@ mod tests {
     async fn prefers_higher_semantic_level_when_both_match() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         ensure_schema(&pool).await.unwrap();
-        insert_event_memory(&pool, "u1", "c1", "s1", "dialogue", "用户问了差旅报销时限。", 80.0)
+        insert_event_memory(&pool, "u1", "c1", "s1", "dialogue", "用户问了差旅报销时限。", 80.0, DEFAULT_EVENT_EXPIRY_DAYS)
             .await
             .unwrap();
         insert_event_memory(
@@ -878,11 +1079,107 @@ mod tests {
             "semantic_memory_l3",
             "差旅报销时限：发生后 3 天内提交。",
             40.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
         )
         .await
         .unwrap();
         let hits = search_event_memories(&pool, "u1", "差旅报销时限", None, None, 2, None).await;
         assert_eq!(hits[0].memory_key, "semantic_memory_l3");
         assert_eq!(hits[1].memory_key, "dialogue");
+    }
+
+    #[test]
+    fn decay_matches_python_formula() {
+        assert_eq!(decay_importance_score("event", 50.0, 0.5, 0, 0.0), 25.0);
+        let aged = decay_importance_score("event", 50.0, 1.0, 0, 90.0);
+        let expected = (50.0 * (-1.0_f64).exp() * 100.0).round() / 100.0;
+        assert_eq!(aged, expected);
+        assert_eq!(decay_importance_score("profile", 80.0, 1.0, 0, 0.0), 80.0);
+        let with_access = decay_importance_score("event", 50.0, 1.0, 10, 0.0);
+        assert!(with_access > 50.0);
+        assert!(with_access <= 65.0);
+    }
+
+    #[test]
+    fn expire_rules_cover_deadline_score_and_profile_stale() {
+        let settings = MemoryCleanupSettings::default();
+        let now = crate::db::now_naive();
+        let past = crate::db::fmt_dt(&(now - chrono::Duration::days(1)));
+        assert!(should_expire_memory("event", 90.0, 0.0, Some(&past), now, &settings));
+        assert!(should_expire_memory("event", 10.0, 0.0, None, now, &settings));
+        assert!(!should_expire_memory("profile", 10.0, 10.0, None, now, &settings));
+        assert!(should_expire_memory("profile", 10.0, 180.0, None, now, &settings));
+        assert!(!should_expire_memory("event", 50.0, 0.0, None, now, &settings));
+    }
+
+    #[tokio::test]
+    async fn cleanup_expires_low_score_events_and_purges_old_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "低分事件",
+            5.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        upsert_profile_candidates(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            &[json!({
+                "memory_key": "profile.name",
+                "value": "张三",
+                "confidence": 0.1,
+                "importance": 5,
+                "action": "upsert"
+            })],
+        )
+        .await
+        .unwrap();
+
+        let stats = cleanup_memory_records(&pool, &MemoryCleanupSettings::default())
+            .await
+            .unwrap();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(stats.rescored, 2);
+        let event_status: String = sqlx::query_scalar(
+            "SELECT status FROM memory_records WHERE memory_type = 'event' AND content = '低分事件'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_status, "expired");
+        let profile_status: String = sqlx::query_scalar(
+            "SELECT status FROM memory_records WHERE memory_type = 'profile' AND memory_key = 'profile.name'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(profile_status, "active");
+
+        let old = crate::db::fmt_dt(&(crate::db::now_naive() - chrono::Duration::days(40)));
+        sqlx::query("UPDATE memory_records SET updated_at = ? WHERE status = 'expired'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let purged = cleanup_memory_records(&pool, &MemoryCleanupSettings::default())
+            .await
+            .unwrap();
+        assert_eq!(purged.purged, 1);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE content = '低分事件'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

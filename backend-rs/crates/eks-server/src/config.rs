@@ -52,6 +52,11 @@ pub struct Config {
     pub retrieval_planner_llm_decision_enabled: bool,
     pub enable_cache: bool,
     pub cache_ttl: u64,
+    pub memory_cleanup_interval_seconds: u64,
+    pub memory_event_expiry_days: i64,
+    pub memory_profile_stale_days: i64,
+    pub memory_score_threshold: f64,
+    pub memory_purge_retention_days: i64,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -210,6 +215,12 @@ impl Config {
             ),
             enable_cache: env_bool("ENABLE_CACHE", true),
             cache_ttl: env_i64("CACHE_TTL", 3600).max(0) as u64,
+            memory_cleanup_interval_seconds: env_i64("MEMORY_CLEANUP_INTERVAL_SECONDS", 3600)
+                .max(60) as u64,
+            memory_event_expiry_days: env_i64("MEMORY_EVENT_EXPIRY_DAYS", 90).max(1),
+            memory_profile_stale_days: env_i64("MEMORY_PROFILE_STALE_DAYS", 180).max(1),
+            memory_score_threshold: env_f64("MEMORY_SCORE_THRESHOLD", 20.0).clamp(0.0, 100.0),
+            memory_purge_retention_days: env_i64("MEMORY_PURGE_RETENTION_DAYS", 30).max(1),
         }
     }
 
@@ -265,6 +276,11 @@ impl Config {
             retrieval_planner_llm_decision_enabled: true,
             enable_cache: true,
             cache_ttl: 3600,
+            memory_cleanup_interval_seconds: 3600,
+            memory_event_expiry_days: 90,
+            memory_profile_stale_days: 180,
+            memory_score_threshold: 20.0,
+            memory_purge_retention_days: 30,
         }
     }
 }
@@ -302,5 +318,8 @@ mod tests {
         assert_eq!(Config::jwt_test().unified_react_parallel_workers, 4);
         assert!(Config::jwt_test().enable_cache);
         assert_eq!(Config::jwt_test().cache_ttl, 3600);
+        assert_eq!(Config::jwt_test().memory_cleanup_interval_seconds, 3600);
+        assert_eq!(Config::jwt_test().memory_event_expiry_days, 90);
+        assert_eq!(Config::jwt_test().memory_score_threshold, 20.0);
     }
 }

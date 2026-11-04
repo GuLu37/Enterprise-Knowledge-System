@@ -312,6 +312,7 @@ fn spawn_persist_turn(
     session_id: String,
     query: String,
     answer: String,
+    expiry_days: i64,
 ) {
     if answer.trim().is_empty() || user_id.trim().is_empty() {
         return;
@@ -325,6 +326,7 @@ fn spawn_persist_turn(
             &session_id,
             &query,
             &answer,
+            expiry_days,
         )
         .await;
     });
@@ -562,6 +564,7 @@ pub async fn consolidate_chat(
         &llm_client,
         &user.user_id,
         &conversation_id,
+        state.config.memory_event_expiry_days,
     )
     .await
     .map_err(|detail| crate::auth::AuthError {
@@ -594,6 +597,7 @@ pub async fn generate_chat(
     }
     let conversation_id = request.conversation_id.clone().unwrap_or_default();
     let session_id = request.session_id.clone().unwrap_or_default();
+    let event_expiry_days = state.config.memory_event_expiry_days;
     let options = memory_options(&request);
     if let Err(detail) = options.validate() {
         return Err(crate::auth::AuthError::bad_request(&detail));
@@ -626,6 +630,7 @@ pub async fn generate_chat(
             session_id,
             query.clone(),
             answer.clone(),
+            event_expiry_days,
         );
         return Ok(axum::Json(json!({
             "query": query,
@@ -645,6 +650,7 @@ pub async fn generate_chat(
             session_id,
             query.clone(),
             answer.clone(),
+            event_expiry_days,
         );
         return Ok(axum::Json(json!({
             "query": query,
@@ -686,6 +692,7 @@ pub async fn generate_chat(
             session_id,
             query.clone(),
             answer.clone(),
+            event_expiry_days,
         );
         return Ok(axum::Json(json!({
             "query": query,
@@ -725,6 +732,7 @@ pub async fn generate_chat(
         session_id,
         query.clone(),
         result.content.clone(),
+        event_expiry_days,
     );
     Ok(axum::Json(json!({
         "query": query,
@@ -763,6 +771,7 @@ pub async fn stream_chat(
     let llm_client = Arc::new(LlmClient::new(llm_config));
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
     let config = state.config.clone();
+    let event_expiry_days = config.memory_event_expiry_days;
 
     let stream = async_stream::stream! {
         yield Ok(sse_json("start", json!({
@@ -805,6 +814,7 @@ pub async fn stream_chat(
                         session_id.clone(),
                         query.clone(),
                         answer.clone(),
+                        event_expiry_days,
                     );
                     yield Ok(sse_json("tool_result", json!({"skill": skill_name, "sources": []})));
                     yield Ok(sse_json("message", json!({"content": answer})));
@@ -831,6 +841,7 @@ pub async fn stream_chat(
                 session_id.clone(),
                 query.clone(),
                 answer.clone(),
+                event_expiry_days,
             );
             yield Ok(sse_json("message", json!({"content": answer})));
             yield Ok(sse_json("done", json!({
@@ -911,6 +922,7 @@ pub async fn stream_chat(
                 session_id.clone(),
                 query.clone(),
                 answer.clone(),
+                event_expiry_days,
             );
             yield Ok(sse_json("message", json!({"content": answer})));
             yield Ok(sse_json("token", json!({"content": answer})));
@@ -962,6 +974,7 @@ pub async fn stream_chat(
                     session_id.clone(),
                     query.clone(),
                     full_response.clone(),
+                    event_expiry_days,
                 );
                 yield Ok(sse_json("done", json!({
                     "content": full_response,
@@ -982,6 +995,7 @@ pub async fn stream_chat(
                             session_id.clone(),
                             query.clone(),
                             result.content.clone(),
+                            event_expiry_days,
                         );
                         yield Ok(sse_json("message", json!({"content": result.content})));
                         yield Ok(sse_json("token", json!({"content": result.content})));

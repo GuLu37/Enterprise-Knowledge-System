@@ -66,6 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let engine = std::sync::Arc::new(engine);
 
+    eks_server::memory::spawn_memory_maintenance(
+        pool.clone(),
+        eks_server::memory::MemoryCleanupSettings::from_config(&config),
+        config.memory_cleanup_interval_seconds,
+    );
+
     let mcp_skills = eks_server::remote_mcp::skills_from_manifests(&config.mcp_remote_tool_manifests);
     if mcp_skills.is_empty() {
         tracing::info!("远程 MCP 未配置 manifest");
