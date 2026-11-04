@@ -177,23 +177,27 @@ pub fn fallback_route_query_intent(query: &str, use_retrieval: bool) -> QueryInt
     intent
 }
 
+fn intent_from_routed_skill(skill: &skills::RoutedSkill) -> QueryIntent {
+    QueryIntent {
+        route: "skill".into(),
+        needs_retrieval: false,
+        reason: format!("rule_skill:{}", skill.name),
+        source: "rule".into(),
+        confidence: None,
+        rewritten_query: String::new(),
+        skill_name: Some(skill.name.to_string()),
+        skill_arguments: skill.arguments.clone(),
+        clarify_question: String::new(),
+    }
+}
+
 pub fn rule_route_query_action(query: &str, use_retrieval: bool) -> QueryIntent {
     let normalized = query.trim();
     if normalized.is_empty() {
         return QueryIntent::direct("empty_query", "rule");
     }
     if let Some(skill) = skills::route_local_skill(normalized) {
-        return QueryIntent {
-            route: "skill".into(),
-            needs_retrieval: false,
-            reason: format!("rule_skill:{}", skill.name),
-            source: "rule".into(),
-            confidence: None,
-            rewritten_query: String::new(),
-            skill_name: Some(skill.name.to_string()),
-            skill_arguments: skill.arguments,
-            clarify_question: String::new(),
-        };
+        return intent_from_routed_skill(&skill);
     }
     let mut intent = rule_route_query_intent(normalized, use_retrieval);
     if intent.reason == "direct_keyword" || !intent.needs_retrieval {
@@ -213,22 +217,26 @@ pub async fn route_query_action(
     history: &[(String, String)],
     mcp_manifests: &[Value],
 ) -> QueryIntent {
+    route_query_action_with(query, use_retrieval, llm, history, mcp_manifests, true).await
+}
+
+pub async fn route_query_action_with(
+    query: &str,
+    use_retrieval: bool,
+    llm: Option<&LlmClient>,
+    history: &[(String, String)],
+    mcp_manifests: &[Value],
+    prefer_rule_skill: bool,
+) -> QueryIntent {
     let normalized = query.trim();
     if normalized.is_empty() {
         return QueryIntent::direct("empty_query", "rule");
     }
-    if let Some(skill) = skills::route_local_skill(normalized) {
-        return QueryIntent {
-            route: "skill".into(),
-            needs_retrieval: false,
-            reason: format!("rule_skill:{}", skill.name),
-            source: "rule".into(),
-            confidence: None,
-            rewritten_query: String::new(),
-            skill_name: Some(skill.name.to_string()),
-            skill_arguments: skill.arguments,
-            clarify_question: String::new(),
-        };
+    let rule_skill = skills::route_local_skill(normalized);
+    if prefer_rule_skill {
+        if let Some(skill) = &rule_skill {
+            return intent_from_routed_skill(skill);
+        }
     }
 
     let fallback = rule_route_query_intent(normalized, use_retrieval);
@@ -256,8 +264,15 @@ pub async fn route_query_action(
                 let skill_missing =
                     action.route == "skill" && action.skill_name.as_deref().unwrap_or("").is_empty();
                 if !skill_missing {
-                    if action.route == "direct" && fallback.needs_retrieval {
-                        return finalize_fallback(fallback);
+                    if action.route == "direct" {
+                        if prefer_rule_skill {
+                            if let Some(skill) = &rule_skill {
+                                return intent_from_routed_skill(skill);
+                            }
+                        }
+                        if fallback.needs_retrieval {
+                            return finalize_fallback(fallback);
+                        }
                     }
                     tracing::info!(
                         "动作路由结果: source={} route={} reason={} skill={:?}",
@@ -274,6 +289,9 @@ pub async fn route_query_action(
         }
     }
 
+    if let Some(skill) = &rule_skill {
+        return intent_from_routed_skill(skill);
+    }
     finalize_fallback(fallback)
 }
 
@@ -535,6 +553,32 @@ mod tests {
         let disabled = rule_route_query_action("差旅报销流程是什么", false);
         assert_eq!(disabled.route, "direct");
         assert_eq!(disabled.reason, "retrieval_disabled");
+    }
+
+    #[tokio::test]
+    async fn prefer_rule_skill_false_still_falls_back_without_llm() {
+        let preferred = route_query_action(
+            "列出你的工具",
+            true,
+            None,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(preferred.route, "skill");
+        assert_eq!(preferred.skill_name.as_deref(), Some("list_available_tools"));
+
+        let retry = route_query_action_with(
+            "列出你的工具",
+            true,
+            None,
+            &[],
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(retry.route, "skill");
+        assert_eq!(retry.skill_name.as_deref(), Some("list_available_tools"));
     }
 
     #[test]

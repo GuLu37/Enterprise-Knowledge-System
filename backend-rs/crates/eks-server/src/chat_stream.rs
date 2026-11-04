@@ -75,6 +75,82 @@ fn default_short_memory_m() -> usize {
     10
 }
 
+const MAX_TOOL_CALLS_PER_TURN: usize = 2;
+
+fn tool_budget_exhausted_message(query: &str, last_tool_name: &str) -> String {
+    match last_tool_name {
+        "search_knowledge_base" => {
+            "我已经尝试了两次知识库相关工具，但还是没有足够依据。请补充更具体的文件名、关键词或范围，我再继续。"
+                .into()
+        }
+        "memory_query" => {
+            "我已经尝试了两次记忆查询，但还是没找到足够信息。请再补充更明确的提示或改成别的问题。".into()
+        }
+        "document_hot_word_statistics" => {
+            "我已经尝试了两次热词统计，但还不够明确。请补充更准确的文件名或范围。".into()
+        }
+        _ => {
+            let normalized_query = query.trim();
+            if normalized_query.is_empty() {
+                "我已经尝试了两次工具调用，但仍不足以完成当前任务。请再补充一点信息。".into()
+            } else {
+                format!(
+                    "我已经尝试了两次工具调用，但仍不足以完成“{normalized_query}”。请再补充一点信息。"
+                )
+            }
+        }
+    }
+}
+
+fn json_has_signal(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_f64().map(|value| value != 0.0).unwrap_or(false),
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+    }
+}
+
+fn tool_result_has_signal(tool_name: &str, tool_payload: &serde_json::Value) -> bool {
+    let Some(object) = tool_payload.as_object() else {
+        return false;
+    };
+    match tool_name {
+        "search_knowledge_base" => json_has_signal(object.get("results")),
+        "memory_query" => {
+            let summary = object.get("summary").cloned().unwrap_or(json!({}));
+            json_has_signal(summary.get("profile_count")) || json_has_signal(summary.get("matched_count"))
+        }
+        "memory_retrieve_original" => json_has_signal(object.get("original_chunks")),
+        "document_hot_word_statistics" => json_has_signal(object.get("top_words")),
+        _ => !object.is_empty(),
+    }
+}
+
+fn append_tool_result_to_history(
+    history: &[HistoryMessage],
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    wrapped: &serde_json::Value,
+) -> Vec<HistoryMessage> {
+    let mut next = history.to_vec();
+    let payload = json!({
+        "tool": tool_name,
+        "arguments": arguments,
+        "result": wrapped.get("result").cloned().unwrap_or(json!({})),
+    });
+    next.push(HistoryMessage {
+        role: "system".into(),
+        content: format!(
+            "上一轮工具执行结果：\n{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+        ),
+    });
+    next
+}
+
 fn memory_history(history: &[HistoryMessage]) -> Vec<crate::short_memory::MemoryMessage> {
     history
         .iter()
@@ -133,6 +209,7 @@ struct PreparedSkill {
     wrapped: serde_json::Value,
     fallback: String,
     messages: Option<Vec<ChatMessage>>,
+    sufficient: bool,
 }
 
 async fn prepare_skill_action(
@@ -211,11 +288,13 @@ async fn prepare_skill_action(
     } else {
         None
     };
+    let sufficient = tool_result_has_signal(name, &result);
     Ok(PreparedSkill {
         name: name.to_string(),
         wrapped,
         fallback,
         messages,
+        sufficient,
     })
 }
 
@@ -635,23 +714,6 @@ fn clean_rag_response_text(text: &str) -> String {
     collapse_extra_newlines(&spaced_lines.join("\n")).trim().to_string()
 }
 
-/// 合并两轮检索结果（按 citation key 去重，保留高分）。
-fn merge_results(primary: Vec<RetrievalItem>, secondary: Vec<RetrievalItem>) -> Vec<RetrievalItem> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<(String, String, String)> = primary
-        .iter()
-        .map(crate::retrieval::citation_chunk_key)
-        .collect();
-    let mut merged = primary;
-    for item in secondary {
-        let key = crate::retrieval::citation_chunk_key(&item);
-        if seen.insert(key) {
-            merged.push(item);
-        }
-    }
-    merged
-}
-
 struct RagTurn {
     context: String,
     sources: Vec<RetrievalItem>,
@@ -816,7 +878,7 @@ async fn collect_rag(
     let mut react_kind = None;
     let history_pairs = history_pairs(history, window_n);
     let mcp_manifests = &config.mcp_remote_tool_manifests;
-    let mut retrieval_method = plan.retrieval_method.clone();
+    let retrieval_method = plan.retrieval_method.clone();
 
     let mut attempt = crate::react::run_unified_react(
         engine,
@@ -853,11 +915,39 @@ async fn collect_rag(
         used_react = outcome.used_react;
         react_notes = outcome.notes;
         react_kind = Some(outcome.kind.clone());
-        if outcome.used_react && crate::planner::assess_evidence_rule(query, &outcome.sources).sufficient
-        {
+        if outcome.used_react {
+            if crate::planner::assess_evidence_rule(query, &outcome.sources).sufficient {
+                return Ok(RagTurn {
+                    context: outcome.context,
+                    sources: outcome.sources,
+                    direct: None,
+                    retrieval_method: Some(retrieval_method),
+                    used_react,
+                    react_notes,
+                    react_kind,
+                });
+            }
+            if outcome.sources.is_empty() {
+                return Ok(RagTurn {
+                    context: String::new(),
+                    sources: Vec::new(),
+                    direct: Some(no_result_answer(query)),
+                    retrieval_method: Some(retrieval_method),
+                    used_react,
+                    react_notes,
+                    react_kind,
+                });
+            }
+            working = outcome.sources;
+            let max_chars = if working.iter().any(|item| item.structured_aggregation) {
+                30000
+            } else {
+                6500
+            };
+            let context = crate::retrieval::assemble_rag_context(&working, max_chars);
             return Ok(RagTurn {
-                context: outcome.context,
-                sources: outcome.sources,
+                context,
+                sources: working,
                 direct: None,
                 retrieval_method: Some(retrieval_method),
                 used_react,
@@ -865,49 +955,15 @@ async fn collect_rag(
                 react_kind,
             });
         }
-        if !outcome.sources.is_empty() {
-            working = outcome.sources;
-        }
     }
 
-    let rewritten = rewrite_rag_query(llm, query, history).await;
-    if !rewritten.is_empty()
-        && crate::retrieval::collapse_spaces(&rewritten) != crate::retrieval::collapse_spaces(query)
-    {
-        let second = engine
-            .retrieve_planned(
-                &rewritten,
-                crate::planner::RETRIEVAL_METHOD_HYBRID,
-                plan.top_k,
-                Some(llm),
-            )
-            .await
-            .map(|(results, _)| results)
-            .unwrap_or_default();
-        working = merge_results(working, second);
-        retrieval_method = crate::planner::RETRIEVAL_METHOD_HYBRID.to_string();
-    }
-    if working.is_empty() {
-        return Ok(RagTurn {
-            context: String::new(),
-            sources: Vec::new(),
-            direct: Some(no_result_answer(query)),
-            retrieval_method: Some(retrieval_method),
-            used_react,
-            react_notes,
-            react_kind,
-        });
-    }
-    let max_chars = if working.iter().any(|item| item.structured_aggregation) {
-        30000
-    } else {
-        6500
-    };
-    let context = crate::retrieval::assemble_rag_context(&working, max_chars);
     Ok(RagTurn {
-        context,
-        sources: working,
-        direct: None,
+        context: String::new(),
+        sources: Vec::new(),
+        direct: Some(tool_budget_exhausted_message(
+            query,
+            "search_knowledge_base",
+        )),
         retrieval_method: Some(retrieval_method),
         used_react,
         react_notes,
@@ -1313,7 +1369,7 @@ pub async fn stream_chat(
             "short_memory_m": options.summary_m,
         })));
 
-        let intent = crate::intent::route_query_action(
+        let mut intent = crate::intent::route_query_action(
             &query,
             requested_retrieval,
             if llm_missing { None } else { Some(llm_client.as_ref()) },
@@ -1322,105 +1378,184 @@ pub async fn stream_chat(
         )
         .await;
         yield Ok(sse_json("intent", intent.to_json()));
+        let mut working_history = history.clone();
+        let mut last_skill_name = String::new();
 
         if intent.route == "skill" {
-            let skill_name = intent.skill_name.clone().unwrap_or_default();
-            yield Ok(sse_json("tool_call", json!({
-                "name": skill_name,
-                "arguments": intent.skill_arguments,
-            })));
-            match prepare_skill_action(
-                &SkillActionInput {
-                    pool: &pool,
-                    embedder: &engine.embedder,
-                    user_id: &user_id,
-                    query: &query,
-                    conversation_id: &conversation_id,
-                    session_id: &session_id,
-                    history: &history,
-                    options: &options,
-                    mcp_manifests: &mcp_manifests,
-                    llm: if llm_missing { None } else { Some(llm_client.clone()) },
-                },
-                &intent,
-            )
-            .await
-            {
-                Ok(prepared) => {
-                    yield Ok(sse_json("tool_result", skill_tool_result_payload(&prepared.wrapped)));
-                    if let Some(messages) = prepared.messages.clone() {
-                        match llm_client.stream(&messages).await {
-                            Ok(mut rx) => {
-                                let mut full_response = String::new();
-                                while let Some(chunk) = rx.recv().await {
-                                    full_response.push_str(&chunk.delta);
-                                    yield Ok(sse_json("message", json!({"content": chunk.delta})));
-                                    yield Ok(sse_json("token", json!({"content": chunk.delta})));
+            let mut exhausted = false;
+            for attempt in 0..MAX_TOOL_CALLS_PER_TURN {
+                if intent.route != "skill" {
+                    break;
+                }
+                let skill_name = intent.skill_name.clone().unwrap_or_default();
+                yield Ok(sse_json("tool_call", json!({
+                    "name": skill_name,
+                    "arguments": intent.skill_arguments,
+                })));
+                match prepare_skill_action(
+                    &SkillActionInput {
+                        pool: &pool,
+                        embedder: &engine.embedder,
+                        user_id: &user_id,
+                        query: &query,
+                        conversation_id: &conversation_id,
+                        session_id: &session_id,
+                        history: &working_history,
+                        options: &options,
+                        mcp_manifests: &mcp_manifests,
+                        llm: if llm_missing { None } else { Some(llm_client.clone()) },
+                    },
+                    &intent,
+                )
+                .await
+                {
+                    Ok(prepared) => {
+                        yield Ok(sse_json("tool_result", skill_tool_result_payload(&prepared.wrapped)));
+                        last_skill_name = prepared.name.clone();
+                        if prepared.sufficient {
+                            if let Some(messages) = prepared.messages.clone() {
+                                match llm_client.stream(&messages).await {
+                                    Ok(mut rx) => {
+                                        let mut full_response = String::new();
+                                        while let Some(chunk) = rx.recv().await {
+                                            full_response.push_str(&chunk.delta);
+                                            yield Ok(sse_json("message", json!({"content": chunk.delta})));
+                                            yield Ok(sse_json("token", json!({"content": chunk.delta})));
+                                        }
+                                        let answer = clean_rag_response_text(&full_response);
+                                        spawn_persist_turn(
+                                            pool.clone(),
+                                            Some(llm_client.clone()),
+                                            user_id.clone(),
+                                            conversation_id.clone(),
+                                            session_id.clone(),
+                                            query.clone(),
+                                            answer.clone(),
+                                            event_expiry_days,
+                                        );
+                                        yield Ok(sse_json("done", json!({
+                                            "content": answer,
+                                            "response": answer,
+                                            "sources": [],
+                                        })));
+                                    }
+                                    Err(exc) => {
+                                        tracing::warn!("Skill 流式调用失败，尝试非流式: {exc}");
+                                        let (answer, _) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
+                                        spawn_persist_turn(
+                                            pool.clone(),
+                                            Some(llm_client.clone()),
+                                            user_id.clone(),
+                                            conversation_id.clone(),
+                                            session_id.clone(),
+                                            query.clone(),
+                                            answer.clone(),
+                                            event_expiry_days,
+                                        );
+                                        yield Ok(sse_json("message", json!({"content": answer})));
+                                        yield Ok(sse_json("token", json!({"content": answer})));
+                                        yield Ok(sse_json("done", json!({
+                                            "content": answer,
+                                            "response": answer,
+                                            "sources": [],
+                                        })));
+                                    }
                                 }
-                                let answer = clean_rag_response_text(&full_response);
+                            } else {
                                 spawn_persist_turn(
                                     pool.clone(),
-                                    Some(llm_client.clone()),
+                                    None,
                                     user_id.clone(),
                                     conversation_id.clone(),
                                     session_id.clone(),
                                     query.clone(),
-                                    answer.clone(),
+                                    prepared.fallback.clone(),
                                     event_expiry_days,
                                 );
+                                yield Ok(sse_json("message", json!({"content": prepared.fallback})));
+                                yield Ok(sse_json("token", json!({"content": prepared.fallback})));
                                 yield Ok(sse_json("done", json!({
-                                    "content": answer,
-                                    "response": answer,
+                                    "content": prepared.fallback,
+                                    "response": prepared.fallback,
                                     "sources": [],
                                 })));
                             }
-                            Err(exc) => {
-                                tracing::warn!("Skill 流式调用失败，尝试非流式: {exc}");
-                                let (answer, _) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
-                                spawn_persist_turn(
-                                    pool.clone(),
-                                    Some(llm_client.clone()),
-                                    user_id.clone(),
-                                    conversation_id.clone(),
-                                    session_id.clone(),
-                                    query.clone(),
-                                    answer.clone(),
-                                    event_expiry_days,
-                                );
-                                yield Ok(sse_json("message", json!({"content": answer})));
-                                yield Ok(sse_json("token", json!({"content": answer})));
-                                yield Ok(sse_json("done", json!({
-                                    "content": answer,
-                                    "response": answer,
-                                    "sources": [],
-                                })));
-                            }
+                            return;
                         }
-                    } else {
-                        spawn_persist_turn(
-                            pool.clone(),
-                            None,
-                            user_id.clone(),
-                            conversation_id.clone(),
-                            session_id.clone(),
-                            query.clone(),
-                            prepared.fallback.clone(),
-                            event_expiry_days,
+                        if attempt + 1 >= MAX_TOOL_CALLS_PER_TURN {
+                            exhausted = true;
+                            break;
+                        }
+                        working_history = append_tool_result_to_history(
+                            &working_history,
+                            &prepared.name,
+                            &intent.skill_arguments,
+                            &prepared.wrapped,
                         );
-                        yield Ok(sse_json("message", json!({"content": prepared.fallback})));
-                        yield Ok(sse_json("token", json!({"content": prepared.fallback})));
-                        yield Ok(sse_json("done", json!({
-                            "content": prepared.fallback,
-                            "response": prepared.fallback,
-                            "sources": [],
-                        })));
+                        intent = crate::intent::route_query_action_with(
+                            &query,
+                            requested_retrieval,
+                            if llm_missing { None } else { Some(llm_client.as_ref()) },
+                            &history_pairs(&working_history, window_n),
+                            &mcp_manifests,
+                            false,
+                        )
+                        .await;
+                        if intent.route == "clarify" {
+                            let answer = if intent.clarify_question.trim().is_empty() {
+                                tool_budget_exhausted_message(&query, &last_skill_name)
+                            } else {
+                                clarify_text(&intent)
+                            };
+                            spawn_persist_turn(
+                                pool.clone(),
+                                if llm_missing { None } else { Some(llm_client.clone()) },
+                                user_id.clone(),
+                                conversation_id.clone(),
+                                session_id.clone(),
+                                query.clone(),
+                                answer.clone(),
+                                event_expiry_days,
+                            );
+                            yield Ok(sse_json("message", json!({"content": answer})));
+                            yield Ok(sse_json("done", json!({
+                                "content": answer,
+                                "response": answer,
+                                "sources": [],
+                            })));
+                            return;
+                        }
+                        if intent.route == "direct" {
+                            exhausted = true;
+                            break;
+                        }
+                    }
+                    Err(detail) => {
+                        yield Ok(sse_json("error", json!({"message": detail})));
+                        return;
                     }
                 }
-                Err(detail) => {
-                    yield Ok(sse_json("error", json!({"message": detail})));
-                }
             }
-            return;
+            if exhausted || intent.route == "skill" {
+                let answer = tool_budget_exhausted_message(&query, &last_skill_name);
+                spawn_persist_turn(
+                    pool.clone(),
+                    if llm_missing { None } else { Some(llm_client.clone()) },
+                    user_id.clone(),
+                    conversation_id.clone(),
+                    session_id.clone(),
+                    query.clone(),
+                    answer.clone(),
+                    event_expiry_days,
+                );
+                yield Ok(sse_json("message", json!({"content": answer})));
+                yield Ok(sse_json("done", json!({
+                    "content": answer,
+                    "response": answer,
+                    "sources": [],
+                })));
+                return;
+            }
         }
 
         if intent.route == "clarify" {
@@ -1450,7 +1585,7 @@ pub async fn stream_chat(
         }
 
         let retrieval_query =
-            resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &history).await;
+            resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &working_history).await;
         let use_retrieval = intent.needs_retrieval;
         let preferred_method = preferred_retrieval_method(request_retrieval_method.as_deref());
         if use_retrieval {
@@ -1472,7 +1607,7 @@ pub async fn stream_chat(
             &user_id,
             &query,
             &retrieval_query,
-            &history,
+            &working_history,
             top_k,
             use_retrieval,
             window_n,
@@ -1769,6 +1904,57 @@ mod tests {
         );
 
         assert_eq!(clean_rag_response_text("  \n\n  hello  \n\n\n"), "hello");
+    }
+
+    #[test]
+    fn tool_budget_copy_matches_python() {
+        assert!(tool_budget_exhausted_message("差旅", "search_knowledge_base")
+            .contains("两次知识库相关工具"));
+        assert!(tool_budget_exhausted_message("刚才说过什么", "memory_query").contains("两次记忆查询"));
+        assert!(tool_budget_exhausted_message("热词", "document_hot_word_statistics")
+            .contains("两次热词统计"));
+        assert_eq!(
+            tool_budget_exhausted_message("差旅报销标准", "list_available_tools"),
+            "我已经尝试了两次工具调用，但仍不足以完成“差旅报销标准”。请再补充一点信息。"
+        );
+        assert_eq!(
+            tool_budget_exhausted_message("  ", ""),
+            "我已经尝试了两次工具调用，但仍不足以完成当前任务。请再补充一点信息。"
+        );
+        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 2);
+    }
+
+    #[test]
+    fn tool_result_signal_matches_python_rules() {
+        assert!(tool_result_has_signal(
+            "search_knowledge_base",
+            &json!({"results": [{"chunk_id": "1"}]})
+        ));
+        assert!(!tool_result_has_signal(
+            "search_knowledge_base",
+            &json!({"results": []})
+        ));
+        assert!(tool_result_has_signal(
+            "memory_query",
+            &json!({"summary": {"profile_count": 0, "matched_count": 2}})
+        ));
+        assert!(!tool_result_has_signal(
+            "memory_query",
+            &json!({"summary": {"profile_count": 0, "matched_count": 0}})
+        ));
+        assert!(tool_result_has_signal(
+            "memory_retrieve_original",
+            &json!({"original_chunks": [{"content": "原文"}]})
+        ));
+        assert!(!tool_result_has_signal(
+            "document_hot_word_statistics",
+            &json!({"top_words": []})
+        ));
+        assert!(tool_result_has_signal(
+            "list_available_tools",
+            &json!({"tools": []})
+        ));
+        assert!(!tool_result_has_signal("list_available_tools", &json!({})));
     }
 
     #[test]
