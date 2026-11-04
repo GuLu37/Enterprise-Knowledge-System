@@ -205,6 +205,20 @@ fn passes_similarity_threshold(score: f64, threshold: f64) -> bool {
     threshold <= 0.0 || score >= threshold
 }
 
+/// HTTP dense 默认强制阈值；聊天/规划器对齐 Python `enforce_similarity_threshold=False`。
+fn filter_dense_hits(
+    hits: Vec<(usize, f64)>,
+    threshold: f64,
+    enforce_similarity_threshold: bool,
+) -> Vec<(usize, f64)> {
+    if !enforce_similarity_threshold {
+        return hits;
+    }
+    hits.into_iter()
+        .filter(|(_, score)| passes_similarity_threshold(*score, threshold))
+        .collect()
+}
+
 impl RetrievalEngine {
     pub fn new(store: MilvusLiteStore, embedder: Arc<Embedder>, pool: sqlx::SqlitePool) -> Self {
         RetrievalEngine {
@@ -362,6 +376,7 @@ impl RetrievalEngine {
         &self,
         query: &str,
         top_k: usize,
+        enforce_similarity_threshold: bool,
     ) -> Result<Vec<RetrievalItem>, String> {
         let snapshot = self
             .store
@@ -375,9 +390,8 @@ impl RetrievalEngine {
             .search_cosine(self.child_collection(), vector, top_k)
             .await
             .map_err(|err| err.to_string())?;
-        Ok(hits
+        Ok(filter_dense_hits(hits, self.similarity_threshold, enforce_similarity_threshold)
             .into_iter()
-            .filter(|(_, score)| passes_similarity_threshold(*score, self.similarity_threshold))
             .map(|(index, score)| RetrievalItem::from_row(&snapshot.rows[index], score, "dense"))
             .collect())
     }
@@ -414,7 +428,27 @@ impl RetrievalEngine {
             return Ok(Vec::new());
         }
         if self.use_dense {
-            self.search_dense_inner(query, top_k).await
+            self.search_dense_inner(query, top_k, true).await
+        } else if self.use_sparse {
+            self.search_sparse_inner(query, top_k).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 聊天/规划器 Dense：高召回，不在召回阶段用 SIMILARITY_THRESHOLD 硬过滤。
+    pub async fn search_dense_high_recall(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RetrievalItem>, String> {
+        let top_k = top_k.clamp(1, 50);
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.use_dense {
+            self.search_dense_inner(query, top_k, false).await
         } else if self.use_sparse {
             self.search_sparse_inner(query, top_k).await
         } else {
@@ -436,7 +470,7 @@ impl RetrievalEngine {
         if self.use_sparse {
             self.search_sparse_inner(query, top_k).await
         } else if self.use_dense {
-            self.search_dense_inner(query, top_k).await
+            self.search_dense_inner(query, top_k, true).await
         } else {
             Ok(Vec::new())
         }
@@ -494,7 +528,7 @@ impl RetrievalEngine {
             }
             let (processed, context) = match method.as_str() {
                 crate::planner::RETRIEVAL_METHOD_DENSE => {
-                    let recalled = self.search_dense(query, top_k).await?;
+                    let recalled = self.search_dense_high_recall(query, top_k).await?;
                     let processed = self.post_process(query, recalled, top_k).await?;
                     let context = assemble_processed_context(&processed);
                     (processed, context)
@@ -509,7 +543,7 @@ impl RetrievalEngine {
                     self.run_hybrid_workflow(query, top_k, llm).await?
                 }
                 _ if self.use_dense => {
-                    let recalled = self.search_dense(query, top_k).await?;
+                    let recalled = self.search_dense_high_recall(query, top_k).await?;
                     let processed = self.post_process(query, recalled, top_k).await?;
                     let context = assemble_processed_context(&processed);
                     (processed, context)
@@ -1290,6 +1324,15 @@ mod tests {
         assert!(!passes_similarity_threshold(0.49, 0.5));
         assert!(passes_similarity_threshold(0.01, 0.0));
         assert!(passes_similarity_threshold(-1.0, 0.0));
+    }
+
+    #[test]
+    fn chat_dense_skips_similarity_threshold_like_python() {
+        let hits = vec![(0, 0.49), (1, 0.9)];
+        let http = filter_dense_hits(hits.clone(), 0.5, true);
+        assert_eq!(http, vec![(1, 0.9)]);
+        let chat = filter_dense_hits(hits, 0.5, false);
+        assert_eq!(chat, vec![(0, 0.49), (1, 0.9)]);
     }
 
     #[test]
