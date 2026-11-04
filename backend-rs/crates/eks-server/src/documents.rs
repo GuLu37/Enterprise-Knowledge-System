@@ -1,5 +1,8 @@
 //! 文档路由（列表/正文/上传/删除）。
 
+use std::collections::HashSet;
+use std::path::Path as FsPath;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -54,6 +57,56 @@ fn doc_to_json(row: &DocumentRow) -> Value {
         "created_at": db::dt_to_iso(&row.created_at),
         "updated_at": db::dt_to_iso(&row.updated_at),
     })
+}
+
+fn sanitize_original_filename(raw: &str) -> String {
+    raw.trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn upload_file_type(filename: &str) -> String {
+    FsPath::new(filename)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('.')
+        .to_lowercase()
+}
+
+fn normalized_allowed_types(types: &[String]) -> HashSet<String> {
+    types
+        .iter()
+        .map(|item| {
+            item.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_start_matches('.')
+                .to_lowercase()
+        })
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn reject_unsupported_file_type(file_type: &str, allowed: &[String]) -> Option<String> {
+    let file_type = file_type.trim().trim_start_matches('.').to_lowercase();
+    if normalized_allowed_types(allowed).contains(&file_type) {
+        None
+    } else {
+        Some(format!("不支持的文件类型: {file_type}"))
+    }
+}
+
+fn reject_oversized_upload(size: usize, max_upload_size: i64) -> Option<&'static str> {
+    if (size as i64) > max_upload_size {
+        Some("文件超过最大上传限制")
+    } else {
+        None
+    }
 }
 
 pub fn guess_content_type(file_type: &str) -> &'static str {
@@ -341,12 +394,23 @@ pub async fn upload_document(
         }
     }
 
-    if filename.is_empty() || file_data.is_empty() {
-        return Err(AuthError::bad_request("文件不能为空"));
+    let filename = sanitize_original_filename(&filename);
+    if filename.is_empty() {
+        return Err(AuthError::bad_request("文件名不能为空"));
+    }
+    let file_type = upload_file_type(&filename);
+    if let Some(detail) = reject_unsupported_file_type(&file_type, &state.config.allowed_file_types)
+    {
+        return Err(AuthError::bad_request(&detail));
+    }
+    if let Some(detail) = reject_oversized_upload(file_data.len(), state.config.max_upload_size) {
+        return Err(AuthError::bad_request(detail));
+    }
+    if file_data.is_empty() {
+        return Err(AuthError::bad_request("文档内容为空，无法生成向量"));
     }
 
     let document_id = uuid::Uuid::new_v4().simple().to_string();
-    let file_type = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     let content_type = guess_content_type(&file_type);
     let stored_filename = format!("{document_id}.{file_type}");
     let upload_dir = std::path::Path::new(&state.config.sqlite_path)
@@ -621,5 +685,38 @@ mod tests {
         assert!(!stored.exists());
         assert!(!extra.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitizes_upload_filename_and_type() {
+        assert_eq!(
+            sanitize_original_filename(r"C:\uploads\..\手册.PDF"),
+            "手册.PDF"
+        );
+        assert_eq!(sanitize_original_filename("/tmp/a/b.md"), "b.md");
+        assert_eq!(sanitize_original_filename("  "), "");
+        assert_eq!(upload_file_type("手册.PDF"), "pdf");
+        assert_eq!(upload_file_type("noext"), "");
+    }
+
+    #[test]
+    fn rejects_unsupported_type_and_oversized_upload() {
+        let allowed = vec!["pdf".into(), "md".into(), "txt".into()];
+        assert_eq!(
+            reject_unsupported_file_type("exe", &allowed).as_deref(),
+            Some("不支持的文件类型: exe")
+        );
+        assert_eq!(
+            reject_unsupported_file_type("", &allowed).as_deref(),
+            Some("不支持的文件类型: ")
+        );
+        assert!(reject_unsupported_file_type("PDF", &allowed).is_none());
+        assert!(reject_unsupported_file_type("md", &allowed).is_none());
+        assert_eq!(
+            reject_oversized_upload(104_857_601, 104_857_600),
+            Some("文件超过最大上传限制")
+        );
+        assert!(reject_oversized_upload(104_857_600, 104_857_600).is_none());
+        assert!(reject_oversized_upload(0, 104_857_600).is_none());
     }
 }

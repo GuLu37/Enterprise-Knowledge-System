@@ -64,10 +64,15 @@ pub struct Config {
     pub bootstrap_admin_password: String,
     pub bootstrap_admin_role: String,
     pub startup_init_llm: bool,
+    pub max_upload_size: i64,
+    pub allowed_file_types: Vec<String>,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
     r#"["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080"]"#;
+const DEFAULT_ALLOWED_FILE_TYPES: &str =
+    r#"["pdf", "txt", "md", "doc", "docx", "ppt", "pptx", "xlsx", "xls"]"#;
+const DEFAULT_MAX_UPLOAD_SIZE: i64 = 104_857_600;
 
 /// 对齐 Python `_parse_list`：JSON 数组，失败则按逗号拆。
 pub fn parse_cors_origins(raw: &str) -> Vec<String> {
@@ -97,6 +102,26 @@ pub fn parse_cors_origins(raw: &str) -> Vec<String> {
         .trim_matches(|ch| ch == '[' || ch == ']')
         .split(',')
         .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// 对齐 Python `_parse_list` + `_normalize_allowed_types`。
+pub fn parse_allowed_file_types(raw: &str) -> Vec<String> {
+    let source = if raw.trim().is_empty() {
+        DEFAULT_ALLOWED_FILE_TYPES
+    } else {
+        raw
+    };
+    parse_cors_origins(source)
+        .into_iter()
+        .map(|item| {
+            item.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_start_matches('.')
+                .to_lowercase()
+        })
         .filter(|item| !item.is_empty())
         .collect()
 }
@@ -235,6 +260,10 @@ impl Config {
             bootstrap_admin_password: env_or("BOOTSTRAP_ADMIN_PASSWORD", "123456"),
             bootstrap_admin_role: env_or("BOOTSTRAP_ADMIN_ROLE", "admin"),
             startup_init_llm: env_bool("STARTUP_INIT_LLM", true),
+            max_upload_size: env_i64("MAX_UPLOAD_SIZE", DEFAULT_MAX_UPLOAD_SIZE).max(0),
+            allowed_file_types: parse_allowed_file_types(
+                &env::var("ALLOWED_FILE_TYPES").unwrap_or_default(),
+            ),
         }
     }
 
@@ -302,6 +331,8 @@ impl Config {
             bootstrap_admin_password: "123456".into(),
             bootstrap_admin_role: "admin".into(),
             startup_init_llm: true,
+            max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
+            allowed_file_types: parse_allowed_file_types(""),
         }
     }
 }
@@ -348,5 +379,24 @@ mod tests {
         assert_eq!(Config::jwt_test().app_name, "Enterprise Knowledge System");
         assert_eq!(Config::jwt_test().app_version, "1.0.0");
         assert_eq!(Config::jwt_test().environment, "开发版");
+        assert_eq!(Config::jwt_test().max_upload_size, 104_857_600);
+        assert!(Config::jwt_test().allowed_file_types.contains(&"pdf".into()));
+        assert!(Config::jwt_test().allowed_file_types.contains(&"xlsx".into()));
+    }
+
+    #[test]
+    fn parses_allowed_file_types_like_python() {
+        assert_eq!(
+            parse_allowed_file_types(r#"["PDF", ".Txt", "md"]"#),
+            vec!["pdf", "txt", "md"]
+        );
+        assert_eq!(
+            parse_allowed_file_types("docx, xlsx, pptx"),
+            vec!["docx", "xlsx", "pptx"]
+        );
+        let defaults = parse_allowed_file_types("");
+        assert!(defaults.contains(&"pdf".to_string()));
+        assert!(defaults.contains(&"xls".to_string()));
+        assert!(defaults.contains(&"doc".to_string()));
     }
 }
