@@ -20,6 +20,7 @@ use crate::retrieval::{
     MAX_CITATION_RESULTS, MIN_FINAL_RELEVANCE_SCORE, STRUCTURED_QUERY_CITATION_RESULTS,
     RetrievalItem, SparseIndexSnapshot, canonical_identifier_terms, citation_chunk_key,
     collapse_spaces, expand_multi_query_with_llm, is_structured_lookup_query,
+    legacy_like_search, rank_sparse_hits, should_use_cached_sparse, sparse_candidate_limit,
 };
 
 const MAX_MULTI_QUERY_COUNT: usize = 3;
@@ -166,6 +167,7 @@ pub struct RetrievalEngine {
     pub use_dense: bool,
     pub use_sparse: bool,
     pub use_hybrid: bool,
+    pub sparse_index_mode: String,
     pub sparse_index_max_rows: usize,
     pub similarity_threshold: f64,
     pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
@@ -195,6 +197,7 @@ impl RetrievalEngine {
             use_dense: true,
             use_sparse: true,
             use_hybrid: true,
+            sparse_index_mode: "cached".into(),
             sparse_index_max_rows: 50_000,
             similarity_threshold: 0.5,
             cross_encoder: None,
@@ -216,6 +219,7 @@ impl RetrievalEngine {
         self.use_dense = config.use_dense_retriever;
         self.use_sparse = config.use_sparse_retriever;
         self.use_hybrid = config.use_hybrid_retriever;
+        self.sparse_index_mode = config.sparse_index_mode.clone();
         self.sparse_index_max_rows = config.sparse_index_max_rows;
         self.similarity_threshold = config.similarity_threshold;
         self
@@ -258,28 +262,68 @@ impl RetrievalEngine {
         self
     }
 
-    async fn sparse_snapshot(&self) -> Result<Arc<SparseIndexSnapshot>, String> {
+    async fn ensure_cached_sparse(
+        &self,
+        rows: &[crate::milvus_lite::Row],
+    ) -> Arc<SparseIndexSnapshot> {
         {
             let cached = self.sparse.read().await;
             if let Some(snapshot) = cached.as_ref() {
-                return Ok(snapshot.clone());
+                return snapshot.clone();
             }
+        }
+        let built = Arc::new(SparseIndexSnapshot::build(rows));
+        *self.sparse.write().await = Some(built.clone());
+        built
+    }
+
+    fn uses_cached_sparse(&self, row_count: usize) -> bool {
+        should_use_cached_sparse(&self.sparse_index_mode, row_count, self.sparse_index_max_rows)
+    }
+
+    async fn sparse_hits(
+        &self,
+        rows: &[crate::milvus_lite::Row],
+        query: &str,
+        limit: usize,
+    ) -> Vec<(usize, f64, f64)> {
+        if self.uses_cached_sparse(rows.len()) {
+            let index = self.ensure_cached_sparse(rows).await;
+            return index.search(query, limit.max(1));
+        }
+        if self.sparse_index_mode.trim().eq_ignore_ascii_case("cached")
+            && rows.len() > self.sparse_index_max_rows
+        {
+            tracing::warn!(
+                rows = rows.len(),
+                max_rows = self.sparse_index_max_rows,
+                "child 行数超过稀疏持久索引上限，回退词法预筛"
+            );
+        }
+        legacy_like_search(rows, query, limit.max(1))
+    }
+
+    /// 对齐 Python `warm_build_sparse_index`：cached 模式下预构建进程内 BM25。
+    pub async fn warm_sparse_index(&self) -> Result<usize, String> {
+        if !self.use_sparse || !self.sparse_index_mode.trim().eq_ignore_ascii_case("cached") {
+            return Ok(0);
         }
         let snapshot = self
             .store
             .collection(self.child_collection())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| err.to_string())?;
         if snapshot.rows.len() > self.sparse_index_max_rows {
             tracing::warn!(
                 rows = snapshot.rows.len(),
                 max_rows = self.sparse_index_max_rows,
-                "child 行数超过 SPARSE_INDEX_MAX_ROWS，Rust 无 LIKE 回退，仍构建全量稀疏索引"
+                "稀疏持久索引预热跳过：超过行数上限，检索将走词法预筛"
             );
+            return Ok(0);
         }
-        let built = Arc::new(SparseIndexSnapshot::build(&snapshot.rows));
-        *self.sparse.write().await = Some(built.clone());
-        Ok(built)
+        let count = snapshot.rows.len();
+        let _ = self.ensure_cached_sparse(&snapshot.rows).await;
+        Ok(count)
     }
 
     pub async fn invalidate(&self) {
@@ -328,17 +372,12 @@ impl RetrievalEngine {
             .collection(self.child_collection())
             .await
             .map_err(|err| err.to_string())?;
-        let index = self.sparse_snapshot().await?;
-        Ok(index
-            .search(query, top_k)
+        let hits = self
+            .sparse_hits(&snapshot.rows, query, sparse_candidate_limit(top_k))
+            .await;
+        Ok(rank_sparse_hits(&snapshot.rows, hits, top_k)
             .into_iter()
-            .map(|(row_index, bm25, lexical)| {
-                RetrievalItem::from_row(
-                    &snapshot.rows[row_index],
-                    bm25.max(0.0) + lexical,
-                    "sparse",
-                )
-            })
+            .map(|(row_index, score)| RetrievalItem::from_row(&snapshot.rows[row_index], score, "sparse"))
             .collect())
     }
 
@@ -504,7 +543,6 @@ impl RetrievalEngine {
             .collection(self.child_collection())
             .await
             .map_err(|e| e.to_string())?;
-        let sparse_index = self.sparse_snapshot().await?;
 
         // dense: 一次 embedding 批量 + 每变体一次暴力 COSINE
         let query_vectors = self.embedder.embed_queries(&queries)?;
@@ -521,7 +559,9 @@ impl RetrievalEngine {
                     RetrievalItem::from_row(&snapshot.rows[*row_index], *score, "dense").to_fuse_item()
                 })
                 .collect();
-            let sparse_hits = sparse_index.search(q, candidate_k.max(80));
+            let sparse_hits = self
+                .sparse_hits(&snapshot.rows, q, candidate_k.max(80))
+                .await;
             let sparse: Vec<FuseItem<RetrievalItem>> = sparse_hits
                 .iter()
                 .map(|(row_index, bm25, lexical)| {

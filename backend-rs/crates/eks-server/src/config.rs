@@ -19,10 +19,13 @@ pub struct Config {
     pub bge_model_dir: String,
     pub bge_query_instruction: String,
     pub bge_max_length: i64,
+    pub bge_batch_size: usize,
     pub milvus_lite_path: String,
     pub cross_encoder_enabled: bool,
     pub cross_encoder_onnx: String,
     pub cross_encoder_tokenizer: String,
+    pub cross_encoder_max_length: usize,
+    pub cross_encoder_batch_size: usize,
     pub cross_encoder_candidate_k: usize,
     pub cross_encoder_weight: f64,
     pub rule_rerank_weight: f64,
@@ -80,6 +83,7 @@ pub struct Config {
     pub use_dense_retriever: bool,
     pub use_sparse_retriever: bool,
     pub use_hybrid_retriever: bool,
+    pub sparse_index_mode: String,
     pub sparse_index_max_rows: usize,
 }
 
@@ -373,10 +377,13 @@ impl Config {
                 "为这个句子生成表示以用于检索相关文章：",
             ),
             bge_max_length: env_i64("BGE_MAX_LENGTH", 512),
+            bge_batch_size: env_i64("BGE_BATCH_SIZE", 16).max(1) as usize,
             milvus_lite_path: load_milvus_lite_path(),
             cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", false),
             cross_encoder_onnx: env_or("EKS_CROSS_ENCODER_ONNX", ""),
             cross_encoder_tokenizer: env_or("EKS_CROSS_ENCODER_TOKENIZER", ""),
+            cross_encoder_max_length: env_i64("CROSS_ENCODER_MAX_LENGTH", 512).max(16) as usize,
+            cross_encoder_batch_size: env_i64("CROSS_ENCODER_BATCH_SIZE", 8).max(1) as usize,
             cross_encoder_candidate_k: env_i64("CROSS_ENCODER_CANDIDATE_K", 30).max(1) as usize,
             cross_encoder_weight: env_f64("CROSS_ENCODER_WEIGHT", 0.65).clamp(0.0, 1.0),
             rule_rerank_weight: env_f64("RULE_RERANK_WEIGHT", 0.35).clamp(0.0, 1.0),
@@ -446,6 +453,7 @@ impl Config {
             use_dense_retriever: env_bool("USE_DENSE_RETRIEVER", true),
             use_sparse_retriever: env_bool("USE_SPARSE_RETRIEVER", true),
             use_hybrid_retriever: env_bool("USE_HYBRID_RETRIEVER", true),
+            sparse_index_mode: env_or("SPARSE_INDEX_MODE", "cached").trim().to_lowercase(),
             sparse_index_max_rows: env_i64("SPARSE_INDEX_MAX_ROWS", 50_000).max(1000) as usize,
         };
         if let Err(err) = validate_runtime_security(
@@ -476,10 +484,13 @@ impl Config {
             bge_model_dir: String::new(),
             bge_query_instruction: String::new(),
             bge_max_length: 512,
+            bge_batch_size: 16,
             milvus_lite_path: String::new(),
             cross_encoder_enabled: false,
             cross_encoder_onnx: String::new(),
             cross_encoder_tokenizer: String::new(),
+            cross_encoder_max_length: 512,
+            cross_encoder_batch_size: 8,
             cross_encoder_candidate_k: 30,
             cross_encoder_weight: 0.65,
             rule_rerank_weight: 0.35,
@@ -537,6 +548,7 @@ impl Config {
             use_dense_retriever: true,
             use_sparse_retriever: true,
             use_hybrid_retriever: true,
+            sparse_index_mode: "cached".into(),
             sparse_index_max_rows: 50_000,
         }
     }
@@ -594,6 +606,9 @@ mod tests {
         assert_eq!(Config::jwt_test().similarity_threshold, 0.5);
         assert!(Config::jwt_test().upload_dir.is_empty());
         assert!(!Config::jwt_test().cross_encoder_enabled);
+        assert_eq!(Config::jwt_test().bge_batch_size, 16);
+        assert_eq!(Config::jwt_test().cross_encoder_max_length, 512);
+        assert_eq!(Config::jwt_test().cross_encoder_batch_size, 8);
         assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
         assert_eq!(Config::jwt_test().milvus_memory_collection, "memory_chunks");
         assert_eq!(Config::jwt_test().dense_weight, 0.5);
@@ -601,6 +616,7 @@ mod tests {
         assert!(Config::jwt_test().use_dense_retriever);
         assert!(Config::jwt_test().use_sparse_retriever);
         assert!(Config::jwt_test().use_hybrid_retriever);
+        assert_eq!(Config::jwt_test().sparse_index_mode, "cached");
         assert_eq!(Config::jwt_test().sparse_index_max_rows, 50_000);
     }
 

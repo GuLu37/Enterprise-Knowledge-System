@@ -60,8 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &eks_server::cross_encoder::CrossEncoderConfig {
                 onnx_path: std::path::PathBuf::from(&config.cross_encoder_onnx),
                 tokenizer_path: std::path::PathBuf::from(&config.cross_encoder_tokenizer),
-                max_length: 512,
-                batch_size: 8,
+                max_length: config.cross_encoder_max_length,
+                batch_size: config.cross_encoder_batch_size,
             },
         ) {
             Ok(ce) => {
@@ -84,6 +84,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let engine = std::sync::Arc::new(engine);
+    if config.use_sparse_retriever
+        && config.sparse_index_mode.trim().eq_ignore_ascii_case("cached")
+    {
+        let warm_engine = engine.clone();
+        tokio::spawn(async move {
+            match warm_engine.warm_sparse_index().await {
+                Ok(rows) => tracing::info!(rows, "稀疏持久索引预热完成"),
+                Err(err) => tracing::warn!("稀疏持久索引预热失败，检索将回退词法预筛: {err}"),
+            }
+        });
+    }
     eks_server::memory::configure_memory_vectors(eks_server::memory::MemoryVectorSink {
         store: store.clone(),
         collection: config.milvus_memory_collection.clone(),

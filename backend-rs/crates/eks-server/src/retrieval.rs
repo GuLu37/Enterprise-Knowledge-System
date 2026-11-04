@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use eks_kernels::bm25::BM25Okapi;
 use eks_kernels::fuse::{FuseItem, fuse_ranked_results};
+use eks_kernels::lexical::{build_filter_terms, lexical_match_score};
 use eks_kernels::rerank::{
     Candidate, build_query_keywords, build_relevance_signals, extract_identifier_terms,
     is_identifier_query, is_reference_index_result, normalize_source_score,
@@ -638,6 +639,128 @@ pub fn canonical_identifier_terms(query: &str) -> Vec<String> {
     identifiers
 }
 
+/// 对齐 SparseRetriever：LIKE/持久索引候选上限 `max(top_k * 30, 80)`。
+pub fn sparse_candidate_limit(top_k: usize) -> usize {
+    top_k.saturating_mul(30).max(80)
+}
+
+/// 对齐 Python：仅 `cached` 且未超 `SPARSE_INDEX_MAX_ROWS` 时走进程内持久 BM25。
+pub fn should_use_cached_sparse(mode: &str, row_count: usize, max_rows: usize) -> bool {
+    mode.trim().eq_ignore_ascii_case("cached") && row_count <= max_rows
+}
+
+fn row_field<'a>(row: &'a Row, key: &str) -> &'a str {
+    row.fields
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+fn searchable_row_text(row: &Row) -> String {
+    let source_name = row_field(row, "source_name");
+    let content = ["child_text", "chunk_text", "text"]
+        .into_iter()
+        .map(|key| row_field(row, key))
+        .find(|value| !value.is_empty())
+        .unwrap_or("");
+    [source_name, content]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn row_matches_filter_terms(row: &Row, terms: &[String]) -> bool {
+    let source_name = row_field(row, "source_name");
+    let child_text = row_field(row, "child_text");
+    terms.iter().any(|term| {
+        !term.is_empty() && (child_text.contains(term) || source_name.contains(term))
+    })
+}
+
+fn collect_like_candidates(rows: &[Row], terms: &[String], candidate_limit: usize) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row_matches_filter_terms(row, terms))
+        .map(|(index, _)| index)
+        .take(candidate_limit.max(1))
+        .collect()
+}
+
+fn score_sparse_subset(rows: &[Row], indexes: &[usize], query: &str) -> Vec<(usize, f64, f64)> {
+    if indexes.is_empty() {
+        return Vec::new();
+    }
+    let texts: Vec<String> = indexes
+        .iter()
+        .map(|&index| searchable_row_text(&rows[index]))
+        .collect();
+    let tokens: Vec<Vec<String>> = texts.iter().map(|text| tokenize_cjk(text)).collect();
+    let bm25 = BM25Okapi::build(&tokens);
+    let query_tokens = tokenize_cjk(query);
+    let scores = bm25.get_scores(&query_tokens);
+    indexes
+        .iter()
+        .enumerate()
+        .map(|(position, &row_index)| {
+            let lexical = lexical_match_score(
+                &query_tokens,
+                &tokens[position],
+                query,
+                &texts[position],
+            );
+            (row_index, scores[position], lexical)
+        })
+        .collect()
+}
+
+/// 复刻 SparseRetriever._legacy_like_search：词法预筛候选后再在子集上重建 BM25。
+pub fn legacy_like_search(rows: &[Row], query: &str, candidate_limit: usize) -> Vec<(usize, f64, f64)> {
+    let filter_terms = build_filter_terms(query, 12);
+    if filter_terms.is_empty() {
+        return Vec::new();
+    }
+    let cap = candidate_limit.max(1);
+    let mut candidates = collect_like_candidates(rows, &filter_terms, cap);
+    if candidates.is_empty() && filter_terms.len() > 1 {
+        let fallback = &filter_terms[..filter_terms.len().min(4)];
+        candidates = collect_like_candidates(rows, fallback, cap);
+    }
+    score_sparse_subset(rows, &candidates, query)
+}
+
+/// 对齐 Python：`final_score = max(0, bm25) + lexical`，按分数降序、chunk_index 升序截断。
+pub fn rank_sparse_hits(
+    rows: &[Row],
+    hits: Vec<(usize, f64, f64)>,
+    top_k: usize,
+) -> Vec<(usize, f64)> {
+    let mut ranked: Vec<(f64, i64, usize)> = hits
+        .into_iter()
+        .map(|(row_index, bm25, lexical)| {
+            let score = bm25.max(0.0) + lexical;
+            let chunk_index = rows
+                .get(row_index)
+                .and_then(|row| row.fields.get("chunk_index"))
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            (score, chunk_index, row_index)
+        })
+        .filter(|(score, _, _)| *score > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    ranked
+        .into_iter()
+        .take(top_k.max(1))
+        .map(|(score, _, row_index)| (row_index, score))
+        .collect()
+}
+
 // ---------------- 稀疏索引（两段式 BM25，语义与 Python sparse_index 一致） ----------------
 
 pub struct SparseIndexSnapshot {
@@ -708,7 +831,7 @@ impl SparseIndexSnapshot {
             .iter()
             .enumerate()
             .map(|(position, &text_index)| {
-                let lexical = eks_kernels::lexical::lexical_match_score(
+                let lexical = lexical_match_score(
                     &query_tokens,
                     &self.row_tokens[text_index],
                     query,
@@ -853,5 +976,45 @@ mod tests {
             expand_multi_query_with_llm("差旅报销流程是什么", None, 3).await,
             expand_multi_query("差旅报销流程是什么")
         );
+    }
+
+    fn test_row(pk: i64, source: &str, text: &str, chunk_index: i64) -> Row {
+        let mut fields = HashMap::new();
+        fields.insert("source_name".into(), FieldValue::Str(source.into()));
+        fields.insert("child_text".into(), FieldValue::Str(text.into()));
+        fields.insert("chunk_index".into(), FieldValue::Int(chunk_index));
+        fields.insert("document_id".into(), FieldValue::Str("doc".into()));
+        Row {
+            pk,
+            vector: Vec::new(),
+            fields,
+        }
+    }
+
+    #[test]
+    fn cached_sparse_skips_when_over_max_or_legacy() {
+        assert!(should_use_cached_sparse("cached", 10, 50_000));
+        assert!(should_use_cached_sparse("CACHED", 50_000, 50_000));
+        assert!(!should_use_cached_sparse("cached", 50_001, 50_000));
+        assert!(!should_use_cached_sparse("legacy", 10, 50_000));
+        assert_eq!(sparse_candidate_limit(1), 80);
+        assert_eq!(sparse_candidate_limit(2), 80);
+        assert_eq!(sparse_candidate_limit(3), 90);
+        assert_eq!(sparse_candidate_limit(5), 150);
+    }
+
+    #[test]
+    fn legacy_like_keeps_shared_bigram_rows() {
+        let rows = vec![
+            test_row(1, "手册.pdf", "如何修改密码", 2),
+            test_row(2, "差旅.xlsx", "差旅报销流程说明", 1),
+        ];
+        let hits = legacy_like_search(&rows, "账号密码", 80);
+        let ranked = rank_sparse_hits(&rows, hits, 5);
+        assert!(
+            ranked.iter().any(|(index, _)| *index == 0),
+            "「修改密码」应被「账号密码」的二元词预筛命中"
+        );
+        assert!(!ranked.iter().any(|(index, _)| *index == 1));
     }
 }
