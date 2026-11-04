@@ -31,6 +31,7 @@ pub struct Embedder {
     pub query_instruction: String,
     max_length: usize,
     batch_size: usize,
+    normalize_embeddings: bool,
 }
 
 #[derive(Clone)]
@@ -39,6 +40,7 @@ pub struct EmbedderConfig {
     pub query_instruction: String,
     pub max_length: usize,
     pub batch_size: usize,
+    pub normalize_embeddings: bool,
 }
 
 impl EmbedderConfig {
@@ -48,6 +50,7 @@ impl EmbedderConfig {
             query_instruction: config.bge_query_instruction.clone(),
             max_length: config.bge_max_length as usize,
             batch_size: config.bge_batch_size.max(1),
+            normalize_embeddings: config.bge_normalize_embeddings,
         }
     }
 
@@ -97,6 +100,7 @@ impl Embedder {
             query_instruction: config.query_instruction.clone(),
             max_length: config.max_length.max(3),
             batch_size: config.batch_size.max(1),
+            normalize_embeddings: config.normalize_embeddings,
         })
     }
 
@@ -190,12 +194,7 @@ impl Embedder {
         for row in 0..batch {
             let start = row * seq_len * dim;
             let vector: Vec<f32> = data[start..start + dim].to_vec();
-            let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
-            result.push(if norm > 0.0 {
-                vector.into_iter().map(|v| v / norm).collect()
-            } else {
-                vector
-            });
+            result.push(maybe_l2_normalize(vector, self.normalize_embeddings));
         }
         Ok(result)
     }
@@ -228,7 +227,21 @@ pub fn embedder_for(model_dir: &Path, instruction: &str, max_length: usize) -> R
         query_instruction: instruction.to_string(),
         max_length,
         batch_size: 16,
+        normalize_embeddings: true,
     })
+}
+
+/// 对齐 Python `BGE_NORMALIZE_EMBEDDINGS`：默认 L2，关闭时返回 CLS 原向量。
+fn maybe_l2_normalize(vector: Vec<f32>, enabled: bool) -> Vec<f32> {
+    if !enabled {
+        return vector;
+    }
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.into_iter().map(|v| v / norm).collect()
+    } else {
+        vector
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +253,16 @@ mod tests {
         let config = EmbedderConfig::from_env(&crate::config::Config::jwt_test());
         assert_eq!(config.batch_size, 16);
         assert_eq!(config.max_length, 512);
+        assert!(config.normalize_embeddings);
+    }
+
+    #[test]
+    fn l2_normalize_can_be_disabled() {
+        let raw = vec![3.0_f32, 4.0];
+        let unit = maybe_l2_normalize(raw.clone(), true);
+        assert!((unit[0] - 0.6).abs() < 1e-6);
+        assert!((unit[1] - 0.8).abs() < 1e-6);
+        assert_eq!(maybe_l2_normalize(raw.clone(), false), raw);
+        assert_eq!(maybe_l2_normalize(vec![0.0, 0.0], true), vec![0.0, 0.0]);
     }
 }

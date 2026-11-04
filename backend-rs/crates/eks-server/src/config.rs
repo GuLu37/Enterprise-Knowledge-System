@@ -20,6 +20,7 @@ pub struct Config {
     pub bge_query_instruction: String,
     pub bge_max_length: i64,
     pub bge_batch_size: usize,
+    pub bge_normalize_embeddings: bool,
     pub milvus_lite_path: String,
     pub cross_encoder_enabled: bool,
     pub cross_encoder_onnx: String,
@@ -378,6 +379,7 @@ impl Config {
             ),
             bge_max_length: env_i64("BGE_MAX_LENGTH", 512),
             bge_batch_size: env_i64("BGE_BATCH_SIZE", 16).max(1) as usize,
+            bge_normalize_embeddings: env_bool("BGE_NORMALIZE_EMBEDDINGS", true),
             milvus_lite_path: load_milvus_lite_path(),
             cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", false),
             cross_encoder_onnx: env_or("EKS_CROSS_ENCODER_ONNX", ""),
@@ -485,6 +487,7 @@ impl Config {
             bge_query_instruction: String::new(),
             bge_max_length: 512,
             bge_batch_size: 16,
+            bge_normalize_embeddings: true,
             milvus_lite_path: String::new(),
             cross_encoder_enabled: false,
             cross_encoder_onnx: String::new(),
@@ -607,6 +610,7 @@ mod tests {
         assert!(Config::jwt_test().upload_dir.is_empty());
         assert!(!Config::jwt_test().cross_encoder_enabled);
         assert_eq!(Config::jwt_test().bge_batch_size, 16);
+        assert!(Config::jwt_test().bge_normalize_embeddings);
         assert_eq!(Config::jwt_test().cross_encoder_max_length, 512);
         assert_eq!(Config::jwt_test().cross_encoder_batch_size, 8);
         assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
