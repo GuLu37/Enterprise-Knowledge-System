@@ -186,6 +186,15 @@ pub async fn list_documents_compat(
     list_documents_page(&state, &headers, skip, limit).await
 }
 
+/// 对齐 Python `_log_delete_step`：`[文档删除][n/4] {message} (document_id=…)`。
+fn format_delete_step(document_id: &str, step: &str, message: &str) -> String {
+    format!("[文档删除][{step}] {message} (document_id={document_id})")
+}
+
+fn log_delete_step(document_id: &str, step: &str, message: &str) {
+    tracing::info!("{}", format_delete_step(document_id, step, message));
+}
+
 fn deletion_rejected(status: &str) -> Option<String> {
     match status.trim() {
         "deleting" | "deleted" => Some(format!("文档当前状态为 {status}，无法重复删除")),
@@ -210,12 +219,21 @@ async fn mark_document_deleting(
     pool: &sqlx::SqlitePool,
     document_id: &str,
 ) -> Result<DocumentRow, AuthError> {
+    log_delete_step(document_id, "1/4", "收到删除请求");
     let Some(row) = load_document(pool, document_id).await? else {
         return Err(AuthError::bad_request("文档不存在"));
     };
     if let Some(detail) = deletion_rejected(&row.status) {
         return Err(AuthError::bad_request(&detail));
     }
+    log_delete_step(
+        document_id,
+        "1/4",
+        &format!(
+            "SQLite 元数据校验通过: status={}, file_path={}",
+            row.status, row.file_path
+        ),
+    );
     let now = db::fmt_dt(&db::now_naive());
     sqlx::query(
         "UPDATE documents SET status = 'deleting', error_message = NULL, updated_at = ? \
@@ -230,6 +248,7 @@ async fn mark_document_deleting(
     updated.status = "deleting".into();
     updated.error_message = None;
     updated.updated_at = now;
+    log_delete_step(document_id, "1/4", "SQLite 状态已更新为 deleting");
     Ok(updated)
 }
 
@@ -257,7 +276,9 @@ async fn restore_document_after_delete_failure(
     .await
     {
         tracing::error!(document_id, "文档删除失败后回写状态失败: {restore_err}");
+        return;
     }
+    log_delete_step(document_id, "1/4", "后台删除失败，文档状态已恢复为 ready");
 }
 
 async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Result<(), String> {
@@ -271,17 +292,44 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
         return Ok(());
     }
 
-    tracing::info!(document_id, "开始删除 Milvus 文档切块");
-    let milvus_deleted = state.engine.delete_document_chunks(document_id).await?;
-    tracing::info!(document_id, milvus_deleted, "Milvus 文档切块删除完成");
+    log_delete_step(document_id, "1/4", "开始执行后台删除");
+    log_delete_step(document_id, "2/4", "开始删除 Milvus 文档切块");
+    match state.engine.delete_document_chunks(document_id).await {
+        Ok(deleted) => log_delete_step(
+            document_id,
+            "2/4",
+            &format!("Milvus 文档切块删除完成: deleted={deleted}"),
+        ),
+        Err(err) => {
+            tracing::error!(
+                "{}",
+                format_delete_step(
+                    document_id,
+                    "2/4",
+                    &format!("Milvus 文档切块删除失败: {err}")
+                )
+            );
+            return Err(err);
+        }
+    }
 
     let upload_dir = crate::config::resolve_upload_dir(
         &state.config.upload_dir,
         &state.config.sqlite_path,
     );
+    log_delete_step(
+        document_id,
+        "3/4",
+        &format!("开始删除本地文件: {}", row.file_path),
+    );
     let file_deleted = remove_document_files(&upload_dir, &row);
-    tracing::info!(document_id, file_deleted, "本地文件删除完成");
+    log_delete_step(
+        document_id,
+        "3/4",
+        &format!("本地文件删除完成: deleted={file_deleted}"),
+    );
 
+    log_delete_step(document_id, "4/4", "开始删除 SQLite 文档记录");
     sqlx::query("DELETE FROM document_chunks WHERE document_id = ?")
         .bind(document_id)
         .execute(&state.pool)
@@ -292,8 +340,9 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
         .execute(&state.pool)
         .await
         .map_err(|err| err.to_string())?;
+    log_delete_step(document_id, "4/4", "SQLite 文档记录删除完成");
     state.engine.invalidate().await;
-    tracing::info!(document_id, "文档删除完成");
+    tracing::info!("✓ 文档删除完成 (document_id={document_id})");
     Ok(())
 }
 
@@ -856,6 +905,22 @@ mod tests {
         assert!(deletion_rejected("ready").is_none());
         assert!(deletion_rejected("processing").is_none());
         assert!(deletion_rejected("failed").is_none());
+    }
+
+    #[test]
+    fn delete_step_log_matches_python() {
+        assert_eq!(
+            format_delete_step("doc-1", "1/4", "收到删除请求"),
+            "[文档删除][1/4] 收到删除请求 (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_delete_step("doc-1", "2/4", "Milvus 文档切块删除完成: deleted=true"),
+            "[文档删除][2/4] Milvus 文档切块删除完成: deleted=true (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_delete_step("doc-1", "4/4", "SQLite 文档记录删除完成"),
+            "[文档删除][4/4] SQLite 文档记录删除完成 (document_id=doc-1)"
+        );
     }
 
     #[test]
