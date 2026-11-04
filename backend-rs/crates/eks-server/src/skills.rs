@@ -1,10 +1,13 @@
 //! 本地 Skill：规则路由 + SQLite 执行。
 //!
 //! 覆盖前端会直接碰到的工具目录、知识库文件、热词和画像记忆。
+//! 同名 markdown（`backend/app/skills/{name}/{name}.md`）作为 `skill_instructions`
+//! 写入执行封装，供最终回答把该 Skill 的详细规则当作补充规范。
 //! 远程 MCP 通过 `MCP_REMOTE_TOOL_MANIFESTS` 注册进同一套目录；未就绪工具
 //! 只出现在 capabilities，不进入 Function Calling。
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -691,6 +694,112 @@ pub fn skill_capabilities_payload_from(manifests: &[Value]) -> Value {
     })
 }
 
+pub fn default_skills_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("EKS_SKILLS_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    candidate_skills_dirs()
+        .into_iter()
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| PathBuf::from("../backend/app/skills"))
+}
+
+fn candidate_skills_dirs() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("backend/app/skills"),
+        PathBuf::from("../backend/app/skills"),
+        PathBuf::from("../../backend/app/skills"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../backend/app/skills"),
+    ]
+}
+
+/// 对齐 Python `get_skill_document_path`：拒绝空名、`.` / `..` 与路径分隔符。
+pub fn get_skill_document_path(skill_name: &str) -> Result<PathBuf, String> {
+    get_skill_document_path_in(skill_name, &default_skills_dir())
+}
+
+fn get_skill_document_path_in(skill_name: &str, skills_root: &Path) -> Result<PathBuf, String> {
+    let normalized = skill_name.trim();
+    if normalized.is_empty()
+        || matches!(normalized, "." | "..")
+        || Path::new(normalized)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(normalized)
+    {
+        return Err(format!("非法 Skill 名称: {skill_name}"));
+    }
+    Ok(skills_root.join(normalized).join(format!("{normalized}.md")))
+}
+
+pub fn read_skill_document(skill_name: &str) -> Result<String, String> {
+    let definition =
+        get_skill_definition(skill_name).ok_or_else(|| format!("未找到技能: {skill_name}"))?;
+    read_skill_document_for_definition(&definition)
+}
+
+fn read_skill_document_for_definition(definition: &SkillDefinition) -> Result<String, String> {
+    read_skill_document_for_definition_from(definition, &default_skills_dir())
+}
+
+fn read_skill_document_for_definition_from(
+    definition: &SkillDefinition,
+    skills_root: &Path,
+) -> Result<String, String> {
+    if definition.kind != "local" {
+        return Ok(String::new());
+    }
+    let document_path = get_skill_document_path_in(&definition.name, skills_root)?;
+    ensure_document_within_skills_root(skills_root, &document_path, &definition.name)?;
+    if !document_path.is_file() {
+        tracing::warn!(path = %document_path.display(), "Skill 详细文档不存在");
+        return Ok(String::new());
+    }
+    std::fs::read_to_string(&document_path)
+        .map_err(|err| format!("读取 Skill 文档失败 {}: {err}", document_path.display()))
+}
+
+fn ensure_document_within_skills_root(
+    skills_root: &Path,
+    document_path: &Path,
+    skill_name: &str,
+) -> Result<(), String> {
+    let root = normalize_path(skills_root);
+    let document = normalize_path(document_path);
+    if document.starts_with(&root) && document != root {
+        Ok(())
+    } else {
+        Err(format!("Skill 文档路径超出技能目录: {skill_name}"))
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 pub fn wrap_skill_execution(
     name: &str,
     arguments: &Value,
@@ -703,6 +812,7 @@ pub fn wrap_skill_execution(
     result: Value,
 ) -> Result<Value, String> {
     let definition = get_skill_definition(name).ok_or_else(|| format!("未找到技能: {name}"))?;
+    let skill_instructions = read_skill_document_for_definition(&definition)?;
     let executed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     Ok(json!({
         "skill": definition.name,
@@ -718,6 +828,7 @@ pub fn wrap_skill_execution(
             "trace_id": trace_id,
             "metadata": if metadata.is_null() { json!({}) } else { metadata },
         },
+        "skill_instructions": skill_instructions,
         "result": result,
         "executed_at": executed_at,
     }))
@@ -1373,6 +1484,7 @@ fn is_cjk(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn routes_tool_catalog_and_file_list() {
@@ -1442,7 +1554,88 @@ mod tests {
             wrapped.pointer("/context/conversation_id").and_then(|value| value.as_str()),
             Some("c1")
         );
+        let instructions = wrapped
+            .get("skill_instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        assert!(instructions.contains("记忆查询"));
+        assert!(instructions.contains("不能跨用户"));
         assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
+    }
+
+    #[test]
+    fn rejects_illegal_skill_document_names() {
+        let root = Path::new("/tmp/skills");
+        for name in ["", ".", "..", "../etc", "foo/bar", "a/../b"] {
+            let err = get_skill_document_path_in(name, root).unwrap_err();
+            assert!(err.contains("非法 Skill 名称"), "{name}: {err}");
+        }
+        assert_eq!(
+            get_skill_document_path_in("memory_query", root).unwrap(),
+            root.join("memory_query").join("memory_query.md")
+        );
+    }
+
+    #[test]
+    fn reads_local_markdown_skips_remote_and_missing_files() {
+        let text = read_skill_document("memory_query").unwrap();
+        assert!(text.contains("# 记忆查询 Skill"));
+        assert!(text.contains("## 使用规则"));
+
+        let remote = SkillDefinition {
+            name: "crm_lookup".into(),
+            description: "查询客户".into(),
+            category: "mcp".into(),
+            kind: "remote_mcp".into(),
+            tags: vec![],
+            provider: Some("crm".into()),
+            parameters: json!({"type": "object"}),
+            metadata: json!({"executor_ready": false}),
+        };
+        assert_eq!(read_skill_document_for_definition(&remote).unwrap(), "");
+
+        let missing_root = std::env::temp_dir().join(format!("eks-skill-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&missing_root).unwrap();
+        let missing = skill_def(
+            "memory_query",
+            "d",
+            "memory",
+            &[],
+            json!({"type": "object"}),
+            "r",
+        );
+        assert_eq!(
+            read_skill_document_for_definition_from(&missing, &missing_root).unwrap(),
+            ""
+        );
+        std::fs::remove_dir_all(&missing_root).ok();
+    }
+
+    #[test]
+    fn reads_markdown_from_explicit_root_and_rejects_escaped_paths() {
+        let root = std::env::temp_dir().join(format!("eks-skill-docs-{}", uuid::Uuid::new_v4()));
+        let doc_dir = root.join("fixture_skill");
+        std::fs::create_dir_all(&doc_dir).unwrap();
+        std::fs::write(doc_dir.join("fixture_skill.md"), "# Fixture\n规则甲").unwrap();
+        let definition = skill_def(
+            "fixture_skill",
+            "d",
+            "system",
+            &[],
+            json!({"type": "object"}),
+            "r",
+        );
+        let text = read_skill_document_for_definition_from(&definition, &root).unwrap();
+        assert_eq!(text, "# Fixture\n规则甲");
+
+        let err = ensure_document_within_skills_root(
+            Path::new("/tmp/eks-skills-root"),
+            Path::new("/etc/passwd"),
+            "fixture_skill",
+        )
+        .unwrap_err();
+        assert!(err.contains("超出技能目录"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
