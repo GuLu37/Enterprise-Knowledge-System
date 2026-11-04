@@ -169,7 +169,7 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 | 模块 | 技术 |
 | --- | --- |
 | 前端 | Vue 3、Vite、Lucide Vue |
-| 后端 | Python、FastAPI、Uvicorn、SQLAlchemy、Loguru |
+| 后端 | Rust、Axum、SQLite（`backend-rs`，默认服务）；Python FastAPI 仍保留为对照实现 |
 | LLM 编排 | LangChain Core、Function Calling、ReAct 检索循环 |
 | 检索 | Milvus、BGE Embedding、BM25、RRF、规则重排、可选 Cross-Encoder |
 | 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |

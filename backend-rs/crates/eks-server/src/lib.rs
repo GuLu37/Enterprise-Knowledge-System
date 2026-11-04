@@ -14,6 +14,7 @@ pub mod milvus_lite;
 pub mod retrieval;
 pub mod retrieval_engine;
 pub mod routes;
+pub mod skills;
 pub mod state;
 
 #[cfg(test)]

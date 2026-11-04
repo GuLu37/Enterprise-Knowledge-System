@@ -30,6 +30,7 @@ futures-util = "0.3"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 calamine = "0.24"
 zip = "1"
+pdf-extract = "0.7"
 parquet = { version = "53", features = ["arrow"] }
 arrow = "53"
 arrow-array = "53"

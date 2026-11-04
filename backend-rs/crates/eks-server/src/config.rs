@@ -35,6 +35,7 @@ pub struct Config {
     pub openrouter_model: String,
     pub openai_api_key: String,
     pub openai_model: String,
+    pub chat_max_conversations: i64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -76,7 +77,7 @@ impl Config {
         Config {
             api_prefix: env_or("API_PREFIX", "/api/v1"),
             host: env_or("EKS_HOST", "127.0.0.1"),
-            port: env_i64("EKS_PORT", 8001) as u16,
+            port: env_i64("EKS_PORT", 8000) as u16,
             sqlite_path: env_or(
                 "EKS_SQLITE_PATH",
                 "../backend/app/data/rag_metadata.db",
@@ -118,6 +119,7 @@ impl Config {
             openrouter_model: env_or("OPENROUTER_MODEL", ""),
             openai_api_key: env_or("OPENAI_API_KEY", ""),
             openai_model: env_or("OPENAI_MODEL", "gpt-4o-mini"),
+            chat_max_conversations: env_i64("CHAT_MAX_CONVERSATIONS", 20).clamp(1, 200),
         }
     }
 }

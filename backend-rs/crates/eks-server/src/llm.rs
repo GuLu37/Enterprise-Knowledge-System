@@ -94,6 +94,7 @@ pub struct LlmClient {
 pub struct ChatCompletion {
     pub content: String,
     pub provider: String,
+    pub model: String,
 }
 
 /// 流式 chunk。
@@ -231,6 +232,7 @@ impl LlmClient {
         Ok(ChatCompletion {
             content,
             provider: provider.name.clone(),
+            model: provider.model.clone(),
         })
     }
 

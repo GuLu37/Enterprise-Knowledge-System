@@ -110,12 +110,16 @@ fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
-/// pdf: 用 pdf-extract crate（简化实现）。
+/// pdf: 用 pdf-extract 从内容流提取文字。扫描件没有文本层时会失败。
 fn extract_pdf_text(data: &[u8]) -> Result<String, String> {
-    // pdf-extract 在纯 Rust 环境下对中文 PDF 支持有限
-    // 生产环境建议用外部工具或 pypdf 兜底
-    let _ = data;
-    Err("PDF 解析暂未在 Rust 后端实现，请使用 Python 后端上传 PDF".into())
+    let text = pdf_extract::extract_text_from_mem(data)
+        .map_err(|err| format!("PDF 解析失败: {err}"))?;
+    let cleaned = text.replace('\0', "");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return Err("PDF 未提取到文本，可能是扫描件".into());
+    }
+    Ok(trimmed.to_string())
 }
 
 /// pptx: zip 中的 ppt/slides/slideN.xml。

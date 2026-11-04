@@ -45,11 +45,11 @@
 ```bash
 cd backend-rs
 cargo run --release
-# 默认 127.0.0.1:8001，可通过 EKS_PORT 修改
+# 默认 127.0.0.1:8000，与前端 Vite 代理一致，可通过 EKS_PORT 修改
 ```
 
 前置条件：
-- Rust 1.75+ (rustup + MSVC Build Tools)
+- Rust 1.92+（Dockerfile 使用 `rust:1.92`）
 - `backend/.env` 存在（共享配置）
 - `backend/app/models/bge-base-zh-v1.5/onnx/model.onnx` 存在（见导出流程）
 - `backend/app/data/` 存在（SQLite + milvus_lite.db）
@@ -70,17 +70,27 @@ docker compose up eks-server
 | POST | `/api/v1/auth/password` | 修改密码 |
 | GET | `/api/v1/auth/me` | 当前用户 |
 | POST | `/api/v1/retrieval/search/hybrid` | 混合检索 |
+| POST | `/api/v1/retrieval/search/dense` | Dense 检索 |
+| POST | `/api/v1/retrieval/search/sparse` | Sparse 检索 |
 | POST | `/api/v1/retrieval/rag` | 完整 RAG 工作流 |
 | POST | `/api/v1/retrieval/cache-clear` | 清空检索缓存 |
-| POST | `/api/v1/chat/stream` | SSE 流式聊天（含简化 ReAct） |
+| GET | `/api/v1/chat/settings` | 前端对话上限 |
+| GET | `/api/v1/chat/runtime-status` | 模型预热状态 |
+| POST | `/api/v1/chat/warmup` | 返回当前运行时状态 |
+| POST | `/api/v1/chat/generate` | 同步生成回答 |
+| POST | `/api/v1/chat/stream` | SSE 流式聊天（`message`/`done` 与前端一致，并保留 `token`） |
 | GET | `/api/v1/chat/conversations` | 对话列表 |
 | PUT | `/api/v1/chat/conversations/{id}` | 保存对话 |
 | DELETE | `/api/v1/chat/conversations/{id}` | 删除对话 |
 | DELETE | `/api/v1/chat/conversations` | 清空对话 |
 | GET | `/api/v1/documents` | 文档列表 |
-| POST | `/api/v1/documents/upload` | 上传文档（multipart） |
+| GET | `/api/v1/documents/list` | 分页文档列表（前端契约） |
+| POST | `/api/v1/documents/upload` | 上传文档（multipart，含 PDF 文本层） |
+| GET | `/api/v1/documents/content/{id}` | 文档正文预览 |
+| DELETE | `/api/v1/documents/delete/{id}` | 删除文档（前端契约） |
 | DELETE | `/api/v1/documents/{id}` | 删除文档 |
 | GET | `/api/v1/skills` | 技能列表 |
+| POST | `/api/v1/skills/execute` | 执行本地技能 |
 
 ## 支持的文档格式
 
@@ -90,7 +100,7 @@ docker compose up eks-server
 | .docx | zip + XML | 提取 `<w:t>` 文本 |
 | .xlsx / .xls | calamine | 按 Sheet 提取，含 `[Sheet]` 标记 |
 | .pptx | zip + XML | 提取 `<a:t>` 文本 |
-| .pdf | 暂不支持 | 请使用 Python 后端上传 |
+| .pdf | pdf-extract | 提取文本层；扫描件会失败 |
 
 ## 性能基准（41 条查询，CPU）
 
@@ -182,7 +192,7 @@ docker compose up eks-server
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | EKS_HOST | 127.0.0.1 | 监听地址 |
-| EKS_PORT | 8001 | 监听端口 |
+| EKS_PORT | 8000 | 监听端口 |
 | EKS_ENV_FILE | ../backend/.env | .env 路径 |
 | EKS_SQLITE_PATH | ../backend/app/data/rag_metadata.db | SQLite 路径 |
 | EKS_MILVUS_LITE_PATH | ../backend/app/data/milvus_lite.db | milvus_lite 路径 |

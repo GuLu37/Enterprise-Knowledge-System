@@ -169,168 +169,351 @@ fn merge_results(primary: Vec<RetrievalItem>, secondary: Vec<RetrievalItem>) -> 
     merged
 }
 
+struct RagTurn {
+    context: String,
+    sources: Vec<RetrievalItem>,
+    direct: Option<String>,
+    retrieval_method: Option<String>,
+}
+
+fn sse_json(event: &str, data: serde_json::Value) -> Event {
+    Event::default().event(event).data(data.to_string())
+}
+
+fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
+    items.iter().map(|item| item.to_json()).collect()
+}
+
+fn build_messages(context: &str, history: &[HistoryMessage], query: &str) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    if !context.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".into(),
+            content: build_rag_system_message(context),
+        });
+    }
+    for item in history {
+        if item.role == "system" || item.role == "user" || item.role == "assistant" {
+            messages.push(ChatMessage {
+                role: item.role.clone(),
+                content: item.content.clone(),
+            });
+        }
+    }
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: query.to_string(),
+    });
+    messages
+}
+
+async fn collect_rag(
+    engine: &crate::retrieval_engine::RetrievalEngine,
+    llm: &LlmClient,
+    query: &str,
+    history: &[HistoryMessage],
+    top_k: usize,
+    use_retrieval: bool,
+) -> Result<RagTurn, String> {
+    if !use_retrieval {
+        return Ok(RagTurn {
+            context: String::new(),
+            sources: Vec::new(),
+            direct: None,
+            retrieval_method: None,
+        });
+    }
+    let (first_results, _) = engine.run_rag_workflow(query, top_k).await?;
+    if first_results.is_empty() {
+        return Ok(RagTurn {
+            context: String::new(),
+            sources: Vec::new(),
+            direct: Some(no_result_answer(query)),
+            retrieval_method: Some("hybrid".into()),
+        });
+    }
+    if retrieval_quality_ok(&first_results) {
+        let context = crate::retrieval::assemble_rag_context(&first_results, 6500);
+        return Ok(RagTurn {
+            context,
+            sources: first_results,
+            direct: None,
+            retrieval_method: Some("hybrid".into()),
+        });
+    }
+    if let Some(rewritten) = rewrite_query(llm, query, history).await {
+        let second = engine
+            .run_rag_workflow(&rewritten, top_k)
+            .await
+            .map(|(results, _)| results)
+            .unwrap_or_default();
+        let merged = merge_results(first_results, second);
+        let max_chars = if merged.iter().any(|item| item.structured_aggregation) {
+            30000
+        } else {
+            6500
+        };
+        let context = crate::retrieval::assemble_rag_context(&merged, max_chars);
+        return Ok(RagTurn {
+            context,
+            sources: merged,
+            direct: None,
+            retrieval_method: Some("hybrid".into()),
+        });
+    }
+    let context = crate::retrieval::assemble_rag_context(&first_results, 6500);
+    Ok(RagTurn {
+        context,
+        sources: first_results,
+        direct: None,
+        retrieval_method: Some("hybrid".into()),
+    })
+}
+
+fn llm_unavailable() -> crate::auth::AuthError {
+    crate::auth::AuthError {
+        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        detail: "没有配置任何 LLM 提供商".into(),
+    }
+}
+
+fn runtime_payload(state: &AppState) -> serde_json::Value {
+    let llm = crate::llm::LlmConfig::from_env(&state.config);
+    let llm_warmed = !llm.providers.is_empty();
+    let embedding_warmed = true;
+    let cross_encoder_enabled = state.config.cross_encoder_enabled;
+    let cross_encoder_warmed = state.engine.cross_encoder.is_some();
+    let ready = embedding_warmed && llm_warmed;
+    let provider = llm.providers.first().map(|item| item.name.clone());
+    json!({
+        "ready": ready,
+        "status": if ready { "ready" } else { "failed" },
+        "llm_warmed": llm_warmed,
+        "embedding_warmed": embedding_warmed,
+        "cross_encoder_enabled": cross_encoder_enabled,
+        "cross_encoder_warmed": cross_encoder_warmed,
+        "cross_encoder_model": if cross_encoder_enabled { Some(state.config.cross_encoder_onnx.clone()) } else { None },
+        "cross_encoder_device": "cpu",
+        "cross_encoder_error": if cross_encoder_enabled && !cross_encoder_warmed {
+            Some("Cross-Encoder 未加载，检索将使用规则重排")
+        } else {
+            None
+        },
+        "provider": provider,
+    })
+}
+
+pub async fn chat_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
+    crate::routes::require_current_user(&state, &headers).await?;
+    Ok(axum::Json(json!({
+        "max_conversations": state.config.chat_max_conversations,
+    })))
+}
+
+pub async fn chat_runtime_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
+    crate::routes::require_current_user(&state, &headers).await?;
+    Ok(axum::Json(runtime_payload(&state)))
+}
+
+pub async fn chat_warmup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
+    crate::routes::require_current_user(&state, &headers).await?;
+    Ok(axum::Json(runtime_payload(&state)))
+}
+
+pub async fn generate_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ChatStreamRequest>,
+) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
+    let user = crate::routes::require_current_user(&state, &headers).await?;
+    let query = request.query.trim().to_string();
+    if query.is_empty() {
+        return Err(crate::auth::AuthError::bad_request("问题不能为空"));
+    }
+    if let Some(route) = crate::skills::route_local_skill(&query) {
+        let answer = crate::skills::answer_routed_skill(&state.pool, &user.user_id, &route)
+            .await
+            .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+        return Ok(axum::Json(json!({
+            "query": query,
+            "response": answer,
+            "sources": [],
+            "model": route.name,
+            "retrieval_method": null,
+        })));
+    }
+
+    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    if llm_config.providers.is_empty() {
+        return Err(llm_unavailable());
+    }
+    let llm_client = LlmClient::new(llm_config);
+    let use_retrieval = request.use_retrieval && needs_retrieval(&query);
+    let turn = collect_rag(
+        &state.engine,
+        &llm_client,
+        &query,
+        &request.history,
+        request.top_k,
+        use_retrieval,
+    )
+    .await
+    .map_err(|detail| crate::auth::AuthError {
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        detail,
+    })?;
+    if let Some(answer) = turn.direct {
+        return Ok(axum::Json(json!({
+            "query": query,
+            "response": answer,
+            "sources": [],
+            "model": "",
+            "retrieval_method": turn.retrieval_method,
+        })));
+    }
+    let messages = build_messages(&turn.context, &request.history, &query);
+    let result = llm_client.invoke(&messages).await.map_err(|detail| crate::auth::AuthError {
+        status: axum::http::StatusCode::BAD_GATEWAY,
+        detail,
+    })?;
+    Ok(axum::Json(json!({
+        "query": query,
+        "response": result.content,
+        "sources": source_payload(&turn.sources),
+        "model": result.model,
+        "retrieval_method": turn.retrieval_method,
+    })))
+}
+
 pub async fn stream_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::Json(request): axum::Json<ChatStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
-
-    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
-    if llm_config.providers.is_empty() {
-        return Err(crate::auth::AuthError {
-            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            detail: "没有配置任何 LLM 提供商".into(),
-        });
-    }
-    let llm_client = Arc::new(LlmClient::new(llm_config));
-
     let query = request.query.trim().to_string();
     let use_retrieval = request.use_retrieval && needs_retrieval(&query);
     let top_k = request.top_k;
     let engine = state.engine.clone();
+    let pool = state.pool.clone();
     let user_id = user.user_id.clone();
     let conversation_id = request.conversation_id.clone().unwrap_or_default();
     let session_id = request.session_id.clone().unwrap_or_default();
     let history = request.history.clone();
+    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    let llm_missing = llm_config.providers.is_empty();
+    let llm_client = Arc::new(LlmClient::new(llm_config));
 
     let stream = async_stream::stream! {
-        yield Ok(Event::default().event("start").data(
-            json!({
-                "query": query,
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "user_id": user_id,
-                "use_retrieval": use_retrieval,
-            })
-            .to_string()
-        ));
+        yield Ok(sse_json("start", json!({
+            "query": query,
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "user_id": user_id,
+            "use_retrieval": use_retrieval,
+        })));
 
-        let (context, sources) = if use_retrieval {
-            // ===== 第一轮检索 =====
-            let first_results = match engine.run_rag_workflow(&query, top_k).await {
-                Ok((results, _ctx)) => results,
-                Err(exc) => {
-                    yield Ok(Event::default().event("error").data(
-                        json!({"message": format!("检索失败: {exc}")}).to_string()
-                    ));
-                    return;
+        if let Some(route) = crate::skills::route_local_skill(&query) {
+            yield Ok(sse_json("tool_call", json!({
+                "name": route.name,
+                "arguments": route.arguments,
+            })));
+            match crate::skills::answer_routed_skill(&pool, &user_id, &route).await {
+                Ok(answer) => {
+                    yield Ok(sse_json("tool_result", json!({"skill": route.name, "sources": []})));
+                    yield Ok(sse_json("message", json!({"content": answer})));
+                    yield Ok(sse_json("done", json!({
+                        "content": answer,
+                        "response": answer,
+                        "sources": [],
+                    })));
                 }
-            };
+                Err(detail) => {
+                    yield Ok(sse_json("error", json!({"message": detail})));
+                }
+            }
+            return;
+        }
 
-            if first_results.is_empty() {
-                yield Ok(Event::default().event("token").data(
-                    json!({"content": no_result_answer(&query)}).to_string()
-                ));
-                yield Ok(Event::default().event("done").data(
-                    json!({"response": no_result_answer(&query), "sources": []}).to_string()
-                ));
+        if llm_missing {
+            yield Ok(sse_json("error", json!({"message": "没有配置任何 LLM 提供商"})));
+            return;
+        }
+
+        if use_retrieval {
+            yield Ok(sse_json("tool_call", json!({
+                "name": "search_knowledge_base",
+                "arguments": {"query": query, "top_k": top_k, "retrieval_method": "hybrid"},
+            })));
+        }
+
+        let turn = match collect_rag(&engine, &llm_client, &query, &history, top_k, use_retrieval).await {
+            Ok(turn) => turn,
+            Err(detail) => {
+                yield Ok(sse_json("error", json!({"message": format!("检索失败: {detail}")})));
                 return;
             }
-
-            let (final_results, context) = if retrieval_quality_ok(&first_results) {
-                // 首轮质量足够 → 直接使用
-                let ctx = crate::retrieval::assemble_rag_context(&first_results, 6500);
-                (first_results, ctx)
-            } else {
-                // ===== 简化 ReAct: LLM 改写查询 → 二轮检索 =====
-                yield Ok(Event::default().event("query_rewrite").data(
-                    json!({"original": query, "status": "rewriting"}).to_string()
-                ));
-                let rewritten = rewrite_query(&llm_client, &query, &history).await;
-                match rewritten {
-                    Some(ref rw) if rw != &query => {
-                        yield Ok(Event::default().event("query_rewrite").data(
-                            json!({"original": query, "rewritten": rw, "status": "done"}).to_string()
-                        ));
-                        let second_results = engine.run_rag_workflow(rw, top_k).await
-                            .map(|(r, _)| r).unwrap_or_default();
-                        let merged = merge_results(first_results, second_results);
-                        let max_chars = if merged.iter().any(|i| i.structured_aggregation) {
-                            30000
-                        } else {
-                            6500
-                        };
-                        let ctx = crate::retrieval::assemble_rag_context(&merged, max_chars);
-                        (merged, ctx)
-                    }
-                    _ => {
-                        // 改写失败或无变化 → 用首轮结果
-                        let ctx = crate::retrieval::assemble_rag_context(&first_results, 6500);
-                        (first_results, ctx)
-                    }
-                }
-            };
-
-            // 发送来源事件
-            let source_list: Vec<serde_json::Value> = final_results.iter().map(|item| {
-                json!({
-                    "content": item.content,
-                    "metadata": item.to_json()["metadata"],
-                    "score": item.score,
-                    "source": item.source,
-                })
-            }).collect();
-            yield Ok(Event::default().event("sources").data(
-                json!({"sources": source_list}).to_string()
-            ));
-            (context, final_results)
-        } else {
-            (String::new(), Vec::new())
         };
-
-        // 构建 LLM 消息
-        let mut messages: Vec<ChatMessage> = Vec::new();
-        if !context.is_empty() {
-            messages.push(ChatMessage {
-                role: "system".into(),
-                content: build_rag_system_message(&context),
-            });
+        let sources = source_payload(&turn.sources);
+        if use_retrieval {
+            yield Ok(sse_json("tool_result", json!({
+                "sources": sources,
+                "retrieval_method": turn.retrieval_method,
+            })));
+            yield Ok(sse_json("sources", json!({"sources": sources})));
         }
-        for h in &history {
-            if h.role == "system" || h.role == "user" || h.role == "assistant" {
-                messages.push(ChatMessage {
-                    role: h.role.clone(),
-                    content: h.content.clone(),
-                });
-            }
+        if let Some(answer) = turn.direct.clone() {
+            yield Ok(sse_json("message", json!({"content": answer})));
+            yield Ok(sse_json("token", json!({"content": answer})));
+            yield Ok(sse_json("done", json!({
+                "content": answer,
+                "response": answer,
+                "sources": sources,
+                "retrieval_method": turn.retrieval_method,
+            })));
+            return;
         }
-        messages.push(ChatMessage {
-            role: "user".into(),
-            content: query.clone(),
-        });
 
-        // 流式 LLM 调用（失败降级非流式）
+        let messages = build_messages(&turn.context, &history, &query);
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 let mut full_response = String::new();
                 while let Some(chunk) = rx.recv().await {
                     full_response.push_str(&chunk.delta);
-                    yield Ok(Event::default().event("token").data(
-                        json!({"content": chunk.delta}).to_string()
-                    ));
+                    yield Ok(sse_json("message", json!({"content": chunk.delta})));
+                    yield Ok(sse_json("token", json!({"content": chunk.delta})));
                 }
-                let source_json: Vec<serde_json::Value> = sources.iter().map(|s| s.to_json()).collect();
-                yield Ok(Event::default().event("done").data(
-                    json!({"response": full_response, "sources": source_json}).to_string()
-                ));
+                yield Ok(sse_json("done", json!({
+                    "content": full_response,
+                    "response": full_response,
+                    "sources": sources,
+                    "retrieval_method": turn.retrieval_method,
+                })));
             }
             Err(exc) => {
                 tracing::warn!("流式调用失败，尝试非流式: {exc}");
                 match llm_client.invoke(&messages).await {
                     Ok(result) => {
-                        yield Ok(Event::default().event("token").data(
-                            json!({"content": &result.content}).to_string()
-                        ));
-                        let source_json: Vec<serde_json::Value> = sources.iter().map(|s| s.to_json()).collect();
-                        yield Ok(Event::default().event("done").data(
-                            json!({"response": result.content, "sources": source_json}).to_string()
-                        ));
+                        yield Ok(sse_json("message", json!({"content": result.content})));
+                        yield Ok(sse_json("token", json!({"content": result.content})));
+                        yield Ok(sse_json("done", json!({
+                            "content": result.content,
+                            "response": result.content,
+                            "sources": sources,
+                            "retrieval_method": turn.retrieval_method,
+                        })));
                     }
                     Err(exc2) => {
-                        yield Ok(Event::default().event("error").data(
-                            json!({"message": format!("LLM 调用失败: {exc2}")}).to_string()
-                        ));
+                        yield Ok(sse_json("error", json!({"message": format!("LLM 调用失败: {exc2}")})));
                     }
                 }
             }

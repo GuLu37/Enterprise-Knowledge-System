@@ -261,10 +261,34 @@ pub fn router(state: AppState) -> axum::Router {
             &format!("{prefix}/retrieval/search/hybrid"),
             post(retrieval_hybrid),
         )
+        .route(
+            &format!("{prefix}/retrieval/search/dense"),
+            post(retrieval_dense),
+        )
+        .route(
+            &format!("{prefix}/retrieval/search/sparse"),
+            post(retrieval_sparse),
+        )
         .route(&format!("{prefix}/retrieval/rag"), post(retrieval_rag))
         .route(
             &format!("{prefix}/retrieval/cache-clear"),
             post(retrieval_cache_clear),
+        )
+        .route(
+            &format!("{prefix}/chat/settings"),
+            get(crate::chat_stream::chat_settings),
+        )
+        .route(
+            &format!("{prefix}/chat/runtime-status"),
+            get(crate::chat_stream::chat_runtime_status),
+        )
+        .route(
+            &format!("{prefix}/chat/warmup"),
+            post(crate::chat_stream::chat_warmup),
+        )
+        .route(
+            &format!("{prefix}/chat/generate"),
+            post(crate::chat_stream::generate_chat),
         )
         .route(
             &format!("{prefix}/chat/stream"),
@@ -285,8 +309,20 @@ pub fn router(state: AppState) -> axum::Router {
             get(crate::documents::list_documents),
         )
         .route(
+            &format!("{prefix}/documents/list"),
+            get(crate::documents::list_documents_compat),
+        )
+        .route(
             &format!("{prefix}/documents/upload"),
             axum::routing::post(crate::documents::upload_document),
+        )
+        .route(
+            &format!("{prefix}/documents/content/{{document_id}}"),
+            get(crate::documents::get_document_content),
+        )
+        .route(
+            &format!("{prefix}/documents/delete/{{document_id}}"),
+            axum::routing::delete(crate::documents::delete_document),
         )
         .route(
             &format!("{prefix}/documents/{{document_id}}"),
@@ -296,6 +332,18 @@ pub fn router(state: AppState) -> axum::Router {
             &format!("{prefix}/skills"),
             get(crate::documents::list_skills),
         )
+        .route(
+            &format!("{prefix}/skills/function-calling"),
+            get(crate::documents::list_skills),
+        )
+        .route(
+            &format!("{prefix}/skills/capabilities"),
+            get(skill_capabilities),
+        )
+        .route(
+            &format!("{prefix}/skills/execute"),
+            post(execute_skill),
+        )
         .with_state(state)
 }
 
@@ -304,6 +352,90 @@ pub struct RetrievalRequest {
     pub query: String,
     #[serde(default)]
     pub top_k: Option<usize>,
+}
+
+pub async fn retrieval_dense(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RetrievalRequest>,
+) -> Result<Json<Value>, AuthError> {
+    retrieval_simple(state, headers, request, "dense").await
+}
+
+pub async fn retrieval_sparse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RetrievalRequest>,
+) -> Result<Json<Value>, AuthError> {
+    retrieval_simple(state, headers, request, "sparse").await
+}
+
+async fn retrieval_simple(
+    state: AppState,
+    headers: HeaderMap,
+    request: RetrievalRequest,
+    method: &str,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    let top_k = request.top_k.unwrap_or(5).clamp(1, 50);
+    let query = request.query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Json(json!({
+            "query": query, "retrieval_method": method, "results": [], "top_k": top_k,
+        })));
+    }
+    let results = if method == "dense" {
+        state.engine.search_dense(&query, top_k).await
+    } else {
+        state.engine.search_sparse(&query, top_k).await
+    }
+    .map_err(internal_error)?;
+    Ok(Json(json!({
+        "query": query,
+        "retrieval_method": method,
+        "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
+        "top_k": top_k,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SkillExecuteBody {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+pub async fn skill_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    let catalog = crate::skills::execute_named(&state.pool, "", "list_available_tools", &json!({}))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(catalog))
+}
+
+pub async fn execute_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SkillExecuteBody>,
+) -> Result<Json<Value>, AuthError> {
+    let user = require_current_user(&state, &headers).await?;
+    let result = crate::skills::execute_named(
+        &state.pool,
+        &user.user_id,
+        request.name.trim(),
+        &request.arguments,
+    )
+    .await
+    .map_err(|detail| AuthError::bad_request(&detail))?;
+    Ok(Json(json!({
+        "skill": request.name,
+        "kind": "local",
+        "arguments": request.arguments,
+        "result": result,
+    })))
 }
 
 pub async fn retrieval_hybrid(

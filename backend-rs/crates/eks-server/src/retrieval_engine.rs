@@ -217,6 +217,65 @@ impl RetrievalEngine {
         *self.sparse.write().await = None;
     }
 
+    /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
+    pub async fn search_dense(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RetrievalItem>, String> {
+        let top_k = top_k.clamp(1, 50);
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot = self
+            .store
+            .collection("doc_chunk")
+            .await
+            .map_err(|err| err.to_string())?;
+        let vectors = self.embedder.embed_queries(&[query.to_string()])?;
+        let vector = vectors.first().ok_or_else(|| "查询向量为空".to_string())?;
+        let hits = self
+            .store
+            .search_cosine("doc_chunk", vector, top_k)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(hits
+            .into_iter()
+            .map(|(index, score)| RetrievalItem::from_row(&snapshot.rows[index], score, "dense"))
+            .collect())
+    }
+
+    /// 单次 Sparse（BM25）检索。
+    pub async fn search_sparse(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RetrievalItem>, String> {
+        let top_k = top_k.clamp(1, 50);
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot = self
+            .store
+            .collection("doc_chunk")
+            .await
+            .map_err(|err| err.to_string())?;
+        let index = self.sparse_snapshot().await?;
+        Ok(index
+            .search(query, top_k)
+            .into_iter()
+            .map(|(row_index, bm25, lexical)| {
+                RetrievalItem::from_row(
+                    &snapshot.rows[row_index],
+                    bm25.max(0.0) + lexical,
+                    "sparse",
+                )
+            })
+            .collect())
+    }
+
     /// 完整 RAG 工作流（对齐 run_rag_workflow, llm=None）。
     pub async fn run_rag_workflow(
         &self,
