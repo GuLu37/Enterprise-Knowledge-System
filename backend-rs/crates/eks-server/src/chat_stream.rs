@@ -764,6 +764,14 @@ async fn invoke_llm_safely(llm: &LlmClient, messages: &[ChatMessage]) -> (String
     }
 }
 
+/// 对齐 Python `ChatRunResult.model = model or "default"`：回显请求 model，空值用 `"default"`。
+fn chat_response_model(requested: Option<&str>) -> String {
+    match requested {
+        Some(model) if !model.is_empty() => model.to_string(),
+        _ => "default".to_string(),
+    }
+}
+
 struct RagTurn {
     context: String,
     sources: Vec<RetrievalItem>,
@@ -1227,7 +1235,7 @@ pub async fn generate_chat(
         )
         .await
         .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
-        let (answer, model) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
+        let (answer, _) = resolve_skill_answer(&prepared, Some(&llm_client)).await;
         spawn_persist_turn(
             state.pool.clone(),
             Some(llm_client),
@@ -1242,7 +1250,7 @@ pub async fn generate_chat(
             "query": query,
             "response": answer,
             "sources": [],
-            "model": model,
+            "model": chat_response_model(request.model.as_deref()),
             "retrieval_method": null,
         })));
     }
@@ -1262,7 +1270,7 @@ pub async fn generate_chat(
             "query": query,
             "response": answer,
             "sources": [],
-            "model": "",
+            "model": chat_response_model(request.model.as_deref()),
             "retrieval_method": null,
         })));
     }
@@ -1302,7 +1310,7 @@ pub async fn generate_chat(
             "query": query,
             "response": answer,
             "sources": [],
-            "model": "",
+            "model": chat_response_model(request.model.as_deref()),
             "retrieval_method": turn.retrieval_method,
         })));
     }
@@ -1326,7 +1334,7 @@ pub async fn generate_chat(
     )
     .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
     let messages = build_messages(&long_term, &turn.context, history_messages, &query);
-    let (answer, model) = invoke_llm_safely(llm_client.as_ref(), &messages).await;
+    let (answer, _) = invoke_llm_safely(llm_client.as_ref(), &messages).await;
     spawn_persist_turn(
         state.pool.clone(),
         Some(llm_client),
@@ -1341,7 +1349,7 @@ pub async fn generate_chat(
         "query": query,
         "response": answer,
         "sources": source_payload(&turn.sources),
-        "model": model,
+        "model": chat_response_model(request.model.as_deref()),
         "retrieval_method": turn.retrieval_method,
     })))
 }
@@ -2124,6 +2132,14 @@ mod tests {
         assert_eq!(LLM_UNAVAILABLE_MESSAGE, "系统暂时无法处理，请稍后重试。");
         assert_eq!(finalize_llm_answer("  \n\n"), LLM_UNAVAILABLE_MESSAGE);
         assert_eq!(finalize_llm_answer("可以报销"), "可以报销");
+    }
+
+    #[test]
+    fn generate_model_echoes_request_or_default_like_python() {
+        assert_eq!(chat_response_model(None), "default");
+        assert_eq!(chat_response_model(Some("")), "default");
+        assert_eq!(chat_response_model(Some("gpt-4o-mini")), "gpt-4o-mini");
+        assert_eq!(chat_response_model(Some(" ")), " ");
     }
 
     #[test]
