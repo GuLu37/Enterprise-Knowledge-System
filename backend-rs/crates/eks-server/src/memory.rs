@@ -1,9 +1,17 @@
-//! 长期记忆：对话块、画像抽取、会话删除级联。写入 SQLite `memory_records`，
-//! 与 Python memory_service 共用同一张表，不依赖 Milvus 记忆 collection。
+//! 长期记忆：对话块、画像抽取、会话删除级联、分层召回。
+//! 写入 SQLite `memory_records`，与 Python memory_service 共用同一张表；
+//! 召回用词法 + 可选 BGE 余弦，不依赖 Milvus 记忆 collection。
 
 use serde_json::{Value, json};
 
+use crate::embedder::Embedder;
 use crate::llm::{ChatMessage, LlmClient};
+
+const LONG_TERM_MEMORY_TOP_K: usize = 3;
+const LONG_TERM_MEMORY_SNIPPET_LIMIT: usize = 240;
+const CANDIDATE_LIMIT: i64 = 200;
+const COSINE_RERANK_LIMIT: usize = 24;
+const MIN_LEXICAL_SCORE: f64 = 0.0;
 
 const PROFILE_TRIGGER_TERMS: &[&str] = &[
     "记住", "记得", "帮我记", "请记", "以后", "下次", "我的名字", "我叫", "叫我",
@@ -17,6 +25,40 @@ const PROFILE_SYSTEM_PROMPT: &str = "你是用户个性化记忆抽取器。\
 没有可记忆内容时输出 {\"memories\":[]}。\
 只输出严格 JSON，不要解释。格式：\
 {\"memories\":[{\"memory_key\":\"profile.xxx\",\"value\":\"...\",\"confidence\":0到1之间的小数,\"importance\":0到100之间的数字,\"action\":\"upsert\"或\"delete\"}]}";
+
+const LONG_TERM_MEMORY_HINTS: &[&str] = &[
+    "之前", "刚才", "上次", "前面", "记得", "记忆", "偏好", "我说过", "你还记得", "根据我们",
+    "继续", "沿用", "完整对话", "原始对话", "展开", "我的名字", "我叫什么",
+];
+
+const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "这件事", "该问题"];
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct EventMemoryRow {
+    memory_id: String,
+    memory_key: Option<String>,
+    content: String,
+    conversation_id: Option<String>,
+    session_id: Option<String>,
+    turn_start: Option<i64>,
+    turn_end: Option<i64>,
+    importance_score: f64,
+}
+
+/// 分层召回命中（chunk_type 存在 SQLite `memory_key`：L3/L2/L1/dialogue）。
+#[derive(Debug, Clone)]
+pub struct EventMemoryHit {
+    pub memory_id: String,
+    pub content: String,
+    pub memory_key: String,
+    pub conversation_id: Option<String>,
+    pub session_id: Option<String>,
+    pub turn_start: Option<i64>,
+    pub turn_end: Option<i64>,
+    pub score: f64,
+    pub lexical_score: f64,
+    pub importance_score: f64,
+}
 
 pub async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -124,6 +166,302 @@ pub async fn profile_prompt(pool: &sqlx::SqlitePool, user_id: &str) -> String {
     lines.join("\n")
 }
 
+/// 对齐 Python `_should_retrieve_long_term_memory`：direct/clarify 跳过，其余看记忆线索。
+pub fn should_retrieve_event_memory(query: &str, route: Option<&str>) -> bool {
+    match route.map(str::trim) {
+        Some("direct") | Some("clarify") => return false,
+        Some(route) if !matches!(route, "rag" | "skill") => return false,
+        _ => {}
+    }
+    let normalized: String = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    LONG_TERM_MEMORY_HINTS
+        .iter()
+        .chain(LONG_TERM_MEMORY_REFERENCE_HINTS.iter())
+        .any(|hint| normalized.contains(hint))
+}
+
+/// 按 L3 > L2 > L1 > dialogue 分层召回事件记忆。
+pub async fn search_event_memories(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+    embedder: Option<&Embedder>,
+) -> Vec<EventMemoryHit> {
+    if user_id.trim().is_empty() {
+        return Vec::new();
+    }
+    let _ = ensure_schema(pool).await;
+    let rows: Vec<EventMemoryRow> = match sqlx::query_as(
+        "SELECT memory_id, memory_key, content, conversation_id, session_id, \
+         turn_start, turn_end, importance_score \
+         FROM memory_records \
+         WHERE user_id = ? AND memory_type = 'event' AND status = 'active' \
+         ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(CANDIDATE_LIMIT)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("长期记忆读取失败: {err}");
+            return Vec::new();
+        }
+    };
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let query = query.trim();
+    let query_tokens = if query.is_empty() {
+        Vec::new()
+    } else {
+        eks_kernels::tokenize_cjk(query)
+    };
+    let conversation_id = conversation_id.map(str::trim).filter(|item| !item.is_empty());
+    let session_id = session_id.map(str::trim).filter(|item| !item.is_empty());
+    let mut scored: Vec<EventMemoryHit> = rows
+        .into_iter()
+        .map(|row| {
+            let memory_key = row
+                .memory_key
+                .as_deref()
+                .unwrap_or("dialogue")
+                .trim()
+                .to_string();
+            let lexical_score = if query.is_empty() {
+                0.0
+            } else {
+                let row_tokens = eks_kernels::tokenize_cjk(&row.content);
+                eks_kernels::lexical::lexical_match_score(&query_tokens, &row_tokens, query, &row.content)
+            };
+            let mut score = lexical_score * 0.55 + (row.importance_score / 100.0).clamp(0.0, 1.0) * 0.20;
+            if conversation_id.is_some() && row.conversation_id.as_deref() == conversation_id {
+                score += 0.12;
+            }
+            if session_id.is_some() && row.session_id.as_deref() == session_id {
+                score += 0.04;
+            }
+            EventMemoryHit {
+                memory_id: row.memory_id,
+                content: row.content,
+                memory_key,
+                conversation_id: row.conversation_id,
+                session_id: row.session_id,
+                turn_start: row.turn_start,
+                turn_end: row.turn_end,
+                score,
+                lexical_score,
+                importance_score: row.importance_score,
+            }
+        })
+        .collect();
+
+    if let Some(embedder) = embedder.filter(|_| !query.is_empty()) {
+        blend_cosine_scores(&mut scored, query, embedder);
+    }
+
+    if !query.is_empty() {
+        let compact_query = eks_kernels::normalize_text(query);
+        scored.retain(|hit| {
+            hit.lexical_score > MIN_LEXICAL_SCORE
+                || hit.score >= 0.35
+                || (!compact_query.is_empty()
+                    && eks_kernels::normalize_text(&hit.content).contains(&compact_query))
+        });
+    }
+    scored.sort_by(|left, right| {
+        level_rank(&left.memory_key)
+            .cmp(&level_rank(&right.memory_key))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let limit = top_k.max(1);
+    scored.truncate(limit);
+    mark_accessed(pool, user_id, &scored).await;
+    scored
+}
+
+/// 对齐 Python `_build_hierarchical_memory_lines`：有命中才生成 system 提示。
+pub async fn hierarchical_prompt(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+    embedder: Option<&Embedder>,
+    route: Option<&str>,
+) -> String {
+    if !should_retrieve_event_memory(query, route) {
+        return String::new();
+    }
+    let hits = search_event_memories(
+        pool,
+        user_id,
+        query,
+        conversation_id,
+        session_id,
+        if top_k == 0 { LONG_TERM_MEMORY_TOP_K } else { top_k },
+        embedder,
+    )
+    .await;
+    format_hierarchical_prompt(&hits)
+}
+
+pub fn format_hierarchical_prompt(hits: &[EventMemoryHit]) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["以下是与当前问题相关的长期记忆，仅在相关时参考，不能把未确认信息当作事实：".to_string()];
+    for (index, hit) in hits.iter().enumerate() {
+        let reference = json!({
+            "memory_id": hit.memory_id,
+            "conversation_id": hit.conversation_id,
+            "chunk_type": hit.memory_key,
+            "topic": "",
+            "turn_start": hit.turn_start,
+            "turn_end": hit.turn_end,
+            "disclosure_tool": "memory_retrieve_original",
+        });
+        lines.push(format!(
+            "{}. {}\n   摘要引用：{}",
+            index + 1,
+            compact_content(&hit.content),
+            reference
+        ));
+    }
+    lines.join("\n")
+}
+
+fn level_rank(memory_key: &str) -> i32 {
+    match memory_key.trim() {
+        "semantic_memory_l3" => 0,
+        "semantic_memory_l2" => 1,
+        "semantic_memory_l1" => 2,
+        "dialogue" => 3,
+        _ => 9,
+    }
+}
+
+fn compact_content(content: &str) -> String {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let mut topic = String::new();
+    let mut summary = String::new();
+    for line in normalized.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("【主题】") {
+            topic = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("【摘要】") {
+            summary = rest.trim().to_string();
+        }
+    }
+    if !topic.is_empty() && !summary.is_empty() {
+        return format!("{topic}：{summary}");
+    }
+    if !summary.is_empty() {
+        return summary;
+    }
+    if !topic.is_empty() {
+        return topic;
+    }
+    normalized.replace('\n', " ").chars().take(LONG_TERM_MEMORY_SNIPPET_LIMIT).collect()
+}
+
+fn blend_cosine_scores(hits: &mut [EventMemoryHit], query: &str, embedder: &Embedder) {
+    if hits.is_empty() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..hits.len()).collect();
+    order.sort_by(|left, right| {
+        hits[*right]
+            .score
+            .partial_cmp(&hits[*left].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.truncate(COSINE_RERANK_LIMIT);
+    let query_vec = match embedder.embed_queries(&[query.to_string()]) {
+        Ok(vectors) if !vectors.is_empty() => vectors.into_iter().next().unwrap_or_default(),
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!("长期记忆 query 向量化失败: {err}");
+            return;
+        }
+    };
+    let texts: Vec<String> = order.iter().map(|&index| hits[index].content.clone()).collect();
+    let doc_vecs = match embedder.embed_documents(&texts) {
+        Ok(vectors) => vectors,
+        Err(err) => {
+            tracing::warn!("长期记忆文档向量化失败: {err}");
+            return;
+        }
+    };
+    for (offset, index) in order.into_iter().enumerate() {
+        if let Some(vector) = doc_vecs.get(offset) {
+            hits[index].score += 0.25 * cosine(&query_vec, vector).max(0.0);
+        }
+    }
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> f64 {
+    let n = left.len().min(right.len());
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for i in 0..n {
+        let a = left[i] as f64;
+        let b = right[i] as f64;
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+async fn mark_accessed(pool: &sqlx::SqlitePool, user_id: &str, hits: &[EventMemoryHit]) {
+    if hits.is_empty() {
+        return;
+    }
+    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    for hit in hits {
+        if let Err(err) = sqlx::query(
+            "UPDATE memory_records SET access_count = access_count + 1, last_accessed_at = ?, updated_at = ? \
+             WHERE user_id = ? AND memory_id = ? AND status = 'active'",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(user_id)
+        .bind(&hit.memory_id)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!("更新长期记忆访问统计失败: {err}");
+        }
+    }
+}
+
 pub async fn delete_conversation_memory(
     pool: &sqlx::SqlitePool,
     user_id: &str,
@@ -206,7 +544,7 @@ pub async fn consolidate_conversation(
     Ok(true)
 }
 
-async fn insert_event_memory(
+pub(crate) async fn insert_event_memory(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     conversation_id: &str,
@@ -416,5 +754,135 @@ mod tests {
             1
         );
         assert!(profile_prompt(&pool, "u1").await.is_empty());
+    }
+
+    #[test]
+    fn gates_event_memory_retrieval_like_python() {
+        assert!(should_retrieve_event_memory("你还记得上次说的报销时限吗", Some("rag")));
+        assert!(should_retrieve_event_memory("继续刚才的话题", Some("rag")));
+        assert!(should_retrieve_event_memory("这个怎么处理", Some("skill")));
+        assert!(!should_retrieve_event_memory("差旅报销流程是什么", Some("rag")));
+        assert!(!should_retrieve_event_memory("你还记得上次说的吗", Some("direct")));
+        assert!(!should_retrieve_event_memory("你还记得吗", Some("clarify")));
+        assert!(!should_retrieve_event_memory("", Some("rag")));
+    }
+
+    #[test]
+    fn compacts_topic_summary_blocks() {
+        assert_eq!(
+            compact_content("【主题】差旅\n【摘要】报销时限三天"),
+            "差旅：报销时限三天"
+        );
+        assert!(compact_content("用户: 你好\n助手: 你好").contains("用户: 你好"));
+    }
+
+    #[tokio::test]
+    async fn ranks_l1_over_dialogue_and_drops_unrelated() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限是几天？\n助手: 差旅报销需要在发生后 3 天内提交。",
+            55.0,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】差旅报销\n【摘要】差旅费用须在发生后 3 天内提交报销申请。",
+            70.0,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c2",
+            "s2",
+            "semantic_memory_l1",
+            "【主题】天气闲聊\n【摘要】今天下午可能下雨，出门记得带伞。",
+            90.0,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u2",
+            "c9",
+            "s9",
+            "semantic_memory_l1",
+            "【主题】差旅报销\n【摘要】另一名用户的报销时限是 7 天。",
+            99.0,
+        )
+        .await
+        .unwrap();
+
+        let hits = search_event_memories(&pool, "u1", "报销时限是多久", Some("c1"), Some("s1"), 3, None).await;
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].memory_key, "semantic_memory_l1");
+        assert!(hits[0].content.contains("3 天"));
+        assert!(hits.iter().all(|hit| !hit.content.contains("下雨") && !hit.content.contains("7 天")));
+
+        let prompt = hierarchical_prompt(
+            &pool,
+            "u1",
+            "你还记得上次报销时限吗",
+            Some("c1"),
+            Some("s1"),
+            3,
+            None,
+            Some("rag"),
+        )
+        .await;
+        assert!(prompt.contains("长期记忆"));
+        assert!(prompt.contains("差旅报销"));
+        assert!(prompt.contains("memory_retrieve_original"));
+        assert!(prompt.contains("semantic_memory_l1"));
+
+        let access: i64 = sqlx::query_scalar(
+            "SELECT access_count FROM memory_records \
+             WHERE user_id = 'u1' AND memory_key = 'semantic_memory_l1' AND content LIKE '%3 天%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(access >= 1);
+
+        assert!(
+            hierarchical_prompt(&pool, "u1", "差旅报销流程是什么", Some("c1"), None, 3, None, Some("rag"))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefers_higher_semantic_level_when_both_match() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(&pool, "u1", "c1", "s1", "dialogue", "用户问了差旅报销时限。", 80.0)
+            .await
+            .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l3",
+            "差旅报销时限：发生后 3 天内提交。",
+            40.0,
+        )
+        .await
+        .unwrap();
+        let hits = search_event_memories(&pool, "u1", "差旅报销时限", None, None, 2, None).await;
+        assert_eq!(hits[0].memory_key, "semantic_memory_l3");
+        assert_eq!(hits[1].memory_key, "dialogue");
     }
 }

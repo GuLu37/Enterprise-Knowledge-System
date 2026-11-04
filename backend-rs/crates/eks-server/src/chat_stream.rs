@@ -228,6 +228,7 @@ fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
 
 fn build_messages(
     profile: &str,
+    event_memory: &str,
     context: &str,
     history_messages: Vec<ChatMessage>,
     query: &str,
@@ -236,12 +237,46 @@ fn build_messages(
     if !profile.is_empty() {
         messages.push(ChatMessage::new("system", profile));
     }
+    if !event_memory.is_empty() {
+        messages.push(ChatMessage::new("system", event_memory));
+    }
     if !context.is_empty() {
         messages.push(ChatMessage::new("system", build_rag_system_message(context)));
     }
     messages.extend(history_messages);
     messages.push(ChatMessage::new("user", query));
     messages
+}
+
+async fn event_memory_prompt(
+    pool: &sqlx::SqlitePool,
+    embedder: &crate::embedder::Embedder,
+    user_id: &str,
+    query: &str,
+    conversation_id: &str,
+    session_id: &str,
+    route: &str,
+) -> String {
+    crate::memory::hierarchical_prompt(
+        pool,
+        user_id,
+        query,
+        nonempty(conversation_id),
+        nonempty(session_id),
+        3,
+        Some(embedder),
+        Some(route),
+    )
+    .await
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn spawn_persist_turn(
@@ -583,13 +618,23 @@ pub async fn generate_chat(
         })));
     }
     let profile = crate::memory::profile_prompt(&state.pool, &user.user_id).await;
+    let event_memory = event_memory_prompt(
+        &state.pool,
+        &state.engine.embedder,
+        &user.user_id,
+        &query,
+        &conversation_id,
+        &session_id,
+        &intent.route,
+    )
+    .await;
     let history_messages = crate::short_memory::assemble(
         &memory_history(&request.history),
         &options,
         Some(llm_client.clone()),
     )
     .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
-    let messages = build_messages(&profile, &turn.context, history_messages, &query);
+    let messages = build_messages(&profile, &event_memory, &turn.context, history_messages, &query);
     let result = llm_client.invoke(&messages).await.map_err(|detail| crate::auth::AuthError {
         status: axum::http::StatusCode::BAD_GATEWAY,
         detail,
@@ -783,6 +828,16 @@ pub async fn stream_chat(
         }
 
         let profile = crate::memory::profile_prompt(&pool, &user_id).await;
+        let event_memory = event_memory_prompt(
+            &pool,
+            &engine.embedder,
+            &user_id,
+            &query,
+            &conversation_id,
+            &session_id,
+            &intent.route,
+        )
+        .await;
         let history_messages = match crate::short_memory::assemble(
             &memory_history(&history),
             &options,
@@ -794,7 +849,7 @@ pub async fn stream_chat(
                 return;
             }
         };
-        let messages = build_messages(&profile, &turn.context, history_messages, &query);
+        let messages = build_messages(&profile, &event_memory, &turn.context, history_messages, &query);
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 let mut full_response = String::new();

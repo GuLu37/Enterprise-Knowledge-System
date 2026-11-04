@@ -821,19 +821,21 @@ async fn memory_query(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value)
     };
 
     let matched_memories = if include_event {
-        let terms = query_terms(&query);
-        load_memories(pool, user_id, None, 300).await?
+        crate::memory::search_event_memories(pool, user_id, &query, None, None, top_k, None)
+            .await
             .into_iter()
-            .filter(memory_active)
-            .filter(|row| row.memory_type != "profile")
-            .filter(|row| terms.is_empty() || terms.iter().any(|term| eks_kernels::normalize_text(&row.content).contains(term)))
-            .take(top_k)
-            .map(|row| json!({
-                "memory_id": row.memory_id,
-                "content": row.content,
-                "score": row.importance_score,
-                "source": row.memory_type,
-                "metadata": {"conversation_id": row.conversation_id, "memory_key": row.memory_key},
+            .map(|hit| json!({
+                "memory_id": hit.memory_id,
+                "content": hit.content,
+                "score": hit.score,
+                "source": hit.memory_key,
+                "metadata": {
+                    "conversation_id": hit.conversation_id,
+                    "memory_key": hit.memory_key,
+                    "chunk_type": hit.memory_key,
+                    "turn_start": hit.turn_start,
+                    "turn_end": hit.turn_end,
+                },
             }))
             .collect::<Vec<_>>()
     } else {
@@ -1132,5 +1134,45 @@ mod tests {
         assert_eq!(queried.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
         let deleted = delete_profile_memory(&pool, "u1", &json!({"keywords":["张三"]})).await.unwrap();
         assert_eq!(deleted.get("deleted_count").and_then(|value| value.as_u64()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn queries_event_memory_by_hierarchical_rank() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        crate::memory::insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限几天？\n助手: 3 天内提交。",
+            55.0,
+        )
+        .await
+        .unwrap();
+        crate::memory::insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "差旅报销时限是发生后 3 天。",
+            70.0,
+        )
+        .await
+        .unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"报销时限","memory_scope":"event","top_k":2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queried.pointer("/summary/matched_count").and_then(|value| value.as_u64()), Some(2));
+        assert_eq!(
+            queried.pointer("/matched_memories/0/metadata/memory_key").and_then(|value| value.as_str()),
+            Some("semantic_memory_l1")
+        );
     }
 }
