@@ -3,7 +3,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -118,60 +118,145 @@ pub async fn list_documents_compat(
     list_documents_page(&state, &headers, query.skip, query.limit.unwrap_or(10).clamp(1, 100)).await
 }
 
+fn deletion_rejected(status: &str) -> Option<String> {
+    match status.trim() {
+        "deleting" | "deleted" => Some(format!("文档当前状态为 {status}，无法重复删除")),
+        _ => None,
+    }
+}
+
+async fn load_document(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+) -> Result<Option<DocumentRow>, AuthError> {
+    sqlx::query_as(&format!(
+        "SELECT {DOCUMENT_COLUMNS} FROM documents WHERE document_id = ?"
+    ))
+    .bind(document_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AuthError::from)
+}
+
+async fn mark_document_deleting(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+) -> Result<DocumentRow, AuthError> {
+    let Some(row) = load_document(pool, document_id).await? else {
+        return Err(AuthError::bad_request("文档不存在"));
+    };
+    if let Some(detail) = deletion_rejected(&row.status) {
+        return Err(AuthError::bad_request(&detail));
+    }
+    let now = db::fmt_dt(&db::now_naive());
+    sqlx::query(
+        "UPDATE documents SET status = 'deleting', error_message = NULL, updated_at = ? \
+         WHERE document_id = ?",
+    )
+    .bind(&now)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    .map_err(AuthError::from)?;
+    let mut updated = row;
+    updated.status = "deleting".into();
+    updated.error_message = None;
+    updated.updated_at = now;
+    Ok(updated)
+}
+
+fn remove_document_files(sqlite_path: &str, row: &DocumentRow) -> bool {
+    let upload_dir = std::path::Path::new(sqlite_path)
+        .parent()
+        .map(|parent| parent.join("uploads"))
+        .unwrap_or_default();
+    let removed_stored = std::fs::remove_file(upload_dir.join(&row.stored_filename)).is_ok();
+    let removed_dir = std::fs::remove_dir_all(upload_dir.join(&row.document_id)).is_ok();
+    let removed_path = !row.file_path.is_empty() && std::fs::remove_file(&row.file_path).is_ok();
+    removed_stored || removed_dir || removed_path
+}
+
+async fn restore_document_after_delete_failure(
+    pool: &sqlx::SqlitePool,
+    document_id: &str,
+    err: &str,
+) {
+    let now = db::fmt_dt(&db::now_naive());
+    if let Err(restore_err) = sqlx::query(
+        "UPDATE documents SET status = 'ready', error_message = ?, updated_at = ? \
+         WHERE document_id = ?",
+    )
+    .bind(format!("删除失败: {err}"))
+    .bind(&now)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(document_id, "文档删除失败后回写状态失败: {restore_err}");
+    }
+}
+
+async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Result<(), String> {
+    let row = load_document(&state.pool, document_id)
+        .await
+        .map_err(|err| err.detail)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row.status == "deleted" {
+        return Ok(());
+    }
+
+    tracing::info!(document_id, "开始删除 Milvus 文档切块");
+    let milvus_deleted = state.engine.delete_document_chunks(document_id).await?;
+    tracing::info!(document_id, milvus_deleted, "Milvus 文档切块删除完成");
+
+    let file_deleted = remove_document_files(&state.config.sqlite_path, &row);
+    tracing::info!(document_id, file_deleted, "本地文件删除完成");
+
+    sqlx::query("DELETE FROM document_chunks WHERE document_id = ?")
+        .bind(document_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    sqlx::query("DELETE FROM documents WHERE document_id = ?")
+        .bind(document_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    state.engine.invalidate().await;
+    tracing::info!(document_id, "文档删除完成");
+    Ok(())
+}
+
+fn deletion_accepted_payload(row: &DocumentRow) -> Value {
+    let mut payload = doc_to_json(row);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("status".into(), json!("deleting"));
+        object.insert("milvus_deleted".into(), json!(false));
+        object.insert("file_deleted".into(), json!(false));
+    }
+    payload
+}
+
 // DELETE /api/v1/documents/{document_id}
 pub async fn delete_document(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(document_id): Path<String>,
-) -> Result<Json<Value>, AuthError> {
+) -> Result<(StatusCode, Json<Value>), AuthError> {
     require_current_user(&state, &headers).await?;
-
-    // 查是否存在
-    let row: Option<DocumentRow> = sqlx::query_as(&format!(
-        "SELECT {DOCUMENT_COLUMNS} FROM documents WHERE document_id = ?"
-    ))
-    .bind(&document_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AuthError::from)?;
-
-    let Some(row) = row else {
-        return Err(AuthError::not_found(&document_id));
-    };
-
-    // 删除 SQLite 中的 chunk 记录
-    sqlx::query("DELETE FROM document_chunks WHERE document_id = ?")
-        .bind(&document_id)
-        .execute(&state.pool)
-        .await
-        .map_err(AuthError::from)?;
-
-    // 删除文档元数据
-    sqlx::query("DELETE FROM documents WHERE document_id = ?")
-        .bind(&document_id)
-        .execute(&state.pool)
-        .await
-        .map_err(AuthError::from)?;
-
-    let upload_dir = std::path::Path::new(&state.config.sqlite_path)
-        .parent()
-        .map(|parent| parent.join("uploads"))
-        .unwrap_or_default();
-    let removed_stored = std::fs::remove_file(upload_dir.join(&row.stored_filename)).is_ok();
-    let removed_dir = std::fs::remove_dir_all(upload_dir.join(&document_id)).is_ok();
-    let removed_path = !row.file_path.is_empty() && std::fs::remove_file(&row.file_path).is_ok();
-    let file_deleted = removed_stored || removed_dir || removed_path;
-
-    state.engine.invalidate().await;
-
-    let mut payload = doc_to_json(&row);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("status".into(), json!("deleted"));
-        object.insert("milvus_deleted".into(), json!(false));
-        object.insert("file_deleted".into(), json!(file_deleted));
-        object.insert("deleted".into(), json!(true));
-    }
-    Ok(Json(payload))
+    let row = mark_document_deleting(&state.pool, &document_id).await?;
+    let payload = deletion_accepted_payload(&row);
+    let state = state.clone();
+    let document_id = document_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = finalize_document_deletion(&state, &document_id).await {
+            tracing::error!(document_id = %document_id, "文档后台删除失败: {err}");
+            restore_document_after_delete_failure(&state.pool, &document_id, &err).await;
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(payload)))
 }
 
 // GET /api/v1/documents/content/{document_id}
@@ -227,15 +312,6 @@ pub async fn get_document_content(
         "content_type": row.content_type,
         "updated_at": db::dt_to_iso(&row.updated_at),
     })))
-}
-
-impl AuthError {
-    pub fn not_found(detail: &str) -> Self {
-        AuthError {
-            status: axum::http::StatusCode::NOT_FOUND,
-            detail: format!("资源不存在: {detail}"),
-        }
-    }
 }
 
 // POST /api/v1/documents/upload (multipart)
@@ -383,4 +459,167 @@ pub async fn upload_document(
         "created_at": db::dt_to_iso(&now),
         "updated_at": db::dt_to_iso(&now),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn sample_row(status: &str) -> DocumentRow {
+        DocumentRow {
+            document_id: "doc-1".into(),
+            original_filename: "手册.md".into(),
+            stored_filename: "doc-1.md".into(),
+            file_path: "/tmp/doc-1.md".into(),
+            content_type: Some("text/markdown".into()),
+            file_type: "md".into(),
+            file_size: 12,
+            status: status.into(),
+            chunk_count: 3,
+            error_message: None,
+            created_at: "2026-01-01 00:00:00.000000".into(),
+            updated_at: "2026-01-01 00:00:00.000000".into(),
+        }
+    }
+
+    async fn memory_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE documents (
+                document_id TEXT PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                stored_filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                content_type TEXT,
+                file_type TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn insert_row(pool: &sqlx::SqlitePool, row: &DocumentRow) {
+        sqlx::query(
+            "INSERT INTO documents (
+                document_id, original_filename, stored_filename, file_path, content_type,
+                file_type, file_size, status, chunk_count, error_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.document_id)
+        .bind(&row.original_filename)
+        .bind(&row.stored_filename)
+        .bind(&row.file_path)
+        .bind(&row.content_type)
+        .bind(&row.file_type)
+        .bind(row.file_size)
+        .bind(&row.status)
+        .bind(row.chunk_count)
+        .bind(&row.error_message)
+        .bind(&row.created_at)
+        .bind(&row.updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_deleting_or_deleted_status() {
+        assert_eq!(
+            deletion_rejected("deleting").as_deref(),
+            Some("文档当前状态为 deleting，无法重复删除")
+        );
+        assert_eq!(
+            deletion_rejected("deleted").as_deref(),
+            Some("文档当前状态为 deleted，无法重复删除")
+        );
+        assert!(deletion_rejected("ready").is_none());
+        assert!(deletion_rejected("processing").is_none());
+        assert!(deletion_rejected("failed").is_none());
+    }
+
+    #[test]
+    fn accepted_payload_keeps_python_request_shape() {
+        let payload = deletion_accepted_payload(&sample_row("ready"));
+        assert_eq!(payload["status"], json!("deleting"));
+        assert_eq!(payload["milvus_deleted"], json!(false));
+        assert_eq!(payload["file_deleted"], json!(false));
+        assert_eq!(payload["document_id"], json!("doc-1"));
+        assert!(payload.get("deleted").is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_missing_document_is_bad_request() {
+        let pool = memory_pool().await;
+        let err = mark_document_deleting(&pool, "missing").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.detail, "文档不存在");
+    }
+
+    #[tokio::test]
+    async fn mark_repeat_delete_is_rejected() {
+        let pool = memory_pool().await;
+        insert_row(&pool, &sample_row("deleting")).await;
+        let err = mark_document_deleting(&pool, "doc-1").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.detail, "文档当前状态为 deleting，无法重复删除");
+    }
+
+    #[tokio::test]
+    async fn marks_ready_document_deleting() {
+        let pool = memory_pool().await;
+        insert_row(&pool, &sample_row("ready")).await;
+        let updated = mark_document_deleting(&pool, "doc-1").await.unwrap();
+        assert_eq!(updated.status, "deleting");
+        assert!(updated.error_message.is_none());
+        let status: String = sqlx::query_scalar("SELECT status FROM documents WHERE document_id = ?")
+            .bind("doc-1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "deleting");
+    }
+
+    #[tokio::test]
+    async fn restore_after_delete_failure_rewrites_ready() {
+        let pool = memory_pool().await;
+        insert_row(&pool, &sample_row("deleting")).await;
+        restore_document_after_delete_failure(&pool, "doc-1", "向量库不可用").await;
+        let row = load_document(&pool, "doc-1").await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
+        assert_eq!(row.error_message.as_deref(), Some("删除失败: 向量库不可用"));
+    }
+
+    #[test]
+    fn remove_document_files_deletes_stored_and_path() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-doc-delete-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let upload_dir = root.join("uploads");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let stored = upload_dir.join("doc-1.md");
+        let extra = root.join("extra.md");
+        std::fs::write(&stored, b"hello").unwrap();
+        std::fs::write(&extra, b"hello").unwrap();
+        let mut row = sample_row("deleting");
+        row.stored_filename = "doc-1.md".into();
+        row.file_path = extra.display().to_string();
+        let sqlite_path = root.join("rag_metadata.db");
+        assert!(remove_document_files(sqlite_path.to_str().unwrap(), &row));
+        assert!(!stored.exists());
+        assert!(!extra.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

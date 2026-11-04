@@ -241,6 +241,10 @@ impl RetrievalEngine {
         self.result_cache.lock().await.clear();
     }
 
+    pub async fn delete_document_chunks(&self, document_id: &str) -> Result<bool, String> {
+        self.store.delete_by_document_id("doc_chunk", document_id).await
+    }
+
     /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
     pub async fn search_dense(
         &self,

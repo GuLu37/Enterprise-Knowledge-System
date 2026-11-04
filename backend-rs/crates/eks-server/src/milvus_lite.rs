@@ -19,7 +19,9 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Int64Array, LargeStringArray, ListArray, RecordBatch,
     StringArray,
 };
+use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
@@ -157,6 +159,26 @@ impl MilvusLiteStore {
     /// 强制失效（文档写入后由外部调用）。
     pub async fn invalidate(&self, name: &str) {
         self.cache.write().await.remove(name);
+    }
+
+    /// 按 document_id 写入 delta PK，对齐 Python `client.delete(filter=document_id == ...)`。
+    /// 集合不存在时返回 false；存在则返回 true（即使没有匹配行）。
+    pub async fn delete_by_document_id(
+        &self,
+        collection: &str,
+        document_id: &str,
+    ) -> Result<bool, String> {
+        let snapshot = match self.collection(collection).await {
+            Ok(snapshot) => snapshot,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.to_string()),
+        };
+        let pks = pks_for_document(&snapshot.rows, document_id);
+        if !pks.is_empty() {
+            append_delta_pks(&self.root, collection, &pks)?;
+        }
+        self.invalidate(collection).await;
+        Ok(true)
     }
 
     fn load_collection(&self, collection_dir: &Path) -> std::io::Result<CollectionSnapshot> {
@@ -313,6 +335,78 @@ fn io_err(e: impl std::error::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
 
+pub fn pks_for_document(rows: &[Row], document_id: &str) -> Vec<i64> {
+    let document_id = document_id.trim();
+    if document_id.is_empty() {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|row| {
+            row.fields
+                .get("document_id")
+                .and_then(FieldValue::as_str)
+                .map(str::trim)
+                == Some(document_id)
+        })
+        .map(|row| row.pk)
+        .collect()
+}
+
+fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), String> {
+    if pks.is_empty() {
+        return Ok(());
+    }
+    let collection_dir = root.join("collections").join(collection);
+    let manifest_path = collection_dir.join("manifest.json");
+    let manifest_str = std::fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("manifest 读取失败: {err}"))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&manifest_str).map_err(|err| format!("manifest 解析失败: {err}"))?;
+
+    let delta_dir = collection_dir.join("partitions").join("_default").join("delta");
+    std::fs::create_dir_all(&delta_dir).map_err(|err| err.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let file_name = format!("delta_{stamp}_{}.parquet", pks.len());
+    let relative = format!("delta/{file_name}");
+    let file_path = delta_dir.join(&file_name);
+
+    let schema = Schema::new(vec![Field::new("pk", DataType::Int64, false)]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(Int64Array::from(pks.to_vec())) as ArrayRef],
+    )
+    .map_err(|err| format!("delta RecordBatch 构建失败: {err}"))?;
+    let file = std::fs::File::create(&file_path).map_err(|err| err.to_string())?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
+        .map_err(|err| format!("delta Parquet writer 创建失败: {err}"))?;
+    writer
+        .write(&batch)
+        .map_err(|err| format!("delta Parquet 写入失败: {err}"))?;
+    writer
+        .close()
+        .map_err(|err| format!("delta Parquet 关闭失败: {err}"))?;
+
+    let version = manifest.get("version").and_then(|value| value.as_i64()).unwrap_or(0) + 1;
+    manifest["version"] = serde_json::json!(version);
+    let delta_files = manifest
+        .pointer_mut("/partitions/_default/delta_files")
+        .and_then(serde_json::Value::as_array_mut);
+    if let Some(files) = delta_files {
+        files.push(serde_json::json!(relative));
+    } else {
+        manifest["partitions"]["_default"]["delta_files"] = serde_json::json!([relative]);
+    }
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +448,103 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 7);
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pks_for_document_filters_by_id() {
+        let row = |pk, document_id: &str| Row {
+            pk,
+            vector: Vec::new(),
+            fields: HashMap::from([(
+                "document_id".into(),
+                FieldValue::Str(document_id.into()),
+            )]),
+        };
+        let rows = vec![row(1, "doc-a"), row(2, "doc-b"), row(3, "doc-a")];
+        assert_eq!(pks_for_document(&rows, "doc-a"), vec![1, 3]);
+        assert!(pks_for_document(&rows, "missing").is_empty());
+        assert!(pks_for_document(&rows, "  ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_by_document_id_writes_delta_and_drops_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-milvus-delete-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let collection_dir = root.join("collections").join("doc_chunk");
+        let data_dir = collection_dir.join("partitions").join("_default").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("document_id", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![11, 12, 13])) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(vec!["keep", "drop-me", "keep"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data_path = data_dir.join("data_000001_000003.parquet");
+        let file = std::fs::File::create(&data_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let manifest = serde_json::json!({
+            "version": 1,
+            "current_seq": 3,
+            "partitions": {
+                "_default": {
+                    "data_files": ["data/data_000001_000003.parquet"],
+                    "delta_files": []
+                }
+            }
+        });
+        std::fs::write(
+            collection_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let store = MilvusLiteStore::open(&root);
+        assert!(store.delete_by_document_id("doc_chunk", "drop-me").await.unwrap());
+        let snapshot = store.collection("doc_chunk").await.unwrap();
+        let remaining: Vec<i64> = snapshot.rows.iter().map(|row| row.pk).collect();
+        assert_eq!(remaining, vec![11, 13]);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(collection_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["version"], 2);
+        let delta_files = manifest["partitions"]["_default"]["delta_files"]
+            .as_array()
+            .unwrap();
+        assert_eq!(delta_files.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_collection_returns_false() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-milvus-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = MilvusLiteStore::open(&root);
+        assert!(!store
+            .delete_by_document_id("doc_chunk", "any")
+            .await
+            .unwrap());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
