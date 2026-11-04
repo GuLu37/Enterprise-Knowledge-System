@@ -936,6 +936,35 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+/// 对齐 Python `SkillNotFoundError(KeyError)`：HTTP 404 文案带引号。
+pub fn skill_not_found_http_detail(name: &str) -> String {
+    format!("未找到技能: '{name}'")
+}
+
+/// 对齐 Python `SkillExecuteResponse`：HTTP 不回传 `skill_instructions`，context 含 provider/model。
+pub fn skill_execute_http_payload(wrapped: Value) -> Value {
+    let mut payload = wrapped;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("skill_instructions");
+        if let Some(context) = obj.get_mut("context").and_then(Value::as_object_mut) {
+            context.entry("provider".to_string()).or_insert(Value::Null);
+            context.entry("model".to_string()).or_insert(Value::Null);
+        }
+    }
+    payload
+}
+
+fn public_context_metadata(metadata: Value) -> Value {
+    match metadata {
+        Value::Null => json!({}),
+        Value::Object(mut map) => {
+            map.remove("memory_context");
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
 pub fn wrap_skill_execution(
     name: &str,
     arguments: &Value,
@@ -961,8 +990,10 @@ pub fn wrap_skill_execution(
             "conversation_id": conversation_id,
             "session_id": session_id,
             "query": query,
+            "provider": Value::Null,
+            "model": Value::Null,
             "trace_id": trace_id,
-            "metadata": if metadata.is_null() { json!({}) } else { metadata },
+            "metadata": public_context_metadata(metadata),
         },
         "skill_instructions": skill_instructions,
         "result": result,
@@ -2014,6 +2045,31 @@ mod tests {
         assert!(instructions.contains("记忆查询"));
         assert!(instructions.contains("不能跨用户"));
         assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
+        assert_eq!(
+            skill_not_found_http_detail("memory_query"),
+            "未找到技能: 'memory_query'"
+        );
+        let http_payload = skill_execute_http_payload(wrapped.clone());
+        assert!(http_payload.get("skill_instructions").is_none());
+        assert_eq!(http_payload["skill"], "memory_query");
+        assert_eq!(http_payload["context"]["provider"], json!(null));
+        assert_eq!(http_payload["context"]["model"], json!(null));
+        assert_eq!(http_payload["context"]["conversation_id"], "c1");
+        assert!(wrapped.get("skill_instructions").is_some());
+        let filtered = wrap_skill_execution(
+            "memory_query",
+            &json!({}),
+            "u1",
+            None,
+            None,
+            None,
+            None,
+            json!({"keep": true, "memory_context": {"secret": 1}}),
+            json!({"ok": true}),
+        )
+        .unwrap();
+        assert_eq!(filtered["context"]["metadata"], json!({"keep": true}));
+        assert!(filtered["context"]["metadata"].get("memory_context").is_none());
 
         let messages = build_skill_messages(
             " 我叫什么 ",

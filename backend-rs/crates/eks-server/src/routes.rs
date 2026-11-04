@@ -532,7 +532,7 @@ pub async fn execute_skill(
     let Some(definition) = crate::skills::get_skill_definition_from(name, manifests) else {
         return Err(AuthError {
             status: StatusCode::NOT_FOUND,
-            detail: format!("未找到技能: {name}"),
+            detail: crate::skills::skill_not_found_http_detail(name),
         });
     };
     if definition.kind == "remote_mcp" {
@@ -553,7 +553,10 @@ pub async fn execute_skill(
         Some(state.engine.embedder.as_ref()),
     )
     .await
-    .map_err(|detail| AuthError::bad_request(&detail))?;
+    .map_err(|detail| AuthError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail,
+    })?;
     let payload = crate::skills::wrap_skill_execution(
         name,
         &request.arguments,
@@ -565,11 +568,20 @@ pub async fn execute_skill(
         request.context.metadata,
         result,
     )
-    .map_err(|detail| AuthError {
-        status: StatusCode::NOT_FOUND,
-        detail,
+    .map_err(|detail| {
+        if detail.starts_with("未找到技能:") {
+            AuthError {
+                status: StatusCode::NOT_FOUND,
+                detail: crate::skills::skill_not_found_http_detail(name),
+            }
+        } else {
+            AuthError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                detail,
+            }
+        }
     })?;
-    Ok(Json(payload))
+    Ok(Json(crate::skills::skill_execute_http_payload(payload)))
 }
 
 pub async fn retrieval_hybrid(
