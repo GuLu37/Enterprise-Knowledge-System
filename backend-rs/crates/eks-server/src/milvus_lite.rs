@@ -322,7 +322,82 @@ impl MilvusLiteStore {
     }
 }
 
-const MEMORY_EMBEDDING_DIM: usize = 768;
+pub const DEFAULT_EMBEDDING_DIMENSION: usize = 768;
+
+/// 对齐 Python `_validate_vector_dimension` 的错误文案。
+pub fn vector_dimension_mismatch(collection: &str, actual: usize, expected: usize) -> String {
+    format!("Milvus collection 维度不匹配: {collection} 当前为 {actual}, 配置为 {expected}")
+}
+
+pub fn validate_vector_dimension(
+    collection: &str,
+    actual: usize,
+    expected: usize,
+) -> Result<(), String> {
+    if actual != expected {
+        return Err(vector_dimension_mismatch(collection, actual, expected));
+    }
+    Ok(())
+}
+
+/// 读取已有 parquet 的 FixedSizeList 维度；空集合返回 None。
+pub fn collection_stored_vector_dimension(root: &Path, collection: &str) -> Option<usize> {
+    let collection_dir = root.join("collections").join(collection);
+    let manifest_str = std::fs::read_to_string(collection_dir.join("manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
+    let files = manifest
+        .pointer("/partitions/_default/data_files")?
+        .as_array()?;
+    let partition_dir = collection_dir.join("partitions").join("_default");
+    for file in files {
+        let rel = file.as_str()?;
+        let path = partition_dir.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        if let Some(dim) = parquet_vector_list_size(&path) {
+            return Some(dim);
+        }
+    }
+    None
+}
+
+fn parquet_vector_list_size(path: &Path) -> Option<usize> {
+    let file = std::fs::File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    for field in builder.schema().fields() {
+        if field.name() == "vector" {
+            if let DataType::FixedSizeList(_, size) = field.data_type() {
+                return Some(*size as usize);
+            }
+        }
+    }
+    None
+}
+
+pub fn ensure_collection_dimension(
+    root: &Path,
+    collection: &str,
+    expected: usize,
+) -> Result<(), String> {
+    if let Some(actual) = collection_stored_vector_dimension(root, collection) {
+        validate_vector_dimension(collection, actual, expected)?;
+    }
+    Ok(())
+}
+
+fn flatten_fixed_vectors<'a>(
+    collection: &str,
+    expected: usize,
+    vectors: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<Vec<f32>, String> {
+    let mut flat = Vec::new();
+    for vector in vectors {
+        validate_vector_dimension(collection, vector.len(), expected)?;
+        flat.extend_from_slice(vector);
+    }
+    Ok(flat)
+}
 
 #[derive(Debug, Clone)]
 pub struct MemoryChunkRow {
@@ -374,11 +449,14 @@ pub fn append_memory_chunks(
     root: &Path,
     collection: &str,
     rows: &[MemoryChunkRow],
+    embedding_dimension: usize,
 ) -> Result<(), String> {
     if rows.is_empty() {
         return Ok(());
     }
+    let embedding_dimension = embedding_dimension.max(1);
     ensure_collection(root, collection)?;
+    ensure_collection_dimension(root, collection, embedding_dimension)?;
     let collection_dir = root.join("collections").join(collection);
     let manifest_path = collection_dir.join("manifest.json");
     let manifest_str =
@@ -398,15 +476,14 @@ pub fn append_memory_chunks(
     let pk_start = current_seq + 100;
     let pk_values: Vec<i64> = (0..n).map(|i| pk_start + i as i64).collect();
     let seq_values: Vec<i64> = (0..n).map(|i| start_seq + i as i64).collect();
-    let mut flat_vectors = Vec::with_capacity(n * MEMORY_EMBEDDING_DIM);
-    for row in rows {
-        let mut vector = row.vector.clone();
-        vector.resize(MEMORY_EMBEDDING_DIM, 0.0);
-        flat_vectors.extend_from_slice(&vector);
-    }
+    let flat_vectors = flatten_fixed_vectors(
+        collection,
+        embedding_dimension,
+        rows.iter().map(|row| row.vector.as_slice()),
+    )?;
     let vector_array = FixedSizeListArray::new(
         std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
-        MEMORY_EMBEDDING_DIM as i32,
+        embedding_dimension as i32,
         std::sync::Arc::new(arrow_array::Float32Array::from(flat_vectors)) as ArrayRef,
         None,
     );
@@ -418,7 +495,7 @@ pub fn append_memory_chunks(
             "vector",
             DataType::FixedSizeList(
                 std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
-                MEMORY_EMBEDDING_DIM as i32,
+                embedding_dimension as i32,
             ),
             false,
         ),
@@ -879,9 +956,9 @@ mod tests {
                 .unwrap()
                 .as_millis()
         ));
-        let mut keep = vec![0.0f32; MEMORY_EMBEDDING_DIM];
+        let mut keep = vec![0.0f32; DEFAULT_EMBEDDING_DIMENSION];
         keep[0] = 1.0;
-        let mut other = vec![0.0f32; MEMORY_EMBEDDING_DIM];
+        let mut other = vec![0.0f32; DEFAULT_EMBEDDING_DIMENSION];
         other[1] = 1.0;
         append_memory_chunks(
             &root,
@@ -918,6 +995,7 @@ mod tests {
                     vector: other,
                 },
             ],
+            DEFAULT_EMBEDDING_DIMENSION,
         )
         .unwrap();
         let store = MilvusLiteStore::open(&root);
@@ -951,6 +1029,118 @@ mod tests {
                 .get("memory_id")
                 .and_then(FieldValue::as_str),
             Some("u1:c2:0:bbb")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vector_dimension_mismatch_matches_python() {
+        assert_eq!(
+            vector_dimension_mismatch("memory_chunks", 1024, 768),
+            "Milvus collection 维度不匹配: memory_chunks 当前为 1024, 配置为 768"
+        );
+        assert!(validate_vector_dimension("doc_chunk", 768, 768).is_ok());
+        assert!(validate_vector_dimension("doc_chunk", 512, 768)
+            .unwrap_err()
+            .contains("当前为 512, 配置为 768"));
+    }
+
+    #[test]
+    fn append_memory_chunks_rejects_wrong_vector_dim() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-memory-dim-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let err = append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[MemoryChunkRow {
+                memory_id: "u1:c1:0:aaa".into(),
+                chunk_index: 0,
+                source_name: "conversation".into(),
+                chunk_text: "差旅".into(),
+                user_id: "u1".into(),
+                conversation_id: "c1".into(),
+                session_id: "s1".into(),
+                chunk_type: "dialogue".into(),
+                topic: String::new(),
+                turn_start: 0,
+                turn_end: 0,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                vector: vec![0.1, 0.2],
+            }],
+            DEFAULT_EMBEDDING_DIMENSION,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Milvus collection 维度不匹配: memory_chunks 当前为 2, 配置为 768"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_collection_rejects_config_dim_change() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-memory-dim-change-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let vector = vec![0.0f32; DEFAULT_EMBEDDING_DIMENSION];
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[MemoryChunkRow {
+                memory_id: "u1:c1:0:aaa".into(),
+                chunk_index: 0,
+                source_name: "conversation".into(),
+                chunk_text: "差旅".into(),
+                user_id: "u1".into(),
+                conversation_id: "c1".into(),
+                session_id: "s1".into(),
+                chunk_type: "dialogue".into(),
+                topic: String::new(),
+                turn_start: 0,
+                turn_end: 0,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                vector: vector.clone(),
+            }],
+            DEFAULT_EMBEDDING_DIMENSION,
+        )
+        .unwrap();
+        assert_eq!(
+            collection_stored_vector_dimension(&root, "memory_chunks"),
+            Some(DEFAULT_EMBEDDING_DIMENSION)
+        );
+        let err = append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[MemoryChunkRow {
+                memory_id: "u1:c1:1:bbb".into(),
+                chunk_index: 1,
+                source_name: "conversation".into(),
+                chunk_text: "下一句".into(),
+                user_id: "u1".into(),
+                conversation_id: "c1".into(),
+                session_id: "s1".into(),
+                chunk_type: "dialogue".into(),
+                topic: String::new(),
+                turn_start: 1,
+                turn_end: 1,
+                created_at: "2026-01-01T00:00:01Z".into(),
+                vector: vec![0.0f32; 4],
+            }],
+            4,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Milvus collection 维度不匹配: memory_chunks 当前为 768, 配置为 4"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -217,6 +217,7 @@ pub struct RetrievalEngine {
     pub use_hybrid: bool,
     pub sparse_index_mode: String,
     pub sparse_index_max_rows: usize,
+    pub embedding_dimension: usize,
     pub similarity_threshold: f64,
     pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
     pub ce_candidate_k: usize,
@@ -261,6 +262,7 @@ impl RetrievalEngine {
             use_hybrid: true,
             sparse_index_mode: "cached".into(),
             sparse_index_max_rows: 50_000,
+            embedding_dimension: crate::milvus_lite::DEFAULT_EMBEDDING_DIMENSION,
             similarity_threshold: 0.5,
             cross_encoder: None,
             ce_candidate_k: 30,
@@ -283,6 +285,7 @@ impl RetrievalEngine {
         self.use_hybrid = config.use_hybrid_retriever;
         self.sparse_index_mode = config.sparse_index_mode.clone();
         self.sparse_index_max_rows = config.sparse_index_max_rows;
+        self.embedding_dimension = config.embedding_dimension;
         self.similarity_threshold = config.similarity_threshold;
         self
     }

@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         collection: config.milvus_memory_collection.clone(),
         embedder: engine.embedder.clone(),
+        embedding_dimension: config.embedding_dimension,
     });
 
     eks_server::memory::spawn_memory_maintenance(

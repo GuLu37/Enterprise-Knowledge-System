@@ -218,6 +218,7 @@ pub struct MemoryVectorSink {
     pub store: MilvusLiteStore,
     pub collection: String,
     pub embedder: Arc<Embedder>,
+    pub embedding_dimension: usize,
 }
 
 static MEMORY_VECTOR_SINK: OnceLock<MemoryVectorSink> = OnceLock::new();
@@ -2395,7 +2396,12 @@ async fn write_memory_vector(
         created_at: created_at.to_string(),
         vector,
     };
-    if let Err(err) = crate::milvus_lite::append_memory_chunks(&sink.store.root, &sink.collection, &[row]) {
+    if let Err(err) = crate::milvus_lite::append_memory_chunks(
+        &sink.store.root,
+        &sink.collection,
+        &[row],
+        sink.embedding_dimension,
+    ) {
         tracing::warn!("长期记忆向量写入失败: {err}");
         return;
     }
@@ -2414,8 +2420,24 @@ async fn search_event_memories_ann(
     if query.is_empty() || !sink.store.has_collection(&sink.collection).await {
         return None;
     }
+    if let Err(err) = crate::milvus_lite::ensure_collection_dimension(
+        &sink.store.root,
+        &sink.collection,
+        sink.embedding_dimension,
+    ) {
+        tracing::warn!("长期记忆向量召回跳过: {err}");
+        return None;
+    }
     let vectors = sink.embedder.embed_queries(&[query.to_string()]).ok()?;
     let vector = vectors.into_iter().next()?;
+    if let Err(err) = crate::milvus_lite::validate_vector_dimension(
+        &sink.collection,
+        vector.len(),
+        sink.embedding_dimension,
+    ) {
+        tracing::warn!("长期记忆向量召回跳过: {err}");
+        return None;
+    }
     let conv = conversation_id;
     let sess = session_id;
     let hits = sink

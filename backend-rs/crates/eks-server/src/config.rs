@@ -86,6 +86,7 @@ pub struct Config {
     pub use_hybrid_retriever: bool,
     pub sparse_index_mode: String,
     pub sparse_index_max_rows: usize,
+    pub embedding_dimension: usize,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -469,6 +470,7 @@ impl Config {
             use_hybrid_retriever: env_bool("USE_HYBRID_RETRIEVER", true),
             sparse_index_mode: env_or("SPARSE_INDEX_MODE", "cached").trim().to_lowercase(),
             sparse_index_max_rows: env_i64("SPARSE_INDEX_MAX_ROWS", 50_000).max(1000) as usize,
+            embedding_dimension: env_i64("EMBEDDING_DIMENSION", 768).max(1) as usize,
         };
         if let Err(err) = validate_runtime_security(
             config.debug,
@@ -565,6 +567,7 @@ impl Config {
             use_hybrid_retriever: true,
             sparse_index_mode: "cached".into(),
             sparse_index_max_rows: 50_000,
+            embedding_dimension: 768,
         }
     }
 }
@@ -644,6 +647,7 @@ mod tests {
         assert!(Config::jwt_test().use_hybrid_retriever);
         assert_eq!(Config::jwt_test().sparse_index_mode, "cached");
         assert_eq!(Config::jwt_test().sparse_index_max_rows, 50_000);
+        assert_eq!(Config::jwt_test().embedding_dimension, 768);
     }
 
     #[test]

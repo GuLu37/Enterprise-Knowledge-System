@@ -46,7 +46,6 @@ const STRUCTURED_FILE_TYPES: [&str; 4] = ["csv", "tsv", "xls", "xlsx"];
 const ARTICLE_FILE_TYPES: [&str; 9] = [
     "pdf", "doc", "docx", "md", "txt", "html", "htm", "rtf", "markdown",
 ];
-const EMBEDDING_DIM: usize = 768;
 
 // ==================== 文本提取 ====================
 
@@ -1296,9 +1295,15 @@ pub async fn append_to_milvus_lite(
     file_type: &str,
     content_type: &str,
     vectors: &[Vec<f32>],
+    embedding_dimension: usize,
 ) -> Result<(), String> {
     if child_rows.is_empty() || vectors.is_empty() {
         return Ok(());
+    }
+    let embedding_dimension = embedding_dimension.max(1);
+    crate::milvus_lite::ensure_collection_dimension(&store.root, collection, embedding_dimension)?;
+    for vector in vectors {
+        crate::milvus_lite::validate_vector_dimension(collection, vector.len(), embedding_dimension)?;
     }
 
     let collection_dir = store
@@ -1334,7 +1339,7 @@ pub async fn append_to_milvus_lite(
         Field::new("pk", DataType::Int64, false),
         Field::new("text", DataType::Utf8, false),
         Field::new("vector", DataType::FixedSizeList(
-            std::sync::Arc::new(Field::new("item", DataType::Float32, true)), EMBEDDING_DIM as i32
+            std::sync::Arc::new(Field::new("item", DataType::Float32, true)), embedding_dimension as i32
         ), false),
         Field::new("document_id", DataType::Utf8, false),
         Field::new("chunk_index", DataType::Int64, false),
@@ -1352,7 +1357,7 @@ pub async fn append_to_milvus_lite(
     let flat_vectors: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
     let vector_array = FixedSizeListArray::new(
         std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
-        EMBEDDING_DIM as i32,
+        embedding_dimension as i32,
         std::sync::Arc::new(Float32Array::from(flat_vectors)) as ArrayRef,
         None,
     );

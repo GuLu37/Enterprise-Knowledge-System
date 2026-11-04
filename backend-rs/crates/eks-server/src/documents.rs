@@ -643,6 +643,7 @@ async fn process_document_upload_inner(
         file_type,
         content_type,
         &vectors,
+        state.config.embedding_dimension,
     )
     .await
     .map_err(|err| format!("向量库写入失败: {err}"))?;
