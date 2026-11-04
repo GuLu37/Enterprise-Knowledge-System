@@ -183,6 +183,55 @@ fn is_filename_break(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '，' | '。' | '；' | '：' | ',' | ';' | ':' | '、' | '《' | '》' | '（' | '）' | '(' | ')')
 }
 
+/// 对齐 Python `_default_action_arguments`。
+pub fn default_action_arguments(tool_name: &str, query: &str) -> Value {
+    match tool_name {
+        "search_knowledge_base" => json!({
+            "query": query,
+            "top_k": 5,
+            "retrieval_method": "hybrid",
+        }),
+        "memory_query" => json!({
+            "query": query,
+            "top_k": 5,
+            "memory_scope": "all",
+        }),
+        "memory_retrieve_original" => json!({
+            "query": query,
+            "top_k": 8,
+            "max_chars": 12000,
+        }),
+        "document_hot_word_statistics" => {
+            let mut defaults = json!({
+                "top_k": 10,
+                "include_samples": true,
+            });
+            let file_name = extract_file_name_hint(query);
+            if !file_name.is_empty() {
+                defaults["file_name"] = json!(file_name);
+            }
+            defaults
+        }
+        _ => json!({}),
+    }
+}
+
+/// 对齐 Python `_normalize_action_arguments`：只补缺省，不覆盖调用方已给的键。
+pub fn normalize_action_arguments(tool_name: &str, arguments: &Value, query: &str) -> Value {
+    let mut normalized = if arguments.is_object() {
+        arguments.clone()
+    } else {
+        json!({})
+    };
+    let defaults = default_action_arguments(tool_name, query);
+    if let (Some(target), Some(defaults)) = (normalized.as_object_mut(), defaults.as_object()) {
+        for (key, value) in defaults {
+            target.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    normalized
+}
+
 pub fn should_disclose_original_memory(query: &str) -> bool {
     let normalized: String = query
         .chars()
@@ -2302,6 +2351,34 @@ mod tests {
         assert!(freq.get("账号").copied().unwrap_or(0) >= 1);
         assert!(freq.get("密码").copied().unwrap_or(0) >= 1);
         assert!(!freq.contains_key("账号密码"));
+    }
+
+    #[test]
+    fn tool_defaults_are_shared_by_direct_and_agent_paths() {
+        let query = "请展开之前摘要对应的完整对话";
+        let direct = normalize_action_arguments("memory_retrieve_original", &json!({}), query);
+        let agent = default_action_arguments("memory_retrieve_original", query);
+        assert_eq!(direct, agent);
+        assert_eq!(direct["query"], query);
+        assert_eq!(direct["top_k"], 8);
+        assert_eq!(direct["max_chars"], 12000);
+
+        let provided = normalize_action_arguments(
+            "memory_query",
+            &json!({"query": "只要这个", "top_k": 2}),
+            "原始问题",
+        );
+        assert_eq!(provided["query"], "只要这个");
+        assert_eq!(provided["top_k"], 2);
+        assert_eq!(provided["memory_scope"], "all");
+
+        let hot = default_action_arguments(
+            "document_hot_word_statistics",
+            "统计 05_费用标准表.xlsx 的热词",
+        );
+        assert_eq!(hot["top_k"], 10);
+        assert_eq!(hot["include_samples"], true);
+        assert_eq!(hot["file_name"], "05_费用标准表.xlsx");
     }
 
     #[tokio::test]

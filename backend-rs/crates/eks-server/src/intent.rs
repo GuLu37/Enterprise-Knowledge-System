@@ -384,7 +384,7 @@ fn intent_from_tool_call(name: &str, arguments: &Value, query: &str) -> Option<Q
         confidence: Some(1.0),
         rewritten_query: String::new(),
         skill_name: Some(name.to_string()),
-        skill_arguments: arguments.clone(),
+        skill_arguments: crate::skills::normalize_action_arguments(name, arguments, query),
         clarify_question: String::new(),
     })
 }

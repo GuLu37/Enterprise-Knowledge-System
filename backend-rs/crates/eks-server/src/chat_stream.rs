@@ -248,11 +248,13 @@ async fn prepare_skill_action(
         return Err("skill 路由缺少 skill_name".into());
     }
     let history_messages = memory_history(input.history);
+    let arguments =
+        crate::skills::normalize_action_arguments(name, &intent.skill_arguments, input.query);
     let result = crate::skills::execute_named_from(
         input.pool,
         input.user_id,
         name,
-        &intent.skill_arguments,
+        &arguments,
         input.mcp_manifests,
         nonempty(input.conversation_id),
         &history_messages,
@@ -261,7 +263,7 @@ async fn prepare_skill_action(
     )
     .await?;
     let query_sufficient = tool_result_has_signal(name, &result);
-    let wrapped = wrap_prepared_skill(input, name, &intent.skill_arguments, result.clone())?;
+    let wrapped = wrap_prepared_skill(input, name, &arguments, result.clone())?;
     let mut answer_name = name.to_string();
     let mut answer_result = result.clone();
     let mut answer_wrapped = wrapped.clone();
@@ -1616,6 +1618,11 @@ pub async fn stream_chat(
                     break;
                 }
                 let skill_name = intent.skill_name.clone().unwrap_or_default();
+                intent.skill_arguments = crate::skills::normalize_action_arguments(
+                    &skill_name,
+                    &intent.skill_arguments,
+                    &query,
+                );
                 yield Ok(sse_json(
                     "tool_call",
                     sse_tool_call_payload(&skill_name, intent.skill_arguments.clone(), &intent.reason),

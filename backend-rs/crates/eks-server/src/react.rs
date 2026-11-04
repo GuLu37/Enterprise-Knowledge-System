@@ -471,22 +471,20 @@ async fn execute_tool(
     llm: &LlmClient,
     history: &[(String, String)],
 ) -> (Value, Vec<RetrievalItem>) {
+    let arguments = skills::normalize_action_arguments(&call.name, &call.arguments, original_query);
     if call.name == "search_knowledge_base" {
-        let query = call
-            .arguments
+        let query = arguments
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or(original_query)
             .trim();
-        let top_k = call
-            .arguments
+        let top_k = arguments
             .get("top_k")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(default_top_k)
             .clamp(1, 50);
-        let method = call
-            .arguments
+        let method = arguments
             .get("retrieval_method")
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
@@ -512,7 +510,7 @@ async fn execute_tool(
         pool,
         user_id,
         &call.name,
-        &call.arguments,
+        &arguments,
         mcp_manifests,
         None,
         &recent_history,
