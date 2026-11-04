@@ -236,6 +236,7 @@ fn env_i64_first(keys: &[&str], default: i64) -> i64 {
 }
 
 /// 对齐 Python `_resolve_sqlite_url`：从 `DATABASE_URL` 抽出 sqlite 文件路径。
+/// 非 sqlite URL 返回 `None`；调用方应配合 `reject_unsupported_database_url` 失败而不是静默忽略。
 pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
     let path = raw.trim().strip_prefix("sqlite:///")?;
     if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
@@ -253,6 +254,18 @@ pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .map(|name| format!("../backend/app/data/{name}"))
+}
+
+/// Rust 不实现 MySQL/PostgreSQL：非 sqlite 的 `DATABASE_URL` 必须启动失败。
+pub fn reject_unsupported_database_url(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.to_ascii_lowercase().starts_with("sqlite") {
+        Ok(())
+    } else {
+        Err(format!(
+            "Rust 后端仅支持 sqlite DATABASE_URL，当前为 `{trimmed}`。MySQL/PostgreSQL 不在此实现。"
+        ))
+    }
 }
 
 /// 对齐 Python `_resolve_backend_model_path`：相对路径相对 backend 目录解析。
@@ -302,6 +315,9 @@ fn load_sqlite_path() -> String {
         }
     }
     if let Ok(value) = env::var("DATABASE_URL") {
+        if let Err(err) = reject_unsupported_database_url(&value) {
+            panic!("{err}");
+        }
         if let Some(path) = sqlite_path_from_database_url(&value) {
             return path;
         }
@@ -808,6 +824,20 @@ mod tests {
             Some("/var/eks/rag_metadata.db")
         );
         assert!(sqlite_path_from_database_url("postgresql://localhost/rag").is_none());
+        assert!(reject_unsupported_database_url("").is_ok());
+        assert!(reject_unsupported_database_url("sqlite:///./app/data/rag_metadata.db").is_ok());
+        assert!(
+            reject_unsupported_database_url("postgresql://localhost/rag")
+                .unwrap_err()
+                .contains("仅支持 sqlite DATABASE_URL")
+        );
+        assert!(
+            reject_unsupported_database_url(
+                "mysql+pymysql://user:password@mysql:3306/rag_db?charset=utf8mb4"
+            )
+            .unwrap_err()
+            .contains("MySQL/PostgreSQL 不在此实现")
+        );
         assert_eq!(
             resolve_backend_model_path("./app/models/bge-base-zh-v1.5", "def"),
             "../backend/app/models/bge-base-zh-v1.5"
