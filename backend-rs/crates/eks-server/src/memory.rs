@@ -344,6 +344,7 @@ pub async fn cleanup_memory_records(
     .await?;
 
     let mut stats = MemoryCleanupStats::default();
+    let mut expired_event_ids: Vec<String> = Vec::new();
     for row in rows {
         let age_days = age_days_since(row.last_accessed_at.as_deref(), &row.created_at, now);
         let score = decay_importance_score(
@@ -363,6 +364,9 @@ pub async fn cleanup_memory_records(
         );
         let status = if expire {
             stats.expired += 1;
+            if row.memory_type == MEMORY_TYPE_EVENT {
+                expired_event_ids.push(row.memory_id.clone());
+            }
             "expired"
         } else {
             MEMORY_STATUS_ACTIVE
@@ -379,6 +383,7 @@ pub async fn cleanup_memory_records(
         .await?;
         stats.rescored += 1;
     }
+    delete_memory_vectors(&expired_event_ids).await;
 
     let purge_before = crate::db::fmt_dt(&(now - chrono::Duration::days(settings.purge_retention_days.max(1))));
     let purged = sqlx::query(
@@ -2225,6 +2230,28 @@ async fn insert_event_memory_with_confidence(
         uuid::Uuid::new_v4().simple()
     );
     let stored_key = event_logical_key(user_id, conversation_id, chunk_type, &memory_id, chunk_index);
+    let current: Option<(String, i64)> = sqlx::query_as(
+        "SELECT memory_id, version FROM memory_records \
+         WHERE user_id = ? AND memory_type = 'event' AND memory_key = ? AND status = 'active' \
+         ORDER BY version DESC, updated_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(&stored_key)
+    .fetch_optional(pool)
+    .await?;
+    let mut version = 1i64;
+    let mut supersedes_memory_id: Option<String> = None;
+    if let Some((old_id, old_version)) = current {
+        sqlx::query(
+            "UPDATE memory_records SET status = 'superseded', updated_at = ? WHERE memory_id = ?",
+        )
+        .bind(&now_text)
+        .bind(&old_id)
+        .execute(pool)
+        .await?;
+        version = old_version + 1;
+        supersedes_memory_id = Some(old_id);
+    }
     write_memory_vector(
         &memory_id,
         chunk_index,
@@ -2242,8 +2269,8 @@ async fn insert_event_memory_with_confidence(
         "INSERT INTO memory_records (
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
             turn_start, turn_end, importance_score, base_importance_score, confidence_score,
-            access_count, status, version, created_at, updated_at, expires_at
-        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', 1, ?, ?, ?)",
+            access_count, status, version, supersedes_memory_id, created_at, updated_at, expires_at
+        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?, ?)",
     )
     .bind(&memory_id)
     .bind(user_id)
@@ -2256,11 +2283,16 @@ async fn insert_event_memory_with_confidence(
     .bind(clamp_score(importance))
     .bind(clamp_score(importance))
     .bind(clamp_confidence(confidence))
+    .bind(version)
+    .bind(supersedes_memory_id.as_deref())
     .bind(&now_text)
     .bind(&now_text)
     .bind(&expires_at)
     .execute(pool)
     .await?;
+    if let Some(retired) = supersedes_memory_id {
+        delete_memory_vectors(&[retired]).await;
+    }
     Ok(memory_id)
 }
 
@@ -2604,6 +2636,101 @@ mod tests {
             "{}",
             row.1
         );
+    }
+
+    #[tokio::test]
+    async fn rewriting_same_logical_key_supersedes_previous_event() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let first = insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】报销\n【摘要】第一版摘要",
+            70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(0),
+            Some(9),
+        )
+        .await
+        .unwrap();
+        let second = insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】报销\n【摘要】第二版摘要",
+            80.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(0),
+            Some(9),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first, second);
+        let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT memory_id, status, version, supersedes_memory_id \
+             FROM memory_records WHERE user_id = 'u1' ORDER BY version ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, first);
+        assert_eq!(rows[0].1, "superseded");
+        assert_eq!(rows[0].2, 1);
+        assert!(rows[0].3.is_none());
+        assert_eq!(rows[1].0, second);
+        assert_eq!(rows[1].1, "active");
+        assert_eq!(rows[1].2, 2);
+        assert_eq!(rows[1].3.as_deref(), Some(first.as_str()));
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE user_id = 'u1' AND status = 'active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[tokio::test]
+    async fn dialogue_events_keep_independent_logical_keys() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 第一轮\n助手: 回答一",
+            55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 第二轮\n助手: 回答二",
+            55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, version FROM memory_records WHERE user_id = 'u1' ORDER BY created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![("active".into(), 1), ("active".into(), 1)]);
     }
 
     #[tokio::test]
