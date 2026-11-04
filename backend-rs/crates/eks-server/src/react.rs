@@ -65,6 +65,24 @@ fn format_react_sufficient(kind: &str, reason: &str) -> String {
     }
 }
 
+/// 对齐 Python rag `bind_tools` 失败「回退规则检索」与 unified「回退 rag 专用循环」。
+fn format_react_bind_tools_fail(kind: &str, err: &str) -> String {
+    if kind == "unified_react" {
+        format!("统一 ReAct 编排 bind_tools 失败，回退 rag 专用循环: {err}")
+    } else {
+        format!("ReAct 检索决策 bind_tools 失败，回退规则检索: {err}")
+    }
+}
+
+/// 对齐 Python `ReAct 检索决策工具执行失败` / `统一 ReAct 编排工具执行失败`。
+fn format_react_tool_exec_fail(kind: &str, name: &str, err: &str) -> String {
+    if kind == "unified_react" {
+        format!("统一 ReAct 编排工具执行失败: {name} -> {err}")
+    } else {
+        format!("ReAct 检索决策工具执行失败: {name} -> {err}")
+    }
+}
+
 pub async fn run_unified_react(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
@@ -178,11 +196,7 @@ async fn run_react_loop(
             Ok(result) => result,
             Err(err) => {
                 if !used_react {
-                    if kind == "unified_react" {
-                        tracing::warn!("统一 ReAct 编排 bind_tools 失败，回退 rag 专用循环: {err}");
-                    } else {
-                        tracing::warn!("{kind} bind_tools 失败: {err}");
-                    }
+                    tracing::warn!("{}", format_react_bind_tools_fail(kind, &err.to_string()));
                     return ReactAttempt::Unavailable;
                 }
                 tracing::warn!("{kind} 后续轮次失败，使用已有观察: {err}");
@@ -250,6 +264,12 @@ async fn run_react_loop(
                 }
             }).buffer_unordered(workers);
             while let Some((index, observation, extra)) = stream.next().await {
+                if let Some(err) = observation.get("error").and_then(Value::as_str) {
+                    tracing::warn!(
+                        "{}",
+                        format_react_tool_exec_fail(kind, &calls[index].name, err)
+                    );
+                }
                 observations[index] = observation;
                 extras[index] = extra;
             }
@@ -635,6 +655,22 @@ mod tests {
         assert_eq!(
             format_react_sufficient("unified_react", "enough_results"),
             "统一 ReAct 编排：证据评估充分（enough_results），提前结束"
+        );
+        assert_eq!(
+            format_react_bind_tools_fail("rag_react", "vendor unsupported"),
+            "ReAct 检索决策 bind_tools 失败，回退规则检索: vendor unsupported"
+        );
+        assert_eq!(
+            format_react_bind_tools_fail("unified_react", "timeout"),
+            "统一 ReAct 编排 bind_tools 失败，回退 rag 专用循环: timeout"
+        );
+        assert_eq!(
+            format_react_tool_exec_fail("rag_react", "search_knowledge_base", "milvus down"),
+            "ReAct 检索决策工具执行失败: search_knowledge_base -> milvus down"
+        );
+        assert_eq!(
+            format_react_tool_exec_fail("unified_react", "memory_query", "db locked"),
+            "统一 ReAct 编排工具执行失败: memory_query -> db locked"
         );
     }
 
