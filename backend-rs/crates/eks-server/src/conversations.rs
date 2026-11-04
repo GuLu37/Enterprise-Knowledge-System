@@ -241,20 +241,7 @@ mod tests {
 
     async fn memory_pool() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE user_conversations (
-                user_id TEXT NOT NULL,
-                conversation_id TEXT NOT NULL,
-                session_id TEXT,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, conversation_id)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        crate::db::ensure_conversation_schema(&pool).await.unwrap();
         crate::memory::ensure_schema(&pool).await.unwrap();
         pool
     }

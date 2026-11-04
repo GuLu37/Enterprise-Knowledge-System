@@ -107,6 +107,73 @@ pub async fn ensure_document_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx:
     )
     .execute(pool)
     .await?;
+    migrate_document_parent_id(pool).await?;
+    Ok(())
+}
+
+/// 对齐 Python `init_metadata_db` 中的 user_conversations 表。
+pub async fn ensure_conversation_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT,
+            payload TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, conversation_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS ix_user_conversations_user_updated \
+         ON user_conversations (user_id, updated_at)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn table_column_names(
+    pool: &sqlx::SqlitePool,
+    table: &str,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    let mut names = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(name) = sqlx::Row::try_get::<String, _>(&row, "name") {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+/// 对齐 Python：旧库补 `parent_id` 列，并按 `document_id:p{chunk_index:06}` 回填。
+async fn migrate_document_parent_id(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = table_column_names(pool, "document_chunks").await?;
+    if !columns.contains("parent_id") {
+        sqlx::query("ALTER TABLE document_chunks ADD COLUMN parent_id TEXT")
+            .execute(pool)
+            .await?;
+        tracing::info!("SQLite document_chunks 已补充 parent_id 字段");
+    }
+    let result = sqlx::query(
+        "UPDATE document_chunks \
+         SET parent_id = document_id || char(58) || 'p' || printf('%06d', chunk_index) \
+         WHERE parent_id IS NULL OR parent_id = ''",
+    )
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            migrated = result.rows_affected(),
+            "SQLite document_chunks 已补齐历史 Parent ID"
+        );
+    }
     Ok(())
 }
 
@@ -340,4 +407,69 @@ pub async fn revoke_session(pool: &sqlx::SqlitePool, session_id: &str) -> Result
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn conversation_schema_supports_upsert_conflict() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_conversation_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO user_conversations (user_id, conversation_id, session_id, payload, created_at, updated_at) \
+             VALUES ('u1', 'c1', 's1', '[]', '2026-01-01 00:00:00.000000', '2026-01-01 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_conversations (user_id, conversation_id, session_id, payload, created_at, updated_at) \
+             VALUES ('u1', 'c1', 's2', '[1]', '2026-01-01 00:00:00.000000', '2026-01-02 00:00:00.000000') \
+             ON CONFLICT(user_id, conversation_id) DO UPDATE SET \
+             session_id = excluded.session_id, payload = excluded.payload, updated_at = excluded.updated_at",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row: (String, String) = sqlx::query_as(
+            "SELECT session_id, payload FROM user_conversations WHERE user_id = 'u1' AND conversation_id = 'c1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("s2".into(), "[1]".into()));
+    }
+
+    #[tokio::test]
+    async fn document_parent_id_is_backfilled_for_legacy_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE document_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, chunk_text, created_at) \
+             VALUES ('doc-a', 2, '正文', '2026-01-01 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        ensure_document_schema(&pool).await.unwrap();
+        let parent_id: String =
+            sqlx::query_scalar("SELECT parent_id FROM document_chunks WHERE document_id = 'doc-a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(parent_id, "doc-a:p000002");
+    }
 }
