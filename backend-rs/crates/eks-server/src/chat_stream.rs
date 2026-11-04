@@ -257,26 +257,20 @@ async fn prepare_skill_action(
     )?;
     let fallback = crate::skills::format_skill_answer(name, &result);
     let messages = if input.llm.is_some() {
-        let profile = crate::memory::profile_prompt(input.pool, input.user_id).await;
-        let event_memory = event_memory_prompt(
+        let long_term = crate::memory::build_long_term_memory_messages(
             input.pool,
-            input.embedder,
             input.user_id,
             input.query,
-            input.conversation_id,
-            input.session_id,
-            "skill",
+            nonempty(input.conversation_id),
+            nonempty(input.session_id),
+            0,
+            Some(input.embedder),
+            Some("skill"),
+            &history_messages,
         )
         .await;
-        let mut long_term = Vec::new();
-        if !profile.is_empty() {
-            long_term.push(ChatMessage::new("system", profile));
-        }
-        if !event_memory.is_empty() {
-            long_term.push(ChatMessage::new("system", event_memory));
-        }
         let history_messages = crate::short_memory::assemble(
-            &memory_history(input.history),
+            &history_messages,
             input.options,
             input.llm.clone(),
         )?;
@@ -750,47 +744,19 @@ fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
 }
 
 fn build_messages(
-    profile: &str,
-    event_memory: &str,
+    long_term: &[ChatMessage],
     context: &str,
     history_messages: Vec<ChatMessage>,
     query: &str,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    if !profile.is_empty() {
-        messages.push(ChatMessage::new("system", profile));
-    }
-    if !event_memory.is_empty() {
-        messages.push(ChatMessage::new("system", event_memory));
-    }
+    messages.extend(long_term.iter().cloned());
     if !context.is_empty() {
         messages.push(ChatMessage::new("system", build_rag_system_message(context)));
     }
     messages.extend(history_messages);
     messages.push(ChatMessage::new("user", query));
     messages
-}
-
-async fn event_memory_prompt(
-    pool: &sqlx::SqlitePool,
-    embedder: &crate::embedder::Embedder,
-    user_id: &str,
-    query: &str,
-    conversation_id: &str,
-    session_id: &str,
-    route: &str,
-) -> String {
-    crate::memory::hierarchical_prompt(
-        pool,
-        user_id,
-        query,
-        nonempty(conversation_id),
-        nonempty(session_id),
-        3,
-        Some(embedder),
-        Some(route),
-    )
-    .await
 }
 
 fn nonempty(value: &str) -> Option<&str> {
@@ -1299,24 +1265,26 @@ pub async fn generate_chat(
             "retrieval_method": turn.retrieval_method,
         })));
     }
-    let profile = crate::memory::profile_prompt(&state.pool, &user.user_id).await;
-    let event_memory = event_memory_prompt(
+    let history = memory_history(&request.history);
+    let long_term = crate::memory::build_long_term_memory_messages(
         &state.pool,
-        &state.engine.embedder,
         &user.user_id,
         &query,
-        &conversation_id,
-        &session_id,
-        &intent.route,
+        nonempty(&conversation_id),
+        nonempty(&session_id),
+        0,
+        Some(&state.engine.embedder),
+        Some(&intent.route),
+        &history,
     )
     .await;
     let history_messages = crate::short_memory::assemble(
-        &memory_history(&request.history),
+        &history,
         &options,
         Some(llm_client.clone()),
     )
     .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
-    let messages = build_messages(&profile, &event_memory, &turn.context, history_messages, &query);
+    let messages = build_messages(&long_term, &turn.context, history_messages, &query);
     let (answer, model) = invoke_llm_safely(llm_client.as_ref(), &messages).await;
     spawn_persist_turn(
         state.pool.clone(),
@@ -1677,19 +1645,21 @@ pub async fn stream_chat(
             return;
         }
 
-        let profile = crate::memory::profile_prompt(&pool, &user_id).await;
-        let event_memory = event_memory_prompt(
+        let memory_history = memory_history(&history);
+        let long_term = crate::memory::build_long_term_memory_messages(
             &pool,
-            &engine.embedder,
             &user_id,
             &query,
-            &conversation_id,
-            &session_id,
-            &intent.route,
+            nonempty(&conversation_id),
+            nonempty(&session_id),
+            0,
+            Some(&engine.embedder),
+            Some(&intent.route),
+            &memory_history,
         )
         .await;
         let history_messages = match crate::short_memory::assemble(
-            &memory_history(&history),
+            &memory_history,
             &options,
             if llm_missing { None } else { Some(llm_client.clone()) },
         ) {
@@ -1699,7 +1669,7 @@ pub async fn stream_chat(
                 return;
             }
         };
-        let messages = build_messages(&profile, &event_memory, &turn.context, history_messages, &query);
+        let messages = build_messages(&long_term, &turn.context, history_messages, &query);
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 let mut full_response = String::new();
@@ -1820,6 +1790,27 @@ mod tests {
             parse_rewritten_rag_query("{\"query\":\"优先用这个\",\"rewritten_query\":\"忽略我\"}"),
             "优先用这个"
         );
+    }
+
+    #[test]
+    fn build_messages_puts_long_term_before_rag_context() {
+        let long_term = vec![
+            ChatMessage::new("system", "画像：张三"),
+            ChatMessage::new(
+                "system",
+                "以下是当前会话最近尚未进入长期记忆的对话原文，仅用于补足刚刚发生的上下文：\n1. 用户: 上一问",
+            ),
+        ];
+        let history = vec![
+            ChatMessage::new("user", "上一问"),
+            ChatMessage::new("assistant", "上一答"),
+        ];
+        let messages = build_messages(&long_term, "知识库段落", history, "你还记得吗");
+        assert_eq!(messages[0].content, "画像：张三");
+        assert!(messages[1].content.contains("尚未进入长期记忆"));
+        assert!(messages[2].content.contains("知识库段落"));
+        assert_eq!(messages[3].content, "上一问");
+        assert_eq!(messages.last().unwrap().content, "你还记得吗");
     }
 
     #[test]

@@ -535,6 +535,103 @@ pub async fn profile_prompt(pool: &sqlx::SqlitePool, user_id: &str) -> String {
     lines.join("\n")
 }
 
+/// 对齐 Python `_recent_conversation_memory_lines`：取当前请求历史最后 top_k 轮原文。
+pub fn recent_unsaved_conversation_prompt(
+    history: &[crate::short_memory::MemoryMessage],
+    top_k: usize,
+) -> String {
+    let lines = recent_unsaved_conversation_lines(history, top_k);
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "以下是当前会话最近尚未进入长期记忆的对话原文，仅用于补足刚刚发生的上下文：\n{}",
+        lines.join("\n\n")
+    )
+}
+
+fn recent_unsaved_conversation_lines(
+    history: &[crate::short_memory::MemoryMessage],
+    top_k: usize,
+) -> Vec<String> {
+    let (_, turns) = crate::short_memory::split_history(history);
+    if turns.is_empty() {
+        return Vec::new();
+    }
+    let keep = top_k.max(1);
+    let start = turns.len().saturating_sub(keep);
+    let mut lines = Vec::new();
+    for (index, turn) in turns[start..].iter().enumerate() {
+        let mut rendered = Vec::new();
+        for message in turn {
+            let role = message.role.trim();
+            let content = message.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            if role == "user" {
+                rendered.push(format!("用户: {content}"));
+            } else if role == "assistant" {
+                rendered.push(format!("助手: {content}"));
+            }
+        }
+        if !rendered.is_empty() {
+            lines.push(format!("{}. {}", index + 1, rendered.join("\n")));
+        }
+    }
+    lines
+}
+
+/// 对齐 Python `_build_long_term_memory_messages_uncached`：
+/// 无记忆线索时跳过画像、未入库原文和事件召回。
+pub async fn build_long_term_memory_messages(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+    embedder: Option<&Embedder>,
+    route: Option<&str>,
+    recent_history: &[crate::short_memory::MemoryMessage],
+) -> Vec<ChatMessage> {
+    if user_id.trim().is_empty() {
+        return Vec::new();
+    }
+    if !should_retrieve_event_memory(query, route) {
+        return Vec::new();
+    }
+    let top_k = if top_k == 0 {
+        LONG_TERM_MEMORY_TOP_K
+    } else {
+        top_k
+    };
+    let mut messages = Vec::new();
+    let profile = profile_prompt(pool, user_id).await;
+    if !profile.is_empty() {
+        messages.push(ChatMessage::new("system", profile));
+    }
+    let recent = recent_unsaved_conversation_prompt(recent_history, top_k);
+    if !recent.is_empty() {
+        messages.push(ChatMessage::new("system", recent));
+    }
+    let event = hierarchical_prompt(
+        pool,
+        user_id,
+        query,
+        conversation_id,
+        session_id,
+        top_k,
+        embedder,
+        route,
+    )
+    .await;
+    if !event.is_empty() {
+        messages.push(ChatMessage::new("system", event));
+    }
+    messages
+}
+
 /// 对齐 Python `_should_retrieve_long_term_memory`：direct/clarify 跳过，其余看记忆线索。
 pub fn should_retrieve_event_memory(query: &str, route: Option<&str>) -> bool {
     match route.map(str::trim) {
@@ -2127,6 +2224,142 @@ mod tests {
         assert!(!should_retrieve_event_memory("你还记得上次说的吗", Some("direct")));
         assert!(!should_retrieve_event_memory("你还记得吗", Some("clarify")));
         assert!(!should_retrieve_event_memory("", Some("rag")));
+    }
+
+    fn mem(role: &str, content: &str) -> crate::short_memory::MemoryMessage {
+        crate::short_memory::MemoryMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn recent_unsaved_conversation_keeps_last_top_k_turns() {
+        let history = vec![
+            mem("user", "第一轮问题"),
+            mem("assistant", "第一轮回答"),
+            mem("user", "第二轮问题"),
+            mem("assistant", "第二轮回答"),
+            mem("user", "第三轮问题"),
+            mem("assistant", "第三轮回答"),
+            mem("user", "第四轮问题"),
+            mem("assistant", "第四轮回答"),
+        ];
+        let prompt = recent_unsaved_conversation_prompt(&history, 3);
+        assert!(prompt.starts_with(
+            "以下是当前会话最近尚未进入长期记忆的对话原文，仅用于补足刚刚发生的上下文："
+        ));
+        assert!(!prompt.contains("第一轮问题"));
+        assert!(prompt.contains("1. 用户: 第二轮问题\n助手: 第二轮回答"));
+        assert!(prompt.contains("2. 用户: 第三轮问题\n助手: 第三轮回答"));
+        assert!(prompt.contains("3. 用户: 第四轮问题\n助手: 第四轮回答"));
+        assert!(recent_unsaved_conversation_prompt(&[], 3).is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_skips_profile_and_recent_without_hints() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        upsert_profile_candidates(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            &[json!({
+                "memory_key": "profile.name",
+                "value": "张三",
+                "confidence": 0.9,
+                "importance": 80,
+                "action": "upsert"
+            })],
+        )
+        .await
+        .unwrap();
+        let history = vec![mem("user", "我叫张三"), mem("assistant", "好的")];
+        let messages = build_long_term_memory_messages(
+            &pool,
+            "u1",
+            "差旅报销流程是什么",
+            Some("c1"),
+            Some("s1"),
+            3,
+            None,
+            Some("rag"),
+            &history,
+        )
+        .await;
+        assert!(messages.is_empty());
+        assert!(
+            build_long_term_memory_messages(
+                &pool,
+                "u1",
+                "你还记得我叫什么吗",
+                Some("c1"),
+                Some("s1"),
+                3,
+                None,
+                Some("direct"),
+                &history,
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_includes_profile_recent_and_event() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        upsert_profile_candidates(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            &[json!({
+                "memory_key": "profile.name",
+                "value": "张三",
+                "confidence": 0.9,
+                "importance": 80,
+                "action": "upsert"
+            })],
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】差旅报销\n【摘要】差旅费用须在发生后 3 天内提交报销申请。",
+            70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        let history = vec![
+            mem("user", "报销时限是几天"),
+            mem("assistant", "发生后三天内提交"),
+        ];
+        let messages = build_long_term_memory_messages(
+            &pool,
+            "u1",
+            "你还记得上次说的报销时限吗",
+            Some("c1"),
+            Some("s1"),
+            3,
+            None,
+            Some("rag"),
+            &history,
+        )
+        .await;
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].content.contains("画像记忆"));
+        assert!(messages[0].content.contains("张三"));
+        assert!(messages[1].content.contains("尚未进入长期记忆"));
+        assert!(messages[1].content.contains("用户: 报销时限是几天"));
+        assert!(messages[2].content.contains("长期记忆"));
+        assert!(messages[2].content.contains("差旅报销"));
     }
 
     #[test]
