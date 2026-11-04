@@ -17,6 +17,7 @@ pub mod planner;
 pub mod rag_cache;
 pub mod react;
 pub mod remote_mcp;
+pub mod request_log;
 pub mod retrieval;
 pub mod retrieval_engine;
 pub mod routes;

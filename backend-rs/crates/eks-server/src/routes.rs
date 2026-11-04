@@ -372,6 +372,7 @@ pub fn router(state: AppState) -> axum::Router {
         .with_state(state.clone())
         .layer(axum::middleware::from_fn(crate::auth::access_token_renewal_middleware))
         .layer(crate::auth::cors_layer(&state.config.cors_origins))
+        .layer(axum::middleware::from_fn(crate::request_log::log_requests))
 }
 
 #[derive(Deserialize)]

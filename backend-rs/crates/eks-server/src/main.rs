@@ -4,6 +4,7 @@ use eks_server::config::Config;
 use eks_server::routes;
 use eks_server::state::{AppState, RuntimeWarmup};
 use sqlx::sqlite::SqliteConnectOptions;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 #[tokio::main]
@@ -131,6 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
