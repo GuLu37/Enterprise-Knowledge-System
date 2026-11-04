@@ -35,29 +35,53 @@ pub struct ConversationUpsertRequest {
     pub updated_at: Option<String>,
 }
 
+/// 对齐 Python `if item.get("ephemeral")`：任意 JSON 真值都视为占位消息。
+fn json_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(n) => n
+            .as_i64()
+            .map(|v| v != 0)
+            .or_else(|| n.as_u64().map(|v| v != 0))
+            .or_else(|| n.as_f64().map(|v| v != 0.0))
+            .unwrap_or(false),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+fn message_role(item: &Value) -> String {
+    match item.get("role") {
+        Some(Value::String(role)) => role.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// 过滤临时占位消息，只保留 user/assistant 角色（对齐 _normalize_messages）。
 fn normalize_messages(messages: &Value) -> String {
-    let list = match messages.as_array() {
-        Some(list) => list,
-        None => return "[]".to_string(),
+    let Some(list) = messages.as_array() else {
+        return "[]".to_string();
     };
     let filtered: Vec<&Value> = list
         .iter()
         .take(500)
+        .filter(|item| item.is_object())
+        .filter(|item| !item.get("ephemeral").map(json_is_truthy).unwrap_or(false))
         .filter(|item| {
-            item.get("ephemeral")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                == false
-        })
-        .filter(|item| {
-            item.get("role")
-                .and_then(|v| v.as_str())
-                .map(|r| r == "user" || r == "assistant")
-                .unwrap_or(false)
+            let role = message_role(item);
+            role == "user" || role == "assistant"
         })
         .collect();
     serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 对齐 Python `upsert_user_conversation` 的 ValueError 文案。
+fn empty_conversation_identity_error() -> &'static str {
+    "user_id 和 conversation_id 不能为空"
 }
 
 /// 对齐 Python `list_user_conversations`：`max(1, min(int(limit or 100), 500))`。
@@ -130,8 +154,8 @@ pub async fn upsert_conversation(
     let user = require_current_user(&state, &headers).await?;
     crate::validate::session_id_field(request.session_id.as_deref())?;
     let cid = conversation_id.trim().to_string();
-    if cid.is_empty() {
-        return Err(AuthError::bad_request("conversation_id 不能为空"));
+    if user.user_id.is_empty() || cid.is_empty() {
+        return Err(AuthError::bad_request(empty_conversation_identity_error()));
     }
 
     let payload = normalize_messages(&request.messages);
@@ -184,17 +208,32 @@ pub async fn delete_conversation(
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     let cid = conversation_id.trim().to_string();
-    sqlx::query("DELETE FROM user_conversations WHERE user_id = ? AND conversation_id = ?")
+    if user.user_id.is_empty() || cid.is_empty() {
+        return Ok(Json(conversation_delete_payload(&conversation_id, false)));
+    }
+    let deleted = sqlx::query("DELETE FROM user_conversations WHERE user_id = ? AND conversation_id = ?")
         .bind(&user.user_id)
         .bind(&cid)
         .execute(&state.pool)
         .await
         .map_err(AuthError::from)?;
-    let memory_deleted = crate::memory::delete_conversation_memory(&state.pool, &user.user_id, &cid)
+    if deleted.rows_affected() > 0 {
+        tracing::info!(
+            "用户对话记录已删除 (user_id={}, conversation_id={})",
+            user.user_id,
+            cid
+        );
+    }
+    let memory_deleted = match crate::memory::delete_conversation_memory(&state.pool, &user.user_id, &cid)
         .await
-        .map_err(AuthError::from)?
-        > 0;
-    Ok(Json(conversation_delete_payload(&cid, memory_deleted)))
+    {
+        Ok(count) => count > 0,
+        Err(err) => {
+            tracing::warn!("删除会话长期记忆失败，会话记录已删除: {err}");
+            false
+        }
+    };
+    Ok(Json(conversation_delete_payload(&conversation_id, memory_deleted)))
 }
 
 /// 对齐 Python `ConversationDeleteResponse`：只返回 conversation_id 与 memory_deleted。
@@ -209,6 +248,9 @@ async fn list_user_conversation_ids(
     pool: &sqlx::SqlitePool,
     user_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
+    if user_id.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_scalar(
         "SELECT conversation_id FROM user_conversations WHERE user_id = ? ORDER BY updated_at DESC",
     )
@@ -225,8 +267,14 @@ async fn memory_deleted_conversation_count(
 ) -> Result<i64, sqlx::Error> {
     let mut count = 0i64;
     for conversation_id in conversation_ids {
-        if crate::memory::delete_conversation_memory(pool, user_id, conversation_id).await? > 0 {
-            count += 1;
+        match crate::memory::delete_conversation_memory(pool, user_id, conversation_id).await {
+            Ok(deleted) if deleted > 0 => count += 1,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "删除会话长期记忆失败，跳过该会话: conversation_id={conversation_id} err={err}"
+                );
+            }
         }
     }
     Ok(count)
@@ -238,6 +286,12 @@ pub async fn clear_conversations(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    if user.user_id.is_empty() {
+        return Ok(Json(json!({
+            "deleted_count": 0,
+            "memory_deleted_count": 0,
+        })));
+    }
     let conversation_ids = list_user_conversation_ids(&state.pool, &user.user_id)
         .await
         .map_err(AuthError::from)?;
@@ -246,10 +300,20 @@ pub async fn clear_conversations(
         .execute(&state.pool)
         .await
         .map_err(AuthError::from)?;
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            "用户对话记录已清空 (user_id={}, deleted={})",
+            user.user_id,
+            result.rows_affected()
+        );
+    }
     let memory_deleted_count =
         memory_deleted_conversation_count(&state.pool, &user.user_id, &conversation_ids)
             .await
-            .map_err(AuthError::from)?;
+            .unwrap_or_else(|err| {
+                tracing::warn!("清空会话长期记忆失败，会话记录已删除: {err}");
+                0
+            });
     Ok(Json(json!({
         "deleted_count": result.rows_affected(),
         "memory_deleted_count": memory_deleted_count,
@@ -316,6 +380,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining_other, 1);
+    }
+
+    #[test]
+    fn normalize_messages_matches_python_ephemeral_and_role_strip() {
+        let payload = json!([
+            {"role": "user", "content": "问", "ephemeral": true},
+            {"role": "user", "content": "占位1", "ephemeral": 1},
+            {"role": "user", "content": "占位文字", "ephemeral": "yes"},
+            {"role": "assistant", "content": "答", "ephemeral": false},
+            {"role": " user ", "content": "带空白角色"},
+            {"role": "system", "content": "忽略"},
+            "not-an-object",
+            {"role": "assistant", "content": "零占位", "ephemeral": 0}
+        ]);
+        let normalized: Value = serde_json::from_str(&normalize_messages(&payload)).unwrap();
+        assert_eq!(
+            normalized,
+            json!([
+                {"role": "assistant", "content": "答", "ephemeral": false},
+                {"role": " user ", "content": "带空白角色"},
+                {"role": "assistant", "content": "零占位", "ephemeral": 0}
+            ])
+        );
+        assert_eq!(normalize_messages(&json!("not-list")), "[]");
+        assert_eq!(empty_conversation_identity_error(), "user_id 和 conversation_id 不能为空");
+        assert!(!json_is_truthy(&json!(null)));
+        assert!(!json_is_truthy(&json!(0)));
+        assert!(!json_is_truthy(&json!("")));
+        assert!(json_is_truthy(&json!("false")));
+        assert!(json_is_truthy(&json!(1)));
     }
 
     #[test]
