@@ -25,6 +25,7 @@
 ## 检索链路
 
 ```
+用户查询 → 意图路由（规则快判 skill/direct/rag，冲突或模糊时 LLM 消歧）
 用户查询 → 多查询启发式扩展（含编号保护/结构化别名）
   ├─ Dense: BGE ONNX 向量化 → milvus_lite COSINE 暴力扫描
   ├─ Sparse: CJK 2/3-gram 分词 → BM25Okapi 两段式（全语料选候选→切片重打分）
@@ -36,7 +37,7 @@
 → 父块上下文批量回填（SQLite IN 查询）
 → 上下文组装（6.5K/30K 字符限制）
 → 证据不足时统一 ReAct（全量本地工具，最多 3 轮；失败回退 query 改写）
-→ SSE 流式推送 (start/sources/token/done)
+→ SSE 流式推送 (start/intent/sources/token/done)
 → 回合写入 SQLite `memory_records`（事件记忆 + 触发词画像抽取）
 ```
 

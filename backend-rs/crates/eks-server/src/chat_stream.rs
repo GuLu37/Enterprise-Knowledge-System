@@ -55,20 +55,26 @@ fn default_true() -> bool {
     true
 }
 
-/// 规则优先意图路由（判断是否需要 RAG）。
-fn needs_retrieval(query: &str) -> bool {
-    let lowered = query.trim().to_lowercase();
-    if lowered.is_empty() {
-        return false;
+fn clarify_text(intent: &crate::intent::QueryIntent) -> String {
+    let text = intent.clarify_question.trim();
+    if text.is_empty() {
+        "我需要再确认一下你的需求，请补充一点具体信息。".into()
+    } else {
+        text.to_string()
     }
-    let direct_signals = [
-        "写一首", "写一篇", "翻译", "润色", "你好", "嗨", "再见", "谢谢",
-        "讲个笑话", "写代码", "帮我写", "总结一下这段",
-    ];
-    if direct_signals.iter().any(|s| lowered.contains(s)) {
-        return false;
+}
+
+async fn answer_skill_intent(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    intent: &crate::intent::QueryIntent,
+) -> Result<String, String> {
+    let name = intent.skill_name.as_deref().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("skill 路由缺少 skill_name".into());
     }
-    true
+    let result = crate::skills::execute_named(pool, user_id, name, &intent.skill_arguments).await?;
+    Ok(crate::skills::format_skill_answer(name, &result))
 }
 
 /// 首轮检索质量是否足够（简化 ReAct 判断）。
@@ -456,8 +462,15 @@ pub async fn generate_chat(
         Some(Arc::new(LlmClient::new(llm_config)))
     };
 
-    if let Some(route) = crate::skills::route_local_skill(&query) {
-        let answer = crate::skills::answer_routed_skill(&state.pool, &user.user_id, &route)
+    let intent = crate::intent::route_query_action(
+        &query,
+        request.use_retrieval,
+        llm_client.as_deref(),
+        &history_pairs(&request.history),
+    )
+    .await;
+    if intent.route == "skill" {
+        let answer = answer_skill_intent(&state.pool, &user.user_id, &intent)
             .await
             .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
         spawn_persist_turn(
@@ -473,7 +486,26 @@ pub async fn generate_chat(
             "query": query,
             "response": answer,
             "sources": [],
-            "model": route.name,
+            "model": intent.skill_name.unwrap_or_default(),
+            "retrieval_method": null,
+        })));
+    }
+    if intent.route == "clarify" {
+        let answer = clarify_text(&intent);
+        spawn_persist_turn(
+            state.pool.clone(),
+            llm_client,
+            user.user_id.clone(),
+            conversation_id,
+            session_id,
+            query.clone(),
+            answer.clone(),
+        );
+        return Ok(axum::Json(json!({
+            "query": query,
+            "response": answer,
+            "sources": [],
+            "model": "",
             "retrieval_method": null,
         })));
     }
@@ -481,16 +513,16 @@ pub async fn generate_chat(
     let Some(llm_client) = llm_client else {
         return Err(llm_unavailable());
     };
-    let use_retrieval = request.use_retrieval && needs_retrieval(&query);
+    let retrieval_query = intent.retrieval_query(&query).to_string();
     let turn = collect_rag(
         &state.engine,
         &state.pool,
         &llm_client,
         &user.user_id,
-        &query,
+        &retrieval_query,
         &request.history,
         request.top_k,
-        use_retrieval,
+        intent.needs_retrieval,
     )
     .await
     .map_err(|detail| crate::auth::AuthError {
@@ -546,7 +578,7 @@ pub async fn stream_chat(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     let query = request.query.trim().to_string();
-    let use_retrieval = request.use_retrieval && needs_retrieval(&query);
+    let requested_retrieval = request.use_retrieval;
     let top_k = request.top_k;
     let engine = state.engine.clone();
     let pool = state.pool.clone();
@@ -564,15 +596,25 @@ pub async fn stream_chat(
             "conversation_id": conversation_id,
             "session_id": session_id,
             "user_id": user_id,
-            "use_retrieval": use_retrieval,
+            "use_retrieval": requested_retrieval,
         })));
 
-        if let Some(route) = crate::skills::route_local_skill(&query) {
+        let intent = crate::intent::route_query_action(
+            &query,
+            requested_retrieval,
+            if llm_missing { None } else { Some(llm_client.as_ref()) },
+            &history_pairs(&history),
+        )
+        .await;
+        yield Ok(sse_json("intent", intent.to_json()));
+
+        if intent.route == "skill" {
+            let skill_name = intent.skill_name.clone().unwrap_or_default();
             yield Ok(sse_json("tool_call", json!({
-                "name": route.name,
-                "arguments": route.arguments,
+                "name": skill_name,
+                "arguments": intent.skill_arguments,
             })));
-            match crate::skills::answer_routed_skill(&pool, &user_id, &route).await {
+            match answer_skill_intent(&pool, &user_id, &intent).await {
                 Ok(answer) => {
                     spawn_persist_turn(
                         pool.clone(),
@@ -583,7 +625,7 @@ pub async fn stream_chat(
                         query.clone(),
                         answer.clone(),
                     );
-                    yield Ok(sse_json("tool_result", json!({"skill": route.name, "sources": []})));
+                    yield Ok(sse_json("tool_result", json!({"skill": skill_name, "sources": []})));
                     yield Ok(sse_json("message", json!({"content": answer})));
                     yield Ok(sse_json("done", json!({
                         "content": answer,
@@ -598,15 +640,37 @@ pub async fn stream_chat(
             return;
         }
 
+        if intent.route == "clarify" {
+            let answer = clarify_text(&intent);
+            spawn_persist_turn(
+                pool.clone(),
+                if llm_missing { None } else { Some(llm_client.clone()) },
+                user_id.clone(),
+                conversation_id.clone(),
+                session_id.clone(),
+                query.clone(),
+                answer.clone(),
+            );
+            yield Ok(sse_json("message", json!({"content": answer})));
+            yield Ok(sse_json("done", json!({
+                "content": answer,
+                "response": answer,
+                "sources": [],
+            })));
+            return;
+        }
+
         if llm_missing {
             yield Ok(sse_json("error", json!({"message": "没有配置任何 LLM 提供商"})));
             return;
         }
 
+        let retrieval_query = intent.retrieval_query(&query).to_string();
+        let use_retrieval = intent.needs_retrieval;
         if use_retrieval {
             yield Ok(sse_json("tool_call", json!({
                 "name": "search_knowledge_base",
-                "arguments": {"query": query, "top_k": top_k, "retrieval_method": "hybrid"},
+                "arguments": {"query": retrieval_query, "top_k": top_k, "retrieval_method": "hybrid"},
             })));
         }
 
@@ -615,7 +679,7 @@ pub async fn stream_chat(
             &pool,
             &llm_client,
             &user_id,
-            &query,
+            &retrieval_query,
             &history,
             top_k,
             use_retrieval,

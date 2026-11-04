@@ -9,6 +9,7 @@ pub mod db;
 pub mod documents;
 pub mod embedder;
 pub mod ingest;
+pub mod intent;
 pub mod llm;
 pub mod memory;
 pub mod milvus_lite;
