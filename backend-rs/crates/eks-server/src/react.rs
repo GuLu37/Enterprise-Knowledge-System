@@ -9,6 +9,10 @@ use crate::retrieval::RetrievalItem;
 use crate::retrieval_engine::RetrievalEngine;
 use crate::skills;
 
+const REACT_TOOL_MAX_CHARS: usize = 200;
+const REACT_TOOL_MAX_ITEMS: usize = 5;
+const REACT_TOOL_MAX_DEPTH: usize = 4;
+
 const UNIFIED_REACT_SYSTEM_PROMPT: &str = "你是企业知识库助手的任务执行者。你的目标是为后续回答收集到足够的证据，不要直接回答用户问题本身。\n\
 可用工具不止一个，按用途分为三类，你可以按需组合、跨工具多次调用：\n\
 - 检索类：search_knowledge_base，查文档、制度、流程、内部事实，可按 retrieval_method 与 top_k 自主调策略。\n\
@@ -233,8 +237,9 @@ async fn run_react_loop(
         let mut searched = false;
         for (index, call) in calls.iter().enumerate() {
             let observation = std::mem::take(&mut observations[index]);
-            notes.push(format!("{}: {}", call.name, truncate(&observation.to_string(), 240)));
-            messages.push(tool_message(call, observation));
+            let compacted = compact_react_tool_result(&call.name, &observation);
+            notes.push(format!("{}: {}", call.name, truncate(&compacted.to_string(), 240)));
+            messages.push(tool_message(call, compacted));
             merge_sources(&mut sources, std::mem::take(&mut extras[index]));
             searched |= call.name == "search_knowledge_base";
         }
@@ -277,6 +282,163 @@ fn tool_message(call: &ToolCall, observation: Value) -> ChatMessage {
         tool_calls: None,
         tool_call_id: Some(call.id.clone()),
     }
+}
+
+fn slice_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+fn truncate_react_value(value: &Value) -> Value {
+    truncate_react_value_at(value, REACT_TOOL_MAX_ITEMS, REACT_TOOL_MAX_CHARS, 0)
+}
+
+fn truncate_react_value_at(
+    value: &Value,
+    max_items: usize,
+    max_chars: usize,
+    depth: usize,
+) -> Value {
+    if depth >= REACT_TOOL_MAX_DEPTH {
+        return json!("…");
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(text) => json!(truncate_chars(text, max_chars)),
+        Value::Object(map) => {
+            let limit = max_items.saturating_mul(4);
+            let mut out = serde_json::Map::new();
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index >= limit {
+                    break;
+                }
+                out.insert(
+                    key.clone(),
+                    truncate_react_value_at(item, max_items, max_chars, depth + 1),
+                );
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(max_items)
+                .map(|item| truncate_react_value_at(item, max_items, max_chars, depth + 1))
+                .collect(),
+        ),
+    }
+}
+
+fn observation_error(observation: &Value) -> Option<Value> {
+    observation.get("error").cloned().filter(|value| !value.is_null())
+}
+
+fn observation_payload(observation: &Value) -> Value {
+    if observation.get("skipped").is_some() {
+        return json!({});
+    }
+    match observation.get("result") {
+        Some(value) => value.clone(),
+        None => {
+            let mut clone = observation.clone();
+            if let Value::Object(map) = &mut clone {
+                map.remove("error");
+                map.remove("ok");
+                map.remove("count");
+                map.remove("results");
+                map.remove("message");
+            }
+            if clone.as_object().map(|map| map.is_empty()).unwrap_or(false) {
+                json!({})
+            } else {
+                clone
+            }
+        }
+    }
+}
+
+fn compact_search_results(results: &[Value]) -> Vec<Value> {
+    results
+        .iter()
+        .take(REACT_TOOL_MAX_ITEMS)
+        .map(|item| {
+            let content = if item.is_object() {
+                item.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                item.to_string()
+            };
+            let score = item.get("score").cloned().unwrap_or(Value::Null);
+            let source = item
+                .pointer("/metadata/source_name")
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({
+                "content": slice_chars(&content, REACT_TOOL_MAX_CHARS),
+                "score": score,
+                "source": source,
+            })
+        })
+        .collect()
+}
+
+/// 对齐 Python `_compact_react_tool_result`：回填模型前压缩工具观察。
+fn compact_react_tool_result(tool_name: &str, observation: &Value) -> Value {
+    let error = observation_error(observation);
+    if tool_name == "search_knowledge_base" {
+        let results = observation
+            .get("results")
+            .or_else(|| observation.pointer("/result/results"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let message = observation
+            .get("message")
+            .or_else(|| observation.pointer("/result/message"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut compacted = json!({
+            "tool": tool_name,
+            "message": message,
+            "result_count": results.len(),
+            "results": compact_search_results(&results),
+        });
+        if let Some(error) = error {
+            compacted
+                .as_object_mut()
+                .expect("compacted object")
+                .insert("error".into(), error);
+        }
+        return compacted;
+    }
+
+    let mut compacted = json!({
+        "tool": tool_name,
+        "result": truncate_react_value(&observation_payload(observation)),
+    });
+    if let Some(error) = error {
+        compacted
+            .as_object_mut()
+            .expect("compacted object")
+            .insert("error".into(), error);
+    }
+    compacted
 }
 
 fn parallel_worker_limit(pending: usize, configured: usize) -> usize {
@@ -330,7 +492,7 @@ async fn execute_tool(
             .unwrap_or("hybrid");
         return match engine.retrieve_planned(query, method, top_k, Some(llm)).await {
             Ok((items, _)) => {
-                let payload: Vec<Value> = items.iter().take(8).map(|item| item.to_json()).collect();
+                let payload: Vec<Value> = items.iter().map(|item| item.to_json()).collect();
                 (
                     json!({"ok": true, "count": payload.len(), "results": payload}),
                     items,
@@ -415,6 +577,73 @@ mod tests {
     fn truncates_and_dedupes_args() {
         assert_eq!(truncate("abcdef", 3), "abc…");
         assert_eq!(compact_args(&json!({"query":"a"})), "{\"query\":\"a\"}");
+    }
+
+    #[test]
+    fn truncate_react_value_caps_string_list_and_depth() {
+        let long = "测".repeat(210);
+        let truncated = truncate_react_value(&json!(long));
+        let text = truncated.as_str().unwrap();
+        assert_eq!(text.chars().count(), 201);
+        assert!(text.ends_with('…'));
+
+        let items: Vec<Value> = (0..9).map(|index| json!(index)).collect();
+        let trimmed = truncate_react_value(&json!(items));
+        assert_eq!(trimmed.as_array().unwrap().len(), 5);
+
+        let nested = json!({"a": {"b": {"c": {"d": {"e": "too-deep"}}}}});
+        assert_eq!(truncate_react_value(&nested).pointer("/a/b/c/d"), Some(&json!("…")));
+    }
+
+    #[test]
+    fn compact_search_keeps_count_and_slices_results() {
+        let results: Vec<Value> = (0..7)
+            .map(|index| {
+                json!({
+                    "content": "x".repeat(250),
+                    "score": 0.9 - index as f64 * 0.01,
+                    "metadata": {"source_name": format!("doc-{index}.md")},
+                })
+            })
+            .collect();
+        let compacted = compact_react_tool_result(
+            "search_knowledge_base",
+            &json!({"ok": true, "count": 7, "results": results, "message": ""}),
+        );
+        assert_eq!(compacted["tool"], "search_knowledge_base");
+        assert_eq!(compacted["result_count"], 7);
+        let items = compacted["results"].as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0]["content"].as_str().unwrap().chars().count(), 200);
+        assert_eq!(items[0]["source"], "doc-0.md");
+        assert!(compacted.get("error").is_none());
+    }
+
+    #[test]
+    fn compact_skill_truncates_payload_and_keeps_error() {
+        let compacted = compact_react_tool_result(
+            "memory_query",
+            &json!({
+                "ok": true,
+                "result": {
+                    "summary": {"matched_count": 1},
+                    "matched_memories": [{"content": "y".repeat(250)}],
+                },
+                "error": "timeout",
+            }),
+        );
+        assert_eq!(compacted["tool"], "memory_query");
+        assert_eq!(compacted["error"], "timeout");
+        assert_eq!(
+            compacted["result"]["matched_memories"][0]["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            201
+        );
+        let skipped = compact_react_tool_result("memory_query", &json!({"skipped": "duplicate"}));
+        assert_eq!(skipped["result"], json!({}));
     }
 
     #[test]
