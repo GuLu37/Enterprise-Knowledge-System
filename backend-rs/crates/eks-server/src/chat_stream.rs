@@ -343,13 +343,13 @@ async fn resolve_skill_answer(
     (prepared.fallback.clone(), prepared.name.clone())
 }
 
+/// 对齐 Python stream skill `tool_result`：skill/kind/result/executed_at，不含 sources。
 fn skill_tool_result_payload(wrapped: &serde_json::Value) -> serde_json::Value {
     json!({
         "skill": wrapped.get("skill"),
         "kind": wrapped.get("kind"),
         "result": wrapped.get("result").cloned().unwrap_or(json!({})),
         "executed_at": wrapped.get("executed_at"),
-        "sources": [],
     })
 }
 
@@ -2307,6 +2307,21 @@ mod tests {
         assert_eq!(payload["args"]["query"], "我叫什么");
         assert_eq!(payload["reason"], "rule");
         assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn skill_tool_result_omits_sources_like_python() {
+        let payload = skill_tool_result_payload(&json!({
+            "skill": "memory_query",
+            "kind": "skill",
+            "result": {"ok": true},
+            "executed_at": "2026-01-01T00:00:00Z",
+        }));
+        assert_eq!(payload["skill"], "memory_query");
+        assert_eq!(payload["kind"], "skill");
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["executed_at"], "2026-01-01T00:00:00Z");
+        assert!(payload.get("sources").is_none());
     }
 
     #[test]
