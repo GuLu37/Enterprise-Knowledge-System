@@ -50,6 +50,8 @@ pub struct Config {
     pub unified_react_parallel_workers: usize,
     pub react_max_iterations: usize,
     pub retrieval_planner_llm_decision_enabled: bool,
+    pub enable_cache: bool,
+    pub cache_ttl: u64,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -206,6 +208,8 @@ impl Config {
                 "RETRIEVAL_PLANNER_LLM_DECISION_ENABLED",
                 true,
             ),
+            enable_cache: env_bool("ENABLE_CACHE", true),
+            cache_ttl: env_i64("CACHE_TTL", 3600).max(0) as u64,
         }
     }
 
@@ -259,6 +263,8 @@ impl Config {
             unified_react_parallel_workers: 4,
             react_max_iterations: 3,
             retrieval_planner_llm_decision_enabled: true,
+            enable_cache: true,
+            cache_ttl: 3600,
         }
     }
 }
@@ -294,5 +300,7 @@ mod tests {
     #[test]
     fn jwt_test_keeps_react_parallel_workers() {
         assert_eq!(Config::jwt_test().unified_react_parallel_workers, 4);
+        assert!(Config::jwt_test().enable_cache);
+        assert_eq!(Config::jwt_test().cache_ttl, 3600);
     }
 }

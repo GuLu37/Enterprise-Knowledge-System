@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
     let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
         store, embedder, pool.clone(),
-    );
+    )
+    .with_result_cache(config.enable_cache, config.cache_ttl);
     if config.cross_encoder_enabled {
         match eks_server::cross_encoder::CrossEncoder::load(
             &eks_server::cross_encoder::CrossEncoderConfig {

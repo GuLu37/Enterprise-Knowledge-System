@@ -165,6 +165,7 @@ pub struct RetrievalEngine {
     pub ce_margin: f64,
     pub ce_trigger_mode: String,
     sparse: tokio::sync::RwLock<Option<Arc<SparseIndexSnapshot>>>,
+    result_cache: tokio::sync::Mutex<crate::rag_cache::RagResultCache>,
 }
 
 impl RetrievalEngine {
@@ -181,6 +182,16 @@ impl RetrievalEngine {
             ce_margin: 0.08,
             ce_trigger_mode: "adaptive".to_string(),
             sparse: tokio::sync::RwLock::new(None),
+            result_cache: tokio::sync::Mutex::new(crate::rag_cache::RagResultCache::new(true, 3600)),
+        }
+    }
+
+    pub fn with_result_cache(self, enabled: bool, ttl_secs: u64) -> Self {
+        RetrievalEngine {
+            result_cache: tokio::sync::Mutex::new(crate::rag_cache::RagResultCache::new(
+                enabled, ttl_secs,
+            )),
+            ..self
         }
     }
 
@@ -224,6 +235,7 @@ impl RetrievalEngine {
     pub async fn invalidate(&self) {
         self.store.invalidate("doc_chunk").await;
         *self.sparse.write().await = None;
+        self.result_cache.lock().await.clear();
     }
 
     /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
@@ -291,12 +303,17 @@ impl RetrievalEngine {
         query: &str,
         top_k: usize,
     ) -> Result<(Vec<RetrievalItem>, String), String> {
-        let normalized_query = query.trim();
-        if normalized_query.is_empty() {
-            return Ok((Vec::new(), String::new()));
-        }
-        let recalled = self.retrieve_documents_multi_query(normalized_query, top_k).await?;
-        let processed = self.post_process(normalized_query, recalled, top_k).await?;
+        self.retrieve_planned(query, crate::planner::RETRIEVAL_METHOD_HYBRID, top_k)
+            .await
+    }
+
+    async fn run_hybrid_workflow(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<(Vec<RetrievalItem>, String), String> {
+        let recalled = self.retrieve_documents_multi_query(query, top_k).await?;
+        let processed = self.post_process(query, recalled, top_k).await?;
         let context = assemble_processed_context(&processed);
         Ok((processed, context))
     }
@@ -313,18 +330,33 @@ impl RetrievalEngine {
             return Ok((Vec::new(), String::new()));
         }
         let method = crate::planner::resolve_method_for_query(query, method);
-        let processed = match method.as_str() {
+        let cache_key = crate::rag_cache::rag_cache_key(query, top_k, &method);
+        {
+            let cache = self.result_cache.lock().await;
+            if let Some(hit) = cache.get(&cache_key) {
+                tracing::info!(query, method = method.as_str(), "检索结果缓存命中");
+                return Ok(hit);
+            }
+        }
+        let (processed, context) = match method.as_str() {
             crate::planner::RETRIEVAL_METHOD_DENSE => {
                 let recalled = self.search_dense(query, top_k).await?;
-                self.post_process(query, recalled, top_k).await?
+                let processed = self.post_process(query, recalled, top_k).await?;
+                let context = assemble_processed_context(&processed);
+                (processed, context)
             }
             crate::planner::RETRIEVAL_METHOD_SPARSE => {
                 let recalled = self.search_sparse(query, top_k).await?;
-                self.post_process(query, recalled, top_k).await?
+                let processed = self.post_process(query, recalled, top_k).await?;
+                let context = assemble_processed_context(&processed);
+                (processed, context)
             }
-            _ => self.run_rag_workflow(query, top_k).await?.0,
+            _ => self.run_hybrid_workflow(query, top_k).await?,
         };
-        let context = assemble_processed_context(&processed);
+        self.result_cache
+            .lock()
+            .await
+            .put(cache_key, processed.clone(), context.clone());
         Ok((processed, context))
     }
 
