@@ -1226,7 +1226,7 @@ pub async fn load_active_profile_lines(
         .take(limit)
         .map(|row| {
             let key = row.memory_key.unwrap_or_else(|| "profile".into());
-            format!("- {key}：{}", row.content)
+            format!("- {key}: {}", row.content)
         })
         .collect())
 }

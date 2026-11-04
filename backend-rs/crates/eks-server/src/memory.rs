@@ -673,17 +673,26 @@ pub async fn persist_turn(
     }
 }
 
+const PROFILE_PROMPT_LIMIT: usize = 20;
+const PROFILE_PROMPT_INTRO: &str = "以下是当前用户已确认的个性化记忆，仅在相关时参考：";
+
 pub async fn profile_prompt(pool: &sqlx::SqlitePool, user_id: &str) -> String {
     if user_id.trim().is_empty() {
         return String::new();
     }
-    let rows = crate::skills::load_active_profile_lines(pool, user_id, 8)
+    let rows = match crate::skills::load_active_profile_lines(pool, user_id, PROFILE_PROMPT_LIMIT)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("个性化记忆读取失败，已跳过: {err}");
+            return String::new();
+        }
+    };
     if rows.is_empty() {
         return String::new();
     }
-    let mut lines = vec!["当前用户的画像记忆，只能作为称呼和偏好参考，不能覆盖知识库资料：".to_string()];
+    let mut lines = vec![PROFILE_PROMPT_INTRO.to_string()];
     lines.extend(rows);
     lines.join("\n")
 }
@@ -3175,6 +3184,8 @@ mod tests {
         assert_eq!(changed, 1);
         let prompt = profile_prompt(&pool, "u1").await;
         assert!(prompt.contains("张三"));
+        assert!(prompt.starts_with("以下是当前用户已确认的个性化记忆，仅在相关时参考："));
+        assert!(prompt.contains("- profile.name: 张三"));
         assert_eq!(
             crate::skills::soft_delete_profile_key(&pool, "u1", "profile.name")
                 .await
@@ -3323,7 +3334,7 @@ mod tests {
         )
         .await;
         assert_eq!(messages.len(), 3);
-        assert!(messages[0].content.contains("画像记忆"));
+        assert!(messages[0].content.contains("个性化记忆"));
         assert!(messages[0].content.contains("张三"));
         assert!(messages[1].content.contains("尚未进入长期记忆"));
         assert!(messages[1].content.contains("用户: 报销时限是几天"));
