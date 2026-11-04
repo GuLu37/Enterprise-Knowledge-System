@@ -236,6 +236,7 @@ struct RagTurn {
     retrieval_method: Option<String>,
     used_react: bool,
     react_notes: Vec<String>,
+    react_kind: Option<String>,
 }
 
 fn sse_json(event: &str, data: serde_json::Value) -> Event {
@@ -339,7 +340,7 @@ async fn collect_rag(
     top_k: usize,
     use_retrieval: bool,
     window_n: usize,
-    mcp_manifests: &[serde_json::Value],
+    config: &crate::config::Config,
 ) -> Result<RagTurn, String> {
     if !use_retrieval {
         return Ok(RagTurn {
@@ -349,6 +350,7 @@ async fn collect_rag(
             retrieval_method: None,
             used_react: false,
             react_notes: Vec::new(),
+            react_kind: None,
         });
     }
     let (first_results, _) = engine.run_rag_workflow(query, top_k).await?;
@@ -361,43 +363,64 @@ async fn collect_rag(
             retrieval_method: Some("hybrid".into()),
             used_react: false,
             react_notes: Vec::new(),
+            react_kind: None,
         });
     }
 
     let mut working = first_results;
     let mut used_react = false;
     let mut react_notes = Vec::new();
-    match crate::react::run_unified_react(
+    let mut react_kind = None;
+    let history_pairs = history_pairs(history, window_n);
+    let mcp_manifests = &config.mcp_remote_tool_manifests;
+
+    let mut attempt = crate::react::run_unified_react(
         engine,
         pool,
         llm,
         user_id,
         query,
-        &history_pairs(history, window_n),
+        &history_pairs,
         top_k,
         working.clone(),
         mcp_manifests,
+        config.unified_react_enabled,
+        config.unified_react_max_iterations,
     )
-    .await
-    {
-        Ok(outcome) => {
-            used_react = outcome.used_react;
-            react_notes = outcome.notes;
-            if outcome.used_react && retrieval_quality_ok(&outcome.sources) {
-                return Ok(RagTurn {
-                    context: outcome.context,
-                    sources: outcome.sources,
-                    direct: None,
-                    retrieval_method: Some("hybrid".into()),
-                    used_react,
-                    react_notes,
-                });
-            }
-            if !outcome.sources.is_empty() {
-                working = outcome.sources;
-            }
+    .await;
+    if matches!(attempt, crate::react::ReactAttempt::Unavailable) {
+        tracing::info!("统一 ReAct 编排未启用或不可用，回退 rag 专用 ReAct 循环");
+        attempt = crate::react::run_rag_react(
+            engine,
+            pool,
+            llm,
+            user_id,
+            query,
+            &history_pairs,
+            top_k,
+            working.clone(),
+            config.react_max_iterations,
+        )
+        .await;
+    }
+    if let crate::react::ReactAttempt::Ran(outcome) = attempt {
+        used_react = outcome.used_react;
+        react_notes = outcome.notes;
+        react_kind = Some(outcome.kind.clone());
+        if outcome.used_react && retrieval_quality_ok(&outcome.sources) {
+            return Ok(RagTurn {
+                context: outcome.context,
+                sources: outcome.sources,
+                direct: None,
+                retrieval_method: Some("hybrid".into()),
+                used_react,
+                react_notes,
+                react_kind,
+            });
         }
-        Err(err) => tracing::warn!("统一 ReAct 失败，回退改写检索: {err}"),
+        if !outcome.sources.is_empty() {
+            working = outcome.sources;
+        }
     }
 
     if let Some(rewritten) = rewrite_query(llm, query, history).await {
@@ -416,6 +439,7 @@ async fn collect_rag(
             retrieval_method: Some("hybrid".into()),
             used_react,
             react_notes,
+            react_kind,
         });
     }
     let max_chars = if working.iter().any(|item| item.structured_aggregation) {
@@ -431,6 +455,7 @@ async fn collect_rag(
         retrieval_method: Some("hybrid".into()),
         used_react,
         react_notes,
+        react_kind,
     })
 }
 
@@ -617,7 +642,7 @@ pub async fn generate_chat(
         request.top_k,
         intent.needs_retrieval,
         request.short_memory_n,
-        &mcp_manifests,
+        state.config.as_ref(),
     )
     .await
     .map_err(|detail| crate::auth::AuthError {
@@ -709,6 +734,7 @@ pub async fn stream_chat(
     let llm_missing = llm_config.providers.is_empty();
     let llm_client = Arc::new(LlmClient::new(llm_config));
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
+    let config = state.config.clone();
 
     let stream = async_stream::stream! {
         yield Ok(sse_json("start", json!({
@@ -811,7 +837,7 @@ pub async fn stream_chat(
             top_k,
             use_retrieval,
             window_n,
-            &mcp_manifests,
+            config.as_ref(),
         )
         .await
         {
@@ -830,12 +856,13 @@ pub async fn stream_chat(
             yield Ok(sse_json("sources", json!({"sources": sources})));
         }
         if turn.used_react {
+            let react_name = turn.react_kind.as_deref().unwrap_or("unified_react");
             yield Ok(sse_json("tool_call", json!({
-                "name": "unified_react",
+                "name": react_name,
                 "arguments": {"query": query, "notes": turn.react_notes},
             })));
             yield Ok(sse_json("tool_result", json!({
-                "skill": "unified_react",
+                "skill": react_name,
                 "notes": turn.react_notes,
                 "sources": sources,
             })));

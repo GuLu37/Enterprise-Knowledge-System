@@ -45,6 +45,9 @@ pub struct Config {
     pub chat_max_conversations: i64,
     pub cors_origins: Vec<String>,
     pub mcp_remote_tool_manifests: Vec<serde_json::Value>,
+    pub unified_react_enabled: bool,
+    pub unified_react_max_iterations: usize,
+    pub react_max_iterations: usize,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -192,6 +195,9 @@ impl Config {
             mcp_remote_tool_manifests: parse_dict_list(
                 &env::var("MCP_REMOTE_TOOL_MANIFESTS").unwrap_or_default(),
             ),
+            unified_react_enabled: env_bool("UNIFIED_REACT_ENABLED", true),
+            unified_react_max_iterations: env_i64("UNIFIED_REACT_MAX_ITERATIONS", 3).max(1) as usize,
+            react_max_iterations: env_i64("REACT_MAX_ITERATIONS", 3).max(1) as usize,
         }
     }
 
@@ -240,6 +246,9 @@ impl Config {
             chat_max_conversations: 20,
             cors_origins: parse_cors_origins(""),
             mcp_remote_tool_manifests: Vec::new(),
+            unified_react_enabled: true,
+            unified_react_max_iterations: 3,
+            react_max_iterations: 3,
         }
     }
 }

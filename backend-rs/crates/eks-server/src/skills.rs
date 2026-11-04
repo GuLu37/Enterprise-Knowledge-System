@@ -456,6 +456,10 @@ fn skill_def(
     }
 }
 
+pub fn rag_function_calling_tools() -> Vec<Value> {
+    vec![rag_tool_definition()]
+}
+
 fn rag_tool_definition() -> Value {
     json!({
         "type": "function",
