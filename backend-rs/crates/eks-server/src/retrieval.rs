@@ -1,6 +1,6 @@
 //! 检索编排：retrieval_service.py 的 Rust 移植（B4a 子集）。
 //!
-//! 覆盖: 多查询启发式扩展、dense(milvus_lite 直读 COSINE)+sparse(内核 BM25 两段式)、
+//! 覆盖: 多查询启发式扩展、启发式不足时 LLM 补写、dense(milvus_lite 直读 COSINE)+sparse(内核 BM25 两段式)、
 //! 变体间 RRF 融合与原始查询保护、规则重排(含 adaptive 精排跳过语义)、
 //! 关键词门控过滤、编号保护、结构化 schema 打分、父块上下文批量回填、
 //! 上下文组装与序列化。
@@ -20,9 +20,17 @@ use eks_kernels::text::{normalize_text, tokenize_cjk};
 use serde_json::{Value, json};
 
 use crate::db;
+use crate::llm::{ChatMessage, LlmClient};
 use crate::milvus_lite::{FieldValue, MilvusLiteStore, Row};
 
+const MIN_MULTI_QUERY_COUNT: usize = 3;
 const MAX_MULTI_QUERY_COUNT: usize = 3;
+const MULTI_QUERY_SYSTEM_PROMPT: &str = "\
+你是企业知识库检索查询扩展器。\
+把用户问题改写为 3 条适合检索的查询，不回答问题本身。\
+必须覆盖：原始问法、关键词短语、可能的文件名或标题表达、同义表达。\
+如果问题包含编号、工号、产品号、人名、文档名或带书名号的名称，必须原样保留。\
+只输出严格 JSON，格式：{\"queries\":[\"查询1\",\"查询2\",\"查询3\"]}";
 pub const MAX_CITATION_RESULTS: usize = 3;
 pub const STRUCTURED_QUERY_CITATION_RESULTS: usize = 12;
 pub const RAG_CONTEXT_MAX_CHARS: usize = 6500;
@@ -504,6 +512,10 @@ fn structured_query_aliases(query: &str) -> Vec<String> {
 
 /// 复刻 generate_multi_query_variants（llm=None 路径）。
 pub fn expand_multi_query(query: &str) -> Vec<String> {
+    expand_multi_query_with_limit(query, MAX_MULTI_QUERY_COUNT)
+}
+
+fn expand_multi_query_with_limit(query: &str, max_queries: usize) -> Vec<String> {
     let normalized_query = collapse_spaces(query.trim());
     if normalized_query.is_empty() {
         return Vec::new();
@@ -511,7 +523,90 @@ pub fn expand_multi_query(query: &str) -> Vec<String> {
     if is_identifier_query(&normalized_query) {
         return identifier_query_variants(&normalized_query);
     }
-    heuristic_multi_query_variants(&normalized_query, MAX_MULTI_QUERY_COUNT)
+    heuristic_multi_query_variants(&normalized_query, max_queries.max(1))
+}
+
+fn variant_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+pub fn parse_multi_query_payload(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    let trimmed = trimmed.strip_prefix("```json").unwrap_or(trimmed);
+    let trimmed = trimmed.strip_prefix("```").unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
+    let start = trimmed.find('{').unwrap_or(0);
+    let end = trimmed.rfind('}').map(|index| index + 1).unwrap_or(trimmed.len());
+    serde_json::from_str(&trimmed[start..end]).unwrap_or_else(|_| json!({}))
+}
+
+/// 对齐 Python：LLM 产出的 queries / query_variants / variants 规范化后至少 3 条才采用。
+pub fn apply_llm_multi_query_payload(
+    query: &str,
+    payload: &Value,
+    max_queries: usize,
+) -> Option<Vec<String>> {
+    let variants = payload
+        .get("queries")
+        .or_else(|| payload.get("query_variants"))
+        .or_else(|| payload.get("variants"))
+        .and_then(Value::as_array)?;
+    let candidates: Vec<String> = variants.iter().map(variant_text).collect();
+    let normalized = normalize_query_variants(&candidates, query, max_queries.max(1));
+    (normalized.len() >= MIN_MULTI_QUERY_COUNT).then_some(normalized)
+}
+
+/// 启发式变体不足 2 条且配置了 LLM 时补一次改写；编号查询与 LLM 失败都回退启发式。
+pub async fn expand_multi_query_with_llm(
+    query: &str,
+    llm: Option<&LlmClient>,
+    max_queries: usize,
+) -> Vec<String> {
+    let max_queries = max_queries.max(1);
+    let heuristic = expand_multi_query_with_limit(query, max_queries);
+    let normalized_query = collapse_spaces(query.trim());
+    if normalized_query.is_empty() || is_identifier_query(&normalized_query) {
+        return heuristic;
+    }
+    let Some(llm) = llm else {
+        return heuristic;
+    };
+    if heuristic.len() >= 2 {
+        return heuristic;
+    }
+    let human = format!(
+        "用户问题：{normalized_query}\n\n请输出 3 条查询变体，避免长句，优先提升 source_name、标题、编号和正文关键词召回。"
+    );
+    match llm
+        .invoke(&[
+            ChatMessage::new("system", MULTI_QUERY_SYSTEM_PROMPT),
+            ChatMessage::new("user", human),
+        ])
+        .await
+    {
+        Ok(result) => {
+            let payload = parse_multi_query_payload(&result.content);
+            if let Some(variants) = apply_llm_multi_query_payload(&normalized_query, &payload, max_queries)
+            {
+                tracing::info!(
+                    query = normalized_query.as_str(),
+                    count = variants.len(),
+                    "LLM multi-query 补写成功"
+                );
+                return variants;
+            }
+            tracing::info!(query = normalized_query.as_str(), "LLM multi-query 变体不足，回退启发式");
+        }
+        Err(err) => tracing::warn!("LLM multi-query 失败，回退启发式: {err}"),
+    }
+    heuristic
 }
 
 fn identifier_query_variants(query: &str) -> Vec<String> {
@@ -692,4 +787,71 @@ pub fn assemble_rag_context(results: &[RetrievalItem], max_chars: usize) -> Stri
     blocks.join("
 
 ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_query_has_fewer_than_two_heuristic_variants() {
+        assert!(expand_multi_query("报销").len() < 2);
+        assert!(expand_multi_query("差旅报销流程是什么").len() >= 2);
+        assert!(expand_multi_query("").is_empty());
+    }
+
+    #[test]
+    fn identifier_query_keeps_number_terms() {
+        let queries = expand_multi_query("查询工号 E0011");
+        assert!(queries.iter().any(|item| item.contains("E0011")));
+    }
+
+    #[test]
+    fn llm_payload_requires_three_normalized_variants() {
+        let accepted = apply_llm_multi_query_payload(
+            "报销",
+            &json!({"queries": ["差旅报销", "费用标准", "报销流程"]}),
+            3,
+        )
+        .unwrap();
+        assert_eq!(accepted.len(), 3);
+        assert_eq!(accepted[0], "报销");
+
+        let by_alias = apply_llm_multi_query_payload(
+            "报销",
+            &json!({"query_variants": ["报销", "差旅报销", "费用标准"]}),
+            3,
+        )
+        .unwrap();
+        assert_eq!(by_alias[0], "报销");
+        assert_eq!(by_alias.len(), 3);
+
+        assert!(
+            apply_llm_multi_query_payload("报销", &json!({"queries": ["报销", "差旅报销"]}), 3)
+                .is_none()
+        );
+        assert!(apply_llm_multi_query_payload("报销", &json!({"queries": "not-a-list"}), 3).is_none());
+    }
+
+    #[test]
+    fn parses_fenced_multi_query_json() {
+        let payload = parse_multi_query_payload(
+            "```json\n{\"variants\":[\"报销标准\",\"差旅报销\",\"费用报销\"]}\n```",
+        );
+        let variants = apply_llm_multi_query_payload("报销", &payload, 3).unwrap();
+        assert_eq!(variants.len(), 3);
+        assert!(variants.contains(&"报销标准".to_string()));
+    }
+
+    #[tokio::test]
+    async fn without_llm_keeps_heuristic_path() {
+        assert_eq!(
+            expand_multi_query_with_llm("报销", None, 3).await,
+            expand_multi_query("报销")
+        );
+        assert_eq!(
+            expand_multi_query_with_llm("差旅报销流程是什么", None, 3).await,
+            expand_multi_query("差旅报销流程是什么")
+        );
+    }
 }

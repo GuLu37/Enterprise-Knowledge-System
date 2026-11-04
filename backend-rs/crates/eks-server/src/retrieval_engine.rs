@@ -13,10 +13,11 @@ use eks_kernels::rerank::{
 
 use crate::embedder::Embedder;
 use crate::milvus_lite::MilvusLiteStore;
+use crate::llm::LlmClient;
 use crate::retrieval::{
     MAX_CITATION_RESULTS, MIN_FINAL_RELEVANCE_SCORE, STRUCTURED_QUERY_CITATION_RESULTS,
     RetrievalItem, SparseIndexSnapshot, canonical_identifier_terms, citation_chunk_key,
-    collapse_spaces, expand_multi_query, is_structured_lookup_query,
+    collapse_spaces, expand_multi_query_with_llm, is_structured_lookup_query,
 };
 
 const MAX_MULTI_QUERY_COUNT: usize = 3;
@@ -297,13 +298,13 @@ impl RetrievalEngine {
             .collect())
     }
 
-    /// 完整 RAG 工作流（对齐 run_rag_workflow, llm=None）。
+    /// 完整 RAG 工作流（对齐 run_rag_workflow）。HTTP 检索入口不传 LLM，聊天/ReAct 传入。
     pub async fn run_rag_workflow(
         &self,
         query: &str,
         top_k: usize,
     ) -> Result<(Vec<RetrievalItem>, String), String> {
-        self.retrieve_planned(query, crate::planner::RETRIEVAL_METHOD_HYBRID, top_k)
+        self.retrieve_planned(query, crate::planner::RETRIEVAL_METHOD_HYBRID, top_k, None)
             .await
     }
 
@@ -311,8 +312,9 @@ impl RetrievalEngine {
         &self,
         query: &str,
         top_k: usize,
+        llm: Option<&LlmClient>,
     ) -> Result<(Vec<RetrievalItem>, String), String> {
-        let recalled = self.retrieve_documents_multi_query(query, top_k).await?;
+        let recalled = self.retrieve_documents_multi_query(query, top_k, llm).await?;
         let processed = self.post_process(query, recalled, top_k).await?;
         let context = assemble_processed_context(&processed);
         Ok((processed, context))
@@ -324,6 +326,7 @@ impl RetrievalEngine {
         query: &str,
         method: &str,
         top_k: usize,
+        llm: Option<&LlmClient>,
     ) -> Result<(Vec<RetrievalItem>, String), String> {
         let query = query.trim();
         if query.is_empty() {
@@ -351,7 +354,7 @@ impl RetrievalEngine {
                 let context = assemble_processed_context(&processed);
                 (processed, context)
             }
-            _ => self.run_hybrid_workflow(query, top_k).await?,
+            _ => self.run_hybrid_workflow(query, top_k, llm).await?,
         };
         self.result_cache
             .lock()
@@ -364,8 +367,9 @@ impl RetrievalEngine {
         &self,
         query: &str,
         top_k: usize,
+        llm: Option<&LlmClient>,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let mut queries = expand_multi_query(query);
+        let mut queries = expand_multi_query_with_llm(query, llm, MAX_MULTI_QUERY_COUNT).await;
         if !eks_kernels::rerank::is_identifier_query(query) {
             queries.truncate(MAX_MULTI_QUERY_COUNT);
         }

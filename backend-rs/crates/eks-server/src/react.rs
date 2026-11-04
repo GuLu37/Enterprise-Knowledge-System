@@ -211,7 +211,7 @@ async fn run_react_loop(
                         "ReAct 工具执行"
                     );
                     let (observation, extra) =
-                        execute_tool(engine, pool, user_id, query, top_k, &call, mcp_manifests).await;
+                        execute_tool(engine, pool, user_id, query, top_k, &call, mcp_manifests, llm).await;
                     (index, observation, extra)
                 }
             }).buffer_unordered(workers);
@@ -296,6 +296,7 @@ async fn execute_tool(
     default_top_k: usize,
     call: &ToolCall,
     mcp_manifests: &[Value],
+    llm: &LlmClient,
 ) -> (Value, Vec<RetrievalItem>) {
     if call.name == "search_knowledge_base" {
         let query = call
@@ -316,7 +317,7 @@ async fn execute_tool(
             .get("retrieval_method")
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
-        return match engine.retrieve_planned(query, method, top_k).await {
+        return match engine.retrieve_planned(query, method, top_k, Some(llm)).await {
             Ok((items, _)) => {
                 let payload: Vec<Value> = items.iter().take(8).map(|item| item.to_json()).collect();
                 (

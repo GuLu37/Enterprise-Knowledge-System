@@ -540,7 +540,7 @@ pub async fn retrieval_hybrid(
     }
     let recalled = state
         .engine
-        .retrieve_documents_multi_query(&query, top_k)
+        .retrieve_documents_multi_query(&query, top_k, None)
         .await
         .map_err(internal_error)?;
     let results = state

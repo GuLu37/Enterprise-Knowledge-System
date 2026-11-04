@@ -463,7 +463,7 @@ async fn collect_rag(
         "常规检索规划器初始决策"
     );
     let (first_results, context) = engine
-        .retrieve_planned(&plan.query, &plan.retrieval_method, plan.top_k)
+        .retrieve_planned(&plan.query, &plan.retrieval_method, plan.top_k, Some(llm))
         .await?;
     let evidence = crate::planner::assess_evidence(query, &first_results, planner_llm).await;
     tracing::info!(
@@ -546,7 +546,12 @@ async fn collect_rag(
 
     if let Some(rewritten) = rewrite_query(llm, query, history).await {
         let second = engine
-            .retrieve_planned(&rewritten, crate::planner::RETRIEVAL_METHOD_HYBRID, plan.top_k)
+            .retrieve_planned(
+                &rewritten,
+                crate::planner::RETRIEVAL_METHOD_HYBRID,
+                plan.top_k,
+                Some(llm),
+            )
             .await
             .map(|(results, _)| results)
             .unwrap_or_default();
