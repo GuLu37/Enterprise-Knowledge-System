@@ -16,6 +16,25 @@ use serde_json::json;
 use crate::auth::AuthError;
 use crate::state::AppState;
 
+/// 对齐 Python `_extract_text_from_txt`：utf-8 → utf-8-sig → gbk → gb18030。
+fn decode_text_bytes(data: &[u8]) -> Result<String, String> {
+    if let Ok(text) = std::str::from_utf8(data) {
+        return Ok(text.to_string());
+    }
+    if let Some(without_bom) = data.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(text) = std::str::from_utf8(without_bom) {
+            return Ok(text.to_string());
+        }
+    }
+    for encoding in [encoding_rs::GBK, encoding_rs::GB18030] {
+        let (text, _, had_errors) = encoding.decode(data);
+        if !had_errors {
+            return Ok(text.into_owned());
+        }
+    }
+    Err("TXT 文件编码无法识别".into())
+}
+
 const PARENT_CHUNK_SIZE: usize = 500;
 const PARENT_CHUNK_OVERLAP: usize = 60;
 const CHILD_CHUNK_SIZE: usize = 150;
@@ -33,7 +52,8 @@ pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
         .to_lowercase();
 
     match ext.as_str() {
-        "txt" | "md" | "csv" | "tsv" => {
+        "txt" | "md" => decode_text_bytes(data),
+        "csv" | "tsv" => {
             String::from_utf8(data.to_vec()).map_err(|e| format!("UTF-8 解码失败: {e}"))
         }
         "docx" => extract_docx_text(data),
@@ -403,4 +423,25 @@ pub async fn append_to_milvus_lite(
     std::fs::write(&manifest_path, manifest_out).map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_utf8_and_gbk_text_files() {
+        assert_eq!(extract_text("手册.txt", "你好".as_bytes()).unwrap(), "你好");
+        let (gbk, _, _) = encoding_rs::GBK.encode("差旅报销");
+        assert_eq!(extract_text("手册.md", &gbk).unwrap(), "差旅报销");
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice("带BOM".as_bytes());
+        assert_eq!(extract_text("a.txt", &bom).unwrap(), "\u{feff}带BOM");
+    }
+
+    #[test]
+    fn rejects_unrecognized_text_encoding() {
+        let err = extract_text("bad.txt", &[0xFF, 0xFE, 0x00]).unwrap_err();
+        assert_eq!(err, "TXT 文件编码无法识别");
+    }
 }

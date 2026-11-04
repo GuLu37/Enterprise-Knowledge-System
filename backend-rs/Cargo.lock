@@ -961,6 +961,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "eks-kernels",
+ "encoding_rs",
  "futures-util",
  "hex",
  "hmac",
