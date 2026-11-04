@@ -6,6 +6,7 @@ pub struct Config {
     pub app_name: String,
     pub app_version: String,
     pub environment: String,
+    pub debug: bool,
     pub api_prefix: String,
     pub host: String,
     pub port: u16,
@@ -143,6 +144,30 @@ pub fn parse_dict_list(raw: &str) -> Vec<serde_json::Value> {
     }
 }
 
+/// 对齐 Python `_validate_runtime_security`：非 DEBUG 拒绝弱 JWT / 默认管理员口令。
+pub fn validate_runtime_security(
+    debug: bool,
+    jwt_secret_key: &str,
+    bootstrap_admin_password: &str,
+) -> Result<(), String> {
+    if debug {
+        return Ok(());
+    }
+    if jwt_secret_key.is_empty()
+        || jwt_secret_key == "change-me-in-production"
+        || jwt_secret_key.len() < 32
+    {
+        return Err("生产环境必须配置长度至少 32 个字符的 JWT_SECRET_KEY".into());
+    }
+    if matches!(
+        bootstrap_admin_password,
+        "123456" | "password" | "change-me"
+    ) {
+        return Err("生产环境禁止使用默认 BOOTSTRAP_ADMIN_PASSWORD".into());
+    }
+    Ok(())
+}
+
 fn env_or(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
@@ -179,10 +204,11 @@ impl Config {
     pub fn load() -> Self {
         let env_file = env_or("EKS_ENV_FILE", "../backend/.env");
         let _ = dotenvy::from_filename(&env_file);
-        Config {
+        let config = Config {
             app_name: env_or("APP_NAME", "Enterprise Knowledge System"),
             app_version: env_or("APP_VERSION", "1.0.0"),
             environment: env_or("ENVIRONMENT", "开发版"),
+            debug: env_bool("DEBUG", true),
             api_prefix: env_or("API_PREFIX", "/api/v1"),
             host: env_or("EKS_HOST", "127.0.0.1"),
             port: env_i64("EKS_PORT", 8000) as u16,
@@ -264,7 +290,15 @@ impl Config {
             allowed_file_types: parse_allowed_file_types(
                 &env::var("ALLOWED_FILE_TYPES").unwrap_or_default(),
             ),
+        };
+        if let Err(err) = validate_runtime_security(
+            config.debug,
+            &config.jwt_secret_key,
+            &config.bootstrap_admin_password,
+        ) {
+            panic!("{err}");
         }
+        config
     }
 
     #[cfg(test)]
@@ -273,6 +307,7 @@ impl Config {
             app_name: "Enterprise Knowledge System".into(),
             app_version: "1.0.0".into(),
             environment: "开发版".into(),
+            debug: true,
             api_prefix: "/api/v1".into(),
             host: "127.0.0.1".into(),
             port: 8000,
@@ -379,9 +414,46 @@ mod tests {
         assert_eq!(Config::jwt_test().app_name, "Enterprise Knowledge System");
         assert_eq!(Config::jwt_test().app_version, "1.0.0");
         assert_eq!(Config::jwt_test().environment, "开发版");
+        assert!(Config::jwt_test().debug);
         assert_eq!(Config::jwt_test().max_upload_size, 104_857_600);
         assert!(Config::jwt_test().allowed_file_types.contains(&"pdf".into()));
         assert!(Config::jwt_test().allowed_file_types.contains(&"xlsx".into()));
+    }
+
+    #[test]
+    fn debug_skips_runtime_security_checks() {
+        assert!(validate_runtime_security(true, "change-me-in-production", "123456").is_ok());
+        assert!(validate_runtime_security(true, "", "password").is_ok());
+    }
+
+    #[test]
+    fn production_rejects_weak_jwt_and_bootstrap_password() {
+        assert_eq!(
+            validate_runtime_security(false, "change-me-in-production", "strong-pass").unwrap_err(),
+            "生产环境必须配置长度至少 32 个字符的 JWT_SECRET_KEY"
+        );
+        assert_eq!(
+            validate_runtime_security(false, "", "strong-pass").unwrap_err(),
+            "生产环境必须配置长度至少 32 个字符的 JWT_SECRET_KEY"
+        );
+        assert_eq!(
+            validate_runtime_security(false, "short-secret-key", "strong-pass").unwrap_err(),
+            "生产环境必须配置长度至少 32 个字符的 JWT_SECRET_KEY"
+        );
+        let ok_secret = "a".repeat(32);
+        assert!(validate_runtime_security(false, &ok_secret, "strong-pass").is_ok());
+        assert_eq!(
+            validate_runtime_security(false, &ok_secret, "123456").unwrap_err(),
+            "生产环境禁止使用默认 BOOTSTRAP_ADMIN_PASSWORD"
+        );
+        assert_eq!(
+            validate_runtime_security(false, &ok_secret, "password").unwrap_err(),
+            "生产环境禁止使用默认 BOOTSTRAP_ADMIN_PASSWORD"
+        );
+        assert_eq!(
+            validate_runtime_security(false, &ok_secret, "change-me").unwrap_err(),
+            "生产环境禁止使用默认 BOOTSTRAP_ADMIN_PASSWORD"
+        );
     }
 
     #[test]

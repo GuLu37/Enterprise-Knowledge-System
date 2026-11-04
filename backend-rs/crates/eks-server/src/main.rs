@@ -103,9 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!(
-        "eks-server 启动: {addr} | sqlite={} | prefix={}",
+        "eks-server 启动: {addr} | sqlite={} | prefix={} | 调试模式={}",
         config.sqlite_path,
-        config.api_prefix
+        config.api_prefix,
+        config.debug
     );
 
     let mut warmup = RuntimeWarmup::initializing(&config);
