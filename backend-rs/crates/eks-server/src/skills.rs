@@ -32,6 +32,7 @@ const TOOL_CATALOG_HINTS: &[&str] = &[
 
 const PROFILE_NAME_HINTS: &[&str] = &[
     "我叫什么",
+    "我叫什么名字",
     "我的名字",
     "你记得我叫什么",
     "还记得我叫什么",
@@ -59,38 +60,14 @@ const MEMORY_QUERY_HINTS: &[&str] = &[
     "画像",
 ];
 
-const HOT_WORD_HINTS: &[&str] = &["热词", "高频词", "统计词频", "词频统计"];
-
-const FILE_LIST_HINTS: &[&str] = &[
-    "有哪些文件",
-    "有哪些文档",
-    "有什么文件",
-    "有什么文档",
-    "列出文件",
-    "列出文档",
-    "文件列表",
-    "文档列表",
-    "已上传的文档",
-    "已上传的文件",
-    "上传了哪些",
-    "知识库文件",
-    "知识库文档",
-    "这份文档",
-    "这个文档",
-    "讲了什么",
-];
-
-const FILE_LIST_CONTENT_HINTS: &[&str] = &[
-    "怎么办", "如何", "是什么", "流程", "规定", "标准", "多少钱",
-];
-
-const DELETE_PROFILE_HINTS: &[&str] = &[
-    "删除记忆",
-    "清除记忆",
-    "忘掉",
-    "别再记",
-    "忘记我的",
-    "删除我的",
+const HOT_WORD_HINTS: &[&str] = &[
+    "热词",
+    "高频词",
+    "关键词",
+    "文件里",
+    "文档里",
+    "统计词频",
+    "词频统计",
 ];
 
 const NOISY_TERMS: &[&str] = &[
@@ -117,13 +94,13 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
     }
     let lowered = normalized.to_lowercase();
 
-    if PROFILE_NAME_HINTS.iter().any(|hint| lowered.contains(hint)) {
+    if is_profile_name_query(normalized) {
         return Some(RoutedSkill {
             name: "memory_query",
             arguments: json!({
                 "query": normalized,
                 "top_k": 5,
-                "memory_scope": "profile",
+                "memory_scope": "all",
             }),
         });
     }
@@ -168,32 +145,17 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
             arguments,
         });
     }
-    if DELETE_PROFILE_HINTS.iter().any(|hint| lowered.contains(hint)) {
-        let keywords = extract_delete_keywords(normalized);
-        return Some(RoutedSkill {
-            name: "delete_profile_memory",
-            arguments: json!({ "keywords": keywords, "max_deletes": 50 }),
-        });
-    }
-    if is_file_list_query(&lowered) {
-        let mut arguments = json!({ "summarize": true, "limit": 20 });
-        let file_name = extract_file_name_hint(normalized);
-        if !file_name.is_empty() {
-            arguments["file_name"] = json!(file_name);
-        }
-        return Some(RoutedSkill {
-            name: "list_knowledge_base_files",
-            arguments,
-        });
-    }
     None
 }
 
-fn is_file_list_query(lowered: &str) -> bool {
-    if !FILE_LIST_HINTS.iter().any(|hint| lowered.contains(hint)) {
-        return false;
-    }
-    !FILE_LIST_CONTENT_HINTS.iter().any(|hint| lowered.contains(hint))
+/// 对齐 Python `_is_profile_name_query`：去掉空白后再匹配。
+fn is_profile_name_query(query: &str) -> bool {
+    let normalized: String = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    !normalized.is_empty() && PROFILE_NAME_HINTS.iter().any(|hint| normalized.contains(hint))
 }
 
 pub fn extract_file_name_hint(query: &str) -> String {
@@ -219,19 +181,6 @@ pub fn extract_file_name_hint(query: &str) -> String {
 
 fn is_filename_break(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '，' | '。' | '；' | '：' | ',' | ';' | ':' | '、' | '《' | '》' | '（' | '）' | '(' | ')')
-}
-
-fn extract_delete_keywords(query: &str) -> Vec<String> {
-    let mut text = query.to_string();
-    for hint in DELETE_PROFILE_HINTS {
-        text = text.replace(hint, " ");
-    }
-    text.split(|ch: char| ch.is_whitespace() || matches!(ch, '，' | '。' | '、' | ',' | '的' | '了'))
-        .map(str::trim)
-        .filter(|part| part.chars().count() >= 1 && !matches!(*part, "我" | "你" | "把" | "请"))
-        .map(str::to_string)
-        .take(8)
-        .collect()
 }
 
 pub fn should_disclose_original_memory(query: &str) -> bool {
@@ -1986,12 +1935,17 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn routes_tool_catalog_and_file_list() {
+    fn routes_rule_skills_like_python() {
         let tools = route_local_skill("列出你的工具").expect("tool");
         assert_eq!(tools.name, "list_available_tools");
-        let files = route_local_skill("知识库里有哪些文档").expect("files");
-        assert_eq!(files.name, "list_knowledge_base_files");
+        assert!(route_local_skill("知识库里有哪些文档").is_none());
+        assert!(route_local_skill("忘掉张三").is_none());
         assert!(route_local_skill("差旅报销流程是什么").is_none());
+        let profile = route_local_skill("我 叫 什么 名字").expect("profile");
+        assert_eq!(profile.name, "memory_query");
+        assert_eq!(profile.arguments["memory_scope"], "all");
+        let hot = route_local_skill("这份文档里的关键词").expect("hot");
+        assert_eq!(hot.name, "document_hot_word_statistics");
         let catalog = function_calling_tools();
         let names: Vec<&str> = catalog
             .iter()
