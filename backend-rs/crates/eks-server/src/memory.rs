@@ -3,8 +3,10 @@
 //! 召回用词法 + 可选 BGE 余弦，不依赖 Milvus 记忆 collection。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc;
 
 use serde_json::{Value, json};
 
@@ -40,6 +42,7 @@ const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "
 const MEMORY_TYPE_EVENT: &str = "event";
 const MEMORY_STATUS_ACTIVE: &str = "active";
 const DEFAULT_EVENT_EXPIRY_DAYS: i64 = 90;
+pub const MEMORY_PERSIST_QUEUE_SIZE: usize = 100;
 pub const CONSOLIDATION_LEVELS: [(i64, i32); 3] = [(10, 1), (20, 2), (40, 3)];
 const CONSOLIDATION_RETRY_DELAYS: [u64; 3] = [60, 300, 1800];
 const L1_SUMMARY_SYSTEM_PROMPT: &str = "你是长期记忆摘要器。请将给定对话总结成适合长期记忆的一句话摘要，并给出主题。\
@@ -325,6 +328,103 @@ pub fn spawn_memory_maintenance(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+struct PersistJob {
+    pool: sqlx::SqlitePool,
+    llm: Option<Arc<LlmClient>>,
+    user_id: String,
+    conversation_id: String,
+    session_id: String,
+    query: String,
+    answer: String,
+    expiry_days: i64,
+}
+
+pub struct MemoryPersistQueue {
+    tx: mpsc::Sender<PersistJob>,
+}
+
+impl MemoryPersistQueue {
+    pub fn start(capacity: usize) -> Self {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        tokio::spawn(run_persist_worker(rx));
+        MemoryPersistQueue { tx }
+    }
+
+    #[cfg(test)]
+    fn bounded(capacity: usize) -> (Self, mpsc::Receiver<PersistJob>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (MemoryPersistQueue { tx }, rx)
+    }
+
+    fn try_enqueue(&self, job: PersistJob) -> bool {
+        match self.tx.try_send(job) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                tracing::warn!(
+                    "长期记忆写入队列已满({})，丢弃本轮记忆: query={}",
+                    MEMORY_PERSIST_QUEUE_SIZE,
+                    job.query.chars().take(32).collect::<String>()
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(job)) => {
+                tracing::warn!(
+                    "长期记忆写入队列已关闭，丢弃本轮记忆: query={}",
+                    job.query.chars().take(32).collect::<String>()
+                );
+                false
+            }
+        }
+    }
+}
+
+async fn run_persist_worker(mut rx: mpsc::Receiver<PersistJob>) {
+    while let Some(job) = rx.recv().await {
+        persist_turn(
+            &job.pool,
+            job.llm.as_deref(),
+            &job.user_id,
+            &job.conversation_id,
+            &job.session_id,
+            &job.query,
+            &job.answer,
+            job.expiry_days,
+        )
+        .await;
+    }
+}
+
+fn global_persist_queue() -> &'static MemoryPersistQueue {
+    static QUEUE: OnceLock<MemoryPersistQueue> = OnceLock::new();
+    QUEUE.get_or_init(|| MemoryPersistQueue::start(MEMORY_PERSIST_QUEUE_SIZE))
+}
+
+/// 对齐 Python `_persist_long_term_memory_async`：单 worker + 有界队列串行写入。
+pub fn enqueue_persist_turn(
+    pool: sqlx::SqlitePool,
+    llm: Option<Arc<LlmClient>>,
+    user_id: String,
+    conversation_id: String,
+    session_id: String,
+    query: String,
+    answer: String,
+    expiry_days: i64,
+) -> bool {
+    if answer.trim().is_empty() || user_id.trim().is_empty() {
+        return false;
+    }
+    global_persist_queue().try_enqueue(PersistJob {
+        pool,
+        llm,
+        user_id,
+        conversation_id,
+        session_id,
+        query,
+        answer,
+        expiry_days,
+    })
 }
 
 pub fn should_extract_profile(query: &str) -> bool {
@@ -2529,5 +2629,69 @@ mod tests {
         assert_eq!(l2, 1);
         assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 1).await, 20);
         assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 2).await, 20);
+    }
+
+    fn persist_job(
+        pool: &sqlx::SqlitePool,
+        conversation_id: &str,
+        query: &str,
+        answer: &str,
+    ) -> PersistJob {
+        PersistJob {
+            pool: pool.clone(),
+            llm: None,
+            user_id: "u1".into(),
+            conversation_id: conversation_id.into(),
+            session_id: "s1".into(),
+            query: query.into(),
+            answer: answer.into(),
+            expiry_days: DEFAULT_EVENT_EXPIRY_DAYS,
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_queue_drops_when_full_and_skips_empty_answer() {
+        assert!(!enqueue_persist_turn(
+            sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
+            None,
+            "u1".into(),
+            "c-empty".into(),
+            "s1".into(),
+            "问题".into(),
+            "  ".into(),
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        ));
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let (queue, _rx) = MemoryPersistQueue::bounded(1);
+        assert!(queue.try_enqueue(persist_job(&pool, "c-full", "第一问", "第一答")));
+        assert!(!queue.try_enqueue(persist_job(&pool, "c-full", "第二问", "第二答")));
+        assert_eq!(MEMORY_PERSIST_QUEUE_SIZE, 100);
+    }
+
+    #[tokio::test]
+    async fn persist_queue_serializes_turn_numbers() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let queue = MemoryPersistQueue::start(8);
+        assert!(queue.try_enqueue(persist_job(&pool, "c-serial", "第一问", "第一答")));
+        assert!(queue.try_enqueue(persist_job(&pool, "c-serial", "第二问", "第二答")));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if count_dialogue_turns(&pool, "u1", "c-serial").await >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("串行写入超时");
+        let turns: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT turn_start, turn_end FROM memory_records \
+             WHERE conversation_id = 'c-serial' AND memory_key = 'dialogue' ORDER BY turn_start",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(turns, vec![(0, 0), (1, 1)]);
     }
 }

@@ -420,22 +420,16 @@ fn spawn_persist_turn(
     answer: String,
     expiry_days: i64,
 ) {
-    if answer.trim().is_empty() || user_id.trim().is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        crate::memory::persist_turn(
-            &pool,
-            llm.as_deref(),
-            &user_id,
-            &conversation_id,
-            &session_id,
-            &query,
-            &answer,
-            expiry_days,
-        )
-        .await;
-    });
+    crate::memory::enqueue_persist_turn(
+        pool,
+        llm,
+        user_id,
+        conversation_id,
+        session_id,
+        query,
+        answer,
+        expiry_days,
+    );
 }
 
 fn history_pairs(history: &[HistoryMessage], window_n: usize) -> Vec<(String, String)> {
