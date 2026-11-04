@@ -875,10 +875,13 @@ struct RagTurn {
     sources: Vec<RetrievalItem>,
     direct: Option<String>,
     retrieval_method: Option<String>,
-    used_react: bool,
-    react_notes: Vec<String>,
-    react_kind: Option<String>,
     expanded_queries: Vec<String>,
+    exhausted: bool,
+}
+
+/// 对齐 Python stream：exhausted 只发 message/done，不发 RAG tool 事件。
+fn emit_rag_sse_tools(use_retrieval: bool, exhausted: bool) -> bool {
+    use_retrieval && !exhausted
 }
 
 fn sse_json(event: &str, data: serde_json::Value) -> Event {
@@ -1054,10 +1057,8 @@ async fn collect_rag(
             sources: Vec::new(),
             direct: None,
             retrieval_method: None,
-            used_react: false,
-            react_notes: Vec::new(),
-            react_kind: None,
             expanded_queries: Vec::new(),
+            exhausted: false,
         });
     }
     let planner_query = first_pass_planner_query(query, retrieval_query);
@@ -1088,17 +1089,12 @@ async fn collect_rag(
             sources: first_results,
             direct: None,
             retrieval_method: Some(plan.retrieval_method.clone()),
-            used_react: false,
-            react_notes: Vec::new(),
-            react_kind: None,
             expanded_queries,
+            exhausted: false,
         });
     }
 
     let mut working = first_results;
-    let mut used_react = false;
-    let mut react_notes = Vec::new();
-    let mut react_kind = None;
     let history_pairs = history_pairs(history, window_n);
     let mcp_manifests = &config.mcp_remote_tool_manifests;
     let retrieval_method = plan.retrieval_method.clone();
@@ -1135,9 +1131,6 @@ async fn collect_rag(
         .await;
     }
     if let crate::react::ReactAttempt::Ran(outcome) = attempt {
-        used_react = outcome.used_react;
-        react_notes = outcome.notes;
-        react_kind = Some(outcome.kind.clone());
         if outcome.used_react {
             if crate::planner::assess_evidence_rule(query, &outcome.sources).sufficient {
                 return Ok(RagTurn {
@@ -1145,10 +1138,8 @@ async fn collect_rag(
                     sources: outcome.sources,
                     direct: None,
                     retrieval_method: Some(retrieval_method),
-                    used_react,
-                    react_notes,
-                    react_kind,
                     expanded_queries,
+                    exhausted: false,
                 });
             }
             if outcome.sources.is_empty() {
@@ -1157,10 +1148,8 @@ async fn collect_rag(
                     sources: Vec::new(),
                     direct: Some(no_result_answer(query)),
                     retrieval_method: Some(retrieval_method),
-                    used_react,
-                    react_notes,
-                    react_kind,
                     expanded_queries,
+                    exhausted: false,
                 });
             }
             working = outcome.sources;
@@ -1175,10 +1164,8 @@ async fn collect_rag(
                 sources: working,
                 direct: None,
                 retrieval_method: Some(retrieval_method),
-                used_react,
-                react_notes,
-                react_kind,
                 expanded_queries,
+                exhausted: false,
             });
         }
     }
@@ -1190,11 +1177,9 @@ async fn collect_rag(
             query,
             "search_knowledge_base",
         )),
-        retrieval_method: Some(retrieval_method),
-        used_react,
-        react_notes,
-        react_kind,
+        retrieval_method: None,
         expanded_queries,
+        exhausted: true,
     })
 }
 
@@ -1852,23 +1837,6 @@ pub async fn stream_chat(
             resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &working_history).await;
         let use_retrieval = intent.needs_retrieval;
         let preferred_method = request_retrieval_method.as_str();
-        if use_retrieval {
-            let planner_query = first_pass_planner_query(&query, &retrieval_query);
-            let preview = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
-            yield Ok(sse_json(
-                "tool_call",
-                sse_tool_call_payload(
-                    "search_knowledge_base",
-                    json!({
-                        "query": preview.query,
-                        "top_k": preview.top_k,
-                        "retrieval_method": preview.retrieval_method,
-                    }),
-                    &intent.reason,
-                ),
-            ));
-        }
-
         let turn = match collect_rag(
             &engine,
             &pool,
@@ -1891,8 +1859,45 @@ pub async fn stream_chat(
                 return;
             }
         };
+        if turn.exhausted {
+            let answer = turn.direct.clone().unwrap_or_else(|| {
+                tool_budget_exhausted_message(&query, "search_knowledge_base")
+            });
+            spawn_persist_turn(
+                pool.clone(),
+                Some(llm_client.clone()),
+                user_id.clone(),
+                conversation_id.clone(),
+                session_id.clone(),
+                query.clone(),
+                answer.clone(),
+                event_expiry_days,
+            );
+            yield Ok(sse_json("message", json!({"content": answer})));
+            yield Ok(sse_json("token", json!({"content": answer})));
+            yield Ok(sse_json("done", json!({
+                "content": answer,
+                "response": answer,
+                "sources": [],
+            })));
+            return;
+        }
         let sources = source_payload(&turn.sources);
-        if use_retrieval {
+        if emit_rag_sse_tools(use_retrieval, turn.exhausted) {
+            let planner_query = first_pass_planner_query(&query, &retrieval_query);
+            let preview = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
+            yield Ok(sse_json(
+                "tool_call",
+                sse_tool_call_payload(
+                    "search_knowledge_base",
+                    json!({
+                        "query": preview.query,
+                        "top_k": preview.top_k,
+                        "retrieval_method": preview.retrieval_method,
+                    }),
+                    &intent.reason,
+                ),
+            ));
             yield Ok(sse_json(
                 "tool_result",
                 sse_rag_tool_result_payload(
@@ -1904,22 +1909,6 @@ pub async fn stream_chat(
                 ),
             ));
             yield Ok(sse_json("sources", json!({"sources": sources})));
-        }
-        if turn.used_react {
-            let react_name = turn.react_kind.as_deref().unwrap_or("unified_react");
-            yield Ok(sse_json(
-                "tool_call",
-                sse_tool_call_payload(
-                    react_name,
-                    json!({"query": query, "notes": turn.react_notes}),
-                    &intent.reason,
-                ),
-            ));
-            yield Ok(sse_json("tool_result", json!({
-                "skill": react_name,
-                "notes": turn.react_notes,
-                "sources": sources,
-            })));
         }
         if let Some(answer) = turn.direct.clone() {
             spawn_persist_turn(
@@ -2307,6 +2296,20 @@ mod tests {
         assert_eq!(payload["args"]["query"], "我叫什么");
         assert_eq!(payload["reason"], "rule");
         assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn exhausted_rag_skips_tool_events_like_python() {
+        assert!(
+            emit_rag_sse_tools(true, false),
+            "完整 RAG 回合仍发 tool_call/tool_result"
+        );
+        assert!(
+            !emit_rag_sse_tools(true, true),
+            "exhausted 只发 message/done，对齐 Python stream"
+        );
+        assert!(!emit_rag_sse_tools(false, false));
+        assert!(!emit_rag_sse_tools(false, true));
     }
 
     #[test]
