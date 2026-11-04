@@ -1043,7 +1043,7 @@ fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
 pub async fn warmup_chat_runtime(state: &AppState) -> RuntimeWarmup {
     let mut result = RuntimeWarmup::initializing(&state.config);
 
-    match result.apply_startup_llm(&state.config) {
+    match result.apply_startup_llm(state.default_llm.as_ref()).await {
         Ok(()) => {}
         Err(exc) => tracing::warn!("LLM 预热失败，已跳过: {exc}"),
     }
@@ -2183,26 +2183,46 @@ mod tests {
         assert_eq!(payload["provider"], "openai");
     }
 
-    #[test]
-    fn startup_llm_marks_warmed_when_provider_configured() {
+    #[tokio::test]
+    async fn startup_llm_marks_warmed_when_provider_configured() {
         let mut cfg = crate::config::Config::jwt_test();
         cfg.openai_api_key = "sk-test".into();
+        let llm = LlmClient::from_env(&cfg);
         let mut warmup = RuntimeWarmup::initializing(&cfg);
-        assert!(warmup.apply_startup_llm(&cfg).is_ok());
+        assert!(warmup.apply_startup_llm(&llm).await.is_ok());
         assert!(warmup.llm_warmed);
         assert_eq!(warmup.provider.as_deref(), Some("openai"));
+        assert_eq!(llm.active_provider_name().await.as_deref(), Some("openai"));
         assert_eq!(warmup.status, "initializing");
         assert!(!warmup.is_ready());
     }
 
-    #[test]
-    fn startup_llm_fails_without_providers() {
+    #[tokio::test]
+    async fn startup_llm_fails_without_providers() {
         let cfg = crate::config::Config::jwt_test();
+        let llm = LlmClient::from_env(&cfg);
         let mut warmup = RuntimeWarmup::initializing(&cfg);
-        assert!(warmup.apply_startup_llm(&cfg).is_err());
+        let err = warmup.apply_startup_llm(&llm).await.expect_err("no providers");
+        assert!(err.contains("没有可用的 LLM 提供商"), "{err}");
         assert!(!warmup.llm_warmed);
         assert!(warmup.provider.is_none());
+        assert!(llm.active_provider_name().await.is_none());
         assert_eq!(warmup.status, "initializing");
         assert!(!cfg.cross_encoder_enabled);
+    }
+
+    #[tokio::test]
+    async fn warmup_primes_shared_default_llm_like_python() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        cfg.anthropic_api_key = "ak-test".into();
+        cfg.llm_provider = "anthropic".into();
+        let llm = LlmClient::from_env(&cfg);
+        assert!(llm.active_provider_name().await.is_none());
+        let mut warmup = RuntimeWarmup::initializing(&cfg);
+        warmup.apply_startup_llm(&llm).await.unwrap();
+        assert_eq!(llm.active_provider_name().await.as_deref(), Some("anthropic"));
+        assert_eq!(warmup.provider.as_deref(), Some("anthropic"));
+        assert!(warmup.llm_warmed);
     }
 }

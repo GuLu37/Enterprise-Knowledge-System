@@ -267,6 +267,22 @@ impl LlmClient {
         !self.config.providers.is_empty()
     }
 
+    /// 对齐 Python `FallbackLLM.active_provider`。
+    pub async fn active_provider_name(&self) -> Option<String> {
+        self.active_provider.lock().await.clone()
+    }
+
+    /// 对齐 Python `FallbackLLM.prime`：预先挑选当前可用 provider 并粘滞到进程级实例。
+    pub async fn prime(&self) -> Result<String, String> {
+        let providers = self.candidate_providers().await;
+        if providers.is_empty() {
+            return Err("没有可用的 LLM 提供商，请检查配置: 无可用 provider".into());
+        }
+        let name = providers[0].name.clone();
+        self.remember_success(&name).await;
+        Ok(name)
+    }
+
     /// 按兜底顺序返回当前可用 provider（过滤冷却中的）。
     /// 对齐 Python `_fallback_call` / `stream`：粘滞 `active_provider` 提到队首。
     async fn candidate_providers(&self) -> Vec<ProviderConfig> {
@@ -1555,6 +1571,23 @@ mod tests {
         );
         fail_handle.abort();
         ok_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn prime_sticks_first_available_provider() {
+        let client = test_client(
+            vec![
+                demo_provider("deepseek", false, false),
+                demo_provider("openai", false, false),
+            ],
+            "openai",
+        );
+        assert_eq!(client.prime().await.unwrap(), "openai");
+        assert_eq!(client.active_provider.lock().await.as_deref(), Some("openai"));
+        let empty = test_client(Vec::new(), "openai");
+        let err = empty.prime().await.expect_err("no providers");
+        assert!(err.contains("没有可用的 LLM 提供商，请检查配置"), "{err}");
+        assert!(empty.active_provider.lock().await.is_none());
     }
 
     #[test]

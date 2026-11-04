@@ -122,10 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.debug
     );
 
+    let default_llm = eks_server::llm::LlmClient::from_env(&config);
     let mut warmup = RuntimeWarmup::initializing(&config);
     if config.startup_init_llm {
         let llm_started_at = std::time::Instant::now();
-        match warmup.apply_startup_llm(&config) {
+        match warmup.apply_startup_llm(&default_llm).await {
             Ok(()) => tracing::info!(
                 provider = ?warmup.provider,
                 duration_ms = llm_started_at.elapsed().as_secs_f64() * 1000.0,
@@ -134,8 +135,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(exc) => tracing::warn!("启动阶段 LLM 初始化失败，将回退到后台预热: {exc}"),
         }
     }
-
-    let default_llm = eks_server::llm::LlmClient::from_env(&config);
     let state = AppState {
         pool,
         config: Arc::new(config),

@@ -54,15 +54,11 @@ impl RuntimeWarmup {
         };
     }
 
-    /// 对齐 `STARTUP_INIT_LLM`：构造默认 LLM，不发起实际对话。
-    pub fn apply_startup_llm(&mut self, config: &Config) -> Result<(), String> {
-        let llm = crate::llm::LlmConfig::from_env(config);
-        if llm.providers.is_empty() {
-            return Err("没有配置任何 LLM 提供商".into());
-        }
-        let _client = crate::llm::LlmClient::new(llm.clone());
+    /// 对齐 `STARTUP_INIT_LLM` / `get_default_llm().prime()`：预热进程级默认 LLM。
+    pub async fn apply_startup_llm(&mut self, llm: &crate::llm::LlmClient) -> Result<(), String> {
+        let provider = llm.prime().await?;
         self.llm_warmed = true;
-        self.provider = llm.primary_provider_name();
+        self.provider = Some(provider);
         Ok(())
     }
 }
