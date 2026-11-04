@@ -60,6 +60,7 @@ pub struct Config {
     pub bootstrap_admin_username: String,
     pub bootstrap_admin_password: String,
     pub bootstrap_admin_role: String,
+    pub startup_init_llm: bool,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -227,6 +228,7 @@ impl Config {
             bootstrap_admin_username: env_or("BOOTSTRAP_ADMIN_USERNAME", "admin"),
             bootstrap_admin_password: env_or("BOOTSTRAP_ADMIN_PASSWORD", "123456"),
             bootstrap_admin_role: env_or("BOOTSTRAP_ADMIN_ROLE", "admin"),
+            startup_init_llm: env_bool("STARTUP_INIT_LLM", true),
         }
     }
 
@@ -290,6 +292,7 @@ impl Config {
             bootstrap_admin_username: "admin".into(),
             bootstrap_admin_password: "123456".into(),
             bootstrap_admin_role: "admin".into(),
+            startup_init_llm: true,
         }
     }
 }
@@ -332,5 +335,6 @@ mod tests {
         assert_eq!(Config::jwt_test().memory_score_threshold, 20.0);
         assert_eq!(Config::jwt_test().bootstrap_admin_username, "admin");
         assert_eq!(Config::jwt_test().bootstrap_admin_role, "admin");
+        assert!(Config::jwt_test().startup_init_llm);
     }
 }

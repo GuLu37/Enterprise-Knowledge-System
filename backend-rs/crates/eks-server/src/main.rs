@@ -2,9 +2,9 @@
 //! （分阶段绞杀 Python 版）。
 use eks_server::config::Config;
 use eks_server::routes;
-use eks_server::state::AppState;
+use eks_server::state::{AppState, RuntimeWarmup};
 use sqlx::sqlite::SqliteConnectOptions;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,11 +107,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.api_prefix
     );
 
-    let app = routes::router(AppState {
+    let mut warmup = RuntimeWarmup::initializing(&config);
+    if config.startup_init_llm {
+        let llm_started_at = std::time::Instant::now();
+        match warmup.apply_startup_llm(&config) {
+            Ok(()) => tracing::info!(
+                provider = ?warmup.provider,
+                duration_ms = llm_started_at.elapsed().as_secs_f64() * 1000.0,
+                "启动阶段 LLM 初始化完成"
+            ),
+            Err(exc) => tracing::warn!("启动阶段 LLM 初始化失败，将回退到后台预热: {exc}"),
+        }
+    }
+
+    let state = AppState {
         pool,
         config: Arc::new(config),
         engine,
-    });
+        runtime_warmup: Arc::new(Mutex::new(warmup)),
+    };
+    eks_server::chat_stream::spawn_background_warmup(state.clone());
+
+    let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

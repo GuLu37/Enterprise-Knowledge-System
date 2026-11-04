@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::llm::{ChatMessage, LlmClient};
 use crate::retrieval::RetrievalItem;
-use crate::state::AppState;
+use crate::state::{AppState, RuntimeWarmup};
 
 #[derive(Deserialize)]
 pub struct ChatStreamRequest {
@@ -922,30 +922,108 @@ fn llm_unavailable() -> crate::auth::AuthError {
     }
 }
 
-fn runtime_payload(state: &AppState) -> serde_json::Value {
-    let llm = crate::llm::LlmConfig::from_env(&state.config);
-    let llm_warmed = !llm.providers.is_empty();
-    let embedding_warmed = true;
-    let cross_encoder_enabled = state.config.cross_encoder_enabled;
-    let cross_encoder_warmed = state.engine.cross_encoder.is_some();
-    let ready = embedding_warmed && llm_warmed;
-    let provider = llm.primary_provider_name();
+fn status_for_runtime(warmup: &RuntimeWarmup) -> String {
+    if warmup.is_ready() {
+        "ready".into()
+    } else if warmup.status.trim().is_empty() {
+        "initializing".into()
+    } else {
+        warmup.status.clone()
+    }
+}
+
+fn runtime_status_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
     json!({
-        "ready": ready,
-        "status": if ready { "ready" } else { "failed" },
-        "llm_warmed": llm_warmed,
-        "embedding_warmed": embedding_warmed,
-        "cross_encoder_enabled": cross_encoder_enabled,
-        "cross_encoder_warmed": cross_encoder_warmed,
-        "cross_encoder_model": if cross_encoder_enabled { Some(state.config.cross_encoder_onnx.clone()) } else { None },
-        "cross_encoder_device": "cpu",
-        "cross_encoder_error": if cross_encoder_enabled && !cross_encoder_warmed {
-            Some("Cross-Encoder 未加载，检索将使用规则重排")
-        } else {
-            None
-        },
-        "provider": provider,
+        "ready": warmup.is_ready(),
+        "status": status_for_runtime(warmup),
+        "llm_warmed": warmup.llm_warmed,
+        "embedding_warmed": warmup.embedding_warmed,
+        "cross_encoder_enabled": warmup.cross_encoder_enabled,
+        "cross_encoder_warmed": warmup.cross_encoder_warmed,
+        "cross_encoder_model": warmup.cross_encoder_model,
+        "cross_encoder_device": warmup.cross_encoder_device,
+        "cross_encoder_error": warmup.cross_encoder_error,
+        "provider": warmup.provider,
     })
+}
+
+fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
+    json!({
+        "status": warmup.status,
+        "llm_warmed": warmup.llm_warmed,
+        "embedding_warmed": warmup.embedding_warmed,
+        "cross_encoder_enabled": warmup.cross_encoder_enabled,
+        "cross_encoder_warmed": warmup.cross_encoder_warmed,
+        "cross_encoder_model": warmup.cross_encoder_model,
+        "cross_encoder_device": warmup.cross_encoder_device,
+        "cross_encoder_error": warmup.cross_encoder_error,
+        "provider": warmup.provider,
+    })
+}
+
+/// 对齐 Python `warmup_chat_runtime`：构造 LLM、跑一次 embedding、探测 Cross-Encoder。
+pub async fn warmup_chat_runtime(state: &AppState) -> RuntimeWarmup {
+    let mut result = RuntimeWarmup::initializing(&state.config);
+
+    match result.apply_startup_llm(&state.config) {
+        Ok(()) => {}
+        Err(exc) => tracing::warn!("LLM 预热失败，已跳过: {exc}"),
+    }
+
+    let embedder = state.engine.embedder.clone();
+    match tokio::task::spawn_blocking(move || embedder.embed_queries(&[String::from("warmup")])).await
+    {
+        Ok(Ok(_)) => result.embedding_warmed = true,
+        Ok(Err(exc)) => tracing::warn!("Embedding 预热失败，已跳过: {exc}"),
+        Err(exc) => tracing::warn!("Embedding 预热失败，已跳过: {exc}"),
+    }
+
+    if !result.cross_encoder_enabled {
+        result.cross_encoder_warmed = false;
+    } else if let Some(cross_encoder) = state.engine.cross_encoder.clone() {
+        match tokio::task::spawn_blocking(move || {
+            cross_encoder.score(
+                "__cross_encoder_warmup__",
+                &[String::from("__cross_encoder_warmup__")],
+            )
+        })
+        .await
+        {
+            Ok(Ok(scores)) if !scores.is_empty() => result.cross_encoder_warmed = true,
+            Ok(Ok(_)) => {
+                result.cross_encoder_error = Some("Cross-Encoder 预热未返回分数".into());
+            }
+            Ok(Err(exc)) => {
+                tracing::warn!("Cross-Encoder 预热失败，已跳过: {exc}");
+                result.cross_encoder_error = Some(exc);
+            }
+            Err(exc) => {
+                tracing::warn!("Cross-Encoder 预热失败，已跳过: {exc}");
+                result.cross_encoder_error = Some(exc.to_string());
+            }
+        }
+    } else {
+        result.cross_encoder_error = Some("Cross-Encoder 未加载，检索将使用规则重排".into());
+    }
+
+    result.finalize_status();
+    result
+}
+
+pub fn spawn_background_warmup(state: AppState) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let result = warmup_chat_runtime(&state).await;
+        tracing::info!(
+            llm = result.llm_warmed,
+            embedding = result.embedding_warmed,
+            cross_encoder = result.cross_encoder_warmed,
+            provider = ?result.provider,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "聊天运行时后台预热完成"
+        );
+        state.store_warmup(result);
+    });
 }
 
 pub async fn chat_settings(
@@ -963,7 +1041,7 @@ pub async fn chat_runtime_status(
     headers: HeaderMap,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     crate::routes::require_current_user(&state, &headers).await?;
-    Ok(axum::Json(runtime_payload(&state)))
+    Ok(axum::Json(runtime_status_payload(&state.warmup_snapshot())))
 }
 
 #[derive(Deserialize)]
@@ -1009,7 +1087,9 @@ pub async fn chat_warmup(
     headers: HeaderMap,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     crate::routes::require_current_user(&state, &headers).await?;
-    Ok(axum::Json(runtime_payload(&state)))
+    let snapshot = warmup_chat_runtime(&state).await;
+    state.store_warmup(snapshot.clone());
+    Ok(axum::Json(warmup_response_payload(&snapshot)))
 }
 
 pub async fn generate_chat(
@@ -1689,5 +1769,74 @@ mod tests {
         );
 
         assert_eq!(clean_rag_response_text("  \n\n  hello  \n\n\n"), "hello");
+    }
+
+    #[test]
+    fn runtime_ready_requires_llm_embedding_and_optional_ce() {
+        let mut warmup = RuntimeWarmup {
+            llm_warmed: true,
+            embedding_warmed: true,
+            cross_encoder_enabled: false,
+            status: "initializing".into(),
+            ..RuntimeWarmup::default()
+        };
+        assert!(warmup.is_ready());
+        assert_eq!(status_for_runtime(&warmup), "ready");
+        assert_eq!(runtime_status_payload(&warmup)["ready"], true);
+
+        warmup.cross_encoder_enabled = true;
+        assert!(!warmup.is_ready());
+        assert_eq!(status_for_runtime(&warmup), "initializing");
+
+        warmup.cross_encoder_warmed = true;
+        assert!(warmup.is_ready());
+        assert_eq!(status_for_runtime(&warmup), "ready");
+
+        warmup.embedding_warmed = false;
+        warmup.status = "failed".into();
+        assert!(!warmup.is_ready());
+        assert_eq!(status_for_runtime(&warmup), "failed");
+        assert_eq!(runtime_status_payload(&warmup)["status"], "failed");
+    }
+
+    #[test]
+    fn warmup_response_omits_ready_and_keeps_status() {
+        let mut warmup = RuntimeWarmup {
+            llm_warmed: true,
+            embedding_warmed: true,
+            cross_encoder_enabled: false,
+            provider: Some("openai".into()),
+            ..RuntimeWarmup::default()
+        };
+        warmup.finalize_status();
+        let payload = warmup_response_payload(&warmup);
+        assert!(payload.get("ready").is_none());
+        assert_eq!(payload["status"], "ready");
+        assert_eq!(payload["llm_warmed"], true);
+        assert_eq!(payload["embedding_warmed"], true);
+        assert_eq!(payload["provider"], "openai");
+    }
+
+    #[test]
+    fn startup_llm_marks_warmed_when_provider_configured() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        let mut warmup = RuntimeWarmup::initializing(&cfg);
+        assert!(warmup.apply_startup_llm(&cfg).is_ok());
+        assert!(warmup.llm_warmed);
+        assert_eq!(warmup.provider.as_deref(), Some("openai"));
+        assert_eq!(warmup.status, "initializing");
+        assert!(!warmup.is_ready());
+    }
+
+    #[test]
+    fn startup_llm_fails_without_providers() {
+        let cfg = crate::config::Config::jwt_test();
+        let mut warmup = RuntimeWarmup::initializing(&cfg);
+        assert!(warmup.apply_startup_llm(&cfg).is_err());
+        assert!(!warmup.llm_warmed);
+        assert!(warmup.provider.is_none());
+        assert_eq!(warmup.status, "initializing");
+        assert!(!cfg.cross_encoder_enabled);
     }
 }
