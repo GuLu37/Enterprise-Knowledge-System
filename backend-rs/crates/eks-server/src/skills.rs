@@ -6,7 +6,7 @@
 //! 远程 MCP 通过 `MCP_REMOTE_TOOL_MANIFESTS` 注册进同一套目录；未就绪工具
 //! 只出现在 capabilities，不进入 Function Calling。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -303,6 +303,7 @@ pub async fn maybe_disclose_original_memory(
         &disclosure_arguments,
         manifests,
         conversation_id,
+        &[],
     )
     .await?;
     Ok(json!({
@@ -318,7 +319,7 @@ pub async fn execute_named(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
-    execute_named_from(pool, user_id, name, arguments, &[], None).await
+    execute_named_from(pool, user_id, name, arguments, &[], None, &[]).await
 }
 
 pub async fn execute_named_from(
@@ -328,6 +329,7 @@ pub async fn execute_named_from(
     arguments: &Value,
     manifests: &[Value],
     conversation_id: Option<&str>,
+    recent_history: &[crate::short_memory::MemoryMessage],
 ) -> Result<Value, String> {
     let definition = get_skill_definition_from(name, manifests);
     let kind = crate::trace::trace_kind(definition.as_ref().map(|item| item.kind.as_str()), name);
@@ -358,7 +360,7 @@ pub async fn execute_named_from(
         "list_available_tools" => Ok(list_available_tools(manifests)),
         "list_knowledge_base_files" => list_knowledge_base_files(pool, arguments).await,
         "document_hot_word_statistics" => hot_words(pool, arguments).await,
-        "memory_query" => memory_query(pool, user_id, arguments).await,
+        "memory_query" => memory_query(pool, user_id, arguments, conversation_id, recent_history).await,
         "memory_retrieve_original" => memory_original(pool, user_id, arguments).await,
         "delete_profile_memory" => delete_profile_memory(pool, user_id, arguments).await,
         "search_knowledge_base" => Err("检索请走 /retrieval 或聊天接口".into()),
@@ -1407,7 +1409,129 @@ fn memory_active(row: &MemoryRow) -> bool {
     }
 }
 
-async fn memory_query(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value) -> Result<Value, String> {
+fn json_none_or_display(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "None".into(),
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn memory_record_dedupe_key(record: &Value) -> String {
+    let metadata = record.get("metadata");
+    let memory_id = metadata
+        .and_then(|value| value.get("memory_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            record
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("");
+    if !memory_id.is_empty() {
+        return memory_id.to_string();
+    }
+    let conversation_id = record
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.and_then(|value| value.get("conversation_id")).and_then(Value::as_str))
+        .unwrap_or("");
+    let content = record.get("content").and_then(Value::as_str).unwrap_or("");
+    let prefix: String = content.chars().take(120).collect();
+    format!(
+        "{}:{}:{}:{}",
+        conversation_id,
+        json_none_or_display(metadata.and_then(|value| value.get("turn_start"))),
+        json_none_or_display(metadata.and_then(|value| value.get("turn_end"))),
+        eks_kernels::normalize_text(&prefix)
+    )
+}
+
+fn dedupe_matched_memories(records: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut deduplicated = Vec::new();
+    for record in records {
+        if !seen.insert(memory_record_dedupe_key(&record)) {
+            continue;
+        }
+        deduplicated.push(record);
+    }
+    deduplicated
+}
+
+fn merge_current_history(
+    original: Vec<Value>,
+    recent_history: &[crate::short_memory::MemoryMessage],
+    conversation_id: Option<&str>,
+    top_k: usize,
+) -> Vec<Value> {
+    if recent_history.is_empty() {
+        return original;
+    }
+    let (_, turns) = crate::short_memory::split_history(recent_history);
+    if turns.is_empty() {
+        return original;
+    }
+    let keep = top_k.max(1);
+    let start = turns.len().saturating_sub(keep);
+    let mut existing_texts: HashSet<String> = original
+        .iter()
+        .filter_map(|record| record.get("content").and_then(Value::as_str))
+        .map(eks_kernels::normalize_text)
+        .collect();
+    let mut merged = original;
+    let conversation_id = conversation_id.map(str::trim).filter(|value| !value.is_empty());
+    for turn in &turns[start..] {
+        let mut block_lines = Vec::new();
+        for message in turn {
+            let role = message.role.trim().to_lowercase();
+            let content = message.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            if role == "user" {
+                block_lines.push(format!("用户: {content}"));
+            } else if role == "assistant" {
+                block_lines.push(format!("助手: {content}"));
+            }
+        }
+        let block_text = block_lines.join("\n");
+        let block_text = block_text.trim();
+        if block_text.is_empty() {
+            continue;
+        }
+        let normalized_block = eks_kernels::normalize_text(block_text);
+        if !existing_texts.insert(normalized_block) {
+            continue;
+        }
+        merged.push(json!({
+            "memory_id": Value::Null,
+            "content": block_text,
+            "score": 1.0,
+            "source": "conversation",
+            "metadata": {
+                "memory_id": Value::Null,
+                "conversation_id": conversation_id,
+                "chunk_type": "dialogue_current_turn",
+                "turn_start": Value::Null,
+                "turn_end": Value::Null,
+            },
+        }));
+    }
+    merged
+}
+
+async fn memory_query(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    arguments: &Value,
+    conversation_id: Option<&str>,
+    recent_history: &[crate::short_memory::MemoryMessage],
+) -> Result<Value, String> {
     let query = arg_str(arguments, "query");
     let top_k = arg_usize(arguments, "top_k", 5, 1, 50);
     let scope = arg_str(arguments, "memory_scope");
@@ -1439,8 +1563,8 @@ async fn memory_query(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value)
         Vec::new()
     };
 
-    let matched_memories = if include_event {
-        crate::memory::search_event_memories(pool, user_id, &query, None, None, top_k, None)
+    let matched_memories = if include_event && !query.trim().is_empty() {
+        let stored = crate::memory::search_event_memories(pool, user_id, &query, None, None, top_k, None)
             .await
             .into_iter()
             .map(|hit| json!({
@@ -1450,13 +1574,20 @@ async fn memory_query(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value)
                 "source": hit.memory_key,
                 "metadata": {
                     "conversation_id": hit.conversation_id,
+                    "memory_id": hit.memory_id,
                     "memory_key": hit.memory_key,
                     "chunk_type": hit.memory_key,
                     "turn_start": hit.turn_start,
                     "turn_end": hit.turn_end,
                 },
             }))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        merge_current_history(
+            dedupe_matched_memories(stored),
+            recent_history,
+            conversation_id,
+            top_k,
+        )
     } else {
         Vec::new()
     };
@@ -1946,6 +2077,7 @@ mod tests {
             &json!({}),
             &manifests,
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -1957,6 +2089,7 @@ mod tests {
             &json!({}),
             &manifests,
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -1992,7 +2125,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let queried = memory_query(&pool, "u1", &json!({"query":"我的名字","memory_scope":"profile","top_k":5}))
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我的名字","memory_scope":"profile","top_k":5}),
+            None,
+            &[],
+        )
             .await
             .unwrap();
         assert_eq!(queried.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
@@ -2032,6 +2171,8 @@ mod tests {
             &pool,
             "u1",
             &json!({"query":"报销时限","memory_scope":"event","top_k":2}),
+            None,
+            &[],
         )
         .await
         .unwrap();
@@ -2090,6 +2231,8 @@ mod tests {
             &pool,
             "u1",
             &json!({"query":"Alpha 上线","memory_scope":"event","top_k":5}),
+            None,
+            &[],
         )
         .await
         .unwrap();
@@ -2174,6 +2317,123 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(1)
+        );
+    }
+
+    fn history(items: &[(&str, &str)]) -> Vec<crate::short_memory::MemoryMessage> {
+        items
+            .iter()
+            .map(|(role, content)| crate::short_memory::MemoryMessage {
+                role: (*role).into(),
+                content: (*content).into(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn memory_query_merges_recent_history() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我刚才说过什么","memory_scope":"event","top_k":3}),
+            Some("c1"),
+            &history(&[
+                ("user", "我刚才说过项目 Alpha 的上线计划"),
+                ("assistant", "已记录在案"),
+            ]),
+        )
+        .await
+        .unwrap();
+        let texts: Vec<&str> = queried
+            .get("matched_memories")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("content").and_then(Value::as_str))
+            .collect();
+        assert!(texts.iter().any(|text| text.contains("项目 Alpha")));
+        assert_eq!(
+            queried
+                .pointer("/matched_memories/0/metadata/chunk_type")
+                .and_then(Value::as_str),
+            Some("dialogue_current_turn")
+        );
+        assert_eq!(
+            queried.pointer("/summary/matched_count").and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_skips_duplicate_recent_history_and_older_turns() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        let same_turn = "用户: 我刚才说过项目 Alpha 的上线计划\n助手: 已记录在案";
+        crate::memory::insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            same_turn,
+            55.0,
+            90,
+        )
+        .await
+        .unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"项目 Alpha","memory_scope":"event","top_k":1}),
+            Some("c1"),
+            &history(&[
+                ("user", "更早的旧问题"),
+                ("assistant", "更早的旧回答"),
+                ("user", "我刚才说过项目 Alpha 的上线计划"),
+                ("assistant", "已记录在案"),
+            ]),
+        )
+        .await
+        .unwrap();
+        let matched = queried
+            .get("matched_memories")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let current_turns: Vec<&Value> = matched
+            .iter()
+            .filter(|item| {
+                item.pointer("/metadata/chunk_type").and_then(Value::as_str)
+                    == Some("dialogue_current_turn")
+            })
+            .collect();
+        assert!(current_turns.is_empty(), "已入库的同一轮不应再合并");
+        assert!(
+            matched
+                .iter()
+                .all(|item| !item.get("content").and_then(Value::as_str).unwrap_or("").contains("更早的旧问题")),
+            "超出 top_k 的更早轮次不应进入结果"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_profile_scope_skips_recent_history() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我刚才说过什么","memory_scope":"profile","top_k":3}),
+            Some("c1"),
+            &history(&[("user", "我刚才说过项目 Alpha 的上线计划")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queried.pointer("/summary/matched_count").and_then(Value::as_u64),
+            Some(0)
         );
     }
 }

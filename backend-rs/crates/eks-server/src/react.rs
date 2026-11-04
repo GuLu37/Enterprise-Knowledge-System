@@ -210,8 +210,18 @@ async fn run_react_loop(
                             .unwrap_or("默认"),
                         "ReAct 工具执行"
                     );
-                    let (observation, extra) =
-                        execute_tool(engine, pool, user_id, query, top_k, &call, mcp_manifests, llm).await;
+                    let (observation, extra) = execute_tool(
+                        engine,
+                        pool,
+                        user_id,
+                        query,
+                        top_k,
+                        &call,
+                        mcp_manifests,
+                        llm,
+                        history,
+                    )
+                    .await;
                     (index, observation, extra)
                 }
             }).buffer_unordered(workers);
@@ -297,6 +307,7 @@ async fn execute_tool(
     call: &ToolCall,
     mcp_manifests: &[Value],
     llm: &LlmClient,
+    history: &[(String, String)],
 ) -> (Value, Vec<RetrievalItem>) {
     if call.name == "search_knowledge_base" {
         let query = call
@@ -328,7 +339,23 @@ async fn execute_tool(
             Err(err) => (json!({"error": err}), Vec::new()),
         };
     }
-    match skills::execute_named_from(pool, user_id, &call.name, &call.arguments, mcp_manifests, None).await {
+    let recent_history: Vec<crate::short_memory::MemoryMessage> = history
+        .iter()
+        .map(|(role, content)| crate::short_memory::MemoryMessage {
+            role: role.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    match skills::execute_named_from(
+        pool,
+        user_id,
+        &call.name,
+        &call.arguments,
+        mcp_manifests,
+        None,
+        &recent_history,
+    )
+    .await {
         Ok(result) => {
             let result = if call.name == "memory_query" {
                 match skills::maybe_disclose_original_memory(

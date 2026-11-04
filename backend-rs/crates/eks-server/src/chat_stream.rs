@@ -143,6 +143,7 @@ async fn prepare_skill_action(
     if name.is_empty() {
         return Err("skill 路由缺少 skill_name".into());
     }
+    let history_messages = memory_history(input.history);
     let mut result = crate::skills::execute_named_from(
         input.pool,
         input.user_id,
@@ -150,6 +151,7 @@ async fn prepare_skill_action(
         &intent.skill_arguments,
         input.mcp_manifests,
         nonempty(input.conversation_id),
+        &history_messages,
     )
     .await?;
     if name == "memory_query" {
