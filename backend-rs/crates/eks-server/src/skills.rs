@@ -1332,66 +1332,139 @@ async fn list_knowledge_base_files(pool: &sqlx::SqlitePool, arguments: &Value) -
     }))
 }
 
+fn skill_file_name(arguments: &Value) -> String {
+    let name = arg_str(arguments, "file_name");
+    if name.is_empty() {
+        arg_str(arguments, "filename")
+    } else {
+        name
+    }
+}
+
+fn skill_status_filters(arguments: &Value) -> Vec<String> {
+    let statuses = arg_strings(arguments, "statuses");
+    if statuses.is_empty() {
+        arg_strings(arguments, "status")
+    } else {
+        statuses
+    }
+}
+
+fn skill_document_json(record: &SkillDocument) -> Value {
+    json!({
+        "document_id": record.document_id,
+        "original_filename": record.original_filename,
+        "stored_filename": record.stored_filename,
+        "file_type": record.file_type,
+        "status": record.status,
+        "file_size": record.file_size,
+        "chunk_count": record.chunk_count,
+        "created_at": crate::db::dt_to_iso(&record.created_at),
+        "updated_at": crate::db::dt_to_iso(&record.updated_at),
+    })
+}
+
+/// 对齐 Python `_skill_document_hot_words`：不过滤默认 ready、不加 100 条上限，
+/// 词频文本包含 file_type/status，响应带 filters。
 async fn hot_words(pool: &sqlx::SqlitePool, arguments: &Value) -> Result<Value, String> {
     let top_k = arg_usize(arguments, "top_k", 10, 1, 50);
-    let file_name = arg_str(arguments, "file_name");
-    let mut listed = list_knowledge_base_files(
-        pool,
-        &json!({
-            "file_name": file_name,
-            "statuses": arguments.get("statuses").cloned().unwrap_or(json!([])),
-            "file_types": arguments.get("file_types").cloned().unwrap_or(json!([])),
-            "document_ids": arguments.get("document_ids").cloned().unwrap_or(json!([])),
-            "summarize": false,
-            "limit": 100,
-        }),
-    )
-    .await?;
-    let documents = listed
-        .get_mut("documents")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let file_name = skill_file_name(arguments);
+    let document_ids = arg_strings(arguments, "document_ids");
+    let file_types = arg_strings(arguments, "file_types");
+    let statuses = skill_status_filters(arguments);
+    let include_samples = arg_bool(arguments, "include_samples", true);
+    let filters = json!({
+        "document_ids": document_ids,
+        "file_types": file_types,
+        "statuses": statuses,
+        "file_name": file_name,
+    });
+
+    let mut sql = String::from(
+        "SELECT document_id, original_filename, stored_filename, file_type, status, \
+         file_size, chunk_count, created_at, updated_at FROM documents WHERE 1=1",
+    );
+    let mut binds: Vec<String> = Vec::new();
+    push_in_clause(&mut sql, &mut binds, "status", &statuses);
+    push_in_clause(&mut sql, &mut binds, "file_type", &file_types);
+    push_in_clause(&mut sql, &mut binds, "document_id", &document_ids);
+    if !file_name.is_empty() {
+        sql.push_str(" AND (original_filename LIKE ? OR stored_filename LIKE ?)");
+        let pattern = format!("%{file_name}%");
+        binds.push(pattern.clone());
+        binds.push(pattern);
+    }
+    sql.push_str(" ORDER BY updated_at DESC");
+
+    let mut query = sqlx::query_as::<_, SkillDocument>(&sql);
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+    let documents = query.fetch_all(pool).await.map_err(|err| err.to_string())?;
     if documents.is_empty() {
         return Ok(json!({
             "scope": "documents",
+            "filters": filters,
             "summary": {"document_count": 0, "chunk_count": 0},
             "top_words": [],
         }));
     }
 
+    let ids: Vec<String> = documents.iter().map(|record| record.document_id.clone()).collect();
+    let chunks_by_document = load_chunks_for_documents(pool, &ids).await?;
+
     let mut term_frequency: HashMap<String, usize> = HashMap::new();
     let mut term_documents: HashMap<String, Vec<Value>> = HashMap::new();
-    for doc in &documents {
-        let document_id = doc.get("document_id").and_then(|value| value.as_str()).unwrap_or("");
-        let chunks = load_chunk_texts(pool, document_id).await?;
-        let combined = chunks.join(" ");
+    for record in &documents {
+        let mut parts = vec![record.file_type.clone(), record.status.clone()];
+        if let Some(chunks) = chunks_by_document.get(&record.document_id) {
+            parts.extend(chunks.iter().cloned());
+        }
+        let combined = parts
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
         let limited: String = combined.chars().take(12000).collect();
-        for (term, count) in extract_term_frequencies(&limited) {
+        let document_term_frequency = extract_term_frequencies(&limited);
+        for (term, count) in document_term_frequency {
             *term_frequency.entry(term.clone()).or_default() += count;
-            let samples = term_documents.entry(term).or_default();
-            if samples.len() < 3 && !samples.iter().any(|item| item.get("document_id") == doc.get("document_id")) {
-                samples.push(doc.clone());
+            if include_samples {
+                let samples = term_documents.entry(term).or_default();
+                if samples.len() < 3
+                    && !samples.iter().any(|item| {
+                        item.get("document_id").and_then(Value::as_str) == Some(record.document_id.as_str())
+                    })
+                {
+                    samples.push(skill_document_json(record));
+                }
             }
         }
     }
+
     let mut ranked: Vec<(String, usize)> = term_frequency.into_iter().collect();
-    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.len().cmp(&left.0.len())).then_with(|| left.0.cmp(&right.0)));
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.len().cmp(&left.0.len()))
+            .then_with(|| left.0.cmp(&right.0))
+    });
     let top_words: Vec<Value> = ranked
         .into_iter()
         .take(top_k)
         .map(|(term, count)| {
-            let samples = term_documents.get(&term).cloned().unwrap_or_default();
             json!({
                 "term": term,
                 "document_count": count,
-                "sample_documents": samples,
+                "sample_documents": term_documents.get(&term).cloned().unwrap_or_default(),
             })
         })
         .collect();
-    let chunk_count = documents.iter().map(|doc| doc.get("chunk_count").and_then(|value| value.as_i64()).unwrap_or(0)).sum::<i64>();
+    let chunk_count: i64 = documents.iter().map(|record| record.chunk_count).sum();
     Ok(json!({
         "scope": "documents",
+        "filters": filters,
         "summary": {"document_count": documents.len(), "chunk_count": chunk_count},
         "top_words": top_words,
     }))
@@ -1747,6 +1820,43 @@ async fn load_chunk_texts(pool: &sqlx::SqlitePool, document_id: &str) -> Result<
     .await
     .map_err(|err| err.to_string())?;
     Ok(rows.into_iter().map(|text| text.trim().to_string()).filter(|text| !text.is_empty()).collect())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ChunkTextRow {
+    document_id: String,
+    chunk_text: String,
+}
+
+async fn load_chunks_for_documents(
+    pool: &sqlx::SqlitePool,
+    document_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut chunks_by_document: HashMap<String, Vec<String>> = HashMap::new();
+    if document_ids.is_empty() {
+        return Ok(chunks_by_document);
+    }
+    let placeholders = vec!["?"; document_ids.len()].join(",");
+    let sql = format!(
+        "SELECT document_id, chunk_text FROM document_chunks \
+         WHERE document_id IN ({placeholders}) ORDER BY document_id, chunk_index"
+    );
+    let mut query = sqlx::query_as::<_, ChunkTextRow>(&sql);
+    for document_id in document_ids {
+        query = query.bind(document_id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(|err| err.to_string())?;
+    for row in rows {
+        let text = row.chunk_text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        chunks_by_document
+            .entry(row.document_id)
+            .or_default()
+            .push(text.to_string());
+    }
+    Ok(chunks_by_document)
 }
 
 fn push_in_clause(sql: &mut String, binds: &mut Vec<String>, column: &str, values: &[String]) {
@@ -2137,6 +2247,86 @@ mod tests {
         assert!(freq.get("账号").copied().unwrap_or(0) >= 1);
         assert!(freq.get("密码").copied().unwrap_or(0) >= 1);
         assert!(!freq.contains_key("账号密码"));
+    }
+
+    #[tokio::test]
+    async fn hot_words_counts_all_statuses_and_returns_filters() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::ensure_document_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO documents (document_id, original_filename, stored_filename, file_path, \
+             file_type, file_size, status, chunk_count, created_at, updated_at) VALUES \
+             ('d-ready','报销.md','d-ready.md','/tmp/a','md',10,'ready',1, \
+              '2026-01-01 00:00:00.000000','2026-01-02 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (document_id, original_filename, stored_filename, file_path, \
+             file_type, file_size, status, chunk_count, created_at, updated_at) VALUES \
+             ('d-proc','发布.md','d-proc.md','/tmp/b','md',10,'processing',1, \
+              '2026-01-01 00:00:00.000000','2026-01-03 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at) \
+             VALUES ('d-ready',0,'d-ready:p000000','差旅报销需要发票','2026-01-01 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO document_chunks (document_id, chunk_index, parent_id, chunk_text, created_at) \
+             VALUES ('d-proc',0,'d-proc:p000000','服务器发布窗口确认','2026-01-01 00:00:00.000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let all = hot_words(&pool, &json!({"top_k": 50})).await.unwrap();
+        assert_eq!(all["summary"]["document_count"], 2);
+        assert_eq!(all["summary"]["chunk_count"], 2);
+        assert_eq!(all["scope"], "documents");
+        assert!(all["filters"]["statuses"].as_array().unwrap().is_empty());
+        assert!(all["filters"]["document_ids"].as_array().unwrap().is_empty());
+        assert!(all["filters"]["file_types"].as_array().unwrap().is_empty());
+        assert_eq!(all["filters"]["file_name"], "");
+        let terms: Vec<&str> = all["top_words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|word| word["term"].as_str())
+            .collect();
+        assert!(terms.iter().any(|term| *term == "报销"));
+        assert!(terms.iter().any(|term| *term == "发布"));
+        assert!(terms.iter().any(|term| *term == "ready"));
+        assert!(terms.iter().any(|term| *term == "processing"));
+        assert!(!all["top_words"][0]["sample_documents"].as_array().unwrap().is_empty());
+
+        let ready_only = hot_words(&pool, &json!({"top_k": 50, "status": "ready"})).await.unwrap();
+        assert_eq!(ready_only["summary"]["document_count"], 1);
+        assert_eq!(ready_only["filters"]["statuses"][0], "ready");
+        let ready_terms: Vec<&str> = ready_only["top_words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|word| word["term"].as_str())
+            .collect();
+        assert!(ready_terms.iter().any(|term| *term == "报销"));
+        assert!(!ready_terms.iter().any(|term| *term == "发布"));
+
+        let no_samples = hot_words(&pool, &json!({"top_k": 5, "include_samples": false})).await.unwrap();
+        assert!(no_samples["top_words"][0]["sample_documents"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let by_filename = hot_words(&pool, &json!({"filename": "报销.md"})).await.unwrap();
+        assert_eq!(by_filename["summary"]["document_count"], 1);
+        assert_eq!(by_filename["filters"]["file_name"], "报销.md");
     }
 
     #[tokio::test]
