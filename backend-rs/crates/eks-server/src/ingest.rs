@@ -3,6 +3,7 @@
 //! 支持格式: txt, md (直接读取); docx (zip+xml); xlsx (calamine); pdf (pdf-extract)。
 //! milvus_lite 写入: 新 Parquet data 文件 + manifest 版本更新（对齐 milvus_lite 存储格式）。
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -101,33 +102,310 @@ fn extract_docx_text(data: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
-/// xlsx: 用 calamine 读所有 sheet。
-fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
-    use calamine::{Reader, Xlsx, Data};
-    let cursor = std::io::Cursor::new(data);
+const EXCEL_FILL_COLUMN_HINTS: [&str; 22] = [
+    "部门", "团队", "小组", "班组", "科室", "事业部", "中心", "区域", "地区", "办公地点",
+    "岗位", "职级", "级别", "序列", "分类", "类别", "状态", "负责人", "主管", "上级", "项目",
+    "产品",
+];
+const EXCEL_NO_FILL_HINTS: [&str; 17] = [
+    "金额", "工资", "薪资", "绩效", "应发", "实发", "数量", "单价", "税", "社保", "公积金",
+    "合计", "总计", "余额", "成本", "收入", "支出",
+];
 
-    let mut workbook = Xlsx::new(cursor)
-        .map_err(|e| format!("xlsx 打开失败: {e}"))?;
+fn collapse_excel_text(value: &str) -> String {
+    value
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    let mut text = String::new();
-    for range in workbook.worksheets() {
-        let (title, range) = range;
-        text.push_str(&format!("[Sheet] {}
-", title));
-        for row in range.rows() {
-            let cells: Vec<String> = row
+fn normalize_excel_cell(cell: &calamine::Data) -> String {
+    match cell {
+        calamine::Data::Empty => String::new(),
+        calamine::Data::Float(value) if value.fract() == 0.0 => format!("{}", *value as i64),
+        _ => collapse_excel_text(&cell.to_string()),
+    }
+}
+
+fn serialize_excel_row(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            if value.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", value.replace('"', "\"\""))
+            } else {
+                value.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn looks_numeric_excel_value(value: &str) -> bool {
+    let normalized = value.trim().replace(',', "");
+    if normalized.is_empty() {
+        return false;
+    }
+    let mut rest = normalized.as_str();
+    if rest.starts_with('+') || rest.starts_with('-') {
+        rest = &rest[1..];
+    }
+    if let Some(stripped) = rest.strip_suffix("万元") {
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_suffix('万') {
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_suffix('元') {
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_suffix('%') {
+        rest = stripped;
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for (index, ch) in rest.chars().enumerate() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+            continue;
+        }
+        if ch == '.' && !seen_dot && (index > 0 || rest.len() > 1) {
+            seen_dot = true;
+            continue;
+        }
+        return false;
+    }
+    seen_digit
+}
+
+fn looks_like_excel_fill_column(header: &str, column_values: &[String]) -> bool {
+    let normalized_header = header.split_whitespace().collect::<String>().to_lowercase();
+    if normalized_header.is_empty() {
+        return false;
+    }
+    if EXCEL_NO_FILL_HINTS
+        .iter()
+        .any(|hint| normalized_header.contains(hint))
+    {
+        return false;
+    }
+    if EXCEL_FILL_COLUMN_HINTS
+        .iter()
+        .any(|hint| normalized_header.contains(hint))
+    {
+        return true;
+    }
+    let values: Vec<String> = column_values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .collect();
+    let nonempty: Vec<&str> = values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if nonempty.len() < 2 {
+        return false;
+    }
+    let text_ratio = nonempty
+        .iter()
+        .filter(|value| !looks_numeric_excel_value(value))
+        .count() as f64
+        / nonempty.len() as f64;
+    let blank_ratio = (values.len() - nonempty.len()) as f64 / values.len() as f64;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for value in &nonempty {
+        *counts.entry(*value).or_insert(0) += 1;
+    }
+    let repeated_ratio = counts.values().copied().max().unwrap_or(0) as f64 / nonempty.len() as f64;
+    text_ratio >= 0.7 && blank_ratio >= 0.25 && repeated_ratio >= 0.25
+}
+
+fn forward_fill_excel_rows(headers: &[String], rows: &[Vec<String>]) -> Vec<Vec<String>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let width = headers.len();
+    let column_candidates: Vec<bool> = (0..width)
+        .map(|column_index| {
+            let column_values: Vec<String> = rows
                 .iter()
-                .map(|cell| match cell {
-                    Data::Empty => String::new(),
-                    _ => cell.to_string(),
+                .map(|row| {
+                    row.get(column_index)
+                        .cloned()
+                        .unwrap_or_default()
                 })
                 .collect();
-            text.push_str(&cells.join(","));
-            text.push('\n');
+            looks_like_excel_fill_column(&headers[column_index], &column_values)
+        })
+        .collect();
+    let mut previous_values = vec![String::new(); width];
+    let mut filled_rows = Vec::new();
+    for row in rows {
+        let mut normalized_row = row.clone();
+        normalized_row.resize(width, String::new());
+        for column_index in 0..width {
+            let cell_value = normalized_row[column_index].trim().to_string();
+            if !cell_value.is_empty() {
+                previous_values[column_index] = cell_value;
+                continue;
+            }
+            if column_candidates[column_index] && !previous_values[column_index].is_empty() {
+                normalized_row[column_index] = previous_values[column_index].clone();
+            }
         }
-        text.push('\n');
+        filled_rows.push(normalized_row);
     }
-    Ok(text)
+    filled_rows
+}
+
+fn infer_excel_header_index(rows: &[Vec<String>]) -> usize {
+    let nonempty_rows: Vec<(usize, &Vec<String>)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.iter().any(|cell| !cell.trim().is_empty()))
+        .collect();
+    if nonempty_rows.is_empty() {
+        return 0;
+    }
+    if nonempty_rows.len() == 1 {
+        return nonempty_rows[0].0;
+    }
+    let max_width = nonempty_rows
+        .iter()
+        .map(|(_, row)| row.iter().filter(|cell| !cell.trim().is_empty()).count())
+        .max()
+        .unwrap_or(0);
+    let mut best: Option<(f64, usize, i64, usize)> = None;
+    for &(index, row) in &nonempty_rows {
+        let values: Vec<String> = row
+            .iter()
+            .map(|cell| cell.trim().to_string())
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let width = values.len();
+        if width < 2 {
+            continue;
+        }
+        let unique_ratio = values
+            .iter()
+            .map(|value| value.to_lowercase())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as f64
+            / width as f64;
+        let text_ratio = values
+            .iter()
+            .filter(|value| !looks_numeric_excel_value(value))
+            .count() as f64
+            / width as f64;
+        let similar_rows = rows
+            .iter()
+            .skip(index + 1)
+            .take(3)
+            .filter(|candidate| candidate.iter().any(|cell| !cell.trim().is_empty()))
+            .filter(|candidate| {
+                candidate.iter().filter(|cell| !cell.trim().is_empty()).count()
+                    >= 2.max(width / 2)
+            })
+            .count();
+        let mut score = width as f64 * 2.0
+            + unique_ratio * 3.0
+            + text_ratio * 3.0
+            + similar_rows as f64 * 2.0;
+        if width >= 2.max(max_width / 2) {
+            score += 4.0;
+        }
+        let candidate = (score, width, -(index as i64), index);
+        if best.map(|current| candidate > current).unwrap_or(true) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|item| item.3).unwrap_or(nonempty_rows[0].0)
+}
+
+fn normalize_excel_headers(headers: &[String]) -> Vec<String> {
+    let mut normalized_headers = Vec::new();
+    let mut used_counts: HashMap<String, usize> = HashMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        let mut value = header.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.is_empty() || value.to_lowercase().starts_with("unnamed") {
+            value = format!("列{}", index + 1);
+        }
+        let count = used_counts.entry(value.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            normalized_headers.push(value);
+        } else {
+            normalized_headers.push(format!("{value}_{count}"));
+        }
+    }
+    normalized_headers
+}
+
+fn format_excel_sheet(sheet_name: &str, raw_rows: Vec<Vec<String>>) -> Option<String> {
+    let mut raw_rows: Vec<Vec<String>> = raw_rows
+        .into_iter()
+        .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .collect();
+    if raw_rows.is_empty() {
+        return None;
+    }
+    let max_width = raw_rows.iter().map(Vec::len).max().unwrap_or(0);
+    for row in &mut raw_rows {
+        row.resize(max_width, String::new());
+    }
+    while !raw_rows.is_empty() && raw_rows.iter().all(|row| row.last().map(|cell| cell.trim().is_empty()).unwrap_or(true))
+    {
+        for row in &mut raw_rows {
+            row.pop();
+        }
+    }
+    let header_index = infer_excel_header_index(&raw_rows);
+    let headers = normalize_excel_headers(&raw_rows[header_index]);
+    let width = headers.len();
+    let data_rows = forward_fill_excel_rows(&headers, &raw_rows[header_index + 1..]);
+    let mut blocks = vec![
+        format!("[Sheet] {sheet_name}"),
+        serialize_excel_row(&headers),
+    ];
+    for row in &raw_rows[..header_index] {
+        let values: Vec<&str> = row
+            .iter()
+            .take(width)
+            .map(String::as_str)
+            .filter(|cell| !cell.trim().is_empty())
+            .collect();
+        if !values.is_empty() {
+            blocks.push(format!("[说明] {}", values.join(" | ")));
+        }
+    }
+    for row in data_rows {
+        if row.iter().any(|cell| !cell.trim().is_empty()) {
+            blocks.push(serialize_excel_row(&row));
+        }
+    }
+    Some(blocks.join("\n"))
+}
+
+/// xlsx/xls: calamine 读取后做表头推断、说明行保留与合并单元格向下填充。
+fn extract_xlsx_text(data: &[u8]) -> Result<String, String> {
+    use calamine::{open_workbook_auto_from_rs, Reader};
+    let cursor = std::io::Cursor::new(data);
+    let mut workbook = open_workbook_auto_from_rs(cursor)
+        .map_err(|err| format!("Excel 打开失败: {err}"))?;
+    let mut blocks = Vec::new();
+    for (title, range) in workbook.worksheets() {
+        let raw_rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|row| row.iter().map(normalize_excel_cell).collect())
+            .collect();
+        if let Some(block) = format_excel_sheet(&title, raw_rows) {
+            blocks.push(block);
+        }
+    }
+    Ok(blocks.join("\n"))
 }
 
 /// pdf: 用 pdf-extract 从内容流提取文字。扫描件没有文本层时会失败。
@@ -216,35 +494,133 @@ fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     chunks
 }
 
-/// xlsx 行级切块: 每个 [Sheet] 段落作为 parent，每行作为 child。
-fn split_structured_rows(text: &str, _chunk_size: usize) -> Vec<String> {
-    let mut children = Vec::new();
-    let mut current_sheet = String::new();
-    let mut header = String::new();
-    let mut first_data = true;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("[Sheet]") {
-            current_sheet = line.to_string();
-            header = String::new();
-            first_data = true;
-            continue;
-        }
-        if first_data {
-            header = line.to_string();
-            first_data = false;
-            continue;
-        }
-        // 数据行 → child = sheet名 + 表头 + 行
-        children.push(format!("{}\n{}\n{}", current_sheet, header, line));
+fn parse_structured_sections(text: &str) -> Vec<(String, Vec<String>)> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
+        return Vec::new();
     }
-    if children.is_empty() {
-        children.push(text.to_string());
+    let mut sections = Vec::new();
+    let mut current_name = String::new();
+    let mut current_lines = Vec::new();
+    let flush = |name: &mut String, lines: &mut Vec<String>, sections: &mut Vec<(String, Vec<String>)>| {
+        if !name.is_empty() || !lines.is_empty() {
+            sections.push((name.clone(), std::mem::take(lines)));
+        }
+    };
+    for line in lines {
+        if let Some(name) = line
+            .strip_prefix("[Sheet]")
+            .or_else(|| line.strip_prefix("[sheet]"))
+        {
+            flush(&mut current_name, &mut current_lines, &mut sections);
+            current_name = name.trim().to_string();
+            continue;
+        }
+        current_lines.push(line);
     }
-    children
+    flush(&mut current_name, &mut current_lines, &mut sections);
+    sections
+}
+
+fn split_structured_text_chunks(text: &str, chunk_size: usize) -> Vec<String> {
+    let sections = parse_structured_sections(text);
+    if !sections.iter().any(|(name, _)| !name.is_empty()) {
+        return split_text(text, chunk_size, PARENT_CHUNK_OVERLAP);
+    }
+    let mut chunks = Vec::new();
+    for (sheet_name, sheet_lines) in sections {
+        if sheet_lines.is_empty() {
+            continue;
+        }
+        let sheet_prefix = if sheet_name.is_empty() {
+            String::new()
+        } else {
+            format!("[Sheet] {sheet_name}")
+        };
+        let header = sheet_lines[0].clone();
+        let rows = &sheet_lines[1..];
+        let mut prefix_parts = Vec::new();
+        if !sheet_prefix.is_empty() {
+            prefix_parts.push(sheet_prefix);
+        }
+        if !header.is_empty() {
+            prefix_parts.push(header);
+        }
+        let prefix = prefix_parts.join("\n");
+        let available_size = 120.max(chunk_size.saturating_sub(prefix.chars().count().saturating_add(1)));
+        if rows.is_empty() {
+            if !prefix.is_empty() {
+                chunks.push(prefix);
+            }
+            continue;
+        }
+        let mut current_rows: Vec<String> = Vec::new();
+        let mut current_length = 0usize;
+        for row in rows {
+            let row_length = row.chars().count() + usize::from(!current_rows.is_empty());
+            if !current_rows.is_empty() && current_length + row_length > available_size {
+                chunks.push(prefix_parts.iter().cloned().chain(current_rows.iter().cloned()).collect::<Vec<_>>().join("\n").trim().to_string());
+                current_rows.clear();
+                current_length = 0;
+            }
+            current_rows.push(row.clone());
+            current_length += row_length;
+        }
+        if !current_rows.is_empty() {
+            chunks.push(
+                prefix_parts
+                    .iter()
+                    .cloned()
+                    .chain(current_rows.into_iter())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+    chunks.into_iter().filter(|chunk| !chunk.trim().is_empty()).collect()
+}
+
+fn split_structured_row_chunks(text: &str) -> Vec<String> {
+    let sections = parse_structured_sections(text);
+    if !sections.iter().any(|(name, _)| !name.is_empty()) {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    for (sheet_name, sheet_lines) in sections {
+        if sheet_lines.len() < 2 {
+            continue;
+        }
+        let sheet_prefix = if sheet_name.is_empty() {
+            String::new()
+        } else {
+            format!("[Sheet] {sheet_name}")
+        };
+        let header = &sheet_lines[0];
+        let mut prefix_parts = Vec::new();
+        if !sheet_prefix.is_empty() {
+            prefix_parts.push(sheet_prefix.as_str());
+        }
+        if !header.is_empty() {
+            prefix_parts.push(header.as_str());
+        }
+        for row in &sheet_lines[1..] {
+            let row_text = row.trim();
+            if row_text.is_empty() || row_text.starts_with('[') {
+                continue;
+            }
+            let mut parts = prefix_parts.clone();
+            parts.push(row_text);
+            chunks.push(parts.join("\n"));
+        }
+    }
+    chunks.into_iter().filter(|chunk| !chunk.trim().is_empty()).collect()
 }
 
 #[derive(Debug)]
@@ -276,8 +652,17 @@ pub fn build_parent_child_chunks(
     text: &str,
     file_type: &str,
 ) -> ChunkResult {
-    let parent_texts = split_text(text, PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP);
     let is_structured = STRUCTURED_FILE_TYPES.contains(&file_type.to_lowercase().as_str());
+    let parent_texts = if is_structured {
+        let structured = split_structured_text_chunks(text, PARENT_CHUNK_SIZE);
+        if structured.is_empty() {
+            split_text(text, PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP)
+        } else {
+            structured
+        }
+    } else {
+        split_text(text, PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP)
+    };
 
     let mut parents = Vec::new();
     let mut children = Vec::new();
@@ -292,7 +677,12 @@ pub fn build_parent_child_chunks(
         });
 
         let child_texts = if is_structured {
-            split_structured_rows(parent_text, CHILD_CHUNK_SIZE)
+            let structured = split_structured_row_chunks(parent_text);
+            if structured.is_empty() {
+                vec![parent_text.clone()]
+            } else {
+                structured
+            }
         } else {
             let overlap = CHILD_CHUNK_OVERLAP.min(CHILD_CHUNK_SIZE / 3);
             split_text(parent_text, CHILD_CHUNK_SIZE, overlap)
@@ -473,5 +863,48 @@ mod tests {
                 .unwrap();
         assert!(!chunks.parents.is_empty());
         assert!(!chunks.children.is_empty());
+    }
+
+    #[test]
+    fn excel_headers_fill_and_csv_serialize() {
+        assert!(looks_numeric_excel_value("12.5%"));
+        assert!(looks_numeric_excel_value("3万元"));
+        assert!(!looks_numeric_excel_value("部门"));
+        assert_eq!(
+            normalize_excel_headers(&["部门".into(), "".into(), "unnamed".into(), "部门".into()]),
+            vec!["部门", "列2", "列3", "部门_2"]
+        );
+        assert_eq!(serialize_excel_row(&["上海,浦东".into(), "ok".into()]), "\"上海,浦东\",ok");
+        let rows = vec![
+            vec!["标题".into(), "".into()],
+            vec!["部门".into(), "姓名".into()],
+            vec!["研发".into(), "张三".into()],
+            vec!["".into(), "李四".into()],
+        ];
+        assert_eq!(infer_excel_header_index(&rows), 1);
+        let headers = normalize_excel_headers(&rows[1]);
+        let filled = forward_fill_excel_rows(&headers, &rows[2..]);
+        assert_eq!(filled[1][0], "研发");
+        let text = format_excel_sheet("花名册", rows).unwrap();
+        assert!(text.starts_with("[Sheet] 花名册"));
+        assert!(text.contains("[说明] 标题"));
+        assert!(text.contains("研发,李四"));
+    }
+
+    #[test]
+    fn structured_chunks_copy_sheet_header_and_skip_notes() {
+        let text = "[Sheet] 花名册\n部门,姓名\n[说明] 内部资料\n研发,张三\n市场,李四";
+        let parents = split_structured_text_chunks(text, 500);
+        assert_eq!(parents.len(), 1);
+        assert!(parents[0].contains("[Sheet] 花名册"));
+        assert!(parents[0].contains("部门,姓名"));
+        let children = split_structured_row_chunks(&parents[0]);
+        assert_eq!(children.len(), 2);
+        assert!(children[0].contains("部门,姓名"));
+        assert!(children[0].contains("研发,张三"));
+        assert!(!children.iter().any(|item| item.contains("[说明]")));
+        let chunks = build_parent_child_chunks("doc-x", text, "xlsx");
+        assert_eq!(chunks.children.len(), 2);
+        assert!(chunks.children[1].child_text.contains("市场,李四"));
     }
 }
