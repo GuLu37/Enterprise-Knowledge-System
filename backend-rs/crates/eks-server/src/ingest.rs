@@ -1074,12 +1074,9 @@ fn parse_structured_sections(text: &str) -> Vec<(String, Vec<String>)> {
         }
     };
     for line in lines {
-        if let Some(name) = line
-            .strip_prefix("[Sheet]")
-            .or_else(|| line.strip_prefix("[sheet]"))
-        {
+        if let Some(name) = eks_kernels::structured_sheet_name(&line) {
             flush(&mut current_name, &mut current_lines, &mut sections);
-            current_name = name.trim().to_string();
+            current_name = name.to_string();
             continue;
         }
         current_lines.push(line);
@@ -1475,6 +1472,16 @@ mod tests {
         let chunks = build_parent_child_chunks("doc-x", text, "xlsx");
         assert_eq!(chunks.children.len(), 2);
         assert!(chunks.children[1].child_text.contains("市场,李四"));
+    }
+
+    #[test]
+    fn structured_chunks_accept_uppercase_sheet_marker() {
+        let text = "[SHEET] 花名册\n部门,姓名\n研发,张三";
+        let parents = split_structured_text_chunks(text, 500);
+        assert_eq!(parents.len(), 1);
+        assert!(parents[0].starts_with("[Sheet] 花名册"));
+        assert!(parents[0].contains("研发,张三"));
+        assert!(eks_kernels::structured_sheet_name("[sHeEt] Roster") == Some("Roster"));
     }
 
     fn make_docx(document_xml: &str) -> Vec<u8> {

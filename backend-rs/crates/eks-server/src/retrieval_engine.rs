@@ -1151,11 +1151,9 @@ fn structured_section_marker(text: &str) -> String {
         if line.is_empty() {
             continue;
         }
-        let lower = line.to_lowercase();
-        if let Some(rest) = lower.strip_prefix("[sheet]") {
-            return rest.trim().to_string();
-        }
-        return String::new();
+        return eks_kernels::structured_sheet_name(line)
+            .unwrap_or("")
+            .to_string();
     }
     String::new()
 }
@@ -1171,11 +1169,9 @@ fn parse_structured_table(
     for parent_text in parent_texts {
         let lines: Vec<&str> = parent_text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         for line in lines {
-            let lower = line.to_lowercase();
-            if let Some(rest) = lower.strip_prefix("[sheet]") {
-                let current = rest.trim().to_string();
+            if let Some(current) = eks_kernels::structured_sheet_name(line) {
                 if sheet_name.is_empty() {
-                    sheet_name = current;
+                    sheet_name = current.to_string();
                 }
                 continue;
             }

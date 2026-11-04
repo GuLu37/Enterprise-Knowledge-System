@@ -94,6 +94,23 @@ pub fn tokenize_cjk(text: &str) -> Vec<String> {
     tokens
 }
 
+/// 对齐 Python `STRUCTURED_SECTION_PATTERN`（`re.IGNORECASE`）：
+/// `^[Sheet]\s*(?P<name>.+?)\s*$`。名称保留原文大小写；无名称则不算表头。
+pub fn structured_sheet_name(line: &str) -> Option<&str> {
+    const PREFIX: &str = "[sheet]";
+    let trimmed = line.trim();
+    let prefix = trimmed.get(..PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let name = trimmed[PREFIX.len()..].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +134,17 @@ mod tests {
     fn normalize_removes_punct() {
         assert_eq!(normalize_text("《差旅-报销》制度!"), "差旅报销制度");
         assert_eq!(normalize_text("  A B_c "), "abc");
+    }
+
+    #[test]
+    fn structured_sheet_name_is_case_insensitive_and_keeps_original() {
+        assert_eq!(structured_sheet_name("[Sheet] 花名册"), Some("花名册"));
+        assert_eq!(structured_sheet_name("[SHEET] 花名册"), Some("花名册"));
+        assert_eq!(structured_sheet_name("[sHeEt] Roster"), Some("Roster"));
+        assert_eq!(structured_sheet_name("  [sheet]  明细  "), Some("明细"));
+        assert_eq!(structured_sheet_name("[Sheet]"), None);
+        assert_eq!(structured_sheet_name("[Sheet]   "), None);
+        assert_eq!(structured_sheet_name("部门,姓名"), None);
+        assert_eq!(structured_sheet_name("花名册"), None);
     }
 }

@@ -11,4 +11,4 @@ pub mod text;
 
 pub use bm25::BM25Okapi;
 pub use lexical::{build_filter_terms, lexical_match_score};
-pub use text::{normalize_text, tokenize_cjk};
+pub use text::{normalize_text, structured_sheet_name, tokenize_cjk};
