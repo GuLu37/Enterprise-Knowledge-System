@@ -287,6 +287,13 @@ impl AuthError {
             detail: detail.to_string(),
         }
     }
+
+    pub fn unprocessable(detail: &str) -> Self {
+        AuthError {
+            status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            detail: detail.to_string(),
+        }
+    }
 }
 
 impl From<String> for AuthError {

@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -306,6 +306,7 @@ pub fn router(state: AppState) -> axum::Router {
             post(change_password),
         )
         .route(&format!("{prefix}/auth/me"), get(me))
+        .route(&format!("{prefix}/auth/{{*rest}}"), any(auth_fallback))
         // 检索路由（与 Python 一样需要登录态）
         .route(
             &format!("{prefix}/retrieval/search/hybrid"),
@@ -411,6 +412,16 @@ pub struct RetrievalRequest {
     pub top_k: Option<usize>,
 }
 
+fn reject_empty_query(query: &str) -> Result<(), AuthError> {
+    if query.trim().is_empty() {
+        Err(AuthError::unprocessable(
+            "String should have at least 1 character",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn retrieval_dense(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -439,11 +450,7 @@ async fn retrieval_simple(
         .unwrap_or(state.config.search_top_k)
         .clamp(1, 50);
     let query = request.query.trim().to_string();
-    if query.is_empty() {
-        return Ok(Json(json!({
-            "query": query, "retrieval_method": method, "results": [], "top_k": top_k,
-        })));
-    }
+    reject_empty_query(&query)?;
     let mut results = if method == "dense" {
         state.engine.search_dense(&query, top_k).await
     } else {
@@ -542,6 +549,8 @@ pub async fn execute_skill(
         manifests,
         request.context.conversation_id.as_deref(),
         &[],
+        request.context.session_id.as_deref(),
+        Some(state.engine.embedder.as_ref()),
     )
     .await
     .map_err(|detail| AuthError::bad_request(&detail))?;
@@ -574,11 +583,7 @@ pub async fn retrieval_hybrid(
         .unwrap_or(state.config.search_top_k)
         .clamp(1, 50);
     let query = request.query.trim().to_string();
-    if query.is_empty() {
-        return Ok(Json(json!({
-            "query": query, "retrieval_method": "hybrid", "results": [], "top_k": top_k,
-        })));
-    }
+    reject_empty_query(&query)?;
     let recalled = state
         .engine
         .retrieve_documents_multi_query(&query, top_k, None)
@@ -608,11 +613,7 @@ pub async fn retrieval_rag(
         .unwrap_or(state.config.search_top_k)
         .clamp(1, 50);
     let query = request.query.trim().to_string();
-    if query.is_empty() {
-        return Ok(Json(json!({
-            "query": "", "results": [], "context": "", "message": "未检索到相关内容"
-        })));
-    }
+    reject_empty_query(&query)?;
     let (results, context) = state
         .engine
         .run_rag_workflow(&query, top_k)
@@ -665,12 +666,20 @@ mod health_tests {
         assert!(root.get("service").is_none());
         assert!(root.get("health").is_none());
     }
+
+    #[test]
+    fn empty_retrieval_query_is_unprocessable() {
+        let err = reject_empty_query("   ").unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.detail, "String should have at least 1 character");
+        assert!(reject_empty_query("差旅").is_ok());
+    }
 }
 
 #[cfg(test)]
 mod docs_tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request};
+    use axum::{Router, body::Body, http::Request, response::IntoResponse};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -713,6 +722,15 @@ mod docs_tests {
         let spec: Value = serde_json::from_slice(&spec_body).unwrap();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"].get("/health").is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_unknown_path_matches_python_not_found() {
+        let response = auth_fallback(Path("nope".into())).await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["detail"], "Not Found");
     }
 }
 

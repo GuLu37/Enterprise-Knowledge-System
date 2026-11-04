@@ -516,6 +516,8 @@ async fn execute_tool(
         mcp_manifests,
         None,
         &recent_history,
+        None,
+        Some(engine.embedder.as_ref()),
     )
     .await {
         Ok(result) => {

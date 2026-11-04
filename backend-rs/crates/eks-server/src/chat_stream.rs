@@ -230,6 +230,8 @@ async fn prepare_skill_action(
         input.mcp_manifests,
         nonempty(input.conversation_id),
         &history_messages,
+        nonempty(input.session_id),
+        Some(input.embedder),
     )
     .await?;
     if name == "memory_query" {

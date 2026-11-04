@@ -304,6 +304,8 @@ pub async fn maybe_disclose_original_memory(
         manifests,
         conversation_id,
         &[],
+        None,
+        None,
     )
     .await?;
     Ok(json!({
@@ -319,7 +321,7 @@ pub async fn execute_named(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
-    execute_named_from(pool, user_id, name, arguments, &[], None, &[]).await
+    execute_named_from(pool, user_id, name, arguments, &[], None, &[], None, None).await
 }
 
 pub async fn execute_named_from(
@@ -330,6 +332,8 @@ pub async fn execute_named_from(
     manifests: &[Value],
     conversation_id: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
+    session_id: Option<&str>,
+    embedder: Option<&crate::embedder::Embedder>,
 ) -> Result<Value, String> {
     let definition = get_skill_definition_from(name, manifests);
     let kind = crate::trace::trace_kind(definition.as_ref().map(|item| item.kind.as_str()), name);
@@ -360,7 +364,18 @@ pub async fn execute_named_from(
         "list_available_tools" => Ok(list_available_tools(manifests)),
         "list_knowledge_base_files" => list_knowledge_base_files(pool, arguments).await,
         "document_hot_word_statistics" => hot_words(pool, arguments).await,
-        "memory_query" => memory_query(pool, user_id, arguments, conversation_id, recent_history).await,
+        "memory_query" => {
+            memory_query(
+                pool,
+                user_id,
+                arguments,
+                conversation_id,
+                session_id,
+                recent_history,
+                embedder,
+            )
+            .await
+        }
         "memory_retrieve_original" => memory_original(pool, user_id, arguments).await,
         "delete_profile_memory" => delete_profile_memory(pool, user_id, arguments).await,
         "search_knowledge_base" => Err("检索请走 /retrieval 或聊天接口".into()),
@@ -1530,7 +1545,9 @@ async fn memory_query(
     user_id: &str,
     arguments: &Value,
     conversation_id: Option<&str>,
+    session_id: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
+    embedder: Option<&crate::embedder::Embedder>,
 ) -> Result<Value, String> {
     let query = arg_str(arguments, "query");
     let top_k = arg_usize(arguments, "top_k", 5, 1, 50);
@@ -1564,7 +1581,15 @@ async fn memory_query(
     };
 
     let matched_memories = if include_event && !query.trim().is_empty() {
-        let stored = crate::memory::search_event_memories(pool, user_id, &query, None, None, top_k, None)
+        let stored = crate::memory::search_event_memories(
+            pool,
+            user_id,
+            &query,
+            conversation_id,
+            session_id,
+            top_k,
+            embedder,
+        )
             .await
             .into_iter()
             .map(|hit| json!({
@@ -1597,6 +1622,11 @@ async fn memory_query(
     Ok(json!({
         "query": query,
         "memory_scope": scope,
+        "filters": {
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "top_k": top_k,
+        },
         "profile_memories": profile_memories,
         "matched_memories": matched_memories,
         "summary": {
@@ -2078,6 +2108,8 @@ mod tests {
             &manifests,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2090,6 +2122,8 @@ mod tests {
             &manifests,
             None,
             &[],
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2130,11 +2164,14 @@ mod tests {
             "u1",
             &json!({"query":"我的名字","memory_scope":"profile","top_k":5}),
             None,
+            None,
             &[],
+            None,
         )
             .await
             .unwrap();
         assert_eq!(queried.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
+        assert_eq!(queried.pointer("/filters/top_k").and_then(|value| value.as_u64()), Some(5));
         let deleted = delete_profile_memory(&pool, "u1", &json!({"keywords":["张三"]})).await.unwrap();
         assert_eq!(deleted.get("deleted_count").and_then(|value| value.as_u64()), Some(1));
     }
@@ -2172,11 +2209,14 @@ mod tests {
             "u1",
             &json!({"query":"报销时限","memory_scope":"event","top_k":2}),
             None,
+            None,
             &[],
+            None,
         )
         .await
         .unwrap();
         assert_eq!(queried.pointer("/summary/matched_count").and_then(|value| value.as_u64()), Some(2));
+        assert_eq!(queried.pointer("/filters/top_k").and_then(|value| value.as_u64()), Some(2));
         assert_eq!(
             queried.pointer("/matched_memories/0/metadata/memory_key").and_then(|value| value.as_str()),
             Some("semantic_memory_l1")
@@ -2232,7 +2272,9 @@ mod tests {
             "u1",
             &json!({"query":"Alpha 上线","memory_scope":"event","top_k":5}),
             None,
+            None,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -2339,10 +2381,12 @@ mod tests {
             "u1",
             &json!({"query":"我刚才说过什么","memory_scope":"event","top_k":3}),
             Some("c1"),
+            Some("s1"),
             &history(&[
                 ("user", "我刚才说过项目 Alpha 的上线计划"),
                 ("assistant", "已记录在案"),
             ]),
+            None,
         )
         .await
         .unwrap();
@@ -2388,12 +2432,14 @@ mod tests {
             "u1",
             &json!({"query":"项目 Alpha","memory_scope":"event","top_k":1}),
             Some("c1"),
+            Some("s1"),
             &history(&[
                 ("user", "更早的旧问题"),
                 ("assistant", "更早的旧回答"),
                 ("user", "我刚才说过项目 Alpha 的上线计划"),
                 ("assistant", "已记录在案"),
             ]),
+            None,
         )
         .await
         .unwrap();
@@ -2427,7 +2473,9 @@ mod tests {
             "u1",
             &json!({"query":"我刚才说过什么","memory_scope":"profile","top_k":3}),
             Some("c1"),
+            Some("s1"),
             &history(&[("user", "我刚才说过项目 Alpha 的上线计划")]),
+            None,
         )
         .await
         .unwrap();
