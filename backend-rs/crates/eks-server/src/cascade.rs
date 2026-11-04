@@ -79,12 +79,17 @@ fn attach_rule_only(
     take_return_limit(items, return_limit)
 }
 
+fn format_ce_fallback(err: &str) -> String {
+    format!("Cross-Encoder 精排失败，回退规则重排: {err}")
+}
+
 fn attach_rule_fallback(
     mut items: Vec<crate::retrieval::RetrievalItem>,
     error: impl Into<String>,
     return_limit: usize,
 ) -> Vec<crate::retrieval::RetrievalItem> {
     let error = error.into();
+    tracing::warn!("{}", format_ce_fallback(&error));
     for item in items.iter_mut() {
         item.rerank_stage = Some("rule_fallback".into());
         item.rerank_trace.cross_encoder_used = Some(false);
@@ -324,6 +329,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("expected=2"));
+        assert_eq!(
+            format_ce_fallback("onnx timeout"),
+            "Cross-Encoder 精排失败，回退规则重排: onnx timeout"
+        );
     }
 
     #[test]

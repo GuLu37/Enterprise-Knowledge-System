@@ -191,6 +191,11 @@ fn format_delete_step(document_id: &str, step: &str, message: &str) -> String {
     format!("[文档删除][{step}] {message} (document_id={document_id})")
 }
 
+/// 对齐 Python `logger.exception("[文档删除][n/4] …失败 (document_id=…): {exc}")`。
+fn format_delete_fail(document_id: &str, step: &str, message: &str, err: &str) -> String {
+    format!("[文档删除][{step}] {message} (document_id={document_id}): {err}")
+}
+
 fn log_delete_step(document_id: &str, step: &str, message: &str) {
     tracing::info!("{}", format_delete_step(document_id, step, message));
 }
@@ -334,11 +339,7 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
         Err(err) => {
             tracing::error!(
                 "{}",
-                format_delete_step(
-                    document_id,
-                    "2/4",
-                    &format!("Milvus 文档切块删除失败: {err}")
-                )
+                format_delete_fail(document_id, "2/4", "Milvus 文档切块删除失败", &err)
             );
             return Err(err);
         }
@@ -365,12 +366,34 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
         .bind(document_id)
         .execute(&state.pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            tracing::error!(
+                "{}",
+                format_delete_fail(
+                    document_id,
+                    "4/4",
+                    "SQLite 文档记录删除失败",
+                    &err.to_string()
+                )
+            );
+            err.to_string()
+        })?;
     sqlx::query("DELETE FROM documents WHERE document_id = ?")
         .bind(document_id)
         .execute(&state.pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            tracing::error!(
+                "{}",
+                format_delete_fail(
+                    document_id,
+                    "4/4",
+                    "SQLite 文档记录删除失败",
+                    &err.to_string()
+                )
+            );
+            err.to_string()
+        })?;
     log_delete_step(document_id, "4/4", "SQLite 文档记录删除完成");
     state.engine.invalidate().await;
     tracing::info!("✓ 文档删除完成 (document_id={document_id})");
@@ -694,7 +717,11 @@ async fn process_document_upload_inner(
     let extract_id = document_id.to_string();
     tracing::info!("开始抽取文本 (document_id={document_id})");
     let chunks = tokio::task::spawn_blocking(move || {
-        let data = std::fs::read(&stored_path_buf).map_err(|err| err.to_string())?;
+        let data = std::fs::read(&stored_path_buf).map_err(|err| {
+            let wrapped = format!("提取文本失败: {err}");
+            tracing::error!("{wrapped}");
+            wrapped
+        })?;
         crate::ingest::prepare_upload_chunks(&extract_id, &extract_name, &data, &extract_type)
     })
     .await
@@ -996,6 +1023,14 @@ mod tests {
         assert_eq!(
             format_delete_step("doc-1", "4/4", "SQLite 文档记录删除完成"),
             "[文档删除][4/4] SQLite 文档记录删除完成 (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_delete_fail("doc-1", "2/4", "Milvus 文档切块删除失败", "timeout"),
+            "[文档删除][2/4] Milvus 文档切块删除失败 (document_id=doc-1): timeout"
+        );
+        assert_eq!(
+            format_delete_fail("doc-1", "4/4", "SQLite 文档记录删除失败", "locked"),
+            "[文档删除][4/4] SQLite 文档记录删除失败 (document_id=doc-1): locked"
         );
     }
 
