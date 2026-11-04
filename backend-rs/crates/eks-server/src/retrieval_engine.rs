@@ -32,6 +32,34 @@ fn candidate_pool_limit(top_k: usize) -> usize {
     (top_k * 8).max(top_k + 20).max(MIN_RAG_CANDIDATE_POOL)
 }
 
+/// 对齐 Python `_build_retriever`：按规划方式选择 dense / sparse 通道。
+fn multi_query_channels(method: &str, use_dense: bool, use_sparse: bool) -> (bool, bool) {
+    match method {
+        crate::planner::RETRIEVAL_METHOD_DENSE => {
+            if use_dense {
+                (true, false)
+            } else {
+                (false, use_sparse)
+            }
+        }
+        crate::planner::RETRIEVAL_METHOD_SPARSE => {
+            if use_sparse {
+                (false, true)
+            } else {
+                (use_dense, false)
+            }
+        }
+        _ => (use_dense, use_sparse),
+    }
+}
+
+/// 规划检索一轮的产物：召回结果、组装上下文、实际使用的 Multi-Query 变体。
+pub struct PlannedRetrieval {
+    pub results: Vec<RetrievalItem>,
+    pub context: String,
+    pub expanded_queries: Vec<String>,
+}
+
 fn cross_encoder_used(item: &RetrievalItem) -> bool {
     item.cross_encoder_score.is_some()
         || item.rerank_stage.as_deref() == Some("rule_then_cross_encoder")
@@ -481,34 +509,27 @@ impl RetrievalEngine {
         &self,
         query: &str,
         top_k: usize,
-    ) -> Result<(Vec<RetrievalItem>, String), String> {
+    ) -> Result<PlannedRetrieval, String> {
         self.retrieve_planned(query, crate::planner::RETRIEVAL_METHOD_HYBRID, top_k, None)
             .await
     }
 
-    async fn run_hybrid_workflow(
-        &self,
-        query: &str,
-        top_k: usize,
-        llm: Option<&LlmClient>,
-    ) -> Result<(Vec<RetrievalItem>, String), String> {
-        let recalled = self.retrieve_documents_multi_query(query, top_k, llm).await?;
-        let processed = self.post_process(query, recalled, top_k).await?;
-        let context = assemble_processed_context(&processed);
-        Ok((processed, context))
-    }
-
-    /// 按规划器选定的检索方式执行一轮检索，dense/sparse 也会走后处理以填充证据信号。
+    /// 按规划器选定的检索方式执行一轮检索。对齐 Python `run_rag_workflow`：
+    /// dense/sparse/hybrid 都走 Multi-Query，并回传实际扩展查询。
     pub async fn retrieve_planned(
         &self,
         query: &str,
         method: &str,
         top_k: usize,
         llm: Option<&LlmClient>,
-    ) -> Result<(Vec<RetrievalItem>, String), String> {
+    ) -> Result<PlannedRetrieval, String> {
         let query = query.trim();
         if query.is_empty() {
-            return Ok((Vec::new(), String::new()));
+            return Ok(PlannedRetrieval {
+                results: Vec::new(),
+                context: String::new(),
+                expanded_queries: Vec::new(),
+            });
         }
         let method = crate::planner::resolve_method_for_query(query, method);
         let arguments = json!({
@@ -518,55 +539,45 @@ impl RetrievalEngine {
         });
         crate::trace::log_tool_call("tool", "search_knowledge_base", &arguments, &json!({}));
         let cache_key = crate::rag_cache::rag_cache_key(query, top_k, &method);
-        let outcome: Result<(Vec<RetrievalItem>, String), String> = async {
+        let outcome: Result<PlannedRetrieval, String> = async {
             {
                 let cache = self.result_cache.lock().await;
-                if let Some(hit) = cache.get(&cache_key) {
+                if let Some((results, context, expanded_queries)) = cache.get(&cache_key) {
                     tracing::info!(query, method = method.as_str(), "检索结果缓存命中");
-                    return Ok(hit);
+                    return Ok(PlannedRetrieval {
+                        results,
+                        context,
+                        expanded_queries,
+                    });
                 }
             }
-            let (processed, context) = match method.as_str() {
-                crate::planner::RETRIEVAL_METHOD_DENSE => {
-                    let recalled = self.search_dense_high_recall(query, top_k).await?;
-                    let processed = self.post_process(query, recalled, top_k).await?;
-                    let context = assemble_processed_context(&processed);
-                    (processed, context)
-                }
-                crate::planner::RETRIEVAL_METHOD_SPARSE => {
-                    let recalled = self.search_sparse(query, top_k).await?;
-                    let processed = self.post_process(query, recalled, top_k).await?;
-                    let context = assemble_processed_context(&processed);
-                    (processed, context)
-                }
-                _ if self.use_hybrid && self.use_dense && self.use_sparse => {
-                    self.run_hybrid_workflow(query, top_k, llm).await?
-                }
-                _ if self.use_dense => {
-                    let recalled = self.search_dense_high_recall(query, top_k).await?;
-                    let processed = self.post_process(query, recalled, top_k).await?;
-                    let context = assemble_processed_context(&processed);
-                    (processed, context)
-                }
-                _ => {
-                    let recalled = self.search_sparse(query, top_k).await?;
-                    let processed = self.post_process(query, recalled, top_k).await?;
-                    let context = assemble_processed_context(&processed);
-                    (processed, context)
-                }
-            };
-            self.result_cache
-                .lock()
-                .await
-                .put(cache_key, processed.clone(), context.clone());
-            Ok((processed, context))
+            let (recalled, expanded_queries) = self
+                .retrieve_documents_multi_query(query, top_k, &method, llm)
+                .await?;
+            let processed = self.post_process(query, recalled, top_k).await?;
+            let context = assemble_processed_context(&processed);
+            self.result_cache.lock().await.put(
+                cache_key,
+                processed.clone(),
+                context.clone(),
+                expanded_queries.clone(),
+            );
+            Ok(PlannedRetrieval {
+                results: processed,
+                context,
+                expanded_queries,
+            })
         }
         .await;
         match &outcome {
-            Ok((processed, _)) => crate::trace::log_tool_result(
+            Ok(planned) => crate::trace::log_tool_result(
                 "tool",
                 "search_knowledge_base",
-                &crate::trace::rag_result_summary(&method, processed.len(), processed.is_empty()),
+                &crate::trace::rag_result_summary(
+                    &method,
+                    planned.results.len(),
+                    planned.results.is_empty(),
+                ),
                 &json!({}),
             ),
             Err(err) => {
@@ -580,15 +591,18 @@ impl RetrievalEngine {
         &self,
         query: &str,
         top_k: usize,
+        method: &str,
         llm: Option<&LlmClient>,
-    ) -> Result<Vec<RetrievalItem>, String> {
+    ) -> Result<(Vec<RetrievalItem>, Vec<String>), String> {
         let mut queries = expand_multi_query_with_llm(query, llm, MAX_MULTI_QUERY_COUNT).await;
         if !eks_kernels::rerank::is_identifier_query(query) {
             queries.truncate(MAX_MULTI_QUERY_COUNT);
         }
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), queries));
         }
+        let method = crate::planner::resolve_method_for_query(query, method);
+        let (want_dense, want_sparse) = multi_query_channels(&method, self.use_dense, self.use_sparse);
         let resolved_top_k = top_k.clamp(1, 50);
         let candidate_k = candidate_pool_limit(resolved_top_k);
 
@@ -598,48 +612,71 @@ impl RetrievalEngine {
             .await
             .map_err(|e| e.to_string())?;
 
-        // dense: 一次 embedding 批量 + 每变体一次暴力 COSINE
-        let query_vectors = self.embedder.embed_queries(&queries)?;
+        let query_vectors = if want_dense {
+            self.embedder.embed_queries(&queries)?
+        } else {
+            Vec::new()
+        };
         let mut variant_sets: Vec<Vec<RetrievalItem>> = Vec::with_capacity(queries.len());
         for (position, q) in queries.iter().enumerate() {
-            let dense_hits = self
-                .store
-                .search_cosine(self.child_collection(), &query_vectors[position], candidate_k)
-                .await
-                .map_err(|e| e.to_string())?;
-            let dense: Vec<FuseItem<RetrievalItem>> = dense_hits
-                .iter()
-                .map(|(row_index, score)| {
-                    RetrievalItem::from_row(&snapshot.rows[*row_index], *score, "dense").to_fuse_item()
-                })
-                .collect();
-            let sparse_hits = self
-                .sparse_hits(&snapshot.rows, q, candidate_k.max(80))
-                .await;
-            let sparse: Vec<FuseItem<RetrievalItem>> = sparse_hits
-                .iter()
-                .map(|(row_index, bm25, lexical)| {
-                    let final_score = bm25.max(0.0) + lexical;
-                    RetrievalItem::from_row(&snapshot.rows[*row_index], final_score, "sparse").to_fuse_item()
-                })
-                .collect();
-            if dense.is_empty() && sparse.is_empty() {
+            let mut channel_sets: Vec<Vec<FuseItem<RetrievalItem>>> = Vec::new();
+            let mut channel_weights: Vec<f64> = Vec::new();
+            let mut channel_labels: Vec<&str> = Vec::new();
+            if want_dense {
+                let dense_hits = self
+                    .store
+                    .search_cosine(self.child_collection(), &query_vectors[position], candidate_k)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let dense: Vec<FuseItem<RetrievalItem>> = dense_hits
+                    .iter()
+                    .map(|(row_index, score)| {
+                        RetrievalItem::from_row(&snapshot.rows[*row_index], *score, "dense")
+                            .to_fuse_item()
+                    })
+                    .collect();
+                if !dense.is_empty() {
+                    channel_sets.push(dense);
+                    channel_weights.push(self.dense_weight);
+                    channel_labels.push("dense");
+                }
+            }
+            if want_sparse {
+                let sparse_hits = self
+                    .sparse_hits(&snapshot.rows, q, candidate_k.max(80))
+                    .await;
+                let sparse: Vec<FuseItem<RetrievalItem>> = sparse_hits
+                    .iter()
+                    .map(|(row_index, bm25, lexical)| {
+                        let final_score = bm25.max(0.0) + lexical;
+                        RetrievalItem::from_row(&snapshot.rows[*row_index], final_score, "sparse")
+                            .to_fuse_item()
+                    })
+                    .collect();
+                if !sparse.is_empty() {
+                    channel_sets.push(sparse);
+                    channel_weights.push(self.sparse_weight);
+                    channel_labels.push("sparse");
+                }
+            }
+            if channel_sets.is_empty() {
                 variant_sets.push(Vec::new());
                 continue;
             }
-            let fused = fuse_ranked_results(
-                vec![dense, sparse],
-                &[self.dense_weight, self.sparse_weight],
-                &["dense", "sparse"],
-                60.0,
+            let fused = fuse_ranked_results(channel_sets, &channel_weights, &channel_labels, 60.0);
+            variant_sets.push(
+                fused
+                    .into_iter()
+                    .take(resolved_top_k)
+                    .map(|out| out.value)
+                    .collect(),
             );
-            variant_sets.push(fused.into_iter().take(resolved_top_k).map(|out| out.value).collect());
         }
 
         // 变体间融合（原始查询 1.4 / 变体 0.75）
         let nonempty_indexes: Vec<usize> = (0..variant_sets.len()).filter(|&i| !variant_sets[i].is_empty()).collect();
         if nonempty_indexes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), queries));
         }
         let sets: Vec<Vec<FuseItem<RetrievalItem>>> = nonempty_indexes
             .iter()
@@ -704,7 +741,7 @@ impl RetrievalEngine {
                 }
             }
         }
-        Ok(selected)
+        Ok((selected, queries))
     }
 
     /// 规则重排（Rust 侧无 cross-encoder，等价 adaptive 跳过路径的打分）。
@@ -1333,6 +1370,24 @@ mod tests {
         assert_eq!(http, vec![(1, 0.9)]);
         let chat = filter_dense_hits(hits, 0.5, false);
         assert_eq!(chat, vec![(0, 0.49), (1, 0.9)]);
+    }
+
+    #[test]
+    fn multi_query_channels_follow_planned_method() {
+        assert_eq!(multi_query_channels("dense", true, true), (true, false));
+        assert_eq!(multi_query_channels("sparse", true, true), (false, true));
+        assert_eq!(multi_query_channels("hybrid", true, true), (true, true));
+        assert_eq!(
+            multi_query_channels("dense", false, true),
+            (false, true),
+            "无 dense 时回退 sparse，对齐 search_dense_high_recall"
+        );
+        assert_eq!(
+            multi_query_channels("sparse", true, false),
+            (true, false),
+            "无 sparse 时回退 dense，对齐 search_sparse"
+        );
+        assert_eq!(multi_query_channels("hybrid", true, false), (true, false));
     }
 
     #[test]

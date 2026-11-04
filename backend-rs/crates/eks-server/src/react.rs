@@ -489,11 +489,23 @@ async fn execute_tool(
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
         return match engine.retrieve_planned(query, method, top_k, Some(llm)).await {
-            Ok((items, _)) => {
-                let payload: Vec<Value> = items.iter().map(|item| item.to_json()).collect();
+            Ok(planned) => {
+                let payload: Vec<Value> = planned.results.iter().map(|item| item.to_json()).collect();
                 (
-                    json!({"ok": true, "count": payload.len(), "results": payload}),
-                    items,
+                    json!({
+                        "ok": true,
+                        "count": payload.len(),
+                        "results": payload,
+                        "retrieval_method": method,
+                        "expanded_queries": planned.expanded_queries,
+                        "context": planned.context,
+                        "message": if planned.results.is_empty() {
+                            "当前知识库未检索到足够相关资料"
+                        } else {
+                            "检索完成"
+                        },
+                    }),
+                    planned.results,
                 )
             }
             Err(err) => (json!({"error": err}), Vec::new()),

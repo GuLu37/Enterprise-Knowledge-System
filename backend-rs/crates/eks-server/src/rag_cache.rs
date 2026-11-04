@@ -14,6 +14,7 @@ pub const RAG_CACHE_MAX_ENTRIES: usize = 1000;
 struct CachedRag {
     results: Vec<RetrievalItem>,
     context: String,
+    expanded_queries: Vec<String>,
 }
 
 pub struct RagResultCache {
@@ -45,24 +46,34 @@ impl RagResultCache {
         self.entries.len()
     }
 
-    pub fn get(&self, key: &str) -> Option<(Vec<RetrievalItem>, String)> {
+    pub fn get(&self, key: &str) -> Option<(Vec<RetrievalItem>, String, Vec<String>)> {
         self.get_at(key, Instant::now())
     }
 
-    pub fn get_at(&self, key: &str, now: Instant) -> Option<(Vec<RetrievalItem>, String)> {
+    pub fn get_at(&self, key: &str, now: Instant) -> Option<(Vec<RetrievalItem>, String, Vec<String>)> {
         if !self.enabled {
             return None;
         }
         let (cached_at, value) = self.entries.get(key)?;
         if now.saturating_duration_since(*cached_at) < self.ttl {
-            Some((value.results.clone(), value.context.clone()))
+            Some((
+                value.results.clone(),
+                value.context.clone(),
+                value.expanded_queries.clone(),
+            ))
         } else {
             None
         }
     }
 
-    pub fn put(&mut self, key: String, results: Vec<RetrievalItem>, context: String) {
-        self.put_at(key, Instant::now(), results, context);
+    pub fn put(
+        &mut self,
+        key: String,
+        results: Vec<RetrievalItem>,
+        context: String,
+        expanded_queries: Vec<String>,
+    ) {
+        self.put_at(key, Instant::now(), results, context, expanded_queries);
     }
 
     pub fn put_at(
@@ -71,6 +82,7 @@ impl RagResultCache {
         now: Instant,
         results: Vec<RetrievalItem>,
         context: String,
+        expanded_queries: Vec<String>,
     ) {
         if !self.enabled {
             return;
@@ -105,6 +117,7 @@ impl RagResultCache {
                 CachedRag {
                     results,
                     context,
+                    expanded_queries,
                 },
             ),
         );
@@ -167,7 +180,7 @@ mod tests {
     #[test]
     fn disabled_cache_neither_stores_nor_hits() {
         let mut cache = RagResultCache::new(false, 3600);
-        cache.put("k".into(), vec![item("内容")], "ctx".into());
+        cache.put("k".into(), vec![item("内容")], "ctx".into(), Vec::new());
         assert_eq!(cache.len(), 0);
         assert!(cache.get("k").is_none());
     }
@@ -176,11 +189,19 @@ mod tests {
     fn hit_returns_clone_and_expired_misses() {
         let mut cache = RagResultCache::new(true, 10);
         let now = Instant::now();
-        cache.put_at("k".into(), now, vec![item("原文")], "ctx".into());
-        let (mut results, context) = cache.get_at("k", now).expect("hit");
+        cache.put_at(
+            "k".into(),
+            now,
+            vec![item("原文")],
+            "ctx".into(),
+            vec!["差旅报销".into()],
+        );
+        let (mut results, context, expanded) = cache.get_at("k", now).expect("hit");
+        assert_eq!(expanded, vec!["差旅报销".to_string()]);
         assert_eq!(context, "ctx");
         results[0].content = "被污染".into();
-        let (again, _) = cache.get_at("k", now).expect("still original");
+        let (again, _, again_expanded) = cache.get_at("k", now).expect("still original");
+        assert_eq!(again_expanded, vec!["差旅报销".to_string()]);
         assert_eq!(again[0].content, "原文");
         assert!(cache.get_at("k", now + Duration::from_secs(10)).is_none());
     }
@@ -191,19 +212,25 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);
         let t2 = t0 + Duration::from_secs(2);
-        cache.put_at("a".into(), t0, vec![item("a")], "a".into());
-        cache.put_at("b".into(), t1, vec![item("b")], "b".into());
-        cache.put_at("c".into(), t2, vec![item("c")], "c".into());
+        cache.put_at("a".into(), t0, vec![item("a")], "a".into(), Vec::new());
+        cache.put_at("b".into(), t1, vec![item("b")], "b".into(), Vec::new());
+        cache.put_at("c".into(), t2, vec![item("c")], "c".into(), Vec::new());
         assert_eq!(cache.len(), 2);
         assert!(cache.get_at("a", t2).is_none());
         assert!(cache.get_at("b", t2).is_some());
         assert!(cache.get_at("c", t2).is_some());
 
         let mut cache = RagResultCache::with_limit(true, 5, 2);
-        cache.put_at("old".into(), t0, vec![item("old")], "old".into());
-        cache.put_at("keep".into(), t0 + Duration::from_secs(4), vec![item("keep")], "keep".into());
+        cache.put_at("old".into(), t0, vec![item("old")], "old".into(), Vec::new());
+        cache.put_at(
+            "keep".into(),
+            t0 + Duration::from_secs(4),
+            vec![item("keep")],
+            "keep".into(),
+            Vec::new(),
+        );
         let later = t0 + Duration::from_secs(6);
-        cache.put_at("new".into(), later, vec![item("new")], "new".into());
+        cache.put_at("new".into(), later, vec![item("new")], "new".into(), Vec::new());
         assert!(cache.get_at("old", later).is_none());
         assert!(cache.get_at("keep", later).is_some());
         assert!(cache.get_at("new", later).is_some());
@@ -212,7 +239,7 @@ mod tests {
     #[test]
     fn clear_drops_all_entries() {
         let mut cache = RagResultCache::new(true, 3600);
-        cache.put("k".into(), vec![item("内容")], "ctx".into());
+        cache.put("k".into(), vec![item("内容")], "ctx".into(), Vec::new());
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.get("k").is_none());

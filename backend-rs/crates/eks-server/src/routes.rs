@@ -593,9 +593,14 @@ pub async fn retrieval_hybrid(
     reject_empty_query(&request.query)?;
     let top_k = crate::validate::retrieval_top_k(request.top_k)?;
     let query = request.query.trim().to_string();
-    let recalled = state
+    let (recalled, _) = state
         .engine
-        .retrieve_documents_multi_query(&query, top_k, None)
+        .retrieve_documents_multi_query(
+            &query,
+            top_k,
+            crate::planner::RETRIEVAL_METHOD_HYBRID,
+            None,
+        )
         .await
         .map_err(internal_error)?;
     let results = state
@@ -620,7 +625,7 @@ pub async fn retrieval_rag(
     reject_empty_query(&request.query)?;
     let top_k = crate::validate::retrieval_top_k(request.top_k)?;
     let query = request.query.trim().to_string();
-    let (results, context) = state
+    let planned = state
         .engine
         .run_rag_workflow(&query, top_k)
         .await
@@ -628,10 +633,10 @@ pub async fn retrieval_rag(
     Ok(Json(json!({
         "query": query,
         "retrieval_method": "hybrid",
-        "expanded_queries": crate::retrieval::expand_multi_query(&query),
-        "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
-        "context": context,
-        "message": if results.is_empty() { "当前知识库未检索到足够相关资料" } else { "检索完成" },
+        "expanded_queries": planned.expanded_queries,
+        "results": planned.results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
+        "context": planned.context,
+        "message": if planned.results.is_empty() { "当前知识库未检索到足够相关资料" } else { "检索完成" },
     })))
 }
 

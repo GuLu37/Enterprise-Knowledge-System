@@ -864,6 +864,7 @@ struct RagTurn {
     used_react: bool,
     react_notes: Vec<String>,
     react_kind: Option<String>,
+    expanded_queries: Vec<String>,
 }
 
 fn sse_json(event: &str, data: serde_json::Value) -> Event {
@@ -1042,6 +1043,7 @@ async fn collect_rag(
             used_react: false,
             react_notes: Vec::new(),
             react_kind: None,
+            expanded_queries: Vec::new(),
         });
     }
     let planner_llm = planner_llm(config, llm);
@@ -1058,9 +1060,12 @@ async fn collect_rag(
         top_k = plan.top_k,
         "常规检索规划器初始决策"
     );
-    let (first_results, context) = engine
+    let planned = engine
         .retrieve_planned(&plan.query, &plan.retrieval_method, plan.top_k, Some(llm))
         .await?;
+    let first_results = planned.results;
+    let context = planned.context;
+    let expanded_queries = planned.expanded_queries;
     let evidence = crate::planner::assess_evidence(query, &first_results, planner_llm).await;
     tracing::info!(
         sufficient = evidence.sufficient,
@@ -1077,6 +1082,7 @@ async fn collect_rag(
             used_react: false,
             react_notes: Vec::new(),
             react_kind: None,
+            expanded_queries,
         });
     }
 
@@ -1133,6 +1139,7 @@ async fn collect_rag(
                     used_react,
                     react_notes,
                     react_kind,
+                    expanded_queries,
                 });
             }
             if outcome.sources.is_empty() {
@@ -1144,6 +1151,7 @@ async fn collect_rag(
                     used_react,
                     react_notes,
                     react_kind,
+                    expanded_queries,
                 });
             }
             working = outcome.sources;
@@ -1161,6 +1169,7 @@ async fn collect_rag(
                 used_react,
                 react_notes,
                 react_kind,
+                expanded_queries,
             });
         }
     }
@@ -1176,6 +1185,7 @@ async fn collect_rag(
         used_react,
         react_notes,
         react_kind,
+        expanded_queries,
     })
 }
 
@@ -1873,14 +1883,13 @@ pub async fn stream_chat(
         };
         let sources = source_payload(&turn.sources);
         if use_retrieval {
-            let expanded_queries = crate::retrieval::expand_multi_query(&retrieval_query);
             yield Ok(sse_json(
                 "tool_result",
                 sse_rag_tool_result_payload(
                     &sources,
                     turn.retrieval_method.as_deref(),
                     &retrieval_query,
-                    &expanded_queries,
+                    &turn.expanded_queries,
                     !turn.sources.is_empty(),
                 ),
             ));
