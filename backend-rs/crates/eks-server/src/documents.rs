@@ -147,7 +147,7 @@ async fn list_documents_page(
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
         .fetch_one(&state.pool)
         .await
-        .map_err(AuthError::from)?;
+        .map_err(|err| document_sql_error("获取文档列表失败", err))?;
     let sql = format!(
         "SELECT {DOCUMENT_COLUMNS} FROM documents ORDER BY created_at DESC LIMIT ? OFFSET ?"
     );
@@ -156,7 +156,7 @@ async fn list_documents_page(
         .bind(skip)
         .fetch_all(&state.pool)
         .await
-        .map_err(AuthError::from)?;
+        .map_err(|err| document_sql_error("获取文档列表失败", err))?;
     let documents: Vec<Value> = rows.iter().map(doc_to_json).collect();
     Ok(Json(json!({
         "documents": documents,
@@ -219,17 +219,28 @@ fn deletion_rejected(status: &str) -> Option<String> {
     }
 }
 
+fn format_document_route_error(action: &str, err: &str) -> String {
+    format!("{action}: {err}")
+}
+
+fn document_sql_error(action: &str, err: sqlx::Error) -> AuthError {
+    tracing::error!("{}", format_document_route_error(action, &err.to_string()));
+    AuthError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: "服务器内部错误".to_string(),
+    }
+}
+
 async fn load_document(
     pool: &sqlx::SqlitePool,
     document_id: &str,
-) -> Result<Option<DocumentRow>, AuthError> {
+) -> Result<Option<DocumentRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {DOCUMENT_COLUMNS} FROM documents WHERE document_id = ?"
     ))
     .bind(document_id)
     .fetch_optional(pool)
     .await
-    .map_err(AuthError::from)
 }
 
 async fn mark_document_deleting(
@@ -237,7 +248,10 @@ async fn mark_document_deleting(
     document_id: &str,
 ) -> Result<DocumentRow, AuthError> {
     log_delete_step(document_id, "1/4", "收到删除请求");
-    let Some(row) = load_document(pool, document_id).await? else {
+    let Some(row) = load_document(pool, document_id)
+        .await
+        .map_err(|err| document_sql_error("文档删除失败", err))?
+    else {
         return Err(AuthError::bad_request("文档不存在"));
     };
     if let Some(detail) = deletion_rejected(&row.status) {
@@ -260,7 +274,7 @@ async fn mark_document_deleting(
     .bind(document_id)
     .execute(pool)
     .await
-    .map_err(AuthError::from)?;
+    .map_err(|err| document_sql_error("文档删除失败", err))?;
     let mut updated = row;
     updated.status = "deleting".into();
     updated.error_message = None;
@@ -301,7 +315,7 @@ async fn restore_document_after_delete_failure(
 async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Result<(), String> {
     let row = load_document(&state.pool, document_id)
         .await
-        .map_err(|err| err.detail)?;
+        .map_err(|err| err.to_string())?;
     let Some(row) = row else {
         return Ok(());
     };
@@ -406,7 +420,7 @@ pub async fn get_document_content(
     .bind(&document_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(AuthError::from)?;
+    .map_err(|err| document_sql_error("获取文档内容失败", err))?;
     let Some(row) = row else {
         return Err(document_content_exception("文档不存在"));
     };
@@ -417,7 +431,7 @@ pub async fn get_document_content(
     .bind(&document_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(AuthError::from)?;
+    .map_err(|err| document_sql_error("获取文档内容失败", err))?;
     let mut content = chunks
         .into_iter()
         .map(|text| text.trim().to_string())
@@ -543,10 +557,14 @@ async fn insert_processing_document(
     .bind(&now)
     .execute(pool)
     .await
-    .map_err(AuthError::from)?;
+    .map_err(|err| document_sql_error("文档上传失败", err))?;
     load_document(pool, document_id)
-        .await?
-        .ok_or_else(|| AuthError::from("文档元数据写入失败".to_string()))
+        .await
+        .map_err(|err| document_sql_error("文档上传失败", err))?
+        .ok_or_else(|| {
+            tracing::error!("{}", format_document_route_error("文档上传失败", "文档元数据写入失败"));
+            AuthError::from("文档元数据写入失败".to_string())
+        })
 }
 
 async fn mark_document_failed(pool: &sqlx::SqlitePool, document_id: &str, err: &str) {
@@ -621,7 +639,7 @@ async fn current_document_status(
 ) -> Result<Option<String>, String> {
     Ok(load_document(pool, document_id)
         .await
-        .map_err(|err| err.detail)?
+        .map_err(|err| err.to_string())?
         .map(|row| row.status))
 }
 
@@ -790,7 +808,7 @@ pub async fn upload_document(
     require_current_user(&state, &headers).await?;
     db::ensure_document_schema(&state.pool)
         .await
-        .map_err(AuthError::from)?;
+        .map_err(|err| document_sql_error("文档上传失败", err))?;
 
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
@@ -978,6 +996,26 @@ mod tests {
         assert_eq!(
             format_delete_step("doc-1", "4/4", "SQLite 文档记录删除完成"),
             "[文档删除][4/4] SQLite 文档记录删除完成 (document_id=doc-1)"
+        );
+    }
+
+    #[test]
+    fn document_route_error_logs_match_python() {
+        assert_eq!(
+            format_document_route_error("获取文档内容失败", "boom"),
+            "获取文档内容失败: boom"
+        );
+        assert_eq!(
+            format_document_route_error("文档上传失败", "disk full"),
+            "文档上传失败: disk full"
+        );
+        assert_eq!(
+            format_document_route_error("获取文档列表失败", "locked"),
+            "获取文档列表失败: locked"
+        );
+        assert_eq!(
+            format_document_route_error("文档删除失败", "busy"),
+            "文档删除失败: busy"
         );
     }
 
