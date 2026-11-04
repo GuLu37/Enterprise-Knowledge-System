@@ -402,6 +402,11 @@ pub async fn execute_named(
     execute_named_from(pool, name, arguments, &context, &[], &[], None).await
 }
 
+/// 对齐 Python `logger.exception(f"Skill 执行失败: {name}")`。
+fn format_skill_exec_fail(name: &str) -> String {
+    format!("Skill 执行失败: {name}")
+}
+
 pub async fn execute_named_from(
     pool: &sqlx::SqlitePool,
     name: &str,
@@ -473,6 +478,9 @@ pub async fn execute_named_from(
         }
         Err(err) => {
             crate::trace::log_tool_error(kind, display_name, &err, &context_payload);
+            if definition.is_some() {
+                tracing::error!("{}", format_skill_exec_fail(display_name));
+            }
             Err(err)
         }
     }
@@ -2104,6 +2112,10 @@ mod tests {
         assert!(names.contains(&"memory_query"));
         assert_eq!(names.len(), 7);
         assert_eq!(names[0], "search_knowledge_base");
+        assert_eq!(
+            format_skill_exec_fail("memory_query"),
+            "Skill 执行失败: memory_query"
+        );
     }
 
     #[test]
