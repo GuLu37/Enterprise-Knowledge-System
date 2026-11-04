@@ -963,14 +963,20 @@ impl RetrievalEngine {
             chunk_index: i64,
             chunk_text: String,
         }
-        let rows: Vec<Row> = sqlx::query_as(
+        let rows: Vec<Row> = match sqlx::query_as(
             "SELECT parent_id, document_id, chunk_index, chunk_text FROM document_chunks \
              WHERE document_id = ? ORDER BY chunk_index ASC",
         )
         .bind(document_id)
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::debug!("{}", format_structured_parent_load_fail(&err.to_string()));
+                return Vec::new();
+            }
+        };
         rows.into_iter()
             .filter(|row| !row.chunk_text.trim().is_empty())
             .map(|row| ParentRecord {
@@ -1186,17 +1192,39 @@ impl RetrievalEngine {
     }
 
     /// 一次会话批量读 parent（parent_id 优先，chunk_index 兜底）。
+    /// 批量 SQL 失败时逐条回退，对齐 Python `_load_parent_contexts_batch`。
     async fn load_parent_texts(
         &self,
         items: &[RetrievalItem],
     ) -> HashMap<(String, String), String> {
-        #[derive(sqlx::FromRow)]
-        struct ParentRow {
-            document_id: String,
-            parent_id: String,
-            chunk_index: i64,
-            chunk_text: String,
+        match self.load_parent_texts_batch(items).await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::debug!("{}", format_parent_batch_fail(&err.to_string()));
+                let mut result = HashMap::new();
+                for item in items {
+                    match self.load_parent_text_single(item).await {
+                        Ok(Some(text)) => {
+                            insert_parent_text(&mut result, item, text);
+                        }
+                        Ok(None) => {}
+                        Err(single_err) => {
+                            tracing::debug!(
+                                "{}",
+                                format_parent_single_fail(&single_err.to_string())
+                            );
+                        }
+                    }
+                }
+                result
+            }
         }
+    }
+
+    async fn load_parent_texts_batch(
+        &self,
+        items: &[RetrievalItem],
+    ) -> Result<HashMap<(String, String), String>, sqlx::Error> {
         let mut result: HashMap<(String, String), String> = HashMap::new();
         let mut need_by_parent: Vec<(String, String)> = Vec::new();
         let mut need_by_index: Vec<(String, i64)> = Vec::new();
@@ -1222,15 +1250,8 @@ impl RetrievalEngine {
             for (doc, parent) in &need_by_parent {
                 query = query.bind(doc).bind(parent);
             }
-            if let Ok(rows) = query.fetch_all(&self.pool).await {
-                for row in rows {
-                    let text = row.chunk_text.trim().to_string();
-                    if !text.is_empty() {
-                        result
-                            .entry((row.document_id, row.parent_id))
-                            .or_insert(text);
-                    }
-                }
+            for row in query.fetch_all(&self.pool).await? {
+                record_parent_row(&mut result, row);
             }
         }
         if !need_by_index.is_empty() {
@@ -1243,23 +1264,105 @@ impl RetrievalEngine {
             for (doc, index) in &need_by_index {
                 query = query.bind(doc).bind(index);
             }
-            if let Ok(rows) = query.fetch_all(&self.pool).await {
-                for row in rows {
-                    let text = row.chunk_text.trim().to_string();
-                    if !text.is_empty() {
-                        result
-                            .entry((row.document_id.clone(), row.parent_id.clone()))
-                            .or_insert_with(|| text.clone());
-                        // chunk_index 兜底命中也要能被查到: 以 index 键补充
-                        result
-                            .entry((row.document_id, format!("idx:{}", row.chunk_index)))
-                            .or_insert(text);
-                    }
+            for row in query.fetch_all(&self.pool).await? {
+                record_parent_row(&mut result, row);
+            }
+        }
+        Ok(result)
+    }
+
+    /// 对齐 Python `_load_parent_context`：parent_id 优先，chunk_index 兜底。
+    async fn load_parent_text_single(
+        &self,
+        item: &RetrievalItem,
+    ) -> Result<Option<String>, sqlx::Error> {
+        if item.document_id.is_empty() {
+            return Ok(None);
+        }
+        if !item.parent_id.is_empty() {
+            let text: Option<String> = sqlx::query_scalar(
+                "SELECT chunk_text FROM document_chunks WHERE document_id = ? AND parent_id = ?",
+            )
+            .bind(&item.document_id)
+            .bind(&item.parent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(text) = text {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    return Ok(Some(text));
                 }
             }
         }
-        result
+        if item.parent_index >= 0 {
+            let text: Option<String> = sqlx::query_scalar(
+                "SELECT chunk_text FROM document_chunks WHERE document_id = ? AND chunk_index = ?",
+            )
+            .bind(&item.document_id)
+            .bind(item.parent_index)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(text) = text {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    return Ok(Some(text));
+                }
+            }
+        }
+        Ok(None)
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct ParentRow {
+    document_id: String,
+    parent_id: String,
+    chunk_index: i64,
+    chunk_text: String,
+}
+
+fn record_parent_row(result: &mut HashMap<(String, String), String>, row: ParentRow) {
+    let text = row.chunk_text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    result
+        .entry((row.document_id.clone(), row.parent_id.clone()))
+        .or_insert_with(|| text.clone());
+    result
+        .entry((row.document_id, format!("idx:{}", row.chunk_index)))
+        .or_insert(text);
+}
+
+fn insert_parent_text(
+    result: &mut HashMap<(String, String), String>,
+    item: &RetrievalItem,
+    text: String,
+) {
+    if !item.parent_id.is_empty() {
+        result
+            .entry((item.document_id.clone(), item.parent_id.clone()))
+            .or_insert_with(|| text.clone());
+    }
+    if item.parent_index >= 0 {
+        result
+            .entry((item.document_id.clone(), format!("idx:{}", item.parent_index)))
+            .or_insert(text);
+    } else if item.parent_id.is_empty() {
+        result.insert((item.document_id.clone(), String::new()), text);
+    }
+}
+
+fn format_parent_batch_fail(err: &str) -> String {
+    format!("SQLite Parent 上下文批量读取失败，逐条回退: {err}")
+}
+
+fn format_parent_single_fail(err: &str) -> String {
+    format!("SQLite Parent 上下文读取失败，继续使用原始命中: {err}")
+}
+
+fn format_structured_parent_load_fail(err: &str) -> String {
+    format!("结构化 SQLite Parent 扩展读取失败，继续使用原始命中: {err}")
 }
 
 fn key_for_parent(item: &RetrievalItem) -> (String, String) {
@@ -1555,5 +1658,21 @@ mod tests {
         assert_eq!(payload["result_chunks"][0]["source_name"], "手册.md");
         assert_eq!(payload["context_chars"], 3);
         assert_eq!(payload["best_score"], 0.8);
+    }
+
+    #[test]
+    fn parent_context_fallback_logs_match_python() {
+        assert_eq!(
+            format_parent_batch_fail("busy"),
+            "SQLite Parent 上下文批量读取失败，逐条回退: busy"
+        );
+        assert_eq!(
+            format_parent_single_fail("locked"),
+            "SQLite Parent 上下文读取失败，继续使用原始命中: locked"
+        );
+        assert_eq!(
+            format_structured_parent_load_fail("no such table"),
+            "结构化 SQLite Parent 扩展读取失败，继续使用原始命中: no such table"
+        );
     }
 }
