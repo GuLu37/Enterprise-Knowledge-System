@@ -204,6 +204,39 @@ impl MilvusLiteStore {
         Ok(true)
     }
 
+    /// 按多字段等值过滤删除，对齐 Python `client.delete(filter='user_id == ".." and conversation_id == ".."')`。
+    /// 集合不存在时返回 false；存在则返回 true（即使没有匹配行）。
+    pub async fn delete_by_matching_fields(
+        &self,
+        collection: &str,
+        matches: &[(&str, &str)],
+    ) -> Result<bool, String> {
+        let snapshot = match self.collection(collection).await {
+            Ok(snapshot) => snapshot,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.to_string()),
+        };
+        let pks: Vec<i64> = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                matches.iter().all(|(field, expected)| {
+                    row.fields
+                        .get(*field)
+                        .and_then(FieldValue::as_str)
+                        .map(str::trim)
+                        == Some(expected.trim())
+                })
+            })
+            .map(|row| row.pk)
+            .collect();
+        if !pks.is_empty() {
+            append_delta_pks(&self.root, collection, &pks)?;
+        }
+        self.invalidate(collection).await;
+        Ok(true)
+    }
+
     /// 按 document_id 写入 delta PK，对齐 Python `client.delete(filter=document_id == ...)`。
     /// 集合不存在时返回 false；存在则返回 true（即使没有匹配行）。
     pub async fn delete_by_document_id(
@@ -1030,6 +1063,19 @@ mod tests {
                 .and_then(FieldValue::as_str),
             Some("u1:c2:0:bbb")
         );
+        assert!(store
+            .delete_by_matching_fields(
+                "memory_chunks",
+                &[("user_id", "u1"), ("conversation_id", "c2")]
+            )
+            .await
+            .unwrap());
+        let emptied = store.collection("memory_chunks").await.unwrap();
+        assert!(emptied.rows.is_empty());
+        assert!(!store
+            .delete_by_matching_fields("missing_collection", &[("user_id", "u1")])
+            .await
+            .unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

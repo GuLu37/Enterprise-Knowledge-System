@@ -227,7 +227,7 @@ pub async fn delete_conversation(
     let memory_deleted = match crate::memory::delete_conversation_memory(&state.pool, &user.user_id, &cid)
         .await
     {
-        Ok(count) => count > 0,
+        Ok(deleted) => deleted,
         Err(err) => {
             tracing::warn!("删除会话长期记忆失败，会话记录已删除: {err}");
             false
@@ -259,7 +259,8 @@ async fn list_user_conversation_ids(
     .await
 }
 
-/// 按会话统计长期记忆删除次数，对齐 Python `memory_deleted_count`（会话数而非事件行数）。
+/// 按会话统计长期记忆删除次数，对齐 Python `memory_deleted_count`：
+/// collection 可写时每个会话都计 1，不看出事件行数。
 async fn memory_deleted_conversation_count(
     pool: &sqlx::SqlitePool,
     user_id: &str,
@@ -268,8 +269,8 @@ async fn memory_deleted_conversation_count(
     let mut count = 0i64;
     for conversation_id in conversation_ids {
         match crate::memory::delete_conversation_memory(pool, user_id, conversation_id).await {
-            Ok(deleted) if deleted > 0 => count += 1,
-            Ok(_) => {}
+            Ok(true) => count += 1,
+            Ok(false) => {}
             Err(err) => {
                 tracing::warn!(
                     "删除会话长期记忆失败，跳过该会话: conversation_id={conversation_id} err={err}"
@@ -371,7 +372,7 @@ mod tests {
         let count = memory_deleted_conversation_count(&pool, "u1", &ids)
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
 
         let remaining_other: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM memory_records WHERE user_id = 'u2' AND status = 'active'",

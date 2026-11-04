@@ -604,7 +604,7 @@ pub async fn persist_turn(
         return;
     }
     let turn_offset = count_dialogue_turns(pool, user_id, conversation_id).await;
-    let mut wrote = false;
+    let mut written = 0usize;
     for chunk in &chunks {
         let (importance, confidence) = calculate_event_importance(&chunk.text);
         let local_index = chunk.chunk_index as i64;
@@ -625,11 +625,17 @@ pub async fn persist_turn(
         )
         .await
         {
-            Ok(_) => wrote = true,
+            Ok(_) => written += 1,
             Err(err) => tracing::warn!("长期记忆写入失败: {err}"),
         }
     }
-    if wrote && !conversation_id.trim().is_empty() {
+    if written > 0 {
+        tracing::info!(
+            "{}",
+            format_memory_write_success(user_id, conversation_id, written)
+        );
+    }
+    if written > 0 && !conversation_id.trim().is_empty() {
         let summarizer = llm.map(MemorySummarizer::Llm);
         let _ = consolidate_with(
             pool,
@@ -1513,32 +1519,54 @@ async fn mark_accessed(pool: &sqlx::SqlitePool, user_id: &str, hits: &[EventMemo
     }
 }
 
+fn format_memory_delete_success(user_id: &str, conversation_id: &str) -> String {
+    format!("✓ 长期记忆删除成功 (user_id={user_id}, conversation_id={conversation_id})")
+}
+
+fn format_memory_write_success(user_id: &str, conversation_id: &str, chunks: usize) -> String {
+    format!(
+        "✓ 长期记忆写入成功 (user_id={user_id}, conversation_id={conversation_id}, chunks={chunks})"
+    )
+}
+
+fn format_summary_write_success(
+    level: i32,
+    user_id: &str,
+    conversation_id: &str,
+    turn_start: i64,
+    turn_end: i64,
+) -> String {
+    format!(
+        "✓ 递进摘要 L{level} 写入成功 (user_id={user_id}, conversation_id={conversation_id}, turns={turn_start}-{turn_end})"
+    )
+}
+
+/// 对齐 Python `delete_long_term_memory`：collection 可写时删除成功即 True，不看行数。
 pub async fn delete_conversation_memory(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     conversation_id: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
+    let cid = conversation_id.trim();
+    if cid.is_empty() || user_id.trim().is_empty() {
+        return Ok(false);
+    }
     let _ = ensure_schema(pool).await;
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT memory_id FROM memory_records \
-         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' AND status = 'active'",
-    )
-    .bind(user_id)
-    .bind(conversation_id)
-    .fetch_all(pool)
-    .await?;
-    delete_memory_vectors(&ids).await;
+    if !delete_conversation_memory_vectors(user_id, cid).await {
+        return Ok(false);
+    }
     let now = crate::db::fmt_dt(&crate::db::now_naive());
-    let result = sqlx::query(
+    sqlx::query(
         "UPDATE memory_records SET status = 'deleted', updated_at = ? \
          WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' AND status = 'active'",
     )
     .bind(&now)
     .bind(user_id)
-    .bind(conversation_id)
+    .bind(cid)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    tracing::info!("{}", format_memory_delete_success(user_id, conversation_id));
+    Ok(true)
 }
 
 pub async fn delete_user_event_memory(
@@ -1579,6 +1607,31 @@ async fn delete_memory_vectors(memory_ids: &[String]) {
         .await
     {
         tracing::warn!("长期记忆向量删除失败: {err}");
+    }
+}
+
+/// 对齐 Python `client.delete(filter=user_id == ".." and conversation_id == "..")`。
+/// 未配置向量库或 collection 尚未物化时仍允许 SQL 软删；向量删除失败则中止。
+async fn delete_conversation_memory_vectors(user_id: &str, conversation_id: &str) -> bool {
+    let Some(sink) = memory_vector_sink() else {
+        return true;
+    };
+    if !sink.store.has_collection(&sink.collection).await {
+        return true;
+    }
+    match sink
+        .store
+        .delete_by_matching_fields(
+            &sink.collection,
+            &[("user_id", user_id), ("conversation_id", conversation_id)],
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!("长期记忆删除失败: {err}");
+            false
+        }
     }
 }
 
@@ -1894,7 +1947,7 @@ async fn write_semantic_summary(
 ) -> Result<String, sqlx::Error> {
     let content = format_memory_chunk(topic, summary, transcript);
     let (importance, confidence) = calculate_event_importance(&content);
-    insert_event_memory_with_confidence(
+    let inserted = insert_event_memory_with_confidence(
         pool,
         user_id,
         conversation_id,
@@ -1909,7 +1962,12 @@ async fn write_semantic_summary(
         Some(chunk_index),
         Some(memory_id),
     )
-    .await
+    .await?;
+    tracing::info!(
+        "{}",
+        format_summary_write_success(level, user_id, conversation_id, turn_start, turn_end)
+    );
+    Ok(inserted)
 }
 
 fn conversation_key(conversation_id: &str) -> &str {
@@ -2106,7 +2164,7 @@ async fn consolidate_level(
         {
             Ok(_) => 1,
             Err(err) => {
-                tracing::warn!("递进摘要 L{level} 写入失败: {err}");
+                tracing::error!("递进摘要 L{level} 写入失败: {err}");
                 0
             }
         }
@@ -3047,7 +3105,34 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
         let deleted = delete_conversation_memory(&pool, "u1", "c1").await.unwrap();
-        assert_eq!(deleted, 1);
+        assert!(deleted);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE user_id = 'u1' AND status = 'active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        let empty = delete_conversation_memory(&pool, "u1", "c-empty").await.unwrap();
+        assert!(empty);
+        assert!(!delete_conversation_memory(&pool, "u1", "  ").await.unwrap());
+        assert!(!delete_conversation_memory(&pool, "", "c1").await.unwrap());
+    }
+
+    #[test]
+    fn memory_success_logs_match_python() {
+        assert_eq!(
+            format_memory_delete_success("u1", "c1"),
+            "✓ 长期记忆删除成功 (user_id=u1, conversation_id=c1)"
+        );
+        assert_eq!(
+            format_memory_write_success("u1", "c1", 2),
+            "✓ 长期记忆写入成功 (user_id=u1, conversation_id=c1, chunks=2)"
+        );
+        assert_eq!(
+            format_summary_write_success(1, "u1", "c1", 0, 10),
+            "✓ 递进摘要 L1 写入成功 (user_id=u1, conversation_id=c1, turns=0-10)"
+        );
     }
 
     #[tokio::test]
