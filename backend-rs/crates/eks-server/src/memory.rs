@@ -289,6 +289,30 @@ pub fn clamp_confidence(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
+/// 对齐 Python `_clamp_score(value, default)`：`float(value)` 失败则用 default，再夹 0–100。
+pub fn clamp_score_any(value: Option<&Value>, default: f64) -> f64 {
+    clamp_score(coerce_json_float(value, default))
+}
+
+/// 对齐 Python `_clamp_confidence(value, default)`：`float(value)` 失败则用 default，再夹 0–1。
+pub fn clamp_confidence_any(value: Option<&Value>, default: f64) -> f64 {
+    clamp_confidence(coerce_json_float(value, default))
+}
+
+fn coerce_json_float(value: Option<&Value>, default: f64) -> f64 {
+    let Some(value) = value else {
+        return default;
+    };
+    match value {
+        Value::Null => default,
+        Value::Number(n) => n.as_f64().unwrap_or(default),
+        Value::String(text) => text.trim().parse::<f64>().unwrap_or(default),
+        Value::Bool(true) => 1.0,
+        Value::Bool(false) => 0.0,
+        _ => default,
+    }
+}
+
 pub fn decay_importance_score(
     memory_type: &str,
     base_importance: f64,
@@ -2657,16 +2681,8 @@ pub async fn upsert_profile_candidates(
         if value.is_empty() {
             continue;
         }
-        let importance = candidate
-            .get("importance")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(75.0)
-            .clamp(0.0, 100.0);
-        let confidence = candidate
-            .get("confidence")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.7)
-            .clamp(0.0, 1.0);
+        let importance = clamp_score_any(candidate.get("importance"), 75.0);
+        let confidence = clamp_confidence_any(candidate.get("confidence"), 0.7);
         crate::skills::upsert_profile_memory(
             pool,
             user_id,
@@ -2706,6 +2722,22 @@ fn parse_json_object(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_score_any_parses_strings_like_python() {
+        assert_eq!(clamp_score_any(Some(&json!("80")), 75.0), 80.0);
+        assert_eq!(clamp_score_any(Some(&json!(" 90.5 ")), 75.0), 90.5);
+        assert_eq!(clamp_score_any(Some(&json!(80)), 75.0), 80.0);
+        assert_eq!(clamp_score_any(Some(&json!(null)), 75.0), 75.0);
+        assert_eq!(clamp_score_any(None, 75.0), 75.0);
+        assert_eq!(clamp_score_any(Some(&json!("bad")), 75.0), 75.0);
+        assert_eq!(clamp_score_any(Some(&json!(-10)), 75.0), 0.0);
+        assert_eq!(clamp_score_any(Some(&json!(150)), 75.0), 100.0);
+        assert_eq!(clamp_confidence_any(Some(&json!("0.9")), 0.7), 0.9);
+        assert_eq!(clamp_confidence_any(Some(&json!("nope")), 0.7), 0.7);
+        assert_eq!(clamp_confidence_any(Some(&json!(true)), 0.7), 1.0);
+        assert_eq!(clamp_confidence_any(Some(&json!(false)), 0.7), 0.0);
+    }
 
     #[test]
     fn require_user_id_matches_python() {
