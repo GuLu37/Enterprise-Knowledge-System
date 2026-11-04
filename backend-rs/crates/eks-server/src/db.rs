@@ -45,9 +45,18 @@ fn parse_client_naive(text: &str) -> Option<NaiveDateTime> {
         .or_else(|| parse_dt(text))
 }
 
-/// JSON 序列化格式与 pydantic v2 一致：naive ISO（空格→T），None → null。
+/// JSON 序列化对齐 Python naive `datetime.isoformat()` / pydantic v2：
+/// 空格→T，零微秒省略小数，None → null。
 pub fn dt_to_iso(text: &str) -> Option<String> {
-    parse_dt(text).map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
+    parse_dt(text).map(|dt| naive_isoformat(&dt))
+}
+
+fn naive_isoformat(dt: &NaiveDateTime) -> String {
+    if dt.and_utc().timestamp_subsec_micros() == 0 {
+        dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+    } else {
+        dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
 }
 
 /// 对齐 Python `datetime.now(timezone.utc).isoformat()`：`+00:00`，零微秒省略小数。
@@ -470,6 +479,28 @@ mod tests {
         assert!(parse_client_datetime("").is_none());
         assert!(parse_client_datetime("not-a-date").is_none());
         assert!(parse_dt("2026-03-15T08:30:00.123Z").is_none());
+    }
+
+    #[test]
+    fn dt_to_iso_matches_python_naive_isoformat() {
+        assert_eq!(
+            dt_to_iso("2026-01-01 00:00:00.000000").as_deref(),
+            Some("2026-01-01T00:00:00")
+        );
+        assert_eq!(
+            dt_to_iso("2026-01-01 00:00:00").as_deref(),
+            Some("2026-01-01T00:00:00")
+        );
+        assert_eq!(
+            dt_to_iso("2026-03-15 08:30:00.123000").as_deref(),
+            Some("2026-03-15T08:30:00.123000")
+        );
+        assert_eq!(
+            dt_to_iso("2026-03-15 08:30:00.000123").as_deref(),
+            Some("2026-03-15T08:30:00.000123")
+        );
+        assert!(dt_to_iso("").is_none());
+        assert!(dt_to_iso("not-a-date").is_none());
     }
 
     #[test]
