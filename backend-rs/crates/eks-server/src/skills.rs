@@ -1635,10 +1635,17 @@ async fn memory_query(
 ) -> Result<Value, String> {
     let query = arg_str(arguments, "query");
     let top_k = arg_usize(arguments, "top_k", 5, 1, 50);
-    let scope = arg_str(arguments, "memory_scope");
-    let scope = if scope.is_empty() { "all".to_string() } else { scope };
-    let include_profile = scope == "all" || scope == "profile";
-    let include_event = scope == "all" || scope == "event";
+    let mut scope = arg_str(arguments, "memory_scope").to_lowercase();
+    if scope.is_empty() {
+        scope = "all".to_string();
+    }
+    let mut include_profile = scope == "all" || scope == "profile";
+    let mut include_event = scope == "all" || scope == "event";
+    if !include_profile && !include_event {
+        scope = "all".to_string();
+        include_profile = true;
+        include_event = true;
+    }
 
     let profile_memories = if include_profile {
         load_memories(pool, user_id, Some("profile"), 100).await?
@@ -1658,6 +1665,10 @@ async fn memory_query(
                 "session_id": row.session_id,
                 "created_at": crate::db::dt_to_iso(&row.created_at),
                 "updated_at": crate::db::dt_to_iso(&row.updated_at),
+                "expires_at": row
+                    .expires_at
+                    .as_deref()
+                    .and_then(crate::db::dt_to_iso),
             }))
             .collect::<Vec<_>>()
     } else {
@@ -2427,6 +2438,33 @@ mod tests {
             .unwrap();
         assert_eq!(queried.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
         assert_eq!(queried.pointer("/filters/top_k").and_then(|value| value.as_u64()), Some(5));
+        assert!(queried.pointer("/profile_memories/0/expires_at").unwrap().is_null());
+        let mixed_scope = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我的名字","memory_scope":"PROFILE","top_k":5}),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mixed_scope["memory_scope"], "profile");
+        assert_eq!(mixed_scope.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
+        let invalid_scope = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我的名字","memory_scope":"unknown","top_k":5}),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_scope["memory_scope"], "all");
+        assert_eq!(invalid_scope.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
         let deleted = delete_profile_memory(&pool, "u1", &json!({"keywords":["张三"]})).await.unwrap();
         assert_eq!(deleted.get("deleted_count").and_then(|value| value.as_u64()), Some(1));
     }
