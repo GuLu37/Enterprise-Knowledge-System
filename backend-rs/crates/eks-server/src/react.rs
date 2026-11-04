@@ -53,7 +53,7 @@ pub async fn run_unified_react(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
     llm: &LlmClient,
-    user_id: &str,
+    context: &skills::SkillExecutionContext<'_>,
     query: &str,
     history: &[(String, String)],
     top_k: usize,
@@ -67,11 +67,12 @@ pub async fn run_unified_react(
         tracing::info!("统一 ReAct 编排已关闭，回退 rag 专用循环");
         return ReactAttempt::Unavailable;
     }
+    let context = unified_react_context(context);
     run_react_loop(
         engine,
         pool,
         llm,
-        user_id,
+        &context,
         query,
         history,
         top_k,
@@ -90,7 +91,7 @@ pub async fn run_rag_react(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
     llm: &LlmClient,
-    user_id: &str,
+    context: &skills::SkillExecutionContext<'_>,
     query: &str,
     history: &[(String, String)],
     top_k: usize,
@@ -102,7 +103,7 @@ pub async fn run_rag_react(
         engine,
         pool,
         llm,
-        user_id,
+        context,
         query,
         history,
         top_k,
@@ -121,7 +122,7 @@ async fn run_react_loop(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
     llm: &LlmClient,
-    user_id: &str,
+    context: &skills::SkillExecutionContext<'_>,
     query: &str,
     history: &[(String, String)],
     top_k: usize,
@@ -217,7 +218,7 @@ async fn run_react_loop(
                     let (observation, extra) = execute_tool(
                         engine,
                         pool,
-                        user_id,
+                        context,
                         query,
                         top_k,
                         &call,
@@ -445,6 +446,15 @@ fn parallel_worker_limit(pending: usize, configured: usize) -> usize {
     pending.min(configured.max(1)).max(1)
 }
 
+/// 对齐 Python `_run_unified_react_loop`：context.metadata 带 `react_mode=unified`。
+fn unified_react_context<'a>(
+    context: &skills::SkillExecutionContext<'a>,
+) -> skills::SkillExecutionContext<'a> {
+    let mut context = context.clone();
+    context.metadata = json!({"react_mode": "unified"});
+    context
+}
+
 fn call_dedupe_key(call: &ToolCall) -> String {
     if call.name == "search_knowledge_base" {
         let query_key = eks_kernels::normalize_text(
@@ -463,7 +473,7 @@ fn call_dedupe_key(call: &ToolCall) -> String {
 async fn execute_tool(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    context: &skills::SkillExecutionContext<'_>,
     original_query: &str,
     default_top_k: usize,
     call: &ToolCall,
@@ -520,13 +530,11 @@ async fn execute_tool(
         .collect();
     match skills::execute_named_from(
         pool,
-        user_id,
         &call.name,
         &arguments,
+        context,
         mcp_manifests,
-        None,
         &recent_history,
-        None,
         Some(engine.embedder.as_ref()),
     )
     .await {
@@ -534,9 +542,8 @@ async fn execute_tool(
             let result = if call.name == "memory_query" {
                 match skills::maybe_disclose_original_memory(
                     pool,
-                    user_id,
+                    context,
                     original_query,
-                    None,
                     result,
                     mcp_manifests,
                     false,
@@ -707,6 +714,31 @@ mod tests {
         assert_eq!(
             tools[0].pointer("/function/name").and_then(Value::as_str),
             Some("search_knowledge_base")
+        );
+    }
+
+    #[test]
+    fn unified_react_context_keeps_request_provider_model() {
+        let context = unified_react_context(&skills::SkillExecutionContext {
+            conversation_id: Some("c1"),
+            session_id: Some("s1"),
+            query: Some("差旅"),
+            provider: Some("openai"),
+            model: Some("gpt-4o-mini"),
+            ..skills::SkillExecutionContext::new("u1")
+        });
+        assert_eq!(
+            context.public_payload(),
+            json!({
+                "user_id": "u1",
+                "conversation_id": "c1",
+                "session_id": "s1",
+                "query": "差旅",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "trace_id": null,
+                "metadata": {"react_mode": "unified"},
+            })
         );
     }
 

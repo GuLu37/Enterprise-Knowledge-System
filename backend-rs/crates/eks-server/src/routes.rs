@@ -541,15 +541,23 @@ pub async fn execute_skill(
             detail: crate::remote_mcp::execution_error_message(&definition),
         });
     }
+    let context = crate::skills::SkillExecutionContext {
+        user_id: &user.user_id,
+        conversation_id: request.context.conversation_id.as_deref(),
+        session_id: request.context.session_id.as_deref(),
+        query: request.context.query.as_deref(),
+        provider: None,
+        model: None,
+        trace_id: request.context.trace_id.as_deref(),
+        metadata: request.context.metadata,
+    };
     let result = crate::skills::execute_named_from(
         &state.pool,
-        &user.user_id,
         name,
         &request.arguments,
+        &context,
         manifests,
-        request.context.conversation_id.as_deref(),
         &[],
-        request.context.session_id.as_deref(),
         Some(state.engine.embedder.as_ref()),
     )
     .await
@@ -560,12 +568,7 @@ pub async fn execute_skill(
     let payload = crate::skills::wrap_skill_execution(
         name,
         &request.arguments,
-        &user.user_id,
-        request.context.conversation_id.as_deref(),
-        request.context.session_id.as_deref(),
-        request.context.query.as_deref(),
-        request.context.trace_id.as_deref(),
-        request.context.metadata,
+        &context,
         result,
     )
     .map_err(|detail| {

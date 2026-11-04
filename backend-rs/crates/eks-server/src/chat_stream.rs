@@ -193,10 +193,26 @@ struct SkillActionInput<'a> {
     query: &'a str,
     conversation_id: &'a str,
     session_id: &'a str,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
     history: &'a [HistoryMessage],
     options: &'a crate::short_memory::ShortMemoryOptions,
     mcp_manifests: &'a [serde_json::Value],
     llm: Option<Arc<LlmClient>>,
+}
+
+impl<'a> SkillActionInput<'a> {
+    /// 对齐 Python `_build_skill_execution_context`：聊天请求的 provider/model 写入 skill context。
+    fn execution_context(&self) -> crate::skills::SkillExecutionContext<'a> {
+        chat_skill_context(
+            self.user_id,
+            self.conversation_id,
+            self.session_id,
+            self.query,
+            self.provider,
+            self.model,
+        )
+    }
 }
 
 struct PreparedDisclosure {
@@ -227,17 +243,7 @@ fn wrap_prepared_skill(
     arguments: &serde_json::Value,
     result: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    crate::skills::wrap_skill_execution(
-        name,
-        arguments,
-        input.user_id,
-        nonempty(input.conversation_id),
-        nonempty(input.session_id),
-        Some(input.query),
-        None,
-        json!({}),
-        result,
-    )
+    crate::skills::wrap_skill_execution(name, arguments, &input.execution_context(), result)
 }
 
 async fn prepare_skill_action(
@@ -253,13 +259,11 @@ async fn prepare_skill_action(
         crate::skills::normalize_action_arguments(name, &intent.skill_arguments, input.query);
     let result = crate::skills::execute_named_from(
         input.pool,
-        input.user_id,
         name,
         &arguments,
+        &input.execution_context(),
         input.mcp_manifests,
-        nonempty(input.conversation_id),
         &history_messages,
-        nonempty(input.session_id),
         Some(input.embedder),
     )
     .await?;
@@ -273,9 +277,8 @@ async fn prepare_skill_action(
     if name == "memory_query" {
         if let Some(item) = crate::skills::maybe_run_progressive_disclosure(
             input.pool,
-            input.user_id,
+            &input.execution_context(),
             input.query,
-            nonempty(input.conversation_id),
             &result,
             input.mcp_manifests,
             true,
@@ -1026,6 +1029,27 @@ fn nonempty(value: &str) -> Option<&str> {
     }
 }
 
+/// 对齐 Python `_build_skill_execution_context`：聊天路径带上请求 provider/model。
+fn chat_skill_context<'a>(
+    user_id: &'a str,
+    conversation_id: &'a str,
+    session_id: &'a str,
+    query: &'a str,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+) -> crate::skills::SkillExecutionContext<'a> {
+    crate::skills::SkillExecutionContext {
+        user_id,
+        conversation_id: nonempty(conversation_id),
+        session_id: nonempty(session_id),
+        query: Some(query),
+        provider,
+        model,
+        trace_id: None,
+        metadata: json!({}),
+    }
+}
+
 fn spawn_persist_turn(
     pool: sqlx::SqlitePool,
     llm: Option<Arc<LlmClient>>,
@@ -1056,7 +1080,7 @@ async fn collect_rag(
     engine: &crate::retrieval_engine::RetrievalEngine,
     pool: &sqlx::SqlitePool,
     llm: &LlmClient,
-    user_id: &str,
+    skill_context: &crate::skills::SkillExecutionContext<'_>,
     query: &str,
     retrieval_query: &str,
     history: &[HistoryMessage],
@@ -1118,7 +1142,7 @@ async fn collect_rag(
         engine,
         pool,
         llm,
-        user_id,
+        skill_context,
         query,
         &history_pairs,
         plan.top_k,
@@ -1135,7 +1159,7 @@ async fn collect_rag(
             engine,
             pool,
             llm,
-            user_id,
+            skill_context,
             query,
             &history_pairs,
             plan.top_k,
@@ -1423,6 +1447,8 @@ pub async fn generate_chat(
                 query: &query,
                 conversation_id: &conversation_id,
                 session_id: &session_id,
+                provider: request.provider.as_deref(),
+                model: request.model.as_deref(),
                 history: &request.history,
                 options: &options,
                 mcp_manifests: &mcp_manifests,
@@ -1477,7 +1503,14 @@ pub async fn generate_chat(
         &state.engine,
         &state.pool,
         &llm_client,
-        &user.user_id,
+        &chat_skill_context(
+            &user.user_id,
+            &conversation_id,
+            &session_id,
+            &query,
+            request.provider.as_deref(),
+            request.model.as_deref(),
+        ),
         &query,
         &retrieval_query,
         &request.history,
@@ -1654,6 +1687,8 @@ pub async fn stream_chat(
                         query: &query,
                         conversation_id: &conversation_id,
                         session_id: &session_id,
+                        provider: request_provider.as_deref(),
+                        model: request_model.as_deref(),
                         history: &working_history,
                         options: &options,
                         mcp_manifests: &mcp_manifests,
@@ -1856,7 +1891,14 @@ pub async fn stream_chat(
             &engine,
             &pool,
             &llm_client,
-            &user_id,
+            &chat_skill_context(
+                &user_id,
+                &conversation_id,
+                &session_id,
+                &query,
+                request_provider.as_deref(),
+                request_model.as_deref(),
+            ),
             &query,
             &retrieval_query,
             &working_history,
@@ -2648,6 +2690,30 @@ mod tests {
         assert_eq!(chat_response_model(Some("")), "default");
         assert_eq!(chat_response_model(Some("gpt-4o-mini")), "gpt-4o-mini");
         assert_eq!(chat_response_model(Some(" ")), " ");
+    }
+
+    #[test]
+    fn chat_skill_context_fills_request_provider_model_like_python() {
+        let context = chat_skill_context(
+            "u1",
+            "c1",
+            "s1",
+            "我叫什么",
+            Some("openai"),
+            Some("gpt-4o-mini"),
+        );
+        let payload = context.public_payload();
+        assert_eq!(payload["user_id"], "u1");
+        assert_eq!(payload["conversation_id"], "c1");
+        assert_eq!(payload["session_id"], "s1");
+        assert_eq!(payload["query"], "我叫什么");
+        assert_eq!(payload["provider"], "openai");
+        assert_eq!(payload["model"], "gpt-4o-mini");
+        let http_like = chat_skill_context("u1", "", "", "query", None, None).public_payload();
+        assert_eq!(http_like["provider"], json!(null));
+        assert_eq!(http_like["model"], json!(null));
+        assert_eq!(http_like["conversation_id"], json!(null));
+        assert_eq!(http_like["session_id"], json!(null));
     }
 
     #[test]

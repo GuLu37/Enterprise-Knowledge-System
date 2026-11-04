@@ -266,11 +266,52 @@ pub struct ProgressiveDisclosure {
     pub result: Value,
 }
 
+/// 对齐 Python `SkillExecutionContext`：聊天回填请求 provider/model，HTTP execute 保持空。
+#[derive(Clone, Debug)]
+pub struct SkillExecutionContext<'a> {
+    pub user_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub query: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub trace_id: Option<&'a str>,
+    pub metadata: Value,
+}
+
+impl<'a> SkillExecutionContext<'a> {
+    pub fn new(user_id: &'a str) -> Self {
+        Self {
+            user_id,
+            conversation_id: None,
+            session_id: None,
+            query: None,
+            provider: None,
+            model: None,
+            trace_id: None,
+            metadata: json!({}),
+        }
+    }
+
+    /// 对齐 Python `execute_skill` 的 `context_payload`：含 provider/model，metadata 去掉 memory_context。
+    pub fn public_payload(&self) -> Value {
+        json!({
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
+            "query": self.query,
+            "provider": self.provider,
+            "model": self.model,
+            "trace_id": self.trace_id,
+            "metadata": public_context_metadata(self.metadata.clone()),
+        })
+    }
+}
+
 pub async fn maybe_run_progressive_disclosure(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    context: &SkillExecutionContext<'_>,
     query: &str,
-    conversation_id: Option<&str>,
     memory_query_result: &Value,
     manifests: &[Value],
     allow_conversation_fallback: bool,
@@ -287,7 +328,7 @@ pub async fn maybe_run_progressive_disclosure(
             "max_chars": 12000,
         })
     } else if allow_conversation_fallback {
-        let conversation_id = conversation_id.unwrap_or("").trim();
+        let conversation_id = context.conversation_id.unwrap_or("").trim();
         if conversation_id.is_empty() {
             return Ok(None);
         }
@@ -302,13 +343,11 @@ pub async fn maybe_run_progressive_disclosure(
     };
     let result = execute_named_from(
         pool,
-        user_id,
         "memory_retrieve_original",
         &disclosure_arguments,
+        context,
         manifests,
-        conversation_id,
         &[],
-        None,
         None,
     )
     .await?;
@@ -320,18 +359,16 @@ pub async fn maybe_run_progressive_disclosure(
 
 pub async fn maybe_disclose_original_memory(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    context: &SkillExecutionContext<'_>,
     query: &str,
-    conversation_id: Option<&str>,
     memory_query_result: Value,
     manifests: &[Value],
     allow_conversation_fallback: bool,
 ) -> Result<Value, String> {
     match maybe_run_progressive_disclosure(
         pool,
-        user_id,
+        context,
         query,
-        conversation_id,
         &memory_query_result,
         manifests,
         allow_conversation_fallback,
@@ -361,18 +398,17 @@ pub async fn execute_named(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
-    execute_named_from(pool, user_id, name, arguments, &[], None, &[], None, None).await
+    let context = SkillExecutionContext::new(user_id);
+    execute_named_from(pool, name, arguments, &context, &[], &[], None).await
 }
 
 pub async fn execute_named_from(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
     name: &str,
     arguments: &Value,
+    context: &SkillExecutionContext<'_>,
     manifests: &[Value],
-    conversation_id: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
-    session_id: Option<&str>,
     embedder: Option<&crate::embedder::Embedder>,
 ) -> Result<Value, String> {
     let definition = get_skill_definition_from(name, manifests);
@@ -385,18 +421,22 @@ pub async fn execute_named_from(
     if name == "memory_retrieve_original" {
         let existing = arg_str(&arguments, "conversation_id");
         if existing.is_empty() {
-            if let Some(conversation_id) = conversation_id.map(str::trim).filter(|item| !item.is_empty()) {
+            if let Some(conversation_id) = context
+                .conversation_id
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
                 arguments["conversation_id"] = json!(conversation_id);
             }
         }
     }
     let arguments = &arguments;
-    let context = json!({ "user_id": user_id, "conversation_id": conversation_id });
-    crate::trace::log_tool_call(kind, display_name, arguments, &context);
+    let context_payload = context.public_payload();
+    crate::trace::log_tool_call(kind, display_name, arguments, &context_payload);
     if let Some(definition) = definition.as_ref() {
         if definition.kind == "remote_mcp" {
             let err = crate::remote_mcp::execution_error_message(definition);
-            crate::trace::log_tool_error(kind, display_name, &err, &context);
+            crate::trace::log_tool_error(kind, display_name, &err, &context_payload);
             return Err(err);
         }
     }
@@ -407,17 +447,17 @@ pub async fn execute_named_from(
         "memory_query" => {
             memory_query(
                 pool,
-                user_id,
+                context.user_id,
                 arguments,
-                conversation_id,
-                session_id,
+                context.conversation_id,
+                context.session_id,
                 recent_history,
                 embedder,
             )
             .await
         }
-        "memory_retrieve_original" => memory_original(pool, user_id, arguments).await,
-        "delete_profile_memory" => delete_profile_memory(pool, user_id, arguments).await,
+        "memory_retrieve_original" => memory_original(pool, context.user_id, arguments).await,
+        "delete_profile_memory" => delete_profile_memory(pool, context.user_id, arguments).await,
         "search_knowledge_base" => Err("检索请走 /retrieval 或聊天接口".into()),
         other => Err(format!("未知技能: {other}")),
     };
@@ -427,12 +467,12 @@ pub async fn execute_named_from(
                 kind,
                 display_name,
                 &crate::trace::skill_result_summary(&payload),
-                &context,
+                &context_payload,
             );
             Ok(payload)
         }
         Err(err) => {
-            crate::trace::log_tool_error(kind, display_name, &err, &context);
+            crate::trace::log_tool_error(kind, display_name, &err, &context_payload);
             Err(err)
         }
     }
@@ -1059,12 +1099,7 @@ fn public_context_metadata(metadata: Value) -> Value {
 pub fn wrap_skill_execution(
     name: &str,
     arguments: &Value,
-    user_id: &str,
-    conversation_id: Option<&str>,
-    session_id: Option<&str>,
-    query: Option<&str>,
-    trace_id: Option<&str>,
-    metadata: Value,
+    context: &SkillExecutionContext<'_>,
     result: Value,
 ) -> Result<Value, String> {
     let definition = get_skill_definition(name).ok_or_else(|| format!("未找到技能: {name}"))?;
@@ -1076,16 +1111,7 @@ pub fn wrap_skill_execution(
         "kind": definition.kind,
         "provider": definition.provider,
         "arguments": arguments,
-        "context": {
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "session_id": session_id,
-            "query": query,
-            "provider": Value::Null,
-            "model": Value::Null,
-            "trace_id": trace_id,
-            "metadata": public_context_metadata(metadata),
-        },
+        "context": context.public_payload(),
         "skill_instructions": skill_instructions,
         "result": result,
         "executed_at": executed_at,
@@ -2113,12 +2139,12 @@ mod tests {
         let wrapped = wrap_skill_execution(
             "memory_query",
             &json!({"query": "我的名字"}),
-            "u1",
-            Some("c1"),
-            None,
-            Some("我叫什么"),
-            None,
-            json!({}),
+            &SkillExecutionContext {
+                user_id: "u1",
+                conversation_id: Some("c1"),
+                query: Some("我叫什么"),
+                ..SkillExecutionContext::new("u1")
+            },
             json!({"ok": true}),
         )
         .unwrap();
@@ -2136,7 +2162,15 @@ mod tests {
             .unwrap_or("");
         assert!(instructions.contains("记忆查询"));
         assert!(instructions.contains("不能跨用户"));
-        assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
+        assert!(
+            wrap_skill_execution(
+                "missing",
+                &json!({}),
+                &SkillExecutionContext::new("u1"),
+                json!({})
+            )
+            .is_err()
+        );
         assert_eq!(
             skill_not_found_http_detail("memory_query"),
             "未找到技能: 'memory_query'"
@@ -2151,17 +2185,52 @@ mod tests {
         let filtered = wrap_skill_execution(
             "memory_query",
             &json!({}),
-            "u1",
-            None,
-            None,
-            None,
-            None,
-            json!({"keep": true, "memory_context": {"secret": 1}}),
+            &SkillExecutionContext {
+                metadata: json!({"keep": true, "memory_context": {"secret": 1}}),
+                ..SkillExecutionContext::new("u1")
+            },
             json!({"ok": true}),
         )
         .unwrap();
         assert_eq!(filtered["context"]["metadata"], json!({"keep": true}));
         assert!(filtered["context"]["metadata"].get("memory_context").is_none());
+        let chat_wrapped = wrap_skill_execution(
+            "memory_query",
+            &json!({"query": "我的名字"}),
+            &SkillExecutionContext {
+                conversation_id: Some("c1"),
+                session_id: Some("s1"),
+                query: Some("我叫什么"),
+                provider: Some("openai"),
+                model: Some("gpt-4o-mini"),
+                ..SkillExecutionContext::new("u1")
+            },
+            json!({"ok": true}),
+        )
+        .unwrap();
+        assert_eq!(chat_wrapped["context"]["provider"], "openai");
+        assert_eq!(chat_wrapped["context"]["model"], "gpt-4o-mini");
+        assert_eq!(chat_wrapped["context"]["session_id"], "s1");
+        assert_eq!(
+            SkillExecutionContext {
+                provider: Some("deepseek"),
+                model: Some("deepseek-chat"),
+                query: Some("差旅"),
+                metadata: json!({"react_mode": "unified"}),
+                ..SkillExecutionContext::new("u1")
+            }
+            .public_payload(),
+            json!({
+                "user_id": "u1",
+                "conversation_id": null,
+                "session_id": null,
+                "query": "差旅",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "trace_id": null,
+                "metadata": {"react_mode": "unified"},
+            })
+        );
 
         let messages = build_skill_messages(
             " 我叫什么 ",
@@ -2325,13 +2394,11 @@ mod tests {
 
         let err = execute_named_from(
             &sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
-            "u1",
             "crm_lookup",
             &json!({}),
+            &SkillExecutionContext::new("u1"),
             &manifests,
-            None,
             &[],
-            None,
             None,
         )
         .await
@@ -2339,13 +2406,11 @@ mod tests {
         assert!(err.contains("尚未接入实际执行器"));
         let ready_err = execute_named_from(
             &sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
-            "u1",
             "ticket_create",
             &json!({}),
+            &SkillExecutionContext::new("u1"),
             &manifests,
-            None,
             &[],
-            None,
             None,
         )
         .await
@@ -2707,9 +2772,11 @@ mod tests {
         );
         let disclosure = maybe_run_progressive_disclosure(
             &pool,
-            "u1",
+            &SkillExecutionContext {
+                conversation_id: Some("c1"),
+                ..SkillExecutionContext::new("u1")
+            },
             "请展开刚才摘要对应的完整对话",
-            Some("c1"),
             &queried,
             &[],
             true,
@@ -2739,9 +2806,11 @@ mod tests {
         );
         let merged = maybe_disclose_original_memory(
             &pool,
-            "u1",
+            &SkillExecutionContext {
+                conversation_id: Some("c1"),
+                ..SkillExecutionContext::new("u1")
+            },
             "请展开刚才摘要对应的完整对话",
-            Some("c1"),
             queried,
             &[],
             true,
@@ -2786,9 +2855,11 @@ mod tests {
         });
         let skipped = maybe_disclose_original_memory(
             &pool,
-            "u1",
+            &SkillExecutionContext {
+                conversation_id: Some("c1"),
+                ..SkillExecutionContext::new("u1")
+            },
             "请展开原始对话",
-            Some("c1"),
             queried.clone(),
             &[],
             false,
@@ -2798,9 +2869,11 @@ mod tests {
         assert!(skipped.get("progressive_disclosure").is_none());
         let merged = maybe_disclose_original_memory(
             &pool,
-            "u1",
+            &SkillExecutionContext {
+                conversation_id: Some("c1"),
+                ..SkillExecutionContext::new("u1")
+            },
             "请展开原始对话",
-            Some("c1"),
             queried,
             &[],
             true,
