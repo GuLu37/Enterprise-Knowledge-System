@@ -853,6 +853,32 @@ fn sse_tool_call_payload(name: &str, args: serde_json::Value, reason: &str) -> s
     })
 }
 
+/// 对齐 Python `RagWorkflowResult.message`。
+fn rag_workflow_message(has_results: bool) -> &'static str {
+    if has_results {
+        "检索完成"
+    } else {
+        "当前知识库未检索到足够相关资料"
+    }
+}
+
+/// 对齐 Python `stream_chat` 的 RAG `tool_result`。
+fn sse_rag_tool_result_payload(
+    sources: &[serde_json::Value],
+    retrieval_method: Option<&str>,
+    rewritten_query: &str,
+    expanded_queries: &[String],
+    has_results: bool,
+) -> serde_json::Value {
+    json!({
+        "sources": sources,
+        "retrieval_method": retrieval_method,
+        "rewritten_query": rewritten_query,
+        "expanded_queries": expanded_queries,
+        "message": rag_workflow_message(has_results),
+    })
+}
+
 fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
     items.iter().map(|item| item.to_json()).collect()
 }
@@ -1417,13 +1443,18 @@ pub async fn generate_chat(
         Some(llm_client.clone()),
     )
     .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+    let allow_retrieval = allow_retrieval_for_intent(&intent);
     let messages = build_messages(
         &long_term,
         &turn.context,
         history_messages,
         &query,
-        allow_retrieval_for_intent(&intent),
-        "",
+        allow_retrieval,
+        if allow_retrieval {
+            rag_workflow_message(!turn.sources.is_empty())
+        } else {
+            ""
+        },
     );
     let (answer, _) = invoke_llm_safely(llm_client.as_ref(), &messages).await;
     spawn_persist_turn(
@@ -1754,10 +1785,17 @@ pub async fn stream_chat(
         };
         let sources = source_payload(&turn.sources);
         if use_retrieval {
-            yield Ok(sse_json("tool_result", json!({
-                "sources": sources,
-                "retrieval_method": turn.retrieval_method,
-            })));
+            let expanded_queries = crate::retrieval::expand_multi_query(&retrieval_query);
+            yield Ok(sse_json(
+                "tool_result",
+                sse_rag_tool_result_payload(
+                    &sources,
+                    turn.retrieval_method.as_deref(),
+                    &retrieval_query,
+                    &expanded_queries,
+                    !turn.sources.is_empty(),
+                ),
+            ));
             yield Ok(sse_json("sources", json!({"sources": sources})));
         }
         if turn.used_react {
@@ -1822,13 +1860,18 @@ pub async fn stream_chat(
                 return;
             }
         };
+        let allow_retrieval = allow_retrieval_for_intent(&intent);
         let messages = build_messages(
             &long_term,
             &turn.context,
             history_messages,
             &query,
-            allow_retrieval_for_intent(&intent),
-            "",
+            allow_retrieval,
+            if allow_retrieval {
+                rag_workflow_message(!turn.sources.is_empty())
+            } else {
+                ""
+            },
         );
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
@@ -2157,6 +2200,31 @@ mod tests {
         assert_eq!(payload["args"]["query"], "我叫什么");
         assert_eq!(payload["reason"], "rule");
         assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn sse_rag_tool_result_includes_python_fields() {
+        let sources = vec![json!({"content": "差旅"})];
+        let payload = sse_rag_tool_result_payload(
+            &sources,
+            Some("hybrid"),
+            "差旅报销标准",
+            &["差旅报销标准".into(), "差旅报销流程".into()],
+            true,
+        );
+        assert_eq!(payload["rewritten_query"], "差旅报销标准");
+        assert_eq!(payload["expanded_queries"][0], "差旅报销标准");
+        assert_eq!(payload["expanded_queries"][1], "差旅报销流程");
+        assert_eq!(payload["message"], "检索完成");
+        assert_eq!(payload["retrieval_method"], "hybrid");
+        assert_eq!(payload["sources"].as_array().unwrap().len(), 1);
+
+        let empty = sse_rag_tool_result_payload(&[], None, "", &[], false);
+        assert_eq!(empty["rewritten_query"], "");
+        assert_eq!(empty["expanded_queries"], json!([]));
+        assert_eq!(empty["message"], "当前知识库未检索到足够相关资料");
+        assert_eq!(empty["sources"], json!([]));
+        assert!(empty["retrieval_method"].is_null());
     }
 
     #[test]
