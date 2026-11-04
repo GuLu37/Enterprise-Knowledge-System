@@ -174,6 +174,7 @@ pub async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<Value>, AuthError> {
+    crate::validate::login_fields(&request.username, &request.password)?;
     let username = request.username.trim().to_lowercase();
     if username.is_empty() || request.password.is_empty() {
         return Err(AuthError::unauthorized("用户名或密码错误"));
@@ -196,6 +197,11 @@ pub async fn register(
     State(state): State<AppState>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<Value>, AuthError> {
+    crate::validate::register_fields(
+        &request.username,
+        &request.password,
+        &request.confirm_password,
+    )?;
     let username = request.username.trim().to_lowercase();
     if username.is_empty() {
         return Err(AuthError::bad_request("账号不能为空"));
@@ -225,6 +231,7 @@ pub async fn refresh(
     State(state): State<AppState>,
     Json(request): Json<RefreshTokenRequest>,
 ) -> Result<Json<Value>, AuthError> {
+    crate::validate::refresh_token_field(&request.refresh_token)?;
     let claims = decode_token(&request.refresh_token, "refresh", &state.config.jwt_secret_key)?;
     let user = db::get_user_by_id(&state.pool, &claims.uid)
         .await?
@@ -253,6 +260,7 @@ pub async fn change_password(
     Json(request): Json<PasswordChangeRequest>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    crate::validate::password_change_fields(&request.current_password, &request.new_password)?;
     if !verify_password(&request.current_password, &user.password_salt, &user.password_hash) {
         return Err(AuthError::bad_request("当前密码不正确"));
     }
@@ -413,13 +421,7 @@ pub struct RetrievalRequest {
 }
 
 fn reject_empty_query(query: &str) -> Result<(), AuthError> {
-    if query.trim().is_empty() {
-        Err(AuthError::unprocessable(
-            "String should have at least 1 character",
-        ))
-    } else {
-        Ok(())
-    }
+    crate::validate::string_min_length(query, 1)
 }
 
 pub async fn retrieval_dense(
@@ -445,12 +447,9 @@ async fn retrieval_simple(
     method: &str,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request
-        .top_k
-        .unwrap_or(state.config.search_top_k)
-        .clamp(1, 50);
+    reject_empty_query(&request.query)?;
+    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
     let query = request.query.trim().to_string();
-    reject_empty_query(&query)?;
     let mut results = if method == "dense" {
         state.engine.search_dense(&query, top_k).await
     } else {
@@ -527,6 +526,7 @@ pub async fn execute_skill(
     Json(request): Json<SkillExecuteBody>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    crate::validate::skill_name_field(&request.name)?;
     let name = request.name.trim();
     let manifests = &state.config.mcp_remote_tool_manifests;
     let Some(definition) = crate::skills::get_skill_definition_from(name, manifests) else {
@@ -578,12 +578,9 @@ pub async fn retrieval_hybrid(
     Json(request): Json<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request
-        .top_k
-        .unwrap_or(state.config.search_top_k)
-        .clamp(1, 50);
+    reject_empty_query(&request.query)?;
+    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
     let query = request.query.trim().to_string();
-    reject_empty_query(&query)?;
     let recalled = state
         .engine
         .retrieve_documents_multi_query(&query, top_k, None)
@@ -608,12 +605,9 @@ pub async fn retrieval_rag(
     Json(request): Json<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let top_k = request
-        .top_k
-        .unwrap_or(state.config.search_top_k)
-        .clamp(1, 50);
+    reject_empty_query(&request.query)?;
+    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
     let query = request.query.trim().to_string();
-    reject_empty_query(&query)?;
     let (results, context) = state
         .engine
         .run_rag_workflow(&query, top_k)
@@ -669,9 +663,10 @@ mod health_tests {
 
     #[test]
     fn empty_retrieval_query_is_unprocessable() {
-        let err = reject_empty_query("   ").unwrap_err();
+        let err = reject_empty_query("").unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.detail, "String should have at least 1 character");
+        assert!(reject_empty_query("   ").is_ok());
         assert!(reject_empty_query("差旅").is_ok());
     }
 }

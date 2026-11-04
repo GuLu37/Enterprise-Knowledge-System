@@ -359,6 +359,24 @@ fn prepare_chat_request(request: &ChatStreamRequest) -> Result<(String, String),
     Ok((query, retrieval_method))
 }
 
+/// 对齐 FastAPI `ChatRequest` Pydantic 字段：越界/非法字面量在进入业务前 422。
+fn validate_chat_schema(request: &ChatStreamRequest) -> Result<(), crate::auth::AuthError> {
+    crate::validate::chat_request_fields(&crate::validate::ChatSchema {
+        temperature: request.temperature,
+        top_k: request.top_k,
+        retrieval_method: request.retrieval_method.clone(),
+        short_memory_strategy: request.short_memory_strategy.clone(),
+        short_memory_n: request.short_memory_n,
+        short_memory_m: request.short_memory_m,
+        history: request
+            .history
+            .iter()
+            .map(|item| (item.role.clone(), item.content.clone()))
+            .collect(),
+        query: request.query.clone(),
+    })
+}
+
 const RAG_QUERY_REWRITE_SYSTEM_PROMPT: &str = "你是企业知识库检索 query 改写器。\
 当用户问题已经确定需要进入 RAG 检索时，把口语化、模糊或省略的信息改写成更精准、书面化、适合检索的中文表述。\
 只改写检索语句，不回答问题，不补充企业资料中没有的事实。\
@@ -1170,6 +1188,7 @@ pub async fn generate_chat(
     axum::Json(request): axum::Json<ChatStreamRequest>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
+    validate_chat_schema(&request)?;
     let (query, retrieval_method) = match prepare_chat_request(&request) {
         Ok(value) => value,
         Err(detail) => return Err(crate::auth::AuthError::bad_request(&detail)),
@@ -1341,6 +1360,7 @@ pub async fn stream_chat(
     axum::Json(request): axum::Json<ChatStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
+    validate_chat_schema(&request)?;
     let (query, retrieval_method) = match prepare_chat_request(&request) {
         Ok(value) => value,
         Err(detail) => return Err(crate::auth::AuthError::bad_request(&detail)),
@@ -1815,6 +1835,43 @@ mod tests {
         assert_eq!(
             validate_retrieval_method(Some(" BM25 ")).unwrap_err(),
             "不支持的检索方式:  BM25 "
+        );
+    }
+
+    #[test]
+    fn chat_schema_rejects_pydantic_constraints() {
+        let mut request = ChatStreamRequest {
+            query: "差旅报销标准".into(),
+            history: Vec::new(),
+            conversation_id: None,
+            session_id: None,
+            top_k: 5,
+            use_retrieval: true,
+            retrieval_method: Some("hybrid".into()),
+            provider: None,
+            model: None,
+            temperature: Some(0.2),
+            short_memory_strategy: "window".into(),
+            short_memory_n: 5,
+            short_memory_m: 10,
+        };
+        assert!(validate_chat_schema(&request).is_ok());
+        request.temperature = Some(2.5);
+        assert_eq!(
+            validate_chat_schema(&request).unwrap_err().detail,
+            "Input should be less than or equal to 2"
+        );
+        request.temperature = Some(0.2);
+        request.history = history(&[("tool", "结果")]);
+        assert_eq!(
+            validate_chat_schema(&request).unwrap_err().detail,
+            "Input should be 'system', 'user' or 'assistant'"
+        );
+        request.history.clear();
+        request.query = "".into();
+        assert_eq!(
+            validate_chat_schema(&request).unwrap_err().detail,
+            "String should have at least 1 character"
         );
     }
 

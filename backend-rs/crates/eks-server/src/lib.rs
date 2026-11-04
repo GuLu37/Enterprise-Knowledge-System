@@ -28,6 +28,7 @@ pub mod short_memory;
 pub mod skills;
 pub mod state;
 pub mod trace;
+pub mod validate;
 
 #[cfg(test)]
 mod tests;

@@ -108,6 +108,7 @@ pub async fn upsert_conversation(
     Json(request): Json<ConversationUpsertRequest>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    crate::validate::session_id_field(request.session_id.as_deref())?;
     let cid = conversation_id.trim().to_string();
     if cid.is_empty() {
         return Err(AuthError::bad_request("conversation_id 不能为空"));

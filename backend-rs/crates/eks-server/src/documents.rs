@@ -132,7 +132,7 @@ async fn list_documents_page(
     limit: i64,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(state, headers).await?;
-    let skip = skip.max(0);
+    let skip = crate::validate::document_list_skip(skip)?;
     let limit = limit.clamp(1, 1000);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
         .fetch_one(&state.pool)
@@ -171,7 +171,9 @@ pub async fn list_documents_compat(
     headers: HeaderMap,
     Query(query): Query<DocumentListQuery>,
 ) -> Result<Json<Value>, AuthError> {
-    list_documents_page(&state, &headers, query.skip, query.limit.unwrap_or(10).clamp(1, 100)).await
+    let skip = crate::validate::document_list_skip(query.skip)?;
+    let limit = crate::validate::document_list_limit(query.limit)?;
+    list_documents_page(&state, &headers, skip, limit).await
 }
 
 fn deletion_rejected(status: &str) -> Option<String> {
