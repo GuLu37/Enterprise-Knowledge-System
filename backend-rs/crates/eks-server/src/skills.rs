@@ -249,12 +249,22 @@ pub async fn execute_named_from(
     arguments: &Value,
     manifests: &[Value],
 ) -> Result<Value, String> {
-    if let Some(definition) = get_skill_definition_from(name, manifests) {
+    let definition = get_skill_definition_from(name, manifests);
+    let kind = crate::trace::trace_kind(definition.as_ref().map(|item| item.kind.as_str()), name);
+    let display_name = definition
+        .as_ref()
+        .map(|item| item.name.as_str())
+        .unwrap_or(name);
+    let context = json!({ "user_id": user_id });
+    crate::trace::log_tool_call(kind, display_name, arguments, &context);
+    if let Some(definition) = definition.as_ref() {
         if definition.kind == "remote_mcp" {
-            return Err(crate::remote_mcp::execution_error_message(&definition));
+            let err = crate::remote_mcp::execution_error_message(definition);
+            crate::trace::log_tool_error(kind, display_name, &err, &context);
+            return Err(err);
         }
     }
-    match name {
+    let result = match name {
         "list_available_tools" => Ok(list_available_tools(manifests)),
         "list_knowledge_base_files" => list_knowledge_base_files(pool, arguments).await,
         "document_hot_word_statistics" => hot_words(pool, arguments).await,
@@ -263,6 +273,21 @@ pub async fn execute_named_from(
         "delete_profile_memory" => delete_profile_memory(pool, user_id, arguments).await,
         "search_knowledge_base" => Err("检索请走 /retrieval 或聊天接口".into()),
         other => Err(format!("未知技能: {other}")),
+    };
+    match result {
+        Ok(payload) => {
+            crate::trace::log_tool_result(
+                kind,
+                display_name,
+                &crate::trace::skill_result_summary(&payload),
+                &context,
+            );
+            Ok(payload)
+        }
+        Err(err) => {
+            crate::trace::log_tool_error(kind, display_name, &err, &context);
+            Err(err)
+        }
     }
 }
 

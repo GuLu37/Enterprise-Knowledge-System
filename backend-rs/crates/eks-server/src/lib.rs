@@ -23,6 +23,7 @@ pub mod routes;
 pub mod short_memory;
 pub mod skills;
 pub mod state;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;

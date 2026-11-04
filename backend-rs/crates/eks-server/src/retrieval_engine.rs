@@ -11,6 +11,8 @@ use eks_kernels::rerank::{
     score_result, is_reference_index_result,
 };
 
+use serde_json::json;
+
 use crate::embedder::Embedder;
 use crate::milvus_lite::MilvusLiteStore;
 use crate::llm::LlmClient;
@@ -333,34 +335,55 @@ impl RetrievalEngine {
             return Ok((Vec::new(), String::new()));
         }
         let method = crate::planner::resolve_method_for_query(query, method);
+        let arguments = json!({
+            "query": query,
+            "top_k": top_k,
+            "retrieval_method": method,
+        });
+        crate::trace::log_tool_call("tool", "search_knowledge_base", &arguments, &json!({}));
         let cache_key = crate::rag_cache::rag_cache_key(query, top_k, &method);
-        {
-            let cache = self.result_cache.lock().await;
-            if let Some(hit) = cache.get(&cache_key) {
-                tracing::info!(query, method = method.as_str(), "检索结果缓存命中");
-                return Ok(hit);
+        let outcome: Result<(Vec<RetrievalItem>, String), String> = async {
+            {
+                let cache = self.result_cache.lock().await;
+                if let Some(hit) = cache.get(&cache_key) {
+                    tracing::info!(query, method = method.as_str(), "检索结果缓存命中");
+                    return Ok(hit);
+                }
+            }
+            let (processed, context) = match method.as_str() {
+                crate::planner::RETRIEVAL_METHOD_DENSE => {
+                    let recalled = self.search_dense(query, top_k).await?;
+                    let processed = self.post_process(query, recalled, top_k).await?;
+                    let context = assemble_processed_context(&processed);
+                    (processed, context)
+                }
+                crate::planner::RETRIEVAL_METHOD_SPARSE => {
+                    let recalled = self.search_sparse(query, top_k).await?;
+                    let processed = self.post_process(query, recalled, top_k).await?;
+                    let context = assemble_processed_context(&processed);
+                    (processed, context)
+                }
+                _ => self.run_hybrid_workflow(query, top_k, llm).await?,
+            };
+            self.result_cache
+                .lock()
+                .await
+                .put(cache_key, processed.clone(), context.clone());
+            Ok((processed, context))
+        }
+        .await;
+        match &outcome {
+            Ok((processed, _)) => crate::trace::log_tool_result(
+                "tool",
+                "search_knowledge_base",
+                &crate::trace::rag_result_summary(&method, processed.len(), processed.is_empty()),
+                &json!({}),
+            ),
+            Err(err) => {
+                crate::trace::log_tool_error("tool", "search_knowledge_base", err, &json!({}));
             }
         }
-        let (processed, context) = match method.as_str() {
-            crate::planner::RETRIEVAL_METHOD_DENSE => {
-                let recalled = self.search_dense(query, top_k).await?;
-                let processed = self.post_process(query, recalled, top_k).await?;
-                let context = assemble_processed_context(&processed);
-                (processed, context)
-            }
-            crate::planner::RETRIEVAL_METHOD_SPARSE => {
-                let recalled = self.search_sparse(query, top_k).await?;
-                let processed = self.post_process(query, recalled, top_k).await?;
-                let context = assemble_processed_context(&processed);
-                (processed, context)
-            }
-            _ => self.run_hybrid_workflow(query, top_k, llm).await?,
-        };
-        self.result_cache
-            .lock()
-            .await
-            .put(cache_key, processed.clone(), context.clone());
-        Ok((processed, context))
+        outcome
     }
 
     pub async fn retrieve_documents_multi_query(
