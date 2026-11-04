@@ -94,10 +94,12 @@ fn normalized_allowed_types(types: &[String]) -> HashSet<String> {
 
 fn reject_unsupported_file_type(file_type: &str, allowed: &[String]) -> Option<String> {
     let file_type = file_type.trim().trim_start_matches('.').to_lowercase();
-    if normalized_allowed_types(allowed).contains(&file_type) {
-        None
-    } else {
+    if !normalized_allowed_types(allowed).contains(&file_type)
+        || !crate::ingest::is_extractable_type(&file_type)
+    {
         Some(format!("不支持的文件类型: {file_type}"))
+    } else {
+        None
     }
 }
 
@@ -348,7 +350,12 @@ pub async fn get_document_content(
         .collect::<Vec<_>>()
         .join("\n\n");
     if content.is_empty() {
-        if let Ok(snapshot) = state.engine.store.collection("doc_chunk").await {
+        if let Ok(snapshot) = state
+            .engine
+            .store
+            .collection(&state.engine.child_collection)
+            .await
+        {
             content = crate::milvus_lite::document_content_from_rows(&snapshot.rows, &document_id);
         }
     }
@@ -619,7 +626,7 @@ async fn process_document_upload_inner(
 
     crate::ingest::append_to_milvus_lite(
         &state.engine.store,
-        "doc_chunk",
+        &state.engine.child_collection,
         &chunks.children,
         original_name,
         file_type,
@@ -917,6 +924,16 @@ mod tests {
         );
         assert!(reject_unsupported_file_type("PDF", &allowed).is_none());
         assert!(reject_unsupported_file_type("md", &allowed).is_none());
+        let defaults = crate::config::parse_allowed_file_types("");
+        assert_eq!(
+            reject_unsupported_file_type("doc", &defaults).as_deref(),
+            Some("不支持的文件类型: doc")
+        );
+        assert_eq!(
+            reject_unsupported_file_type("ppt", &defaults).as_deref(),
+            Some("不支持的文件类型: ppt")
+        );
+        assert!(reject_unsupported_file_type("pptx", &defaults).is_none());
         assert_eq!(
             reject_oversized_upload(104_857_601, 104_857_600),
             Some("文件超过最大上传限制")
