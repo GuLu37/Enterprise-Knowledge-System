@@ -328,8 +328,28 @@ async fn execute_tool(
             Err(err) => (json!({"error": err}), Vec::new()),
         };
     }
-    match skills::execute_named_from(pool, user_id, &call.name, &call.arguments, mcp_manifests).await {
-        Ok(result) => (json!({"ok": true, "result": result}), Vec::new()),
+    match skills::execute_named_from(pool, user_id, &call.name, &call.arguments, mcp_manifests, None).await {
+        Ok(result) => {
+            let result = if call.name == "memory_query" {
+                match skills::maybe_disclose_original_memory(
+                    pool,
+                    user_id,
+                    original_query,
+                    None,
+                    result,
+                    mcp_manifests,
+                    false,
+                )
+                .await
+                {
+                    Ok(merged) => merged,
+                    Err(err) => return (json!({"error": err}), Vec::new()),
+                }
+            } else {
+                result
+            };
+            (json!({"ok": true, "result": result}), Vec::new())
+        }
         Err(err) => (json!({"error": err}), Vec::new()),
     }
 }

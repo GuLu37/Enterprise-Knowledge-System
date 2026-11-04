@@ -48,6 +48,7 @@ const ORIGINAL_MEMORY_HINTS: &[&str] = &[
     "逐字",
     "前后文",
     "展开",
+    "细节",
 ];
 
 const MEMORY_QUERY_HINTS: &[&str] = &[
@@ -233,13 +234,91 @@ fn extract_delete_keywords(query: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn should_disclose_original_memory(query: &str) -> bool {
+    let normalized: String = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    !normalized.is_empty() && ORIGINAL_MEMORY_HINTS.iter().any(|hint| normalized.contains(hint))
+}
+
+fn matched_memory_ids(result: &Value) -> Vec<String> {
+    result
+        .get("matched_memories")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("memory_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub async fn maybe_disclose_original_memory(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    memory_query_result: Value,
+    manifests: &[Value],
+    allow_conversation_fallback: bool,
+) -> Result<Value, String> {
+    if !should_disclose_original_memory(query) {
+        return Ok(memory_query_result);
+    }
+    let memory_ids = matched_memory_ids(&memory_query_result);
+    let disclosure_arguments = if !memory_ids.is_empty() {
+        json!({
+            "memory_ids": memory_ids,
+            "include_neighbors": 1,
+            "top_k": 8,
+            "max_chars": 12000,
+        })
+    } else if allow_conversation_fallback {
+        let conversation_id = conversation_id.unwrap_or("").trim();
+        if conversation_id.is_empty() {
+            return Ok(memory_query_result);
+        }
+        json!({
+            "conversation_id": conversation_id,
+            "include_all_conversation": true,
+            "top_k": 8,
+            "max_chars": 12000,
+        })
+    } else {
+        return Ok(memory_query_result);
+    };
+    let original = execute_named_from(
+        pool,
+        user_id,
+        "memory_retrieve_original",
+        &disclosure_arguments,
+        manifests,
+        conversation_id,
+    )
+    .await?;
+    Ok(json!({
+        "memory_query": memory_query_result,
+        "original_conversation": original,
+        "progressive_disclosure": true,
+    }))
+}
+
 pub async fn execute_named(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
-    execute_named_from(pool, user_id, name, arguments, &[]).await
+    execute_named_from(pool, user_id, name, arguments, &[], None).await
 }
 
 pub async fn execute_named_from(
@@ -248,6 +327,7 @@ pub async fn execute_named_from(
     name: &str,
     arguments: &Value,
     manifests: &[Value],
+    conversation_id: Option<&str>,
 ) -> Result<Value, String> {
     let definition = get_skill_definition_from(name, manifests);
     let kind = crate::trace::trace_kind(definition.as_ref().map(|item| item.kind.as_str()), name);
@@ -255,7 +335,17 @@ pub async fn execute_named_from(
         .as_ref()
         .map(|item| item.name.as_str())
         .unwrap_or(name);
-    let context = json!({ "user_id": user_id });
+    let mut arguments = arguments.clone();
+    if name == "memory_retrieve_original" {
+        let existing = arg_str(&arguments, "conversation_id");
+        if existing.is_empty() {
+            if let Some(conversation_id) = conversation_id.map(str::trim).filter(|item| !item.is_empty()) {
+                arguments["conversation_id"] = json!(conversation_id);
+            }
+        }
+    }
+    let arguments = &arguments;
+    let context = json!({ "user_id": user_id, "conversation_id": conversation_id });
     crate::trace::log_tool_call(kind, display_name, arguments, &context);
     if let Some(definition) = definition.as_ref() {
         if definition.kind == "remote_mcp" {
@@ -388,9 +478,18 @@ fn format_hot_words(result: &Value) -> String {
 }
 
 fn format_memory_query(result: &Value) -> String {
-    let profiles = result.get("profile_memories").and_then(|value| value.as_array()).cloned().unwrap_or_default();
-    let matched = result.get("matched_memories").and_then(|value| value.as_array()).cloned().unwrap_or_default();
-    if profiles.is_empty() && matched.is_empty() {
+    let disclosed = result
+        .get("progressive_disclosure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let payload = if disclosed {
+        result.get("memory_query").unwrap_or(result)
+    } else {
+        result
+    };
+    let profiles = payload.get("profile_memories").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+    let matched = payload.get("matched_memories").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+    if profiles.is_empty() && matched.is_empty() && !disclosed {
         return "当前账号还没有可用的画像或长期记忆。".into();
     }
     let mut lines = Vec::new();
@@ -410,15 +509,49 @@ fn format_memory_query(result: &Value) -> String {
             lines.push(format!("- {short}"));
         }
     }
-    lines.join("\n")
+    if disclosed {
+        if let Some(original) = result.get("original_conversation") {
+            let expanded = format_original(original);
+            if !expanded.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(expanded);
+            }
+        }
+    }
+    if lines.is_empty() {
+        "当前账号还没有可用的画像或长期记忆。".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn format_original(result: &Value) -> String {
-    let content = result.get("content").and_then(|value| value.as_str()).unwrap_or("").trim();
-    if content.is_empty() {
-        return "没有找到可展开的原始对话。".into();
+    let chunks = result
+        .get("original_chunks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let joined = if chunks.is_empty() {
+        result.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string()
+    } else {
+        chunks
+            .iter()
+            .filter_map(|item| item.get("content").and_then(Value::as_str))
+            .filter(|item| !item.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    if joined.trim().is_empty() {
+        return result
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or("没有找到可展开的原始对话。")
+            .to_string();
     }
-    format!("按你的要求展开原始对话：\n\n{content}")
+    format!("按你的要求展开原始对话：\n\n{joined}")
 }
 
 #[derive(Clone)]
@@ -569,23 +702,33 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
             }),
             "memory_query_result",
         ),
-        skill_def(
-            "memory_retrieve_original",
-            "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，或需要核对原始措辞时使用。",
-            "memory",
-            &["memory", "conversation", "original", "progressive_disclosure"],
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "memory_ids": {"type": "array", "items": {"type": "string"}},
-                    "query": {"type": "string"},
-                    "conversation_id": {"type": "string"},
-                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 12000}
-                }
-            }),
-            "original_conversation_result",
-        ),
+        {
+            let mut skill = skill_def(
+                "memory_retrieve_original",
+                "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，或需要核对原始措辞时使用。",
+                "memory",
+                &["memory", "conversation", "original", "progressive_disclosure"],
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "memory_ids": {"type": "array", "items": {"type": "string"}},
+                        "summary_memory_ids": {"type": "array", "items": {"type": "string"}},
+                        "query": {"type": "string"},
+                        "conversation_id": {"type": "string"},
+                        "turn_start": {"type": "integer", "minimum": 0},
+                        "turn_end": {"type": "integer", "minimum": 0},
+                        "include_neighbors": {"type": "integer", "minimum": 0, "maximum": 5, "default": 0},
+                        "include_all_conversation": {"type": "boolean", "default": false},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 8},
+                        "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 12000}
+                    }
+                }),
+                "original_conversation_result",
+            );
+            skill.metadata["progressive_disclosure"] = json!(true);
+            skill
+        },
         skill_def(
             "delete_profile_memory",
             "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除某条个人信息时使用。",
@@ -1333,33 +1476,26 @@ async fn memory_query(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value)
 }
 
 async fn memory_original(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value) -> Result<Value, String> {
-    let max_chars = arg_usize(arguments, "max_chars", 12000, 500, 50000);
-    let query = arg_str(arguments, "query");
-    let terms = query_terms(&query);
-    let rows = load_memories(pool, user_id, None, 400).await?;
-    let mut pieces = Vec::new();
-    let mut used = 0usize;
-    for row in rows.into_iter().filter(memory_active).filter(|row| row.memory_type != "profile") {
-        let normalized = eks_kernels::normalize_text(&row.content);
-        if !terms.is_empty() && !terms.iter().any(|term| normalized.contains(term)) {
-            continue;
-        }
-        if used >= max_chars {
-            break;
-        }
-        let remain = max_chars - used;
-        let piece: String = row.content.chars().take(remain).collect();
-        used += piece.chars().count();
-        pieces.push(piece);
-        if pieces.len() >= 8 {
-            break;
-        }
+    let mut memory_ids = arg_strings(arguments, "memory_ids");
+    if memory_ids.is_empty() {
+        memory_ids = arg_strings(arguments, "summary_memory_ids");
     }
-    Ok(json!({
-        "query": query,
-        "content": pieces.join("\n\n"),
-        "piece_count": pieces.len(),
-    }))
+    Ok(crate::memory::retrieve_original_conversation(
+        pool,
+        user_id,
+        crate::memory::OriginalConversationQuery {
+            memory_ids,
+            query: arg_str(arguments, "query"),
+            conversation_id: arg_str(arguments, "conversation_id"),
+            turn_start: arg_i64(arguments, "turn_start"),
+            turn_end: arg_i64(arguments, "turn_end"),
+            include_neighbors: arg_usize(arguments, "include_neighbors", 0, 0, 5) as i64,
+            include_all_conversation: arg_bool(arguments, "include_all_conversation", false),
+            top_k: arg_usize(arguments, "top_k", 8, 1, 50),
+            max_chars: arg_usize(arguments, "max_chars", 12000, 500, 50000),
+        },
+    )
+    .await)
 }
 
 async fn delete_profile_memory(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value) -> Result<Value, String> {
@@ -1482,14 +1618,22 @@ fn arg_usize(arguments: &Value, key: &str, default: usize, min: usize, max: usiz
         .clamp(min, max)
 }
 
-fn query_terms(query: &str) -> Vec<String> {
-    extract_term_frequencies(query)
-        .into_iter()
-        .filter(|(_, count)| *count > 0)
-        .map(|(term, _)| term)
-        .filter(|term| term.chars().count() >= 2)
-        .take(12)
-        .collect()
+fn arg_i64(arguments: &Value, key: &str) -> Option<i64> {
+    arguments.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().map(|item| item as i64))
+            .or_else(|| value.as_str().and_then(|item| item.trim().parse().ok()))
+    })
+}
+
+fn arg_bool(arguments: &Value, key: &str, default: bool) -> bool {
+    match arguments.get(key) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(value)) => matches!(value.trim().to_lowercase().as_str(), "true" | "1" | "yes"),
+        _ => default,
+    }
 }
 
 fn top_terms(text: &str, limit: usize) -> Vec<String> {
@@ -1801,6 +1945,7 @@ mod tests {
             "crm_lookup",
             &json!({}),
             &manifests,
+            None,
         )
         .await
         .unwrap_err();
@@ -1811,6 +1956,7 @@ mod tests {
             "ticket_create",
             &json!({}),
             &manifests,
+            None,
         )
         .await
         .unwrap_err();
@@ -1893,6 +2039,141 @@ mod tests {
         assert_eq!(
             queried.pointer("/matched_memories/0/metadata/memory_key").and_then(|value| value.as_str()),
             Some("semantic_memory_l1")
+        );
+    }
+
+    #[test]
+    fn original_memory_hints_include_details_and_strip_whitespace() {
+        assert!(should_disclose_original_memory("请展开 完整 对话"));
+        assert!(should_disclose_original_memory("把刚才的细节说清楚"));
+        assert!(!should_disclose_original_memory("我之前说过什么"));
+        assert!(!should_disclose_original_memory("   "));
+        let intent = route_local_skill("请展开之前摘要对应的完整对话").expect("original");
+        assert_eq!(intent.name, "memory_retrieve_original");
+        assert_eq!(intent.arguments.get("top_k").and_then(Value::as_u64), Some(8));
+        assert_eq!(intent.arguments.get("max_chars").and_then(Value::as_u64), Some(12000));
+    }
+
+    #[tokio::test]
+    async fn memory_query_merges_progressive_disclosure_from_matched_ids() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        let summary_id = crate::memory::insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】项目 Alpha\n【摘要】用户确认了上线计划。",
+            70.0,
+            90,
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        crate::memory::insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 请确认 Alpha 上线计划\n助手: 已确认本周五上线。",
+            55.0,
+            90,
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"Alpha 上线","memory_scope":"event","top_k":5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queried.pointer("/matched_memories/0/memory_id").and_then(Value::as_str),
+            Some(summary_id.as_str())
+        );
+        let merged = maybe_disclose_original_memory(
+            &pool,
+            "u1",
+            "请展开刚才摘要对应的完整对话",
+            Some("c1"),
+            queried,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.get("progressive_disclosure").and_then(Value::as_bool), Some(true));
+        assert!(
+            merged
+                .pointer("/original_conversation/original_chunks/0/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("Alpha 上线计划")
+        );
+        let formatted = format_skill_answer("memory_query", &merged);
+        assert!(formatted.contains("按你的要求展开原始对话"));
+        assert!(formatted.contains("Alpha 上线计划"));
+    }
+
+    #[tokio::test]
+    async fn memory_query_disclosure_falls_back_to_conversation_id() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        crate::memory::insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 完整原文在这里\n助手: 已记下",
+            55.0,
+            90,
+            Some(0),
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let queried = json!({
+            "matched_memories": [],
+            "profile_memories": [],
+            "summary": {"profile_count": 0, "matched_count": 0},
+        });
+        let skipped = maybe_disclose_original_memory(
+            &pool,
+            "u1",
+            "请展开原始对话",
+            Some("c1"),
+            queried.clone(),
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(skipped.get("progressive_disclosure").is_none());
+        let merged = maybe_disclose_original_memory(
+            &pool,
+            "u1",
+            "请展开原始对话",
+            Some("c1"),
+            queried,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.get("progressive_disclosure").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            merged
+                .pointer("/original_conversation/original_chunks")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
         );
     }
 }

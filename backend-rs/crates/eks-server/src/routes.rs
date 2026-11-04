@@ -504,6 +504,7 @@ pub async fn execute_skill(
         name,
         &request.arguments,
         manifests,
+        request.context.conversation_id.as_deref(),
     )
     .await
     .map_err(|detail| AuthError::bad_request(&detail))?;

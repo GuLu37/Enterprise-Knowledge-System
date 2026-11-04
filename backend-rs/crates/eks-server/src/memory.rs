@@ -515,6 +515,434 @@ pub async fn hierarchical_prompt(
     format_hierarchical_prompt(&hits)
 }
 
+/// 按摘要引用、会话或检索提示展开当前用户的原始对话。
+#[derive(Debug, Clone, Default)]
+pub struct OriginalConversationQuery {
+    pub memory_ids: Vec<String>,
+    pub query: String,
+    pub conversation_id: String,
+    pub turn_start: Option<i64>,
+    pub turn_end: Option<i64>,
+    pub include_neighbors: i64,
+    pub include_all_conversation: bool,
+    pub top_k: usize,
+    pub max_chars: usize,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct OriginalMemoryRow {
+    memory_id: String,
+    memory_key: Option<String>,
+    content: String,
+    conversation_id: Option<String>,
+    session_id: Option<String>,
+    turn_start: Option<i64>,
+    turn_end: Option<i64>,
+    created_at: String,
+}
+
+fn empty_original_conversation(summary: &str) -> Value {
+    json!({
+        "mode": "original_conversation",
+        "summary": summary,
+        "summary_references": [],
+        "original_chunks": [],
+    })
+}
+
+fn serialize_original_row(row: &OriginalMemoryRow) -> Value {
+    json!({
+        "memory_id": row.memory_id,
+        "content": row.content,
+        "conversation_id": row.conversation_id,
+        "session_id": row.session_id,
+        "chunk_type": row.memory_key.as_deref().unwrap_or("dialogue"),
+        "topic": "",
+        "turn_start": row.turn_start,
+        "turn_end": row.turn_end,
+        "status": "active",
+    })
+}
+
+fn clamp_original_query(query: &OriginalConversationQuery) -> OriginalConversationQuery {
+    let mut turn_start = query.turn_start.map(|value| value.max(0));
+    let mut turn_end = query.turn_end.map(|value| value.max(0));
+    if let (Some(start), Some(end)) = (turn_start, turn_end) {
+        if end < start {
+            turn_start = Some(end);
+            turn_end = Some(start);
+        }
+    }
+    OriginalConversationQuery {
+        memory_ids: query
+            .memory_ids
+            .iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        query: query.query.trim().to_string(),
+        conversation_id: query.conversation_id.trim().to_string(),
+        turn_start,
+        turn_end,
+        include_neighbors: query.include_neighbors.clamp(0, 5),
+        include_all_conversation: query.include_all_conversation,
+        top_k: query.top_k.clamp(1, 50),
+        max_chars: query.max_chars.clamp(500, 50_000),
+    }
+}
+
+fn bound_original_chunks(chunks: Vec<Value>, max_chars: usize) -> (Vec<Value>, bool) {
+    let mut total_chars = 0usize;
+    let mut bounded = Vec::new();
+    for mut chunk in chunks {
+        let remaining = max_chars.saturating_sub(total_chars);
+        if remaining == 0 {
+            break;
+        }
+        let content = chunk
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if content.chars().count() > remaining {
+            let truncated: String = content.chars().take(remaining).collect();
+            chunk["content"] = json!(truncated);
+        }
+        total_chars += chunk
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .count();
+        bounded.push(chunk);
+    }
+    (bounded, total_chars >= max_chars)
+}
+
+fn chunk_sort_key(chunk: &Value) -> (String, i64, String) {
+    (
+        chunk
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        chunk.get("turn_start").and_then(Value::as_i64).unwrap_or(0),
+        chunk
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+fn turns_overlap(row: &OriginalMemoryRow, start: Option<i64>, end: Option<i64>) -> bool {
+    if row.turn_start.is_none() && row.turn_end.is_none() {
+        return true;
+    }
+    if let Some(start) = start {
+        if row.turn_end.is_some_and(|turn_end| turn_end < start) {
+            return false;
+        }
+    }
+    if let Some(end) = end {
+        if row.turn_start.is_some_and(|turn_start| turn_start > end) {
+            return false;
+        }
+    }
+    true
+}
+
+fn recovered_from_summary(reference: &Value, conversation_id: &str, start: Option<i64>, end: Option<i64>) -> Option<Value> {
+    let content = reference.get("content").and_then(Value::as_str).unwrap_or("");
+    let transcript = content.split_once("【原文】")?.1.trim();
+    if transcript.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "memory_id": reference.get("memory_id"),
+        "conversation_id": conversation_id,
+        "session_id": reference.get("session_id"),
+        "chunk_type": "dialogue_recovered",
+        "turn_start": start,
+        "turn_end": end,
+        "content": transcript,
+        "source_summary_memory_id": reference.get("memory_id"),
+        "score": reference.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+    }))
+}
+
+async fn load_active_event_rows(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    memory_ids: &[String],
+    conversation_id: Option<&str>,
+    dialogue_only: bool,
+    limit: i64,
+) -> Vec<OriginalMemoryRow> {
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT memory_id, memory_key, content, conversation_id, session_id, \
+         turn_start, turn_end, created_at \
+         FROM memory_records WHERE user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(" AND memory_type = 'event' AND status = 'active'");
+    if !memory_ids.is_empty() {
+        builder.push(" AND memory_id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for memory_id in memory_ids {
+                separated.push_bind(memory_id);
+            }
+        }
+        builder.push(")");
+    }
+    if let Some(conversation_id) = conversation_id.filter(|item| !item.is_empty()) {
+        builder.push(" AND conversation_id = ");
+        builder.push_bind(conversation_id);
+    }
+    if dialogue_only {
+        builder.push(" AND memory_key = 'dialogue'");
+    }
+    builder.push(" ORDER BY created_at ASC LIMIT ");
+    builder.push_bind(limit);
+    builder
+        .build_query_as::<OriginalMemoryRow>()
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!("原文记忆读取失败: {err}");
+            Vec::new()
+        })
+}
+
+async fn mark_ids_accessed(pool: &sqlx::SqlitePool, user_id: &str, memory_ids: &[String]) {
+    let hits: Vec<EventMemoryHit> = memory_ids
+        .iter()
+        .filter(|item| !item.is_empty())
+        .map(|memory_id| EventMemoryHit {
+            memory_id: memory_id.clone(),
+            content: String::new(),
+            memory_key: String::new(),
+            conversation_id: None,
+            session_id: None,
+            turn_start: None,
+            turn_end: None,
+            score: 0.0,
+            lexical_score: 0.0,
+            importance_score: 0.0,
+        })
+        .collect();
+    mark_accessed(pool, user_id, &hits).await;
+}
+
+pub async fn retrieve_original_conversation(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: OriginalConversationQuery,
+) -> Value {
+    if user_id.trim().is_empty() {
+        return empty_original_conversation("请提供摘要 memory_id、检索提示或 conversation_id。");
+    }
+    let _ = ensure_schema(pool).await;
+    let query = clamp_original_query(&query);
+    if query.memory_ids.is_empty() && query.query.is_empty() && query.conversation_id.is_empty() {
+        return empty_original_conversation("请提供摘要 memory_id、检索提示或 conversation_id。");
+    }
+
+    let mut summary_references: Vec<Value> = Vec::new();
+    if !query.memory_ids.is_empty() {
+        let rows = load_active_event_rows(
+            pool,
+            user_id,
+            &query.memory_ids,
+            None,
+            false,
+            query.memory_ids.len() as i64,
+        )
+        .await;
+        summary_references.extend(rows.iter().map(serialize_original_row));
+    } else if query.include_all_conversation && !query.conversation_id.is_empty() {
+        let mut rows = load_active_event_rows(
+            pool,
+            user_id,
+            &[],
+            Some(query.conversation_id.as_str()),
+            true,
+            1000,
+        )
+        .await;
+        rows.sort_by_key(|row| (row.turn_start.unwrap_or(0), row.created_at.clone()));
+        let chunks = rows.iter().map(serialize_original_row).collect();
+        let (bounded, truncated) = bound_original_chunks(chunks, query.max_chars);
+        mark_ids_accessed(
+            pool,
+            user_id,
+            &bounded
+                .iter()
+                .filter_map(|item| item.get("memory_id").and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        return json!({
+            "mode": "original_conversation",
+            "summary": format!("已展开当前会话的 {} 个原始对话块。", bounded.len()),
+            "summary_references": [],
+            "original_chunks": bounded,
+            "truncated": truncated,
+        });
+    } else if !query.query.is_empty() {
+        let hits = search_event_memories(
+            pool,
+            user_id,
+            &query.query,
+            if query.conversation_id.is_empty() {
+                None
+            } else {
+                Some(query.conversation_id.as_str())
+            },
+            None,
+            query.top_k,
+            None,
+        )
+        .await;
+        summary_references.extend(hits.iter().filter(|hit| hit.memory_key.starts_with("semantic_memory")).map(|hit| {
+            json!({
+                "memory_id": hit.memory_id,
+                "content": hit.content,
+                "conversation_id": hit.conversation_id,
+                "session_id": hit.session_id,
+                "chunk_type": hit.memory_key,
+                "topic": "",
+                "turn_start": hit.turn_start,
+                "turn_end": hit.turn_end,
+                "score": hit.score,
+            })
+        }));
+        if summary_references.is_empty() {
+            let raw_chunks: Vec<Value> = hits
+                .iter()
+                .filter(|hit| hit.memory_key == "dialogue")
+                .map(|hit| {
+                    json!({
+                        "memory_id": hit.memory_id,
+                        "conversation_id": hit.conversation_id,
+                        "turn_start": hit.turn_start,
+                        "turn_end": hit.turn_end,
+                        "content": hit.content,
+                        "score": hit.score,
+                    })
+                })
+                .collect();
+            return json!({
+                "mode": "original_conversation",
+                "summary": format!("已按语义找到 {} 个原始对话块。", raw_chunks.len()),
+                "summary_references": [],
+                "original_chunks": raw_chunks,
+            });
+        }
+    }
+
+    let mut original_chunks: Vec<Value> = Vec::new();
+    let mut seen_raw_ids = std::collections::HashSet::new();
+    for reference in summary_references.iter().take(query.top_k) {
+        let reference_conversation = reference
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !query.conversation_id.is_empty()
+            && !reference_conversation.is_empty()
+            && reference_conversation != query.conversation_id
+        {
+            continue;
+        }
+        let ref_conversation = if reference_conversation.is_empty() {
+            query.conversation_id.clone()
+        } else {
+            reference_conversation
+        };
+        if ref_conversation.is_empty() {
+            continue;
+        }
+        let mut ref_start = if query.turn_start.is_some() {
+            query.turn_start
+        } else {
+            reference.get("turn_start").and_then(Value::as_i64)
+        };
+        let mut ref_end = if query.turn_end.is_some() {
+            query.turn_end
+        } else {
+            reference.get("turn_end").and_then(Value::as_i64)
+        };
+        if let Some(start) = ref_start {
+            ref_start = Some((start - query.include_neighbors).max(0));
+        }
+        if let Some(end) = ref_end {
+            ref_end = Some(end + query.include_neighbors);
+        }
+        let rows = load_active_event_rows(
+            pool,
+            user_id,
+            &[],
+            Some(ref_conversation.as_str()),
+            true,
+            (query.top_k * 4) as i64,
+        )
+        .await;
+        let mut matched_any = false;
+        for row in rows {
+            if !turns_overlap(&row, ref_start, ref_end) || !seen_raw_ids.insert(row.memory_id.clone()) {
+                continue;
+            }
+            matched_any = true;
+            let mut serialized = serialize_original_row(&row);
+            serialized["source_summary_memory_id"] = reference.get("memory_id").cloned().unwrap_or(Value::Null);
+            serialized["score"] = json!(reference.get("score").and_then(Value::as_f64).unwrap_or(0.0));
+            original_chunks.push(serialized);
+        }
+        if !matched_any {
+            if let Some(recovered) = recovered_from_summary(reference, &ref_conversation, ref_start, ref_end) {
+                original_chunks.push(recovered);
+            }
+        }
+    }
+
+    original_chunks.sort_by_key(chunk_sort_key);
+    let (bounded, truncated) = bound_original_chunks(original_chunks, query.max_chars);
+    let mut accessed: Vec<String> = summary_references
+        .iter()
+        .filter_map(|item| item.get("memory_id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    accessed.extend(
+        bounded
+            .iter()
+            .filter_map(|item| item.get("memory_id").and_then(Value::as_str).map(str::to_string)),
+    );
+    mark_ids_accessed(pool, user_id, &accessed).await;
+    let summary_preview: Vec<Value> = summary_references
+        .iter()
+        .take(query.top_k)
+        .map(|item| {
+            json!({
+                "memory_id": item.get("memory_id"),
+                "conversation_id": item.get("conversation_id"),
+                "chunk_type": item.get("chunk_type"),
+                "topic": item.get("topic"),
+                "turn_start": item.get("turn_start"),
+                "turn_end": item.get("turn_end"),
+            })
+        })
+        .collect();
+    json!({
+        "mode": "original_conversation",
+        "summary": format!("已展开 {} 个原始对话块。", bounded.len()),
+        "summary_references": summary_preview,
+        "original_chunks": bounded,
+        "truncated": truncated,
+    })
+}
+
 pub fn format_hierarchical_prompt(hits: &[EventMemoryHit]) -> String {
     if hits.is_empty() {
         return String::new();
@@ -746,7 +1174,34 @@ pub(crate) async fn insert_event_memory(
     content: &str,
     importance: f64,
     expiry_days: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<String, sqlx::Error> {
+    insert_event_memory_at(
+        pool,
+        user_id,
+        conversation_id,
+        session_id,
+        memory_key,
+        content,
+        importance,
+        expiry_days,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn insert_event_memory_at(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    session_id: &str,
+    memory_key: &str,
+    content: &str,
+    importance: f64,
+    expiry_days: i64,
+    turn_start: Option<i64>,
+    turn_end: Option<i64>,
+) -> Result<String, sqlx::Error> {
     let now = crate::db::now_naive();
     let now_text = crate::db::fmt_dt(&now);
     let expires_at = crate::db::fmt_dt(&(now + chrono::Duration::days(expiry_days.max(1))));
@@ -759,9 +1214,9 @@ pub(crate) async fn insert_event_memory(
     sqlx::query(
         "INSERT INTO memory_records (
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
-            importance_score, base_importance_score, confidence_score, access_count, status,
-            version, created_at, updated_at, expires_at
-        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, 0.7, 0, 'active', 1, ?, ?, ?)",
+            turn_start, turn_end, importance_score, base_importance_score, confidence_score,
+            access_count, status, version, created_at, updated_at, expires_at
+        ) VALUES (?, ?, 'event', ?, ?, ?, ?, ?, ?, ?, ?, 0.7, 0, 'active', 1, ?, ?, ?)",
     )
     .bind(&memory_id)
     .bind(user_id)
@@ -769,6 +1224,8 @@ pub(crate) async fn insert_event_memory(
     .bind(content)
     .bind(empty_to_none(conversation_id))
     .bind(empty_to_none(session_id))
+    .bind(turn_start)
+    .bind(turn_end)
     .bind(importance)
     .bind(importance)
     .bind(&now_text)
@@ -776,7 +1233,7 @@ pub(crate) async fn insert_event_memory(
     .bind(&expires_at)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(memory_id)
 }
 
 fn empty_to_none(value: &str) -> Option<&str> {
@@ -1181,5 +1638,184 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn original_conversation_expands_summary_range_for_current_user() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let summary_id = insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】项目 Alpha\n【摘要】用户确认了上线计划。",
+            70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        let raw_id = insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 请确认 Alpha 上线计划\n助手: 已确认本周五上线。",
+            55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 昨天的天气如何\n助手: 晴。",
+            40.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(0),
+            Some(0),
+        )
+        .await
+        .unwrap();
+        insert_event_memory_at(
+            &pool,
+            "u2",
+            "c9",
+            "s9",
+            "semantic_memory_l1",
+            "其他用户的摘要",
+            90.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(0),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let result = retrieve_original_conversation(
+            &pool,
+            "u1",
+            OriginalConversationQuery {
+                memory_ids: vec![summary_id.clone()],
+                include_neighbors: 0,
+                top_k: 8,
+                max_chars: 12000,
+                ..OriginalConversationQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            result.pointer("/summary_references/0/memory_id").and_then(Value::as_str),
+            Some(summary_id.as_str())
+        );
+        assert_eq!(
+            result.pointer("/original_chunks/0/memory_id").and_then(Value::as_str),
+            Some(raw_id.as_str())
+        );
+        assert!(result.pointer("/original_chunks/0/content").and_then(Value::as_str).unwrap_or("").contains("Alpha 上线计划"));
+        assert_eq!(result.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(1));
+
+        let hidden = retrieve_original_conversation(
+            &pool,
+            "u1",
+            OriginalConversationQuery {
+                memory_ids: vec!["missing-other".into()],
+                top_k: 8,
+                max_chars: 12000,
+                ..OriginalConversationQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(hidden.get("summary_references").and_then(Value::as_array).map(Vec::len), Some(0));
+        assert_eq!(hidden.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn original_conversation_recovers_embedded_transcript_and_whole_session() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let summary_id = insert_event_memory_at(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "【主题】Alpha\n【摘要】确认上线。\n【原文】用户: 周五上线吗\n助手: 是的",
+            70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        let recovered = retrieve_original_conversation(
+            &pool,
+            "u1",
+            OriginalConversationQuery {
+                memory_ids: vec![summary_id],
+                include_neighbors: 0,
+                top_k: 8,
+                max_chars: 12000,
+                ..OriginalConversationQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            recovered.pointer("/original_chunks/0/chunk_type").and_then(Value::as_str),
+            Some("dialogue_recovered")
+        );
+        assert!(recovered.pointer("/original_chunks/0/content").and_then(Value::as_str).unwrap_or("").contains("周五上线吗"));
+
+        insert_event_memory_at(
+            &pool,
+            "u1",
+            "c2",
+            "s2",
+            "dialogue",
+            "用户: 第一句\n助手: 收到",
+            55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(0),
+            Some(0),
+        )
+        .await
+        .unwrap();
+        insert_event_memory_at(
+            &pool,
+            "u1",
+            "c2",
+            "s2",
+            "dialogue",
+            "用户: 第二句\n助手: 记下了",
+            55.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            Some(1),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let whole = retrieve_original_conversation(
+            &pool,
+            "u1",
+            OriginalConversationQuery {
+                conversation_id: "c2".into(),
+                include_all_conversation: true,
+                top_k: 8,
+                max_chars: 12000,
+                ..OriginalConversationQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(whole.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(2));
+        assert!(whole.get("summary").and_then(Value::as_str).unwrap_or("").contains("当前会话"));
     }
 }

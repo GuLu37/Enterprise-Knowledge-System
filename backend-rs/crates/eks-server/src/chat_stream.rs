@@ -143,14 +143,27 @@ async fn prepare_skill_action(
     if name.is_empty() {
         return Err("skill 路由缺少 skill_name".into());
     }
-    let result = crate::skills::execute_named_from(
+    let mut result = crate::skills::execute_named_from(
         input.pool,
         input.user_id,
         name,
         &intent.skill_arguments,
         input.mcp_manifests,
+        nonempty(input.conversation_id),
     )
     .await?;
+    if name == "memory_query" {
+        result = crate::skills::maybe_disclose_original_memory(
+            input.pool,
+            input.user_id,
+            input.query,
+            nonempty(input.conversation_id),
+            result,
+            input.mcp_manifests,
+            true,
+        )
+        .await?;
+    }
     let wrapped = crate::skills::wrap_skill_execution(
         name,
         &intent.skill_arguments,
