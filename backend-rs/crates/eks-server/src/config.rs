@@ -77,7 +77,8 @@ pub struct Config {
     pub log_dir: String,
     pub log_level: String,
     pub upload_dir: String,
-    pub search_top_k: usize,
+    /// 对齐 Python `SEARCH_TOP_K`：加载时不夹取，使用处再 `max(1, min(..., 50))`。
+    pub search_top_k: i64,
     pub similarity_threshold: f64,
     pub milvus_child_collection: String,
     pub milvus_memory_collection: String,
@@ -416,11 +417,27 @@ pub fn resolve_upload_dir(upload_dir: &str, sqlite_path: &str) -> PathBuf {
 
 /// 对齐 Python `int(os.getenv("CHAT_MAX_CONVERSATIONS"))`：不做 1–200 夹取。
 fn parse_chat_max_conversations(raw: &str, default: i64) -> i64 {
+    parse_unclamped_i64(raw, default)
+}
+
+/// 对齐 Python `int(os.getenv(...))`：空值用缺省，已给的值不做范围夹取。
+fn parse_unclamped_i64(raw: &str, default: i64) -> i64 {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return default;
+        default
+    } else {
+        trimmed.parse().unwrap_or(default)
     }
-    trimmed.parse().unwrap_or(default)
+}
+
+/// 对齐 Python `float(os.getenv(...))`：空值用缺省，已给的值不做 0–1 夹取。
+fn parse_unclamped_f64(raw: &str, default: f64) -> f64 {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        default
+    } else {
+        trimmed.parse().unwrap_or(default)
+    }
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -529,15 +546,27 @@ impl Config {
             log_dir: env_or("LOG_DIR", "logs"),
             log_level: env_or("LOG_LEVEL", "INFO"),
             upload_dir: env_or("UPLOAD_DIR", ""),
-            search_top_k: env_i64("SEARCH_TOP_K", 5).clamp(1, 50) as usize,
-            similarity_threshold: env_f64("SIMILARITY_THRESHOLD", 0.5).clamp(0.0, 1.0),
+            search_top_k: parse_unclamped_i64(
+                &env::var("SEARCH_TOP_K").unwrap_or_default(),
+                5,
+            ),
+            similarity_threshold: parse_unclamped_f64(
+                &env::var("SIMILARITY_THRESHOLD").unwrap_or_default(),
+                0.5,
+            ),
             milvus_child_collection: env_first(
                 &["MILVUS_CHILD_COLLECTION_NAME", "MILVUS_DOC_COLLECTION_NAME"],
                 "doc_chunk",
             ),
             milvus_memory_collection: env_or("MILVUS_MEMORY_COLLECTION_NAME", "memory_chunks"),
-            dense_weight: env_f64("DENSE_WEIGHT", 0.5).clamp(0.0, 1.0),
-            sparse_weight: env_f64("SPARSE_WEIGHT", 0.5).clamp(0.0, 1.0),
+            dense_weight: parse_unclamped_f64(
+                &env::var("DENSE_WEIGHT").unwrap_or_default(),
+                0.5,
+            ),
+            sparse_weight: parse_unclamped_f64(
+                &env::var("SPARSE_WEIGHT").unwrap_or_default(),
+                0.5,
+            ),
             use_dense_retriever: env_bool("USE_DENSE_RETRIEVER", true),
             use_sparse_retriever: env_bool("USE_SPARSE_RETRIEVER", true),
             use_hybrid_retriever: env_bool("USE_HYBRID_RETRIEVER", true),
@@ -681,6 +710,20 @@ mod tests {
         assert_eq!(parse_chat_max_conversations("-3", 20), -3);
         assert_eq!(parse_chat_max_conversations("", 20), 20);
         assert_eq!(parse_chat_max_conversations("abc", 20), 20);
+    }
+
+    #[test]
+    fn retrieval_weights_and_thresholds_are_not_clamped_at_load() {
+        assert_eq!(parse_unclamped_i64("100", 5), 100);
+        assert_eq!(parse_unclamped_i64("0", 5), 0);
+        assert_eq!(parse_unclamped_i64("-3", 5), -3);
+        assert_eq!(parse_unclamped_i64("", 5), 5);
+        assert_eq!(parse_unclamped_i64("abc", 5), 5);
+        assert_eq!(parse_unclamped_f64("1.5", 0.5), 1.5);
+        assert_eq!(parse_unclamped_f64("-0.2", 0.5), -0.2);
+        assert_eq!(parse_unclamped_f64("0", 0.5), 0.0);
+        assert_eq!(parse_unclamped_f64("", 0.5), 0.5);
+        assert_eq!(parse_unclamped_f64("nope", 0.5), 0.5);
     }
 
     #[test]
