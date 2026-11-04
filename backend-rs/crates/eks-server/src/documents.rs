@@ -208,6 +208,10 @@ fn format_upload_task_submitted(document_id: &str) -> String {
     format!("[文档上传] 后台处理任务已提交 (document_id={document_id})")
 }
 
+fn format_milvus_content_skip(error: &str, document_id: &str) -> String {
+    format!("从 Milvus 读取文档正文切片失败，已跳过: {error} (document_id={document_id})")
+}
+
 fn deletion_rejected(status: &str) -> Option<String> {
     match status.trim() {
         "deleting" | "deleted" => Some(format!("文档当前状态为 {status}，无法重复删除")),
@@ -421,13 +425,17 @@ pub async fn get_document_content(
         .collect::<Vec<_>>()
         .join("\n\n");
     if content.is_empty() {
-        if let Ok(snapshot) = state
+        match state
             .engine
             .store
             .collection(&state.engine.child_collection)
             .await
         {
-            content = crate::milvus_lite::document_content_from_rows(&snapshot.rows, &document_id);
+            Ok(snapshot) => {
+                content = crate::milvus_lite::document_content_from_rows(&snapshot.rows, &document_id);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("{}", format_milvus_content_skip(&err.to_string(), &document_id)),
         }
     }
     if content.is_empty() && !row.file_path.is_empty() {
@@ -638,7 +646,7 @@ async fn process_document_upload(
     )
     .await;
     if let Err(err) = result {
-        tracing::error!(document_id = %document_id, "文档后台处理失败: {err}");
+        tracing::error!("文档后台处理失败 (document_id={document_id}): {err}");
         if !document_delete_requested(
             current_document_status(&state.pool, &document_id)
                 .await
@@ -646,7 +654,9 @@ async fn process_document_upload(
                 .flatten()
                 .as_deref(),
         ) {
+            tracing::info!("开始更新文档状态为 failed (document_id={document_id})");
             mark_document_failed(&state.pool, &document_id, &err).await;
+            tracing::info!("文档状态更新完成 (document_id={document_id}, status=failed)");
         }
     }
     delete_local_uploaded_file(&stored_path, &document_id, "background_processed");
@@ -671,6 +681,11 @@ async fn process_document_upload_inner(
     })
     .await
     .map_err(|err| err.to_string())??;
+    tracing::info!(
+        "文本抽取完成 (document_id={document_id}, text_len={})",
+        chunks.text_len
+    );
+    tracing::info!("开始 Parent-Child 切块 (document_id={document_id})");
     tracing::info!(
         "切块完成 (document_id={document_id}, parents={}, children={})",
         chunks.parents.len(),
@@ -701,10 +716,22 @@ async fn process_document_upload_inner(
         .iter()
         .map(|child| child.child_text.clone())
         .collect();
+    tracing::info!(
+        "开始初始化 BGE Embedding (document_id={document_id}, children={})",
+        child_texts.len()
+    );
+    tracing::info!(
+        "BGE Embedding 就绪，开始向量化 (document_id={document_id}, children={})",
+        child_texts.len()
+    );
     let vectors = tokio::task::spawn_blocking(move || embedder.embed_documents(&child_texts))
         .await
         .map_err(|err| err.to_string())?
         .map_err(|err| format!("向量化失败: {err}"))?;
+    tracing::info!(
+        "BGE 向量化完成 (document_id={document_id}, vectors={})",
+        vectors.len()
+    );
 
     crate::ingest::append_to_milvus_lite(
         &state.engine.store,
@@ -718,6 +745,11 @@ async fn process_document_upload_inner(
     )
     .await
     .map_err(|err| format!("向量库写入失败: {err}"))?;
+    tracing::info!(
+        "Milvus Child 写入成功 (document_id={document_id}, parents={}, children={})",
+        chunks.parents.len(),
+        chunks.children.len()
+    );
     log_upload_step(
         document_id,
         "3/3",
@@ -734,8 +766,13 @@ async fn process_document_upload_inner(
         return Ok(());
     }
 
+    tracing::info!("开始更新文档状态为 ready (document_id={document_id})");
     replace_document_chunk_records(&state.pool, document_id, &chunks.parents).await?;
     mark_document_ready(&state.pool, document_id, chunks.children.len() as i64).await?;
+    tracing::info!(
+        "文档状态更新完成 (document_id={document_id}, status=ready, children={})",
+        chunks.children.len()
+    );
     state.engine.invalidate().await;
     tracing::info!(
         "✓ 文档后台处理完成 (document_id={document_id}, children={})",
@@ -973,6 +1010,10 @@ mod tests {
         assert_eq!(
             format_upload_task_submitted("doc-1"),
             "[文档上传] 后台处理任务已提交 (document_id=doc-1)"
+        );
+        assert_eq!(
+            format_milvus_content_skip("connection reset", "doc-1"),
+            "从 Milvus 读取文档正文切片失败，已跳过: connection reset (document_id=doc-1)"
         );
     }
 

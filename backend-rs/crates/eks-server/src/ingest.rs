@@ -1184,6 +1184,7 @@ fn split_structured_row_chunks(text: &str) -> Vec<String> {
 pub struct ChunkResult {
     pub parents: Vec<ParentRow>,
     pub children: Vec<ChildRow>,
+    pub text_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1264,7 +1265,11 @@ pub fn build_parent_child_chunks(
         }
     }
 
-    ChunkResult { parents, children }
+    ChunkResult {
+        parents,
+        children,
+        text_len: text.chars().count(),
+    }
 }
 
 /// 抽取文本并切块；空正文或无 child 时返回与 Python 相同的错误文案。
