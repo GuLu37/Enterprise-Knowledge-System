@@ -74,6 +74,7 @@ pub struct Config {
     pub search_top_k: usize,
     pub similarity_threshold: f64,
     pub milvus_child_collection: String,
+    pub milvus_memory_collection: String,
     pub dense_weight: f64,
     pub sparse_weight: f64,
     pub use_dense_retriever: bool,
@@ -85,7 +86,7 @@ pub struct Config {
 const DEFAULT_CORS_ORIGINS: &str =
     r#"["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080"]"#;
 const DEFAULT_ALLOWED_FILE_TYPES: &str =
-    r#"["pdf", "txt", "md", "doc", "docx", "ppt", "pptx", "xlsx", "xls"]"#;
+    r#"["pdf", "txt", "md", "doc", "docx", "ppt", "pptx", "xlsx", "xls", "html", "htm", "csv", "tsv"]"#;
 const DEFAULT_MAX_UPLOAD_SIZE: i64 = 104_857_600;
 
 /// 对齐 Python `_parse_list`：JSON 数组，失败则按逗号拆。
@@ -439,6 +440,7 @@ impl Config {
                 &["MILVUS_CHILD_COLLECTION_NAME", "MILVUS_DOC_COLLECTION_NAME"],
                 "doc_chunk",
             ),
+            milvus_memory_collection: env_or("MILVUS_MEMORY_COLLECTION_NAME", "memory_chunks"),
             dense_weight: env_f64("DENSE_WEIGHT", 0.5).clamp(0.0, 1.0),
             sparse_weight: env_f64("SPARSE_WEIGHT", 0.5).clamp(0.0, 1.0),
             use_dense_retriever: env_bool("USE_DENSE_RETRIEVER", true),
@@ -529,6 +531,7 @@ impl Config {
             search_top_k: 5,
             similarity_threshold: 0.5,
             milvus_child_collection: "doc_chunk".into(),
+            milvus_memory_collection: "memory_chunks".into(),
             dense_weight: 0.5,
             sparse_weight: 0.5,
             use_dense_retriever: true,
@@ -592,6 +595,7 @@ mod tests {
         assert!(Config::jwt_test().upload_dir.is_empty());
         assert!(!Config::jwt_test().cross_encoder_enabled);
         assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
+        assert_eq!(Config::jwt_test().milvus_memory_collection, "memory_chunks");
         assert_eq!(Config::jwt_test().dense_weight, 0.5);
         assert_eq!(Config::jwt_test().sparse_weight, 0.5);
         assert!(Config::jwt_test().use_dense_retriever);
@@ -696,5 +700,12 @@ mod tests {
         assert!(defaults.contains(&"pdf".to_string()));
         assert!(defaults.contains(&"xls".to_string()));
         assert!(defaults.contains(&"doc".to_string()));
+        assert!(defaults.contains(&"html".to_string()));
+        assert!(defaults.contains(&"csv".to_string()));
+        assert!(defaults.contains(&"tsv".to_string()));
+        assert_eq!(
+            resolve_app_path("logs", "logs"),
+            "../backend/app/logs"
+        );
     }
 }

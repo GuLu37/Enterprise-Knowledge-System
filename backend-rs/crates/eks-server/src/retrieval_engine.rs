@@ -167,6 +167,7 @@ pub struct RetrievalEngine {
     pub use_sparse: bool,
     pub use_hybrid: bool,
     pub sparse_index_max_rows: usize,
+    pub similarity_threshold: f64,
     pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
     pub ce_candidate_k: usize,
     pub ce_weight: f64,
@@ -176,6 +177,10 @@ pub struct RetrievalEngine {
     pub ce_trigger_mode: String,
     sparse: tokio::sync::RwLock<Option<Arc<SparseIndexSnapshot>>>,
     result_cache: tokio::sync::Mutex<crate::rag_cache::RagResultCache>,
+}
+
+fn passes_similarity_threshold(score: f64, threshold: f64) -> bool {
+    threshold <= 0.0 || score >= threshold
 }
 
 impl RetrievalEngine {
@@ -191,6 +196,7 @@ impl RetrievalEngine {
             use_sparse: true,
             use_hybrid: true,
             sparse_index_max_rows: 50_000,
+            similarity_threshold: 0.5,
             cross_encoder: None,
             ce_candidate_k: 30,
             ce_weight: 0.65,
@@ -211,6 +217,7 @@ impl RetrievalEngine {
         self.use_sparse = config.use_sparse_retriever;
         self.use_hybrid = config.use_hybrid_retriever;
         self.sparse_index_max_rows = config.sparse_index_max_rows;
+        self.similarity_threshold = config.similarity_threshold;
         self
     }
 
@@ -306,6 +313,7 @@ impl RetrievalEngine {
             .map_err(|err| err.to_string())?;
         Ok(hits
             .into_iter()
+            .filter(|(_, score)| passes_similarity_threshold(*score, self.similarity_threshold))
             .map(|(index, score)| RetrievalItem::from_row(&snapshot.rows[index], score, "dense"))
             .collect())
     }
@@ -1210,4 +1218,18 @@ fn build_structured_section_summary(
     summary.score = anchor.score.max(0.0) + 0.08;
     summary.source = "structured_evidence".to_string();
     Some(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_threshold_keeps_scores_at_or_above_cutoff() {
+        assert!(passes_similarity_threshold(0.5, 0.5));
+        assert!(passes_similarity_threshold(0.9, 0.5));
+        assert!(!passes_similarity_threshold(0.49, 0.5));
+        assert!(passes_similarity_threshold(0.01, 0.0));
+        assert!(passes_similarity_threshold(-1.0, 0.0));
+    }
 }

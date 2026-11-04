@@ -23,14 +23,7 @@ pub fn parse_log_level(raw: &str) -> &'static str {
 }
 
 pub fn resolve_log_dir(raw: &str) -> PathBuf {
-    let path = PathBuf::from(if raw.trim().is_empty() { "logs" } else { raw.trim() });
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
+    PathBuf::from(crate::config::resolve_app_path(raw, "logs"))
 }
 
 pub fn should_rotate(current_day: NaiveDate, record_day: NaiveDate, size: u64) -> bool {
@@ -206,6 +199,16 @@ pub fn init_tracing(log_dir: &str, log_level: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_log_dir_relative_to_backend_app() {
+        assert_eq!(resolve_log_dir("logs"), PathBuf::from("../backend/app/logs"));
+        assert_eq!(resolve_log_dir(""), PathBuf::from("../backend/app/logs"));
+        assert_eq!(
+            resolve_log_dir("/var/log/eks"),
+            PathBuf::from("/var/log/eks")
+        );
+    }
 
     #[test]
     fn parses_python_log_levels() {

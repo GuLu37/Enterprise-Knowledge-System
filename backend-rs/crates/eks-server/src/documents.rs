@@ -934,6 +934,8 @@ mod tests {
             Some("不支持的文件类型: ppt")
         );
         assert!(reject_unsupported_file_type("pptx", &defaults).is_none());
+        assert!(reject_unsupported_file_type("html", &defaults).is_none());
+        assert!(reject_unsupported_file_type("csv", &defaults).is_none());
         assert_eq!(
             reject_oversized_upload(104_857_601, 104_857_600),
             Some("文件超过最大上传限制")
