@@ -37,6 +37,8 @@ pub struct Config {
     pub cross_encoder_confidence_threshold: f64,
     pub cross_encoder_confidence_margin: f64,
     pub cross_encoder_trigger_mode: String,
+    /// 对齐 Python `CROSS_ENCODER_DEVICE` 的 HTTP 回显；ONNX 推理仍走 CPU，不迁 HF device。
+    pub cross_encoder_device: String,
     pub llm_provider: String,
     pub llm_temperature: f64,
     pub llm_timeout: u64,
@@ -552,6 +554,7 @@ impl Config {
             cross_encoder_confidence_threshold: env_f64("CROSS_ENCODER_CONFIDENCE_THRESHOLD", 0.60).clamp(0.0, 1.0),
             cross_encoder_confidence_margin: env_f64("CROSS_ENCODER_CONFIDENCE_MARGIN", 0.08).clamp(0.0, 1.0),
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
+            cross_encoder_device: env_or("CROSS_ENCODER_DEVICE", "auto"),
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
             llm_timeout: env_i64("LLM_TIMEOUT", 60).max(1) as u64,
@@ -678,6 +681,7 @@ impl Config {
             cross_encoder_confidence_threshold: 0.6,
             cross_encoder_confidence_margin: 0.08,
             cross_encoder_trigger_mode: "adaptive".into(),
+            cross_encoder_device: "auto".into(),
             llm_provider: "ollama".into(),
             llm_temperature: 0.7,
             llm_timeout: 60,
@@ -832,6 +836,7 @@ mod tests {
         assert_eq!(Config::jwt_test().chat_max_conversations, 20);
         assert_eq!(Config::jwt_test().cross_encoder_max_length, 512);
         assert_eq!(Config::jwt_test().cross_encoder_batch_size, 8);
+        assert_eq!(Config::jwt_test().cross_encoder_device, "auto");
         assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
         assert_eq!(Config::jwt_test().milvus_memory_collection, "memory_chunks");
         assert_eq!(Config::jwt_test().dense_weight, 0.5);

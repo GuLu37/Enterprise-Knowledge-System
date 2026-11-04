@@ -1326,18 +1326,54 @@ pub async fn warmup_chat_runtime(state: &AppState) -> RuntimeWarmup {
     result
 }
 
+fn py_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
+fn py_opt(value: Option<&str>) -> String {
+    value.unwrap_or("None").to_string()
+}
+
+fn format_warmup_complete(
+    llm_warmed: bool,
+    embedding_warmed: bool,
+    cross_encoder_warmed: bool,
+    provider: Option<&str>,
+    duration_ms: f64,
+) -> String {
+    format!(
+        "聊天运行时后台预热完成: llm={} embedding={} cross_encoder={} provider={} duration={:.2}ms",
+        py_bool(llm_warmed),
+        py_bool(embedding_warmed),
+        py_bool(cross_encoder_warmed),
+        py_opt(provider),
+        duration_ms
+    )
+}
+
+fn format_warmup_error(err: &str) -> String {
+    format!("聊天运行时后台预热出错，首次请求将按需初始化: {err}")
+}
+
 pub fn spawn_background_warmup(state: AppState) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let result = warmup_chat_runtime(&state).await;
-        tracing::info!(
-            llm = result.llm_warmed,
-            embedding = result.embedding_warmed,
-            cross_encoder = result.cross_encoder_warmed,
-            provider = ?result.provider,
-            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "聊天运行时后台预热完成"
-        );
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(err) = result.error.as_deref() {
+            tracing::warn!("{}", format_warmup_error(err));
+        } else {
+            tracing::info!(
+                "{}",
+                format_warmup_complete(
+                    result.llm_warmed,
+                    result.embedding_warmed,
+                    result.cross_encoder_warmed,
+                    result.provider.as_deref(),
+                    duration_ms,
+                )
+            );
+        }
         state.store_warmup(result);
     });
 }
@@ -2802,6 +2838,16 @@ mod tests {
         assert_eq!(
             warmup_response_payload(&warmup)["cross_encoder_model"],
             "BAAI/bge-reranker-base"
+        );
+        assert_eq!(warmup.cross_encoder_device.as_deref(), Some("auto"));
+        assert_eq!(runtime_status_payload(&warmup)["cross_encoder_device"], "auto");
+        assert_eq!(
+            format_warmup_complete(true, true, false, None, 12.345),
+            "聊天运行时后台预热完成: llm=True embedding=True cross_encoder=False provider=None duration=12.35ms"
+        );
+        assert_eq!(
+            format_warmup_error("embed timeout"),
+            "聊天运行时后台预热出错，首次请求将按需初始化: embed timeout"
         );
     }
 

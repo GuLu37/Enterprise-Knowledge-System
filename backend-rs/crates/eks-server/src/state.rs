@@ -28,7 +28,8 @@ impl RuntimeWarmup {
             cross_encoder_warmed: false,
             // 对齐 Python `settings.CROSS_ENCODER_MODEL_NAME`：禁用时也回填模型名。
             cross_encoder_model: Some(config.cross_encoder_model_name.clone()),
-            cross_encoder_device: Some("cpu".into()),
+            // 对齐 Python `settings.CROSS_ENCODER_DEVICE`（默认 auto），不改变 ONNX CPU 推理。
+            cross_encoder_device: Some(config.cross_encoder_device.clone()),
             cross_encoder_error: None,
             provider: None,
             status: "initializing".into(),
