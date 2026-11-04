@@ -48,6 +48,7 @@ pub struct Config {
     pub unified_react_enabled: bool,
     pub unified_react_max_iterations: usize,
     pub react_max_iterations: usize,
+    pub retrieval_planner_llm_decision_enabled: bool,
 }
 
 const DEFAULT_CORS_ORIGINS: &str =
@@ -198,6 +199,10 @@ impl Config {
             unified_react_enabled: env_bool("UNIFIED_REACT_ENABLED", true),
             unified_react_max_iterations: env_i64("UNIFIED_REACT_MAX_ITERATIONS", 3).max(1) as usize,
             react_max_iterations: env_i64("REACT_MAX_ITERATIONS", 3).max(1) as usize,
+            retrieval_planner_llm_decision_enabled: env_bool(
+                "RETRIEVAL_PLANNER_LLM_DECISION_ENABLED",
+                true,
+            ),
         }
     }
 
@@ -249,6 +254,7 @@ impl Config {
             unified_react_enabled: true,
             unified_react_max_iterations: 3,
             react_max_iterations: 3,
+            retrieval_planner_llm_decision_enabled: true,
         }
     }
 }

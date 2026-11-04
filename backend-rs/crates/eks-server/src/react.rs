@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::llm::{ChatMessage, LlmClient, ToolCall};
+use crate::planner;
 use crate::retrieval::RetrievalItem;
 use crate::retrieval_engine::RetrievalEngine;
 use crate::skills;
@@ -29,14 +30,6 @@ const RAG_REACT_SYSTEM_PROMPT: &str = "你是企业知识库检索决策者。�
 优先在 1-2 轮内完成检索，避免重复或低价值查询；尽量一次性覆盖问题的多个方面。\n\
 示例：当用户问『04_产品与账号常见问题呢』这类文件名查询时，直接用文件名作为 query 调用 search_knowledge_base；若未检索到，说明该文档未在知识库中。\n\
 当你认为已经检索到足够资料时，直接输出简短说明（如「检索完成」）并停止调用工具。";
-
-const STRUCTURED_QUERY_TERMS: &[&str] = &[
-    "列出", "各", "分别", "有哪些", "名单", "列表", "清单", "明细", "统计", "数量", "多少",
-    "一共", "总数", "比较", "对比", "同时", "并且",
-];
-const PROCEDURAL_QUERY_TERMS: &[&str] = &[
-    "如何", "怎么", "流程", "步骤", "要求", "条件", "标准", "规定", "政策", "制度",
-];
 
 pub struct ReactOutcome {
     pub sources: Vec<RetrievalItem>,
@@ -210,7 +203,9 @@ async fn run_react_loop(
                 execute_tool(engine, pool, user_id, query, top_k, &call, &mut sources, mcp_manifests).await;
             notes.push(format!("{}: {}", call.name, truncate(&observation.to_string(), 240)));
             messages.push(tool_message(&call, observation));
-            if retrieval_quality_ok(&sources) && call.name == "search_knowledge_base" {
+            if call.name == "search_knowledge_base"
+                && planner::assess_evidence_rule(query, &sources).sufficient
+            {
                 return ReactAttempt::Ran(finish(sources, notes, used_react, kind));
             }
         }
@@ -219,17 +214,7 @@ async fn run_react_loop(
 }
 
 pub fn rule_retrieval_signal(query: &str) -> String {
-    let normalized = query.trim();
-    if eks_kernels::rerank::is_identifier_query(normalized) {
-        return "查询特征策略=identifier_exact（检测到编号、工号、产品号或编码，优先使用稀疏检索保留精确匹配），规则建议检索方式=sparse".into();
-    }
-    if STRUCTURED_QUERY_TERMS.iter().any(|term| normalized.contains(term)) {
-        return "查询特征策略=structured_multi_query（检测到多条件或结构化查询，保留混合检索并扩大候选范围），规则建议检索方式=hybrid".into();
-    }
-    if PROCEDURAL_QUERY_TERMS.iter().any(|term| normalized.contains(term)) {
-        return "查询特征策略=procedural_hybrid（检测到流程、条件或制度类问题，优先使用混合检索），规则建议检索方式=hybrid".into();
-    }
-    "通用知识库问题，建议 hybrid 检索".into()
+    planner::select_initial_rule(query, 5, planner::RETRIEVAL_METHOD_HYBRID).signal_text()
 }
 
 fn finish(sources: Vec<RetrievalItem>, notes: Vec<String>, used_react: bool, kind: &str) -> ReactOutcome {
@@ -250,10 +235,6 @@ fn finish(sources: Vec<RetrievalItem>, notes: Vec<String>, used_react: bool, kin
         used_react,
         kind: kind.to_string(),
     }
-}
-
-fn retrieval_quality_ok(results: &[RetrievalItem]) -> bool {
-    results.iter().any(|item| item.score >= 0.30)
 }
 
 fn tool_message(call: &ToolCall, observation: Value) -> ChatMessage {
@@ -294,11 +275,7 @@ async fn execute_tool(
             .get("retrieval_method")
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
-        let result = match method {
-            "dense" => engine.search_dense(query, top_k).await.map(|items| (items, String::new())),
-            "sparse" => engine.search_sparse(query, top_k).await.map(|items| (items, String::new())),
-            _ => engine.run_rag_workflow(query, top_k).await,
-        };
+        let result = engine.retrieve_planned(query, method, top_k).await;
         return match result {
             Ok((items, _)) => {
                 let payload: Vec<Value> = items.iter().take(8).map(|item| item.to_json()).collect();
@@ -371,7 +348,7 @@ mod tests {
         assert!(procedural.contains("procedural_hybrid"));
         assert_eq!(
             rule_retrieval_signal("随便聊聊天"),
-            "通用知识库问题，建议 hybrid 检索"
+            "查询特征策略=default_hybrid（通用知识库问题使用混合检索作为稳定起点），规则建议检索方式=hybrid"
         );
     }
 }

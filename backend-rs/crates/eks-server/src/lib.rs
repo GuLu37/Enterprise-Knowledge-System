@@ -13,6 +13,7 @@ pub mod intent;
 pub mod llm;
 pub mod memory;
 pub mod milvus_lite;
+pub mod planner;
 pub mod react;
 pub mod remote_mcp;
 pub mod retrieval;

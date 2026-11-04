@@ -28,6 +28,15 @@ fn candidate_pool_limit(top_k: usize) -> usize {
     (top_k * 8).max(top_k + 20).max(MIN_RAG_CANDIDATE_POOL)
 }
 
+fn assemble_processed_context(processed: &[RetrievalItem]) -> String {
+    let max_chars = if processed.iter().any(|item| item.structured_aggregation) {
+        crate::retrieval::STRUCTURED_CONTEXT_MAX_CHARS
+    } else {
+        crate::retrieval::RAG_CONTEXT_MAX_CHARS
+    };
+    crate::retrieval::assemble_rag_context(processed, max_chars)
+}
+
 fn is_structured_result(item: &RetrievalItem) -> bool {
     let file_type = item.file_type.trim().trim_start_matches('.').to_lowercase();
     file_type == "csv" || file_type == "tsv" || file_type == "xls" || file_type == "xlsx"
@@ -288,15 +297,34 @@ impl RetrievalEngine {
         }
         let recalled = self.retrieve_documents_multi_query(normalized_query, top_k).await?;
         let processed = self.post_process(normalized_query, recalled, top_k).await?;
-        let max_chars = if processed
-            .iter()
-            .any(|item| item.structured_aggregation)
-        {
-            crate::retrieval::STRUCTURED_CONTEXT_MAX_CHARS
-        } else {
-            crate::retrieval::RAG_CONTEXT_MAX_CHARS
+        let context = assemble_processed_context(&processed);
+        Ok((processed, context))
+    }
+
+    /// 按规划器选定的检索方式执行一轮检索，dense/sparse 也会走后处理以填充证据信号。
+    pub async fn retrieve_planned(
+        &self,
+        query: &str,
+        method: &str,
+        top_k: usize,
+    ) -> Result<(Vec<RetrievalItem>, String), String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok((Vec::new(), String::new()));
+        }
+        let method = crate::planner::resolve_method_for_query(query, method);
+        let processed = match method.as_str() {
+            crate::planner::RETRIEVAL_METHOD_DENSE => {
+                let recalled = self.search_dense(query, top_k).await?;
+                self.post_process(query, recalled, top_k).await?
+            }
+            crate::planner::RETRIEVAL_METHOD_SPARSE => {
+                let recalled = self.search_sparse(query, top_k).await?;
+                self.post_process(query, recalled, top_k).await?
+            }
+            _ => self.run_rag_workflow(query, top_k).await?.0,
         };
-        let context = crate::retrieval::assemble_rag_context(&processed, max_chars);
+        let context = assemble_processed_context(&processed);
         Ok((processed, context))
     }
 

@@ -134,13 +134,17 @@ async fn answer_skill_intent(
     Ok(crate::skills::format_skill_answer(name, &result))
 }
 
-/// 首轮检索质量是否足够（简化 ReAct 判断）。
-fn retrieval_quality_ok(results: &[RetrievalItem]) -> bool {
-    if results.is_empty() {
-        return false;
+fn planner_llm<'a>(config: &crate::config::Config, llm: &'a LlmClient) -> Option<&'a LlmClient> {
+    config.retrieval_planner_llm_decision_enabled.then_some(llm)
+}
+
+fn preferred_retrieval_method(value: Option<&str>) -> &str {
+    let method = value.unwrap_or(crate::planner::RETRIEVAL_METHOD_HYBRID).trim();
+    if method.is_empty() {
+        crate::planner::RETRIEVAL_METHOD_HYBRID
+    } else {
+        method
     }
-    // 至少一条综合分 ≥ 0.30（对齐 MIN_FINAL_RELEVANCE_SCORE 附近）
-    results.iter().any(|item| item.score >= 0.30)
 }
 
 /// LLM 改写查询（对齐 rewrite_rag_query prompt）。
@@ -340,6 +344,7 @@ async fn collect_rag(
     top_k: usize,
     use_retrieval: bool,
     window_n: usize,
+    preferred_method: &str,
     config: &crate::config::Config,
 ) -> Result<RagTurn, String> {
     if !use_retrieval {
@@ -353,14 +358,31 @@ async fn collect_rag(
             react_kind: None,
         });
     }
-    let (first_results, _) = engine.run_rag_workflow(query, top_k).await?;
-    if retrieval_quality_ok(&first_results) {
-        let context = crate::retrieval::assemble_rag_context(&first_results, 6500);
+    let planner_llm = planner_llm(config, llm);
+    let plan = crate::planner::select_initial(query, top_k, preferred_method, planner_llm).await;
+    tracing::info!(
+        strategy = plan.strategy.as_str(),
+        method = plan.retrieval_method.as_str(),
+        reason = plan.reason.as_str(),
+        top_k = plan.top_k,
+        "常规检索规划器初始决策"
+    );
+    let (first_results, context) = engine
+        .retrieve_planned(&plan.query, &plan.retrieval_method, plan.top_k)
+        .await?;
+    let evidence = crate::planner::assess_evidence(query, &first_results, planner_llm).await;
+    tracing::info!(
+        sufficient = evidence.sufficient,
+        reason = evidence.reason.as_str(),
+        best_score = evidence.best_score,
+        "常规检索证据评估"
+    );
+    if evidence.sufficient {
         return Ok(RagTurn {
             context,
             sources: first_results,
             direct: None,
-            retrieval_method: Some("hybrid".into()),
+            retrieval_method: Some(plan.retrieval_method.clone()),
             used_react: false,
             react_notes: Vec::new(),
             react_kind: None,
@@ -373,6 +395,7 @@ async fn collect_rag(
     let mut react_kind = None;
     let history_pairs = history_pairs(history, window_n);
     let mcp_manifests = &config.mcp_remote_tool_manifests;
+    let mut retrieval_method = plan.retrieval_method.clone();
 
     let mut attempt = crate::react::run_unified_react(
         engine,
@@ -381,7 +404,7 @@ async fn collect_rag(
         user_id,
         query,
         &history_pairs,
-        top_k,
+        plan.top_k,
         working.clone(),
         mcp_manifests,
         config.unified_react_enabled,
@@ -397,7 +420,7 @@ async fn collect_rag(
             user_id,
             query,
             &history_pairs,
-            top_k,
+            plan.top_k,
             working.clone(),
             config.react_max_iterations,
         )
@@ -407,12 +430,13 @@ async fn collect_rag(
         used_react = outcome.used_react;
         react_notes = outcome.notes;
         react_kind = Some(outcome.kind.clone());
-        if outcome.used_react && retrieval_quality_ok(&outcome.sources) {
+        if outcome.used_react && crate::planner::assess_evidence_rule(query, &outcome.sources).sufficient
+        {
             return Ok(RagTurn {
                 context: outcome.context,
                 sources: outcome.sources,
                 direct: None,
-                retrieval_method: Some("hybrid".into()),
+                retrieval_method: Some(retrieval_method),
                 used_react,
                 react_notes,
                 react_kind,
@@ -425,18 +449,19 @@ async fn collect_rag(
 
     if let Some(rewritten) = rewrite_query(llm, query, history).await {
         let second = engine
-            .run_rag_workflow(&rewritten, top_k)
+            .retrieve_planned(&rewritten, crate::planner::RETRIEVAL_METHOD_HYBRID, plan.top_k)
             .await
             .map(|(results, _)| results)
             .unwrap_or_default();
         working = merge_results(working, second);
+        retrieval_method = crate::planner::RETRIEVAL_METHOD_HYBRID.to_string();
     }
     if working.is_empty() {
         return Ok(RagTurn {
             context: String::new(),
             sources: Vec::new(),
             direct: Some(no_result_answer(query)),
-            retrieval_method: Some("hybrid".into()),
+            retrieval_method: Some(retrieval_method),
             used_react,
             react_notes,
             react_kind,
@@ -452,7 +477,7 @@ async fn collect_rag(
         context,
         sources: working,
         direct: None,
-        retrieval_method: Some("hybrid".into()),
+        retrieval_method: Some(retrieval_method),
         used_react,
         react_notes,
         react_kind,
@@ -642,6 +667,7 @@ pub async fn generate_chat(
         request.top_k,
         intent.needs_retrieval,
         request.short_memory_n,
+        preferred_retrieval_method(request.retrieval_method.as_deref()),
         state.config.as_ref(),
     )
     .await
@@ -820,10 +846,16 @@ pub async fn stream_chat(
 
         let retrieval_query = intent.retrieval_query(&query).to_string();
         let use_retrieval = intent.needs_retrieval;
+        let preferred_method = preferred_retrieval_method(request_retrieval_method.as_deref());
         if use_retrieval {
+            let preview = crate::planner::select_initial_rule(&retrieval_query, top_k, preferred_method);
             yield Ok(sse_json("tool_call", json!({
                 "name": "search_knowledge_base",
-                "arguments": {"query": retrieval_query, "top_k": top_k, "retrieval_method": "hybrid"},
+                "arguments": {
+                    "query": retrieval_query,
+                    "top_k": preview.top_k,
+                    "retrieval_method": preview.retrieval_method,
+                },
             })));
         }
 
@@ -837,6 +869,7 @@ pub async fn stream_chat(
             top_k,
             use_retrieval,
             window_n,
+            preferred_method,
             config.as_ref(),
         )
         .await
