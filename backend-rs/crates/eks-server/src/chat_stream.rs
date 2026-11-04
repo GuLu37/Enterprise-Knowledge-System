@@ -995,8 +995,8 @@ async fn collect_rag(
 
 fn llm_unavailable() -> crate::auth::AuthError {
     crate::auth::AuthError {
-        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        detail: "没有配置任何 LLM 提供商".into(),
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        detail: crate::llm::LLM_NO_PROVIDER_MESSAGE.into(),
     }
 }
 
@@ -1609,7 +1609,7 @@ pub async fn stream_chat(
         }
 
         if llm_missing {
-            yield Ok(sse_json("error", json!({"message": "没有配置任何 LLM 提供商"})));
+            yield Ok(sse_json("error", json!({"message": crate::llm::LLM_NO_PROVIDER_MESSAGE})));
             return;
         }
 
@@ -2126,6 +2126,17 @@ mod tests {
         assert_eq!(LLM_UNAVAILABLE_MESSAGE, "系统暂时无法处理，请稍后重试。");
         assert_eq!(finalize_llm_answer("  \n\n"), LLM_UNAVAILABLE_MESSAGE);
         assert_eq!(finalize_llm_answer("可以报销"), "可以报销");
+    }
+
+    #[test]
+    fn missing_llm_http_is_internal_error_like_python() {
+        let err = llm_unavailable();
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.detail, crate::llm::LLM_NO_PROVIDER_MESSAGE);
+        assert_eq!(
+            err.detail,
+            "没有可用的 LLM 提供商，请检查配置: 无可用 provider"
+        );
     }
 
     #[tokio::test]

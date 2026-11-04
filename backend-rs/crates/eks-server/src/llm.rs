@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 const FAILURE_TTL: Duration = Duration::from_secs(60);
 const FALLBACK_ORDER: &[&str] = &["deepseek", "openrouter", "openai", "anthropic", "ollama"];
 
+/// 对齐 Python `FallbackLLM.prime` / `LLMException` 无可用 provider 文案。
+pub const LLM_NO_PROVIDER_MESSAGE: &str = "没有可用的 LLM 提供商，请检查配置: 无可用 provider";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -276,7 +279,7 @@ impl LlmClient {
     pub async fn prime(&self) -> Result<String, String> {
         let providers = self.candidate_providers().await;
         if providers.is_empty() {
-            return Err("没有可用的 LLM 提供商，请检查配置: 无可用 provider".into());
+            return Err(LLM_NO_PROVIDER_MESSAGE.into());
         }
         let name = providers[0].name.clone();
         self.remember_success(&name).await;
@@ -1586,7 +1589,7 @@ mod tests {
         assert_eq!(client.active_provider.lock().await.as_deref(), Some("openai"));
         let empty = test_client(Vec::new(), "openai");
         let err = empty.prime().await.expect_err("no providers");
-        assert!(err.contains("没有可用的 LLM 提供商，请检查配置"), "{err}");
+        assert_eq!(err, LLM_NO_PROVIDER_MESSAGE);
         assert!(empty.active_provider.lock().await.is_none());
     }
 
