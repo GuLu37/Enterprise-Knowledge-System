@@ -464,7 +464,7 @@ async fn retrieval_simple(
     } else {
         state.engine.search_sparse(query, top_k).await
     }
-    .map_err(internal_error)?;
+    .map_err(|detail| retrieval_internal_error(method, detail))?;
     if method == "dense" && state.config.similarity_threshold > 0.0 {
         results.retain(|item| item.score >= state.config.similarity_threshold);
     }
@@ -614,12 +614,12 @@ pub async fn retrieval_hybrid(
             None,
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(|detail| retrieval_internal_error("hybrid", detail))?;
     let results = state
         .engine
         .post_process(query, recalled, top_k)
         .await
-        .map_err(internal_error)?;
+        .map_err(|detail| retrieval_internal_error("hybrid", detail))?;
     Ok(Json(json!({
         "query": echo_request_query(&request.query),
         "retrieval_method": "hybrid",
@@ -661,6 +661,19 @@ pub async fn retrieval_cache_clear(
     Ok(Json(json!({ "cleared": true })))
 }
 
+fn format_retrieval_route_error(method: &str, err: &str) -> String {
+    match method {
+        "dense" => format!("密集检索失败: {err}"),
+        "sparse" => format!("稀疏检索失败: {err}"),
+        _ => format!("检索失败: {err}"),
+    }
+}
+
+fn retrieval_internal_error(method: &str, detail: String) -> AuthError {
+    tracing::error!("{}", format_retrieval_route_error(method, &detail));
+    internal_error(detail)
+}
+
 fn internal_error(detail: String) -> AuthError {
     AuthError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -699,6 +712,19 @@ mod health_tests {
         assert!(reject_empty_query("差旅").is_ok());
         assert_eq!(echo_request_query("  差旅报销  "), "  差旅报销  ");
         assert_eq!(retrieval_search_query("  差旅报销  "), "差旅报销");
+    }
+
+    #[test]
+    fn retrieval_route_error_logs_match_python() {
+        assert_eq!(format_retrieval_route_error("hybrid", "boom"), "检索失败: boom");
+        assert_eq!(
+            format_retrieval_route_error("dense", "timeout"),
+            "密集检索失败: timeout"
+        );
+        assert_eq!(
+            format_retrieval_route_error("sparse", "index missing"),
+            "稀疏检索失败: index missing"
+        );
     }
 }
 
