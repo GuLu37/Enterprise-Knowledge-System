@@ -369,6 +369,23 @@ pub async fn cleanup_memory_records(
     settings: &MemoryCleanupSettings,
 ) -> Result<MemoryCleanupStats, sqlx::Error> {
     let _ = ensure_schema(pool).await?;
+    let mut stats = MemoryCleanupStats::default();
+    let mut expired_event_ids: Vec<String> = Vec::new();
+    if let Err(err) =
+        cleanup_memory_lifecycle(pool, settings, &mut stats, &mut expired_event_ids).await
+    {
+        tracing::warn!(error = %err, "长期记忆生命周期清理失败");
+    }
+    delete_expired_event_vectors(&expired_event_ids).await;
+    Ok(stats)
+}
+
+async fn cleanup_memory_lifecycle(
+    pool: &sqlx::SqlitePool,
+    settings: &MemoryCleanupSettings,
+    stats: &mut MemoryCleanupStats,
+    expired_event_ids: &mut Vec<String>,
+) -> Result<(), sqlx::Error> {
     let now = crate::db::now_naive();
     let now_text = crate::db::fmt_dt(&now);
     let rows: Vec<ActiveMemoryRow> = sqlx::query_as(
@@ -379,8 +396,6 @@ pub async fn cleanup_memory_records(
     .fetch_all(pool)
     .await?;
 
-    let mut stats = MemoryCleanupStats::default();
-    let mut expired_event_ids: Vec<String> = Vec::new();
     for row in rows {
         let age_days = age_days_since(row.last_accessed_at.as_deref(), &row.created_at, now);
         let score = decay_importance_score(
@@ -419,9 +434,9 @@ pub async fn cleanup_memory_records(
         .await?;
         stats.rescored += 1;
     }
-    delete_memory_vectors(&expired_event_ids).await;
 
-    let purge_before = crate::db::fmt_dt(&(now - chrono::Duration::days(settings.purge_retention_days.max(1))));
+    let purge_before =
+        crate::db::fmt_dt(&(now - chrono::Duration::days(settings.purge_retention_days.max(1))));
     let purged = sqlx::query(
         "DELETE FROM memory_records \
          WHERE status IN ('expired', 'superseded', 'deleted') AND updated_at < ?",
@@ -430,7 +445,7 @@ pub async fn cleanup_memory_records(
     .execute(pool)
     .await?;
     stats.purged = purged.rows_affected() as i64;
-    Ok(stats)
+    Ok(())
 }
 
 pub fn spawn_memory_maintenance(
@@ -508,7 +523,7 @@ impl MemoryPersistQueue {
 
 async fn run_persist_worker(mut rx: mpsc::Receiver<PersistJob>) {
     while let Some(job) = rx.recv().await {
-        persist_turn(
+        if let Err(err) = persist_turn_result(
             &job.pool,
             job.llm.as_deref(),
             &job.user_id,
@@ -518,7 +533,10 @@ async fn run_persist_worker(mut rx: mpsc::Receiver<PersistJob>) {
             &job.answer,
             job.expiry_days,
         )
-        .await;
+        .await
+        {
+            tracing::warn!("{}", format_persist_worker_fail(&err));
+        }
     }
 }
 
@@ -591,67 +609,93 @@ pub async fn persist_turn(
     answer: &str,
     expiry_days: i64,
 ) {
+    let _ = persist_turn_result(
+        pool,
+        llm,
+        user_id,
+        conversation_id,
+        session_id,
+        query,
+        answer,
+        expiry_days,
+    )
+    .await;
+}
+
+async fn persist_turn_result(
+    pool: &sqlx::SqlitePool,
+    llm: Option<&LlmClient>,
+    user_id: &str,
+    conversation_id: &str,
+    session_id: &str,
+    query: &str,
+    answer: &str,
+    expiry_days: i64,
+) -> Result<(), String> {
     if answer.trim().is_empty() || user_id.trim().is_empty() {
-        return;
+        return Ok(());
     }
     let _ = ensure_schema(pool).await;
     let messages = user_assistant_messages(query, answer);
-    if messages.is_empty() {
-        return;
-    }
-    let chunks = build_conversation_chunks(&messages, CHAT_CHUNK_SIZE, CHAT_CHUNK_OVERLAP, false);
+    let chunks = if messages.is_empty() {
+        Vec::new()
+    } else {
+        build_conversation_chunks(&messages, CHAT_CHUNK_SIZE, CHAT_CHUNK_OVERLAP, false)
+    };
     if chunks.is_empty() {
-        return;
+        tracing::info!("{}", format_empty_memory_chunks());
+    } else {
+        let turn_offset = count_dialogue_turns(pool, user_id, conversation_id).await;
+        let mut written = 0usize;
+        for chunk in &chunks {
+            let (importance, confidence) = calculate_event_importance(&chunk.text);
+            let local_index = chunk.chunk_index as i64;
+            match insert_event_memory_with_confidence(
+                pool,
+                user_id,
+                conversation_id,
+                session_id,
+                "dialogue",
+                &chunk.text,
+                importance,
+                confidence,
+                expiry_days,
+                Some(chunk.turn_start + turn_offset),
+                Some(chunk.turn_end + turn_offset),
+                Some(local_index + turn_offset),
+                Some(versioned_chunk_memory_id(user_id, conversation_id, local_index)),
+            )
+            .await
+            {
+                Ok(_) => written += 1,
+                Err(err) => tracing::warn!("长期记忆写入失败: {err}"),
+            }
+        }
+        if written > 0 {
+            tracing::info!(
+                "{}",
+                format_memory_write_success(user_id, conversation_id, written)
+            );
+        }
     }
-    let turn_offset = count_dialogue_turns(pool, user_id, conversation_id).await;
-    let mut written = 0usize;
-    for chunk in &chunks {
-        let (importance, confidence) = calculate_event_importance(&chunk.text);
-        let local_index = chunk.chunk_index as i64;
-        match insert_event_memory_with_confidence(
+    if !conversation_id.trim().is_empty() {
+        if let Err(err) = persist_consolidate_check(
             pool,
+            llm,
             user_id,
             conversation_id,
-            session_id,
-            "dialogue",
-            &chunk.text,
-            importance,
-            confidence,
             expiry_days,
-            Some(chunk.turn_start + turn_offset),
-            Some(chunk.turn_end + turn_offset),
-            Some(local_index + turn_offset),
-            Some(versioned_chunk_memory_id(user_id, conversation_id, local_index)),
         )
         .await
         {
-            Ok(_) => written += 1,
-            Err(err) => tracing::warn!("长期记忆写入失败: {err}"),
+            tracing::warn!("{}", format_consolidate_check_fail(&err));
         }
     }
-    if written > 0 {
-        tracing::info!(
-            "{}",
-            format_memory_write_success(user_id, conversation_id, written)
-        );
-    }
-    if written > 0 && !conversation_id.trim().is_empty() {
-        let summarizer = llm.map(MemorySummarizer::Llm);
-        let _ = consolidate_with(
-            pool,
-            summarizer.as_ref(),
-            user_id,
-            conversation_id,
-            expiry_days,
-            false,
-        )
-        .await;
-    }
     if !should_extract_profile(query) {
-        return;
+        return Ok(());
     }
     let Some(llm) = llm else {
-        return;
+        return Ok(());
     };
     match extract_profile_candidates(llm, query, answer).await {
         Ok(candidates) => match upsert_profile_candidates(
@@ -667,10 +711,21 @@ pub async fn persist_turn(
                 tracing::info!("{}", format_profile_update_success(user_id, updated));
             }
             Ok(_) => {}
-            Err(err) => tracing::warn!("个性化记忆写入失败，已跳过: {err}"),
+            Err(err) => tracing::warn!("{}", format_profile_write_fail(&err)),
         },
-        Err(err) => tracing::warn!("个性化记忆写入失败，已跳过: {err}"),
+        Err(err) => tracing::warn!("{}", format_profile_extract_fail(&err)),
     }
+    Ok(())
+}
+
+async fn persist_consolidate_check(
+    pool: &sqlx::SqlitePool,
+    llm: Option<&LlmClient>,
+    user_id: &str,
+    conversation_id: &str,
+    expiry_days: i64,
+) -> Result<i64, String> {
+    Ok(consolidate_check(pool, llm, user_id, conversation_id, expiry_days).await)
 }
 
 const PROFILE_PROMPT_LIMIT: usize = 20;
@@ -761,6 +816,7 @@ pub async fn build_long_term_memory_messages(
         return Vec::new();
     }
     if !should_retrieve_event_memory(query, route) {
+        tracing::debug!("{}", format_memory_skip_recall());
         return Vec::new();
     }
     let top_k = if top_k == 0 {
@@ -1564,6 +1620,30 @@ fn format_profile_update_success(user_id: &str, updated: usize) -> String {
     format!("个性化记忆更新完成 (user_id={user_id}, updated={updated})")
 }
 
+fn format_empty_memory_chunks() -> &'static str {
+    "没有可写入的长期记忆块。"
+}
+
+fn format_profile_extract_fail(err: &str) -> String {
+    format!("个性化记忆抽取失败，已跳过: {err}")
+}
+
+fn format_profile_write_fail(err: &str) -> String {
+    format!("个性化记忆写入失败，已跳过: {err}")
+}
+
+fn format_memory_skip_recall() -> &'static str {
+    "当前问题未命中长期记忆关联信号，跳过记忆召回"
+}
+
+fn format_consolidate_check_fail(err: &str) -> String {
+    format!("递进摘要合并检查失败，下次触发点重试: {err}")
+}
+
+fn format_persist_worker_fail(err: &str) -> String {
+    format!("后台长期记忆写入失败: {err}")
+}
+
 /// 对齐 Python `delete_long_term_memory`：collection 可写时删除成功即 True，不看行数。
 pub async fn delete_conversation_memory(
     pool: &sqlx::SqlitePool,
@@ -1618,6 +1698,14 @@ pub async fn delete_user_event_memory(
 }
 
 async fn delete_memory_vectors(memory_ids: &[String]) {
+    delete_memory_vectors_logged(memory_ids, "长期记忆向量删除失败").await;
+}
+
+async fn delete_expired_event_vectors(memory_ids: &[String]) {
+    delete_memory_vectors_logged(memory_ids, "清理过期长期记忆向量失败").await;
+}
+
+async fn delete_memory_vectors_logged(memory_ids: &[String], fail_log: &str) {
     let Some(sink) = memory_vector_sink() else {
         return;
     };
@@ -1629,7 +1717,7 @@ async fn delete_memory_vectors(memory_ids: &[String]) {
         .delete_by_field_values(&sink.collection, "memory_id", memory_ids)
         .await
     {
-        tracing::warn!("长期记忆向量删除失败: {err}");
+        tracing::warn!("{fail_log}: {err}");
     }
 }
 
@@ -3159,6 +3247,27 @@ mod tests {
         assert_eq!(
             format_profile_update_success("u1", 2),
             "个性化记忆更新完成 (user_id=u1, updated=2)"
+        );
+        assert_eq!(format_empty_memory_chunks(), "没有可写入的长期记忆块。");
+        assert_eq!(
+            format_profile_extract_fail("llm timeout"),
+            "个性化记忆抽取失败，已跳过: llm timeout"
+        );
+        assert_eq!(
+            format_profile_write_fail("db locked"),
+            "个性化记忆写入失败，已跳过: db locked"
+        );
+        assert_eq!(
+            format_memory_skip_recall(),
+            "当前问题未命中长期记忆关联信号，跳过记忆召回"
+        );
+        assert_eq!(
+            format_consolidate_check_fail("busy"),
+            "递进摘要合并检查失败，下次触发点重试: busy"
+        );
+        assert_eq!(
+            format_persist_worker_fail("panic"),
+            "后台长期记忆写入失败: panic"
         );
     }
 
