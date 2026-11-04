@@ -187,6 +187,19 @@ fn build_provider_order(preferred: &str) -> Vec<String> {
     ordered
 }
 
+/// 对齐 Python `_fallback_call`：若粘滞供应商仍在候选里，提到队首继续用。
+fn promote_active_provider(providers: &mut Vec<ProviderConfig>, active: Option<&str>) {
+    let Some(active) = active.map(str::trim).filter(|name| !name.is_empty()) else {
+        return;
+    };
+    if let Some(index) = providers.iter().position(|item| item.name == active) {
+        if index > 0 {
+            let provider = providers.remove(index);
+            providers.insert(0, provider);
+        }
+    }
+}
+
 pub struct LlmClient {
     http: reqwest::Client,
     config: LlmConfig,
@@ -225,38 +238,44 @@ impl LlmClient {
     }
 
     /// 按兜底顺序返回当前可用 provider（过滤冷却中的）。
+    /// 对齐 Python `_fallback_call` / `stream`：粘滞 `active_provider` 提到队首。
     async fn candidate_providers(&self) -> Vec<ProviderConfig> {
-        let failures = self.failure_at.lock().await;
-        let now = Instant::now();
-        let configured: HashMap<&str, &ProviderConfig> = self
-            .config
-            .providers
-            .iter()
-            .map(|p| (p.name.as_str(), p))
-            .collect();
+        let mut ordered = {
+            let failures = self.failure_at.lock().await;
+            let now = Instant::now();
+            let configured: HashMap<&str, &ProviderConfig> = self
+                .config
+                .providers
+                .iter()
+                .map(|p| (p.name.as_str(), p))
+                .collect();
 
-        let order = build_provider_order(&self.config.preferred_provider);
-        let mut ordered: Vec<ProviderConfig> = Vec::new();
-        for name in &order {
-            if let Some(provider) = configured.get(name.as_str()) {
-                let recently_failed = failures
-                    .get(name.as_str())
-                    .map(|t| now.duration_since(*t) < FAILURE_TTL)
-                    .unwrap_or(false);
-                let skip_cooldown = name == &self.config.preferred_provider;
-                if !recently_failed || skip_cooldown {
-                    ordered.push((*provider).clone());
-                }
-            }
-        }
-        if ordered.is_empty() {
+            let order = build_provider_order(&self.config.preferred_provider);
+            let mut ordered: Vec<ProviderConfig> = Vec::new();
             for name in &order {
                 if let Some(provider) = configured.get(name.as_str()) {
-                    ordered.push((*provider).clone());
+                    let recently_failed = failures
+                        .get(name.as_str())
+                        .map(|t| now.duration_since(*t) < FAILURE_TTL)
+                        .unwrap_or(false);
+                    let skip_cooldown = name == &self.config.preferred_provider;
+                    if !recently_failed || skip_cooldown {
+                        ordered.push((*provider).clone());
+                    }
                 }
             }
-        }
+            if ordered.is_empty() {
+                for name in &order {
+                    if let Some(provider) = configured.get(name.as_str()) {
+                        ordered.push((*provider).clone());
+                    }
+                }
+            }
+            ordered
+        };
         ordered.truncate(self.config.max_fallback_attempts);
+        let active = self.active_provider.lock().await.clone();
+        promote_active_provider(&mut ordered, active.as_deref());
         ordered
     }
 
@@ -266,6 +285,19 @@ impl LlmClient {
             .lock()
             .await
             .insert(provider.to_string(), Instant::now());
+    }
+
+    async fn remember_success(&self, provider: &str) {
+        *self.active_provider.lock().await = Some(provider.to_string());
+    }
+
+    /// 对齐 Python：失败时冷却，并在该供应商正是粘滞项时清空。
+    async fn record_failure(&self, provider: &str) {
+        self.mark_failure(provider).await;
+        let mut active = self.active_provider.lock().await;
+        if active.as_deref() == Some(provider) {
+            *active = None;
+        }
     }
 
     fn build_request_body(
@@ -301,12 +333,12 @@ impl LlmClient {
         for provider in &providers {
             match self.invoke_provider(provider, messages, None, per_timeout).await {
                 Ok(result) => {
-                    *self.active_provider.lock().await = Some(provider.name.clone());
+                    self.remember_success(&provider.name).await;
                     return Ok(result);
                 }
                 Err(exc) => {
                     tracing::warn!("LLM 调用失败，切换 provider: {} -> {exc}", provider.name);
-                    self.mark_failure(&provider.name).await;
+                    self.record_failure(&provider.name).await;
                     errors.push(format!("{}: {exc}", provider.name));
                 }
             }
@@ -332,12 +364,12 @@ impl LlmClient {
                 .await
             {
                 Ok(result) => {
-                    *self.active_provider.lock().await = Some(provider.name.clone());
+                    self.remember_success(&provider.name).await;
                     return Ok(result);
                 }
                 Err(exc) => {
                     tracing::warn!("带工具 LLM 调用失败: {} -> {exc}", provider.name);
-                    self.mark_failure(&provider.name).await;
+                    self.record_failure(&provider.name).await;
                     errors.push(format!("{}: {exc}", provider.name));
                 }
             }
@@ -445,7 +477,7 @@ impl LlmClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
-    /// 流式调用（SSE，带兜底链）。返回一个 chunk 接收器。
+    /// 流式调用（SSE，带兜底链）。HTTP/连接失败时切换下一供应商，对齐 Python `FallbackLLM.stream`。
     pub async fn stream(
         self: &Arc<Self>,
         messages: &[ChatMessage],
@@ -455,13 +487,44 @@ impl LlmClient {
             return Err("没有可用的 LLM 提供商，请检查配置".into());
         }
         let per_timeout = self.config.timeout_secs / providers.len() as u64;
-        let provider = providers[0].clone(); // 简化: 流式先用首选，失败由调用方 fallback 到 invoke
+        let mut errors: Vec<String> = Vec::new();
+        for provider in &providers {
+            match self.open_stream_response(provider, messages, per_timeout).await {
+                Ok(response) => {
+                    self.remember_success(&provider.name).await;
+                    return Ok(spawn_stream_reader(response, provider));
+                }
+                Err(exc) => {
+                    tracing::warn!(
+                        "LLM 流式调用失败，切换到下一个 provider: {} -> {exc}",
+                        provider.name
+                    );
+                    self.record_failure(&provider.name).await;
+                    errors.push(format!("{}: {exc}", provider.name));
+                }
+            }
+        }
+        Err(format!(
+            "所有 LLM 提供商均不可用: {}",
+            if errors.is_empty() {
+                "无可用 provider".to_string()
+            } else {
+                errors.join(" | ")
+            }
+        ))
+    }
 
+    async fn open_stream_response(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[ChatMessage],
+        timeout_secs: u64,
+    ) -> Result<reqwest::Response, String> {
         let (url, body, bearer, anthropic_key) = if provider.is_anthropic {
             (
                 format!("{}/v1/messages", provider.base_url.trim_end_matches('/')),
                 build_anthropic_body(
-                    &provider,
+                    provider,
                     messages,
                     None,
                     self.config.temperature,
@@ -475,7 +538,7 @@ impl LlmClient {
             (
                 format!("{}/api/chat", provider.base_url.trim_end_matches('/')),
                 build_ollama_body(
-                    &provider,
+                    provider,
                     messages,
                     None,
                     self.config.temperature,
@@ -486,7 +549,7 @@ impl LlmClient {
                 None,
             )
         } else {
-            let mut body = self.build_request_body(&provider, messages, None);
+            let mut body = self.build_request_body(provider, messages, None);
             body["stream"] = json!(true);
             (
                 format!("{}/chat/completions", provider.base_url.trim_end_matches('/')),
@@ -500,7 +563,7 @@ impl LlmClient {
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(per_timeout.max(1) * 4))
+            .timeout(Duration::from_secs(timeout_secs.max(1) * 4))
             .json(&body);
         if let Some(key) = bearer.filter(|item| !item.is_empty()) {
             request = request.header("Authorization", format!("Bearer {key}"));
@@ -515,61 +578,66 @@ impl LlmClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            self.mark_failure(&provider.name).await;
             return Err(format!("流式 LLM HTTP {status}: {text}"));
         }
+        Ok(response)
+    }
+}
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let provider_name = provider.name.clone();
-        let is_ollama = provider.is_ollama;
-        let is_anthropic = provider.is_anthropic;
+fn spawn_stream_reader(
+    response: reqwest::Response,
+    provider: &ProviderConfig,
+) -> tokio::sync::mpsc::Receiver<StreamChunk> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let provider_name = provider.name.clone();
+    let is_ollama = provider.is_ollama;
+    let is_anthropic = provider.is_anthropic;
 
-        tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
 
-            while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("SSE chunk 读取失败: {e}");
-                        break;
-                    }
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("SSE chunk 读取失败: {e}");
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].to_string();
+                buffer.drain(..pos + 1);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let delta = if is_ollama {
+                    stream_delta_from_ollama(line)
+                } else if is_anthropic {
+                    stream_delta_from_anthropic(line)
+                } else {
+                    stream_delta_from_openai(line)
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..pos + 1);
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let delta = if is_ollama {
-                        stream_delta_from_ollama(line)
-                    } else if is_anthropic {
-                        stream_delta_from_anthropic(line)
-                    } else {
-                        stream_delta_from_openai(line)
-                    };
-                    if let Some(delta) = delta {
-                        if tx
-                            .send(StreamChunk {
-                                delta,
-                                provider: provider_name.clone(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                if let Some(delta) = delta {
+                    if tx
+                        .send(StreamChunk {
+                            delta,
+                            provider: provider_name.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
             }
-        });
+        }
+    });
 
-        Ok(rx)
-    }
+    rx
 }
 
 fn json_line(line: &str) -> Option<&str> {
@@ -1251,5 +1319,167 @@ mod tests {
                 .as_deref(),
             Some("世界")
         );
+    }
+
+    fn test_client(providers: Vec<ProviderConfig>, preferred: &str) -> LlmClient {
+        LlmClient::new(LlmConfig {
+            preferred_provider: preferred.into(),
+            temperature: 0.2,
+            timeout_secs: 8,
+            max_tokens: 64,
+            max_fallback_attempts: 4,
+            providers,
+        })
+    }
+
+    fn named_provider(name: &str, base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            api_key: "k".into(),
+            base_url: base_url.into(),
+            model: "demo".into(),
+            is_anthropic: false,
+            is_ollama: false,
+        }
+    }
+
+    #[test]
+    fn sticky_active_provider_moves_to_front() {
+        let mut providers = vec![
+            demo_provider("deepseek", false, false),
+            demo_provider("openai", false, false),
+            demo_provider("ollama", false, true),
+        ];
+        promote_active_provider(&mut providers, Some("openai"));
+        assert_eq!(
+            providers.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(),
+            vec!["openai", "deepseek", "ollama"]
+        );
+        promote_active_provider(&mut providers, Some("openai"));
+        assert_eq!(providers[0].name, "openai");
+        promote_active_provider(&mut providers, Some("missing"));
+        assert_eq!(providers[0].name, "openai");
+    }
+
+    #[tokio::test]
+    async fn candidate_providers_promote_sticky_and_skip_cooled_non_preferred() {
+        let client = test_client(
+            vec![
+                demo_provider("deepseek", false, false),
+                demo_provider("openai", false, false),
+            ],
+            "deepseek",
+        );
+        *client.active_provider.lock().await = Some("openai".into());
+        let names: Vec<_> = client
+            .candidate_providers()
+            .await
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(names, vec!["openai", "deepseek"]);
+
+        client.mark_failure("openai").await;
+        let names: Vec<_> = client
+            .candidate_providers()
+            .await
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(names, vec!["deepseek"]);
+    }
+
+    async fn serve_chat_completions(
+        status: axum::http::StatusCode,
+        body: &'static str,
+        content_type: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || async move {
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, content_type)],
+                    body.to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_falls_back_to_next_provider_and_sticks() {
+        const SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n";
+        let (fail_url, fail_handle) = serve_chat_completions(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "boom",
+            "text/plain",
+        )
+        .await;
+        let (ok_url, ok_handle) =
+            serve_chat_completions(axum::http::StatusCode::OK, SSE, "text/event-stream").await;
+
+        let client = std::sync::Arc::new(test_client(
+            vec![
+                named_provider("openai", &fail_url),
+                named_provider("deepseek", &ok_url),
+            ],
+            "openai",
+        ));
+        let mut rx = client
+            .stream(&[ChatMessage::new("user", "hi")])
+            .await
+            .expect("stream should fall back");
+        let mut deltas = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            deltas.push((chunk.provider, chunk.delta));
+        }
+        assert_eq!(deltas, vec![("deepseek".into(), "你好".into())]);
+        assert_eq!(
+            client.active_provider.lock().await.as_deref(),
+            Some("deepseek")
+        );
+        fail_handle.abort();
+        ok_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_exhausts_fallback_chain_and_clears_sticky() {
+        let (fail_a, handle_a) = serve_chat_completions(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "down",
+            "text/plain",
+        )
+        .await;
+        let (fail_b, handle_b) = serve_chat_completions(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "text/plain",
+        )
+        .await;
+        let client = std::sync::Arc::new(test_client(
+            vec![
+                named_provider("openai", &fail_a),
+                named_provider("deepseek", &fail_b),
+            ],
+            "openai",
+        ));
+        *client.active_provider.lock().await = Some("openai".into());
+        let err = client
+            .stream(&[ChatMessage::new("user", "hi")])
+            .await
+            .expect_err("all providers fail");
+        assert!(err.contains("所有 LLM 提供商均不可用"), "{err}");
+        assert!(err.contains("openai"), "{err}");
+        assert!(err.contains("deepseek"), "{err}");
+        assert!(client.active_provider.lock().await.is_none());
+        handle_a.abort();
+        handle_b.abort();
     }
 }
