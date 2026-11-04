@@ -680,32 +680,45 @@ impl RetrievalEngine {
             .map_err(|e| e.to_string())?;
 
         let query_vectors = if want_dense {
-            self.embedder.embed_queries(&queries)?
+            match self.embedder.embed_queries(&queries) {
+                Ok(vectors) => vectors,
+                Err(err) => {
+                    tracing::warn!("批量密集检索失败，跳过该路结果: {err}");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
+        let dense_ready = want_dense && query_vectors.len() == queries.len();
         let mut variant_sets: Vec<Vec<RetrievalItem>> = Vec::with_capacity(queries.len());
         for (position, q) in queries.iter().enumerate() {
             let mut channel_sets: Vec<Vec<FuseItem<RetrievalItem>>> = Vec::new();
             let mut channel_weights: Vec<f64> = Vec::new();
             let mut channel_labels: Vec<&str> = Vec::new();
-            if want_dense {
-                let dense_hits = self
+            if dense_ready {
+                match self
                     .store
                     .search_cosine(self.child_collection(), &query_vectors[position], candidate_k)
                     .await
-                    .map_err(|e| e.to_string())?;
-                let dense: Vec<FuseItem<RetrievalItem>> = dense_hits
-                    .iter()
-                    .map(|(row_index, score)| {
-                        RetrievalItem::from_row(&snapshot.rows[*row_index], *score, "dense")
-                            .to_fuse_item()
-                    })
-                    .collect();
-                if !dense.is_empty() {
-                    channel_sets.push(dense);
-                    channel_weights.push(self.dense_weight);
-                    channel_labels.push("dense");
+                {
+                    Ok(dense_hits) => {
+                        let dense: Vec<FuseItem<RetrievalItem>> = dense_hits
+                            .iter()
+                            .map(|(row_index, score)| {
+                                RetrievalItem::from_row(&snapshot.rows[*row_index], *score, "dense")
+                                    .to_fuse_item()
+                            })
+                            .collect();
+                        if !dense.is_empty() {
+                            channel_sets.push(dense);
+                            channel_weights.push(self.dense_weight);
+                            channel_labels.push("dense");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("密集 检索失败，跳过该路结果: {err}");
+                    }
                 }
             }
             if want_sparse {
