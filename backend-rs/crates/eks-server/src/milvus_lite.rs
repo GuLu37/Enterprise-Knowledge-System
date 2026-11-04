@@ -352,6 +352,49 @@ pub fn pks_for_document(rows: &[Row], document_id: &str) -> Vec<i64> {
         .collect()
 }
 
+/// 对齐 Python `_get_document_content_from_milvus`：按 chunk_index 重组 child 正文。
+pub fn document_content_from_rows(rows: &[Row], document_id: &str) -> String {
+    let document_id = document_id.trim();
+    if document_id.is_empty() {
+        return String::new();
+    }
+    let mut items: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row
+                .fields
+                .get("document_id")
+                .and_then(FieldValue::as_str)
+                .map(str::trim)?;
+            if id != document_id {
+                return None;
+            }
+            let index = row
+                .fields
+                .get("chunk_index")
+                .and_then(FieldValue::as_int)
+                .unwrap_or(0);
+            let text = ["child_text", "chunk_text", "text"]
+                .iter()
+                .find_map(|name| {
+                    row.fields
+                        .get(*name)
+                        .and_then(FieldValue::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })?;
+            Some((index, text))
+        })
+        .collect();
+    items.sort_by_key(|(index, _)| *index);
+    items
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), String> {
     if pks.is_empty() {
         return Ok(());
@@ -464,6 +507,26 @@ mod tests {
         assert_eq!(pks_for_document(&rows, "doc-a"), vec![1, 3]);
         assert!(pks_for_document(&rows, "missing").is_empty());
         assert!(pks_for_document(&rows, "  ").is_empty());
+    }
+
+    #[test]
+    fn document_content_joins_child_chunks_in_index_order() {
+        let row = |index, document_id: &str, text: &str| Row {
+            pk: index,
+            vector: Vec::new(),
+            fields: HashMap::from([
+                ("document_id".into(), FieldValue::Str(document_id.into())),
+                ("chunk_index".into(), FieldValue::Int(index)),
+                ("child_text".into(), FieldValue::Str(text.into())),
+            ]),
+        };
+        let rows = vec![
+            row(1, "doc-a", "第二段"),
+            row(0, "doc-a", "第一段"),
+            row(0, "doc-b", "其他"),
+        ];
+        assert_eq!(document_content_from_rows(&rows, "doc-a"), "第一段\n\n第二段");
+        assert!(document_content_from_rows(&rows, "missing").is_empty());
     }
 
     #[tokio::test]

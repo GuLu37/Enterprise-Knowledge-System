@@ -114,6 +114,7 @@ pub fn guess_content_type(file_type: &str) -> &'static str {
         "pdf" => "application/pdf",
         "txt" => "text/plain",
         "md" => "text/markdown",
+        "html" | "htm" => "text/html",
         "csv" | "tsv" => "text/csv",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -218,11 +219,7 @@ async fn mark_document_deleting(
     Ok(updated)
 }
 
-fn remove_document_files(sqlite_path: &str, row: &DocumentRow) -> bool {
-    let upload_dir = std::path::Path::new(sqlite_path)
-        .parent()
-        .map(|parent| parent.join("uploads"))
-        .unwrap_or_default();
+fn remove_document_files(upload_dir: &FsPath, row: &DocumentRow) -> bool {
     let removed_stored = std::fs::remove_file(upload_dir.join(&row.stored_filename)).is_ok();
     let removed_dir = std::fs::remove_dir_all(upload_dir.join(&row.document_id)).is_ok();
     let removed_path = !row.file_path.is_empty() && std::fs::remove_file(&row.file_path).is_ok();
@@ -264,7 +261,11 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
     let milvus_deleted = state.engine.delete_document_chunks(document_id).await?;
     tracing::info!(document_id, milvus_deleted, "Milvus 文档切块删除完成");
 
-    let file_deleted = remove_document_files(&state.config.sqlite_path, &row);
+    let upload_dir = crate::config::resolve_upload_dir(
+        &state.config.upload_dir,
+        &state.config.sqlite_path,
+    );
+    let file_deleted = remove_document_files(&upload_dir, &row);
     tracing::info!(document_id, file_deleted, "本地文件删除完成");
 
     sqlx::query("DELETE FROM document_chunks WHERE document_id = ?")
@@ -346,6 +347,11 @@ pub async fn get_document_content(
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+    if content.is_empty() {
+        if let Ok(snapshot) = state.engine.store.collection("doc_chunk").await {
+            content = crate::milvus_lite::document_content_from_rows(&snapshot.rows, &document_id);
+        }
+    }
     if content.is_empty() && !row.file_path.is_empty() {
         if let Ok(bytes) = std::fs::read(&row.file_path) {
             if let Ok(text) = crate::ingest::extract_text(&row.original_filename, &bytes) {
@@ -695,10 +701,10 @@ pub async fn upload_document(
     tracing::info!(document_id = %document_id, "[文档上传][1/3] 开始接收上传文件: {filename}");
     let content_type = guess_content_type(&file_type).to_string();
     let stored_filename = format!("{document_id}.{file_type}");
-    let upload_dir = std::path::Path::new(&state.config.sqlite_path)
-        .parent()
-        .map(|parent| parent.join("uploads"))
-        .unwrap_or_default();
+    let upload_dir = crate::config::resolve_upload_dir(
+        &state.config.upload_dir,
+        &state.config.sqlite_path,
+    );
     let _ = std::fs::create_dir_all(&upload_dir);
     let file_path = upload_dir.join(&stored_filename);
     std::fs::write(&file_path, &file_data)
@@ -880,8 +886,7 @@ mod tests {
         let mut row = sample_row("deleting");
         row.stored_filename = "doc-1.md".into();
         row.file_path = extra.display().to_string();
-        let sqlite_path = root.join("rag_metadata.db");
-        assert!(remove_document_files(sqlite_path.to_str().unwrap(), &row));
+        assert!(remove_document_files(&upload_dir, &row));
         assert!(!stored.exists());
         assert!(!extra.exists());
         let _ = std::fs::remove_dir_all(&root);
