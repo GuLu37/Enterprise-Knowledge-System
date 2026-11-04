@@ -50,6 +50,20 @@ pub fn dt_to_iso(text: &str) -> Option<String> {
     parse_dt(text).map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
 }
 
+/// 对齐 Python `datetime.now(timezone.utc).isoformat()`：`+00:00`，零微秒省略小数。
+pub fn utc_isoformat(dt: DateTime<Utc>) -> String {
+    let naive = dt.naive_utc();
+    if dt.timestamp_subsec_micros() == 0 {
+        format!("{}+00:00", naive.format("%Y-%m-%dT%H:%M:%S"))
+    } else {
+        format!("{}+00:00", naive.format("%Y-%m-%dT%H:%M:%S%.6f"))
+    }
+}
+
+pub fn utc_isoformat_now() -> String {
+    utc_isoformat(Utc::now())
+}
+
 /// 对齐 Python `init_metadata_db` 中的 users / auth_sessions 表。
 pub async fn ensure_auth_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -456,6 +470,20 @@ mod tests {
         assert!(parse_client_datetime("").is_none());
         assert!(parse_client_datetime("not-a-date").is_none());
         assert!(parse_dt("2026-03-15T08:30:00.123Z").is_none());
+    }
+
+    #[test]
+    fn utc_isoformat_matches_python_timezone_utc() {
+        let zero = DateTime::parse_from_rfc3339("2026-03-15T08:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(utc_isoformat(zero), "2026-03-15T08:30:00+00:00");
+        let frac = DateTime::parse_from_rfc3339("2026-03-15T08:30:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(utc_isoformat(frac), "2026-03-15T08:30:00.123456+00:00");
+        assert!(!utc_isoformat_now().ends_with('Z'));
+        assert!(utc_isoformat_now().ends_with("+00:00"));
     }
 
     #[tokio::test]

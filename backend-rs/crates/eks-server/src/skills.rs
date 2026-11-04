@@ -1104,7 +1104,7 @@ pub fn wrap_skill_execution(
 ) -> Result<Value, String> {
     let definition = get_skill_definition(name).ok_or_else(|| format!("未找到技能: {name}"))?;
     let skill_instructions = read_skill_document_for_definition(&definition)?;
-    let executed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let executed_at = crate::db::utc_isoformat_now();
     Ok(json!({
         "skill": definition.name,
         "category": definition.category,
@@ -2151,7 +2151,9 @@ mod tests {
         assert_eq!(wrapped.get("skill").and_then(|value| value.as_str()), Some("memory_query"));
         assert_eq!(wrapped.get("category").and_then(|value| value.as_str()), Some("memory"));
         assert_eq!(wrapped.get("kind").and_then(|value| value.as_str()), Some("local"));
-        assert!(wrapped.get("executed_at").and_then(|value| value.as_str()).is_some());
+        let executed_at = wrapped.get("executed_at").and_then(|value| value.as_str()).unwrap();
+        assert!(executed_at.ends_with("+00:00"), "{executed_at}");
+        assert!(!executed_at.ends_with('Z'));
         assert_eq!(
             wrapped.pointer("/context/conversation_id").and_then(|value| value.as_str()),
             Some("c1")

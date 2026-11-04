@@ -43,7 +43,7 @@ pub fn format_payload(kind: &str, stage: &str, name: &str, payload: Value) -> St
         "kind": kind,
         "stage": stage,
         "name": name,
-        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "timestamp": crate::db::utc_isoformat_now(),
     });
     if let (Some(object), Value::Object(extra)) = (event.as_object_mut(), payload) {
         for (key, value) in extra {
@@ -189,7 +189,9 @@ mod tests {
         assert_eq!(parsed["name"], "memory_query");
         assert_eq!(parsed["arguments"]["query"], "记忆查询");
         assert_eq!(parsed["context"]["user_id"], "u1");
-        assert!(parsed.get("timestamp").and_then(Value::as_str).is_some());
+        let timestamp = parsed.get("timestamp").and_then(Value::as_str).unwrap();
+        assert!(timestamp.ends_with("+00:00"), "{timestamp}");
+        assert!(!timestamp.ends_with('Z'));
     }
 
     #[test]

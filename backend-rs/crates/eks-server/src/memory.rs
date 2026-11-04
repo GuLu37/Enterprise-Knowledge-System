@@ -2340,7 +2340,7 @@ async fn insert_event_memory_with_confidence(
         chunk_type,
         turn_start.unwrap_or(0),
         turn_end.unwrap_or(turn_start.unwrap_or(0)),
-        &now_text,
+        &crate::db::utc_isoformat(now.and_utc()),
     )
     .await;
     sqlx::query(
