@@ -458,10 +458,8 @@ pub fn spawn_memory_maintenance(
         loop {
             match cleanup_memory_records(&pool, &settings).await {
                 Ok(stats) if stats.any() => tracing::info!(
-                    rescored = stats.rescored,
-                    expired = stats.expired,
-                    purged = stats.purged,
-                    "长期记忆维护完成"
+                    "{}",
+                    format_memory_maintenance_complete(stats.rescored, stats.expired, stats.purged)
                 ),
                 Ok(_) => {}
                 Err(err) => tracing::warn!("长期记忆维护失败: {err}"),
@@ -1618,6 +1616,10 @@ fn format_summary_write_success(
 
 fn format_profile_update_success(user_id: &str, updated: usize) -> String {
     format!("个性化记忆更新完成 (user_id={user_id}, updated={updated})")
+}
+
+fn format_memory_maintenance_complete(rescored: i64, expired: i64, purged: i64) -> String {
+    format!("长期记忆维护完成: rescored={rescored} expired={expired} purged={purged}")
 }
 
 fn format_empty_memory_chunks() -> &'static str {
@@ -3268,6 +3270,10 @@ mod tests {
         assert_eq!(
             format_persist_worker_fail("panic"),
             "后台长期记忆写入失败: panic"
+        );
+        assert_eq!(
+            format_memory_maintenance_complete(2, 1, 3),
+            "长期记忆维护完成: rescored=2 expired=1 purged=3"
         );
     }
 

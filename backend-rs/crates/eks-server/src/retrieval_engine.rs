@@ -447,6 +447,7 @@ impl RetrievalEngine {
         self.store.invalidate(self.child_collection()).await;
         *self.sparse.write().await = None;
         self.result_cache.lock().await.clear();
+        tracing::info!("{}", format_sparse_index_invalidated());
     }
 
     pub async fn delete_document_chunks(&self, document_id: &str) -> Result<bool, String> {
@@ -1353,6 +1354,10 @@ fn insert_parent_text(
     }
 }
 
+fn format_sparse_index_invalidated() -> &'static str {
+    "稀疏持久索引已失效，将在下次检索时重建"
+}
+
 fn format_parent_batch_fail(err: &str) -> String {
     format!("SQLite Parent 上下文批量读取失败，逐条回退: {err}")
 }
@@ -1658,6 +1663,14 @@ mod tests {
         assert_eq!(payload["result_chunks"][0]["source_name"], "手册.md");
         assert_eq!(payload["context_chars"], 3);
         assert_eq!(payload["best_score"], 0.8);
+    }
+
+    #[test]
+    fn sparse_invalidate_log_matches_python() {
+        assert_eq!(
+            format_sparse_index_invalidated(),
+            "稀疏持久索引已失效，将在下次检索时重建"
+        );
     }
 
     #[test]

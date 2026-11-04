@@ -413,7 +413,10 @@ impl LlmClient {
                     return Ok(result);
                 }
                 Err(exc) => {
-                    tracing::warn!("LLM 调用失败，切换 provider: {} -> {exc}", provider.name);
+                    tracing::warn!(
+                        "LLM 调用失败，切换到下一个 provider: {} -> {exc}",
+                        provider.name
+                    );
                     self.record_failure(&provider.name).await;
                     errors.push(format!("{}: {exc}", provider.name));
                 }
