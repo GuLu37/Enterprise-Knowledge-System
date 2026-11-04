@@ -78,10 +78,23 @@ pub struct RetrievalItem {
     pub rerank_stage: Option<String>,
     /// Cross-Encoder 精排分数（触发精排时填充）。
     pub cross_encoder_score: Option<f64>,
+    /// 对齐 Python cascade metadata：跳过/精排可观测字段。
+    pub rerank_trace: RerankTrace,
     /// 结构化同 Sheet 聚合标记（_expand_structured_section_evidence 产物）。
     pub structured_aggregation: bool,
     pub section_name: Option<String>,
     pub chunk_indices: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RerankTrace {
+    pub cross_encoder_used: Option<bool>,
+    pub rule_confidence: Option<f64>,
+    pub rule_score: Option<f64>,
+    pub rule_score_normalized: Option<f64>,
+    pub final_score: Option<f64>,
+    pub cross_encoder_candidate_rank: Option<i64>,
+    pub cross_encoder_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,6 +144,7 @@ impl RetrievalItem {
             parent_context_text: None,
             rerank_stage: None,
             cross_encoder_score: None,
+            rerank_trace: RerankTrace::default(),
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
@@ -174,9 +188,43 @@ impl RetrievalItem {
         if self.parent_context_text.is_some() {
             map.insert("context_expansion".into(), json!(true));
         }
-        if let Some(ce_score) = self.cross_encoder_score {
+        if let Some(used) = self.rerank_trace.cross_encoder_used {
+            map.insert("cross_encoder_used".into(), json!(used));
+        } else if self.cross_encoder_score.is_some() {
             map.insert("cross_encoder_used".into(), json!(true));
-            map.insert("cross_encoder_score".into(), json!(ce_score));
+        }
+        match self.cross_encoder_score {
+            Some(ce_score) => {
+                map.insert("cross_encoder_score".into(), json!(ce_score));
+            }
+            None if self.rerank_stage.as_deref() == Some("rule_then_cross_encoder") => {
+                map.insert("cross_encoder_score".into(), Value::Null);
+            }
+            None => {}
+        }
+        if let Some(value) = self.rerank_trace.rule_confidence {
+            map.insert("rule_confidence".into(), json!(value));
+        }
+        if let Some(value) = self.rerank_trace.rule_score {
+            map.insert("rule_score".into(), json!(value));
+        }
+        if let Some(value) = self.rerank_trace.rule_score_normalized {
+            map.insert("rule_score_normalized".into(), json!(value));
+        }
+        if let Some(value) = self.rerank_trace.final_score {
+            map.insert("final_score".into(), json!(value));
+        }
+        match self.rerank_trace.cross_encoder_candidate_rank {
+            Some(rank) => {
+                map.insert("cross_encoder_candidate_rank".into(), json!(rank));
+            }
+            None if self.rerank_stage.as_deref() == Some("rule_then_cross_encoder") => {
+                map.insert("cross_encoder_candidate_rank".into(), Value::Null);
+            }
+            None => {}
+        }
+        if let Some(error) = &self.rerank_trace.cross_encoder_error {
+            map.insert("cross_encoder_error".into(), json!(error));
         }
         if self.structured_aggregation {
             map.insert("structured_aggregation".into(), json!(true));

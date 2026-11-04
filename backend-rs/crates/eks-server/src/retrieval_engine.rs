@@ -1330,6 +1330,7 @@ mod tests {
             parent_context_text: None,
             rerank_stage: None,
             cross_encoder_score: None,
+            rerank_trace: crate::retrieval::RerankTrace::default(),
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
