@@ -22,6 +22,8 @@ pub struct Config {
     pub bge_batch_size: usize,
     pub bge_normalize_embeddings: bool,
     pub milvus_lite_path: String,
+    /// 对齐 Python `VECTOR_STORE_TYPE`；Rust 仅实现 milvus_lite / lite。
+    pub vector_store_type: String,
     pub cross_encoder_enabled: bool,
     /// 对齐 Python `CROSS_ENCODER_MODEL_NAME`（本地目录或 HuggingFace 模型 id）。
     pub cross_encoder_model_name: String,
@@ -256,6 +258,27 @@ pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
         .map(|name| format!("../backend/app/data/{name}"))
 }
 
+/// 对齐 Python `VECTOR_STORE_TYPE`：只接受 milvus_lite/lite，拒绝远程 milvus gRPC。
+/// 空值默认 milvus_lite（Rust 不实现服务端 Milvus）。
+pub fn parse_vector_store_type(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_lowercase();
+    let value = if normalized.is_empty() {
+        "milvus_lite".to_string()
+    } else {
+        normalized
+    };
+    match value.as_str() {
+        "milvus_lite" | "lite" => Ok(value),
+        "milvus" => Err(
+            "Rust 后端仅支持 VECTOR_STORE_TYPE=milvus_lite（或 lite），不连接远程 Milvus gRPC"
+                .into(),
+        ),
+        other => Err(format!(
+            "不支持的 VECTOR_STORE_TYPE: {other}，仅支持 milvus_lite / lite"
+        )),
+    }
+}
+
 /// Rust 不实现 MySQL/PostgreSQL：非 sqlite 的 `DATABASE_URL` 必须启动失败。
 pub fn reject_unsupported_database_url(raw: &str) -> Result<(), String> {
     let trimmed = raw.trim();
@@ -488,6 +511,12 @@ impl Config {
         let cross_encoder_model_name = load_cross_encoder_model_name();
         let (cross_encoder_onnx, cross_encoder_tokenizer) =
             load_cross_encoder_paths(&cross_encoder_model_name);
+        let vector_store_type = match parse_vector_store_type(
+            &env::var("VECTOR_STORE_TYPE").unwrap_or_default(),
+        ) {
+            Ok(value) => value,
+            Err(err) => panic!("{err}"),
+        };
         let config = Config {
             app_name: env_or("APP_NAME", "Enterprise Knowledge System"),
             app_version: env_or("APP_VERSION", "1.0.0"),
@@ -510,6 +539,7 @@ impl Config {
             bge_batch_size: env_i64("BGE_BATCH_SIZE", 16).max(1) as usize,
             bge_normalize_embeddings: env_bool("BGE_NORMALIZE_EMBEDDINGS", true),
             milvus_lite_path: load_milvus_lite_path(),
+            vector_store_type,
             cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", false),
             cross_encoder_model_name,
             cross_encoder_onnx,
@@ -635,6 +665,7 @@ impl Config {
             bge_batch_size: 16,
             bge_normalize_embeddings: true,
             milvus_lite_path: String::new(),
+            vector_store_type: "milvus_lite".into(),
             cross_encoder_enabled: false,
             cross_encoder_model_name: "BAAI/bge-reranker-base".into(),
             cross_encoder_onnx: String::new(),
@@ -811,6 +842,20 @@ mod tests {
         assert_eq!(Config::jwt_test().sparse_index_mode, "cached");
         assert_eq!(Config::jwt_test().sparse_index_max_rows, 50_000);
         assert_eq!(Config::jwt_test().embedding_dimension, 768);
+        assert_eq!(Config::jwt_test().vector_store_type, "milvus_lite");
+    }
+
+    #[test]
+    fn vector_store_type_accepts_lite_and_rejects_remote_milvus() {
+        assert_eq!(parse_vector_store_type("").unwrap(), "milvus_lite");
+        assert_eq!(parse_vector_store_type("MILVUS_LITE").unwrap(), "milvus_lite");
+        assert_eq!(parse_vector_store_type("lite").unwrap(), "lite");
+        assert!(parse_vector_store_type("milvus")
+            .unwrap_err()
+            .contains("不连接远程 Milvus gRPC"));
+        assert!(parse_vector_store_type("faiss")
+            .unwrap_err()
+            .contains("不支持的 VECTOR_STORE_TYPE"));
     }
 
     #[test]
