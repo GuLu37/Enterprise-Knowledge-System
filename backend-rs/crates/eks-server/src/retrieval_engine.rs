@@ -160,6 +160,13 @@ pub struct RetrievalEngine {
     pub store: MilvusLiteStore,
     pub embedder: Arc<Embedder>,
     pub pool: sqlx::SqlitePool,
+    pub child_collection: String,
+    pub dense_weight: f64,
+    pub sparse_weight: f64,
+    pub use_dense: bool,
+    pub use_sparse: bool,
+    pub use_hybrid: bool,
+    pub sparse_index_max_rows: usize,
     pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
     pub ce_candidate_k: usize,
     pub ce_weight: f64,
@@ -177,6 +184,13 @@ impl RetrievalEngine {
             store,
             embedder,
             pool,
+            child_collection: "doc_chunk".into(),
+            dense_weight: 0.5,
+            sparse_weight: 0.5,
+            use_dense: true,
+            use_sparse: true,
+            use_hybrid: true,
+            sparse_index_max_rows: 50_000,
             cross_encoder: None,
             ce_candidate_k: 30,
             ce_weight: 0.65,
@@ -186,6 +200,25 @@ impl RetrievalEngine {
             ce_trigger_mode: "adaptive".to_string(),
             sparse: tokio::sync::RwLock::new(None),
             result_cache: tokio::sync::Mutex::new(crate::rag_cache::RagResultCache::new(true, 3600)),
+        }
+    }
+
+    pub fn with_retrieval_options(mut self, config: &crate::config::Config) -> Self {
+        self.child_collection = config.milvus_child_collection.clone();
+        self.dense_weight = config.dense_weight;
+        self.sparse_weight = config.sparse_weight;
+        self.use_dense = config.use_dense_retriever;
+        self.use_sparse = config.use_sparse_retriever;
+        self.use_hybrid = config.use_hybrid_retriever;
+        self.sparse_index_max_rows = config.sparse_index_max_rows;
+        self
+    }
+
+    fn child_collection(&self) -> &str {
+        if self.child_collection.trim().is_empty() {
+            "doc_chunk"
+        } else {
+            self.child_collection.as_str()
         }
     }
 
@@ -227,45 +260,48 @@ impl RetrievalEngine {
         }
         let snapshot = self
             .store
-            .collection("doc_chunk")
+            .collection(self.child_collection())
             .await
             .map_err(|e| e.to_string())?;
+        if snapshot.rows.len() > self.sparse_index_max_rows {
+            tracing::warn!(
+                rows = snapshot.rows.len(),
+                max_rows = self.sparse_index_max_rows,
+                "child 行数超过 SPARSE_INDEX_MAX_ROWS，Rust 无 LIKE 回退，仍构建全量稀疏索引"
+            );
+        }
         let built = Arc::new(SparseIndexSnapshot::build(&snapshot.rows));
         *self.sparse.write().await = Some(built.clone());
         Ok(built)
     }
 
     pub async fn invalidate(&self) {
-        self.store.invalidate("doc_chunk").await;
+        self.store.invalidate(self.child_collection()).await;
         *self.sparse.write().await = None;
         self.result_cache.lock().await.clear();
     }
 
     pub async fn delete_document_chunks(&self, document_id: &str) -> Result<bool, String> {
-        self.store.delete_by_document_id("doc_chunk", document_id).await
+        self.store
+            .delete_by_document_id(self.child_collection(), document_id)
+            .await
     }
 
-    /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
-    pub async fn search_dense(
+    async fn search_dense_inner(
         &self,
         query: &str,
         top_k: usize,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let top_k = top_k.clamp(1, 50);
-        let query = query.trim();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
         let snapshot = self
             .store
-            .collection("doc_chunk")
+            .collection(self.child_collection())
             .await
             .map_err(|err| err.to_string())?;
         let vectors = self.embedder.embed_queries(&[query.to_string()])?;
         let vector = vectors.first().ok_or_else(|| "查询向量为空".to_string())?;
         let hits = self
             .store
-            .search_cosine("doc_chunk", vector, top_k)
+            .search_cosine(self.child_collection(), vector, top_k)
             .await
             .map_err(|err| err.to_string())?;
         Ok(hits
@@ -274,20 +310,14 @@ impl RetrievalEngine {
             .collect())
     }
 
-    /// 单次 Sparse（BM25）检索。
-    pub async fn search_sparse(
+    async fn search_sparse_inner(
         &self,
         query: &str,
         top_k: usize,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let top_k = top_k.clamp(1, 50);
-        let query = query.trim();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
         let snapshot = self
             .store
-            .collection("doc_chunk")
+            .collection(self.child_collection())
             .await
             .map_err(|err| err.to_string())?;
         let index = self.sparse_snapshot().await?;
@@ -302,6 +332,47 @@ impl RetrievalEngine {
                 )
             })
             .collect())
+    }
+
+    /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
+    /// 对齐 Python：对应检索器关闭时回退到另一路。
+    pub async fn search_dense(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RetrievalItem>, String> {
+        let top_k = top_k.clamp(1, 50);
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.use_dense {
+            self.search_dense_inner(query, top_k).await
+        } else if self.use_sparse {
+            self.search_sparse_inner(query, top_k).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 单次 Sparse（BM25）检索。
+    pub async fn search_sparse(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RetrievalItem>, String> {
+        let top_k = top_k.clamp(1, 50);
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.use_sparse {
+            self.search_sparse_inner(query, top_k).await
+        } else if self.use_dense {
+            self.search_dense_inner(query, top_k).await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// 完整 RAG 工作流（对齐 run_rag_workflow）。HTTP 检索入口不传 LLM，聊天/ReAct 传入。
@@ -367,7 +438,21 @@ impl RetrievalEngine {
                     let context = assemble_processed_context(&processed);
                     (processed, context)
                 }
-                _ => self.run_hybrid_workflow(query, top_k, llm).await?,
+                _ if self.use_hybrid && self.use_dense && self.use_sparse => {
+                    self.run_hybrid_workflow(query, top_k, llm).await?
+                }
+                _ if self.use_dense => {
+                    let recalled = self.search_dense(query, top_k).await?;
+                    let processed = self.post_process(query, recalled, top_k).await?;
+                    let context = assemble_processed_context(&processed);
+                    (processed, context)
+                }
+                _ => {
+                    let recalled = self.search_sparse(query, top_k).await?;
+                    let processed = self.post_process(query, recalled, top_k).await?;
+                    let context = assemble_processed_context(&processed);
+                    (processed, context)
+                }
             };
             self.result_cache
                 .lock()
@@ -406,7 +491,11 @@ impl RetrievalEngine {
         let resolved_top_k = top_k.clamp(1, 50);
         let candidate_k = candidate_pool_limit(resolved_top_k);
 
-        let snapshot = self.store.collection("doc_chunk").await.map_err(|e| e.to_string())?;
+        let snapshot = self
+            .store
+            .collection(self.child_collection())
+            .await
+            .map_err(|e| e.to_string())?;
         let sparse_index = self.sparse_snapshot().await?;
 
         // dense: 一次 embedding 批量 + 每变体一次暴力 COSINE
@@ -415,7 +504,7 @@ impl RetrievalEngine {
         for (position, q) in queries.iter().enumerate() {
             let dense_hits = self
                 .store
-                .search_cosine("doc_chunk", &query_vectors[position], candidate_k)
+                .search_cosine(self.child_collection(), &query_vectors[position], candidate_k)
                 .await
                 .map_err(|e| e.to_string())?;
             let dense: Vec<FuseItem<RetrievalItem>> = dense_hits
@@ -436,7 +525,12 @@ impl RetrievalEngine {
                 variant_sets.push(Vec::new());
                 continue;
             }
-            let fused = fuse_ranked_results(vec![dense, sparse], &[0.5, 0.5], &["dense", "sparse"], 60.0);
+            let fused = fuse_ranked_results(
+                vec![dense, sparse],
+                &[self.dense_weight, self.sparse_weight],
+                &["dense", "sparse"],
+                60.0,
+            );
             variant_sets.push(fused.into_iter().take(resolved_top_k).map(|out| out.value).collect());
         }
 

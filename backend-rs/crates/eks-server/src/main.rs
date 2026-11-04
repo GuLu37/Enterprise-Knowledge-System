@@ -52,7 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
         store, embedder, pool.clone(),
     )
-    .with_result_cache(config.enable_cache, config.cache_ttl);
+    .with_result_cache(config.enable_cache, config.cache_ttl)
+    .with_retrieval_options(&config);
     if config.cross_encoder_enabled {
         match eks_server::cross_encoder::CrossEncoder::load(
             &eks_server::cross_encoder::CrossEncoderConfig {
