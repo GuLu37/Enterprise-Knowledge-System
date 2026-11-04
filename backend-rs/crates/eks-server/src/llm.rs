@@ -1,7 +1,7 @@
 //! 多供应商 LLM 客户端（对齐 Python FallbackLLM 语义）。
 //!
-//! 兜底链: deepseek → openrouter → openai → anthropic → ollama（按 .env 配置过滤）。
-//! OpenAI 兼容协议（chat/completions + SSE delta）覆盖 deepseek/openrouter/openai。
+//! 兜底链: preferred → deepseek → openrouter → openai → anthropic → ollama（按 .env 配置过滤）。
+//! OpenAI 兼容协议覆盖 deepseek/openrouter/openai；Anthropic 走 Messages API；Ollama 走 /api/chat。
 //! 失败冷却 60s + 超时预算分摊 + 单次最多尝试 LLM_MAX_FALLBACK_ATTEMPTS 家。
 
 use std::collections::HashMap;
@@ -70,53 +70,121 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
+    pub preferred_provider: String,
     pub temperature: f64,
     pub timeout_secs: u64,
+    pub max_tokens: u32,
     pub max_fallback_attempts: usize,
     pub providers: Vec<ProviderConfig>,
 }
 
 impl LlmConfig {
     pub fn from_env(cfg: &crate::config::Config) -> Self {
+        Self::from_env_with_overrides(cfg, None, None, None)
+    }
+
+    pub fn from_env_with_overrides(
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model: Option<&str>,
+        temperature: Option<f64>,
+    ) -> Self {
+        let preferred = normalize_provider(provider).unwrap_or_else(|| normalize_provider(Some(&cfg.llm_provider)).unwrap_or_default());
+        let model_override = model.map(str::trim).filter(|item| !item.is_empty());
         let mut providers = Vec::new();
-        // OpenAI 兼容供应商
         if !cfg.deepseek_api_key.is_empty() && !cfg.deepseek_base_url.is_empty() {
-            providers.push(ProviderConfig {
-                name: "deepseek".into(),
-                api_key: cfg.deepseek_api_key.clone(),
-                base_url: cfg.deepseek_base_url.clone(),
-                model: cfg.deepseek_model.clone(),
-                is_anthropic: false,
-                is_ollama: false,
-            });
+            providers.push(openai_compat_provider(
+                "deepseek",
+                &cfg.deepseek_api_key,
+                &cfg.deepseek_base_url,
+                model_override.unwrap_or(&cfg.deepseek_model),
+            ));
         }
         if !cfg.openrouter_api_key.is_empty() && !cfg.openrouter_api_base.is_empty() {
+            providers.push(openai_compat_provider(
+                "openrouter",
+                &cfg.openrouter_api_key,
+                &cfg.openrouter_api_base,
+                model_override.unwrap_or(&cfg.openrouter_model),
+            ));
+        }
+        if !cfg.openai_api_key.is_empty() {
+            providers.push(openai_compat_provider(
+                "openai",
+                &cfg.openai_api_key,
+                &cfg.openai_base_url,
+                model_override.unwrap_or(&cfg.openai_model),
+            ));
+        }
+        if !cfg.anthropic_api_key.is_empty() {
             providers.push(ProviderConfig {
-                name: "openrouter".into(),
-                api_key: cfg.openrouter_api_key.clone(),
-                base_url: cfg.openrouter_api_base.clone(),
-                model: cfg.openrouter_model.clone(),
-                is_anthropic: false,
+                name: "anthropic".into(),
+                api_key: cfg.anthropic_api_key.clone(),
+                base_url: "https://api.anthropic.com".into(),
+                model: model_override.unwrap_or(&cfg.anthropic_model).to_string(),
+                is_anthropic: true,
                 is_ollama: false,
             });
         }
-        if !cfg.openai_api_key.is_empty() {
+        if !cfg.ollama_base_url.is_empty() && !cfg.ollama_model.is_empty() {
             providers.push(ProviderConfig {
-                name: "openai".into(),
-                api_key: cfg.openai_api_key.clone(),
-                base_url: "https://api.openai.com/v1".into(),
-                model: cfg.openai_model.clone(),
+                name: "ollama".into(),
+                api_key: String::new(),
+                base_url: cfg.ollama_base_url.clone(),
+                model: model_override.unwrap_or(&cfg.ollama_model).to_string(),
                 is_anthropic: false,
-                is_ollama: false,
+                is_ollama: true,
             });
         }
         LlmConfig {
-            temperature: cfg.llm_temperature,
+            preferred_provider: preferred,
+            temperature: temperature.unwrap_or(cfg.llm_temperature),
             timeout_secs: cfg.llm_timeout,
+            max_tokens: cfg.llm_max_tokens.max(1),
             max_fallback_attempts: cfg.llm_max_fallback_attempts.max(1),
             providers,
         }
     }
+
+    /// 按 preferred → 兜底链选出第一个已配置的供应商名称。
+    pub fn primary_provider_name(&self) -> Option<String> {
+        for name in build_provider_order(&self.preferred_provider) {
+            if self.providers.iter().any(|item| item.name == name) {
+                return Some(name);
+            }
+        }
+        self.providers.first().map(|item| item.name.clone())
+    }
+}
+
+fn openai_compat_provider(name: &str, api_key: &str, base_url: &str, model: &str) -> ProviderConfig {
+    ProviderConfig {
+        name: name.into(),
+        api_key: api_key.to_string(),
+        base_url: base_url.to_string(),
+        model: model.to_string(),
+        is_anthropic: false,
+        is_ollama: false,
+    }
+}
+
+fn normalize_provider(provider: Option<&str>) -> Option<String> {
+    let value = provider.map(str::trim).filter(|item| !item.is_empty())?.to_lowercase();
+    Some(value)
+}
+
+fn build_provider_order(preferred: &str) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let preferred = preferred.trim().to_lowercase();
+    if FALLBACK_ORDER.iter().any(|name| *name == preferred) {
+        ordered.push(preferred);
+    }
+    for name in FALLBACK_ORDER {
+        if !ordered.iter().any(|item| item == name) {
+            ordered.push((*name).to_string());
+        }
+    }
+    ordered
 }
 
 pub struct LlmClient {
@@ -167,22 +235,23 @@ impl LlmClient {
             .map(|p| (p.name.as_str(), p))
             .collect();
 
+        let order = build_provider_order(&self.config.preferred_provider);
         let mut ordered: Vec<ProviderConfig> = Vec::new();
-        for name in FALLBACK_ORDER {
-            if let Some(provider) = configured.get(name) {
+        for name in &order {
+            if let Some(provider) = configured.get(name.as_str()) {
                 let recently_failed = failures
-                    .get(*name)
+                    .get(name.as_str())
                     .map(|t| now.duration_since(*t) < FAILURE_TTL)
                     .unwrap_or(false);
-                if !recently_failed {
+                let skip_cooldown = name == &self.config.preferred_provider;
+                if !recently_failed || skip_cooldown {
                     ordered.push((*provider).clone());
                 }
             }
         }
-        // 所有 provider 都冷却 → 放宽为全量
         if ordered.is_empty() {
-            for name in FALLBACK_ORDER {
-                if let Some(provider) = configured.get(name) {
+            for name in &order {
+                if let Some(provider) = configured.get(name.as_str()) {
                     ordered.push((*provider).clone());
                 }
             }
@@ -208,6 +277,7 @@ impl LlmClient {
         let mut body = json!({
             "model": provider.model,
             "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
             "messages": messages.iter().map(ChatMessage::to_api_json).collect::<Vec<_>>(),
         });
         if let Some(tools) = tools {
@@ -282,39 +352,97 @@ impl LlmClient {
         tools: Option<&[Value]>,
         timeout_secs: u64,
     ) -> Result<ChatCompletion, String> {
+        if provider.is_anthropic {
+            return self.invoke_anthropic(provider, messages, tools, timeout_secs).await;
+        }
+        if provider.is_ollama {
+            return self.invoke_ollama(provider, messages, tools, timeout_secs).await;
+        }
         let body = self.build_request_body(provider, messages, tools);
         let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+        let payload = self
+            .post_json(&url, Some(&provider.api_key), None, &body, timeout_secs)
+            .await?;
+        completion_from_openai(provider, payload)
+    }
 
-        let response = self
+    async fn invoke_anthropic(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        timeout_secs: u64,
+    ) -> Result<ChatCompletion, String> {
+        let body = build_anthropic_body(
+            provider,
+            messages,
+            tools,
+            self.config.temperature,
+            self.config.max_tokens,
+            false,
+        );
+        let url = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
+        let payload = self
+            .post_json(
+                &url,
+                None,
+                Some(&provider.api_key),
+                &body,
+                timeout_secs,
+            )
+            .await?;
+        completion_from_anthropic(provider, payload)
+    }
+
+    async fn invoke_ollama(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        timeout_secs: u64,
+    ) -> Result<ChatCompletion, String> {
+        let body = build_ollama_body(
+            provider,
+            messages,
+            tools,
+            self.config.temperature,
+            self.config.max_tokens,
+            false,
+        );
+        let url = format!("{}/api/chat", provider.base_url.trim_end_matches('/'));
+        let payload = self.post_json(&url, None, None, &body, timeout_secs).await?;
+        completion_from_ollama(provider, payload)
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        anthropic_key: Option<&str>,
+        body: &Value,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
+        let mut request = self
             .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", provider.api_key))
+            .post(url)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(timeout_secs))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .json(body);
+        if let Some(key) = bearer.filter(|item| !item.is_empty()) {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = anthropic_key.filter(|item| !item.is_empty()) {
+            request = request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01");
+        }
+        let response = request.send().await.map_err(|e| e.to_string())?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(format!("HTTP {status}: {text}"));
         }
-
-        let payload: Value = response.json().await.map_err(|e| e.to_string())?;
-        let content = payload
-            .pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tool_calls = parse_tool_calls(payload.pointer("/choices/0/message/tool_calls"));
-        Ok(ChatCompletion {
-            content,
-            provider: provider.name.clone(),
-            model: provider.model.clone(),
-            tool_calls,
-        })
+        response.json().await.map_err(|e| e.to_string())
     }
 
     /// 流式调用（SSE，带兜底链）。返回一个 chunk 接收器。
@@ -329,21 +457,59 @@ impl LlmClient {
         let per_timeout = self.config.timeout_secs / providers.len() as u64;
         let provider = providers[0].clone(); // 简化: 流式先用首选，失败由调用方 fallback 到 invoke
 
-        let body = self.build_request_body(&provider, messages, None);
-        let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+        let (url, body, bearer, anthropic_key) = if provider.is_anthropic {
+            (
+                format!("{}/v1/messages", provider.base_url.trim_end_matches('/')),
+                build_anthropic_body(
+                    &provider,
+                    messages,
+                    None,
+                    self.config.temperature,
+                    self.config.max_tokens,
+                    true,
+                ),
+                None,
+                Some(provider.api_key.clone()),
+            )
+        } else if provider.is_ollama {
+            (
+                format!("{}/api/chat", provider.base_url.trim_end_matches('/')),
+                build_ollama_body(
+                    &provider,
+                    messages,
+                    None,
+                    self.config.temperature,
+                    self.config.max_tokens,
+                    true,
+                ),
+                None,
+                None,
+            )
+        } else {
+            let mut body = self.build_request_body(&provider, messages, None);
+            body["stream"] = json!(true);
+            (
+                format!("{}/chat/completions", provider.base_url.trim_end_matches('/')),
+                body,
+                Some(provider.api_key.clone()),
+                None,
+            )
+        };
 
-        let request = self
+        let mut request = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", provider.api_key))
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(per_timeout * 4)) // 流式给更长时间
-            .json(&json!({
-                "model": body["model"],
-                "temperature": body["temperature"],
-                "messages": body["messages"],
-                "stream": true,
-            }));
+            .timeout(Duration::from_secs(per_timeout.max(1) * 4))
+            .json(&body);
+        if let Some(key) = bearer.filter(|item| !item.is_empty()) {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        if let Some(key) = anthropic_key.filter(|item| !item.is_empty()) {
+            request = request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01");
+        }
 
         let response = request.send().await.map_err(|e| e.to_string())?;
         if !response.status().is_success() {
@@ -355,13 +521,13 @@ impl LlmClient {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let provider_name = provider.name.clone();
-        let client = self.http.clone();
+        let is_ollama = provider.is_ollama;
+        let is_anthropic = provider.is_anthropic;
 
         tokio::spawn(async move {
             use futures_util::StreamExt;
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
-            let mut buffer = std::mem::take(&mut buffer);
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -372,44 +538,442 @@ impl LlmClient {
                     }
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // 解析 SSE: data: {...}
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].to_string();
                     buffer.drain(..pos + 1);
                     let line = line.trim();
-                    if !line.starts_with("data: ") {
+                    if line.is_empty() {
                         continue;
                     }
-                    let data = &line[6..];
-                    if data == "[DONE]" {
-                        return;
-                    }
-                    if let Ok(payload) = serde_json::from_str::<Value>(data) {
-                        let delta = payload
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if !delta.is_empty() {
-                            if tx
-                                .send(StreamChunk {
-                                    delta: delta.to_string(),
-                                    provider: provider_name.clone(),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return; // 接收端关闭
-                            }
+                    let delta = if is_ollama {
+                        stream_delta_from_ollama(line)
+                    } else if is_anthropic {
+                        stream_delta_from_anthropic(line)
+                    } else {
+                        stream_delta_from_openai(line)
+                    };
+                    if let Some(delta) = delta {
+                        if tx
+                            .send(StreamChunk {
+                                delta,
+                                provider: provider_name.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                 }
             }
-            let _ = client; // 保持引用
         });
 
         Ok(rx)
     }
+}
+
+fn json_line(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+        return None;
+    }
+    let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    Some(payload)
+}
+
+fn openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
+    if tool.get("name").and_then(Value::as_str).is_some() && tool.get("input_schema").is_some() {
+        return Some(tool.clone());
+    }
+    let function = tool.get("function").unwrap_or(tool);
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let description = function.get("description").cloned().unwrap_or(json!(""));
+    let input_schema = function
+        .get("parameters")
+        .cloned()
+        .or_else(|| function.get("input_schema").cloned())
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    Some(json!({
+        "name": name,
+        "description": description,
+        "input_schema": input_schema,
+    }))
+}
+
+fn anthropic_tools(tools: Option<&[Value]>) -> Vec<Value> {
+    tools
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(openai_tool_to_anthropic)
+        .collect()
+}
+
+fn parse_json_object(value: &Value) -> Value {
+    if let Some(text) = value.as_str() {
+        serde_json::from_str::<Value>(text).unwrap_or_else(|_| json!({}))
+    } else {
+        value.clone()
+    }
+}
+
+fn anthropic_tool_use_from_openai(item: &Value) -> Option<Value> {
+    let name = item
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("name").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{name}"));
+    let input = item
+        .pointer("/function/arguments")
+        .or_else(|| item.get("input"))
+        .map(parse_json_object)
+        .unwrap_or_else(|| json!({}));
+    Some(json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input,
+    }))
+}
+
+fn anthropic_assistant_message(message: &ChatMessage) -> Value {
+    let mut blocks = Vec::new();
+    if !message.content.is_empty() {
+        blocks.push(json!({"type": "text", "text": message.content}));
+    }
+    if let Some(Value::Array(items)) = &message.tool_calls {
+        for item in items {
+            if let Some(block) = anthropic_tool_use_from_openai(item) {
+                blocks.push(block);
+            }
+        }
+    }
+    if blocks.is_empty() {
+        json!({"role": "assistant", "content": message.content})
+    } else {
+        json!({"role": "assistant", "content": blocks})
+    }
+}
+
+fn anthropic_tool_result(message: &ChatMessage) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+        "content": message.content,
+    })
+}
+
+fn last_user_is_tool_results(messages: &[Value]) -> bool {
+    let Some(Value::Object(object)) = messages.last() else {
+        return false;
+    };
+    if object.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match object.get("content") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result")),
+        _ => false,
+    }
+}
+
+fn split_anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+    let mut system_parts = Vec::new();
+    let mut converted = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {
+                let text = message.content.trim();
+                if !text.is_empty() {
+                    system_parts.push(text.to_string());
+                }
+            }
+            "tool" => {
+                let result = anthropic_tool_result(message);
+                if last_user_is_tool_results(&converted) {
+                    if let Some(Value::Object(object)) = converted.last_mut() {
+                        if let Some(Value::Array(content)) = object.get_mut("content") {
+                            content.push(result);
+                            continue;
+                        }
+                    }
+                }
+                converted.push(json!({
+                    "role": "user",
+                    "content": [result],
+                }));
+            }
+            "assistant" => converted.push(anthropic_assistant_message(message)),
+            _ => converted.push(json!({
+                "role": "user",
+                "content": message.content,
+            })),
+        }
+    }
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
+    (system, converted)
+}
+
+fn build_anthropic_body(
+    provider: &ProviderConfig,
+    messages: &[ChatMessage],
+    tools: Option<&[Value]>,
+    temperature: f64,
+    max_tokens: u32,
+    stream: bool,
+) -> Value {
+    let (system, converted) = split_anthropic_messages(messages);
+    let mut body = json!({
+        "model": provider.model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": converted,
+    });
+    if let Some(system) = system {
+        body["system"] = json!(system);
+    }
+    let converted_tools = anthropic_tools(tools);
+    if !converted_tools.is_empty() {
+        body["tools"] = json!(converted_tools);
+    }
+    if stream {
+        body["stream"] = json!(true);
+    }
+    body
+}
+
+fn normalize_ollama_tool_call(item: &Value) -> Value {
+    let mut mapped = item.clone();
+    let Some(text) = mapped
+        .pointer("/function/arguments")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return mapped;
+    };
+    if let Some(args) = mapped.pointer_mut("/function/arguments") {
+        *args = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+    }
+    mapped
+}
+
+fn ollama_message(message: &ChatMessage) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("role".into(), json!(message.role));
+    object.insert("content".into(), json!(message.content));
+    if let Some(calls) = &message.tool_calls {
+        let normalized = match calls {
+            Value::Array(items) => Value::Array(items.iter().map(normalize_ollama_tool_call).collect()),
+            other => other.clone(),
+        };
+        object.insert("tool_calls".into(), normalized);
+    }
+    if let Some(id) = &message.tool_call_id {
+        object.insert("tool_call_id".into(), json!(id));
+    }
+    Value::Object(object)
+}
+
+fn build_ollama_body(
+    provider: &ProviderConfig,
+    messages: &[ChatMessage],
+    tools: Option<&[Value]>,
+    temperature: f64,
+    max_tokens: u32,
+    stream: bool,
+) -> Value {
+    let mut body = json!({
+        "model": provider.model,
+        "messages": messages.iter().map(ollama_message).collect::<Vec<_>>(),
+        "stream": stream,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        },
+    });
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+    }
+    body
+}
+
+fn message_content(value: &Value) -> String {
+    match value.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn completion_from_openai(provider: &ProviderConfig, payload: Value) -> Result<ChatCompletion, String> {
+    let message = payload.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&provider.model)
+        .to_string();
+    Ok(ChatCompletion {
+        content: message_content(&message),
+        provider: provider.name.clone(),
+        model,
+        tool_calls: parse_tool_calls(message.get("tool_calls")),
+    })
+}
+
+fn tool_call_from_anthropic(block: &Value) -> Option<ToolCall> {
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let id = block
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{name}"));
+    let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+    let raw = json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into()),
+        }
+    });
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
+        raw,
+    })
+}
+
+fn completion_from_anthropic(provider: &ProviderConfig, payload: Value) -> Result<ChatCompletion, String> {
+    let mut texts = Vec::new();
+    let mut tool_calls = Vec::new();
+    match payload.get("content") {
+        Some(Value::String(text)) => texts.push(text.clone()),
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                    "tool_use" => {
+                        if let Some(call) = tool_call_from_anthropic(block) {
+                            tool_calls.push(call);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&provider.model)
+        .to_string();
+    Ok(ChatCompletion {
+        content: texts.join(""),
+        provider: provider.name.clone(),
+        model,
+        tool_calls,
+    })
+}
+
+fn completion_from_ollama(provider: &ProviderConfig, payload: Value) -> Result<ChatCompletion, String> {
+    let message = payload.get("message").cloned().unwrap_or(json!({}));
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&provider.model)
+        .to_string();
+    Ok(ChatCompletion {
+        content: message_content(&message),
+        provider: provider.name.clone(),
+        model,
+        tool_calls: parse_tool_calls(message.get("tool_calls")),
+    })
+}
+
+fn stream_delta_from_openai(line: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(json_line(line)?).ok()?;
+    payload
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn stream_delta_from_anthropic(line: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(json_line(line)?).ok()?;
+    if payload.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+        return payload
+            .pointer("/delta/text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+    }
+    payload
+        .pointer("/delta/text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn stream_delta_from_ollama(line: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(json_line(line)?).ok()?;
+    payload
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("response").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_tool_calls(value: Option<&Value>) -> Vec<ToolCall> {
@@ -486,5 +1050,206 @@ mod tests {
         assert_eq!(encoded["content"], "你好");
         assert!(encoded.get("tool_calls").is_none());
         assert!(encoded.get("tool_call_id").is_none());
+    }
+
+    fn demo_provider(name: &str, anthropic: bool, ollama: bool) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            api_key: "k".into(),
+            base_url: if ollama {
+                "http://127.0.0.1:11434".into()
+            } else {
+                "https://api.example.com".into()
+            },
+            model: "demo".into(),
+            is_anthropic: anthropic,
+            is_ollama: ollama,
+        }
+    }
+
+    #[test]
+    fn preferred_provider_leads_fallback_order() {
+        assert_eq!(
+            build_provider_order("anthropic"),
+            vec!["anthropic", "deepseek", "openrouter", "openai", "ollama"]
+        );
+        assert_eq!(
+            build_provider_order("unknown"),
+            vec!["deepseek", "openrouter", "openai", "anthropic", "ollama"]
+        );
+    }
+
+    #[test]
+    fn request_overrides_preferred_model_and_temperature() {
+        let mut cfg = crate::config::Config::jwt_test();
+        cfg.openai_api_key = "sk-test".into();
+        cfg.openai_model = "gpt-4o-mini".into();
+        cfg.anthropic_api_key = "ak-test".into();
+        cfg.ollama_base_url = "http://127.0.0.1:11434".into();
+        cfg.ollama_model = "qwen".into();
+        cfg.llm_provider = "openai".into();
+        cfg.llm_temperature = 0.7;
+
+        let llm = LlmConfig::from_env_with_overrides(
+            &cfg,
+            Some("Anthropic"),
+            Some("claude-sonnet-4-6"),
+            Some(0.2),
+        );
+        assert_eq!(llm.preferred_provider, "anthropic");
+        assert_eq!(llm.temperature, 0.2);
+        assert_eq!(llm.primary_provider_name().as_deref(), Some("anthropic"));
+        assert!(llm.providers.iter().all(|item| item.model == "claude-sonnet-4-6"));
+        assert!(llm.providers.iter().any(|item| item.is_anthropic));
+        assert!(llm.providers.iter().any(|item| item.is_ollama));
+    }
+
+    #[test]
+    fn anthropic_body_extracts_system_and_converts_tools() {
+        let provider = demo_provider("anthropic", true, false);
+        let messages = vec![
+            ChatMessage::new("system", "你是助手"),
+            ChatMessage::new("user", "查报销"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_knowledge_base",
+                        "arguments": "{\"query\":\"报销\"}"
+                    }
+                }])),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "{\"ok\":true}".into(),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+        let tools = [json!({
+            "type": "function",
+            "function": {
+                "name": "search_knowledge_base",
+                "description": "检索",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }
+        })];
+        let body = build_anthropic_body(&provider, &messages, Some(&tools), 0.3, 1024, true);
+        assert_eq!(body["model"], "demo");
+        assert_eq!(body["system"], "你是助手");
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][1]["content"][0]["input"]["query"], "报销");
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(body["tools"][0]["name"], "search_knowledge_base");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn ollama_body_uses_native_chat_options() {
+        let provider = demo_provider("ollama", false, true);
+        let messages = vec![
+            ChatMessage::new("system", "你是助手"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_knowledge_base",
+                        "arguments": "{\"query\":\"报销\"}"
+                    }
+                }])),
+                tool_call_id: None,
+            },
+        ];
+        let body = build_ollama_body(&provider, &messages, None, 0.4, 2048, false);
+        assert_eq!(body["model"], "demo");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["options"]["temperature"], 0.4);
+        assert_eq!(body["options"]["num_predict"], 2048);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["arguments"]["query"],
+            "报销"
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_and_ollama_completions() {
+        let anthropic = demo_provider("anthropic", true, false);
+        let parsed = completion_from_anthropic(
+            &anthropic,
+            json!({
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "text", "text": "先查知识库"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "search_knowledge_base",
+                        "input": {"query": "报销"}
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(parsed.content, "先查知识库");
+        assert_eq!(parsed.model, "claude-sonnet-4-6");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "toolu_1");
+        assert_eq!(parsed.tool_calls[0].arguments["query"], "报销");
+        assert_eq!(parsed.tool_calls[0].raw["function"]["name"], "search_knowledge_base");
+
+        let ollama = demo_provider("ollama", false, true);
+        let parsed = completion_from_ollama(
+            &ollama,
+            json!({
+                "model": "qwen",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "search_knowledge_base",
+                            "arguments": {"query": "差旅"}
+                        }
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(parsed.model, "qwen");
+        assert_eq!(parsed.tool_calls[0].name, "search_knowledge_base");
+        assert_eq!(parsed.tool_calls[0].arguments["query"], "差旅");
+    }
+
+    #[test]
+    fn parses_provider_stream_deltas() {
+        assert_eq!(
+            stream_delta_from_openai(r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#).as_deref(),
+            Some("你好")
+        );
+        assert_eq!(stream_delta_from_openai("data: [DONE]"), None);
+        assert_eq!(
+            stream_delta_from_anthropic(
+                r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}"#
+            )
+            .as_deref(),
+            Some("Hello")
+        );
+        assert_eq!(
+            stream_delta_from_ollama(r#"{"message":{"role":"assistant","content":"世界"},"done":false}"#)
+                .as_deref(),
+            Some("世界")
+        );
     }
 }

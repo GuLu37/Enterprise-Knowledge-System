@@ -92,6 +92,18 @@ fn memory_options(request: &ChatStreamRequest) -> crate::short_memory::ShortMemo
     }
 }
 
+fn llm_config_for_request(
+    cfg: &crate::config::Config,
+    request: &ChatStreamRequest,
+) -> crate::llm::LlmConfig {
+    crate::llm::LlmConfig::from_env_with_overrides(
+        cfg,
+        request.provider.as_deref(),
+        request.model.as_deref(),
+        request.temperature,
+    )
+}
+
 fn clarify_text(intent: &crate::intent::QueryIntent) -> String {
     let text = intent.clarify_question.trim();
     if text.is_empty() {
@@ -426,7 +438,7 @@ fn runtime_payload(state: &AppState) -> serde_json::Value {
     let cross_encoder_enabled = state.config.cross_encoder_enabled;
     let cross_encoder_warmed = state.engine.cross_encoder.is_some();
     let ready = embedding_warmed && llm_warmed;
-    let provider = llm.providers.first().map(|item| item.name.clone());
+    let provider = llm.primary_provider_name();
     json!({
         "ready": ready,
         "status": if ready { "ready" } else { "failed" },
@@ -524,7 +536,7 @@ pub async fn generate_chat(
     if let Err(detail) = options.validate() {
         return Err(crate::auth::AuthError::bad_request(&detail));
     }
-    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    let llm_config = llm_config_for_request(&state.config, &request);
     let llm_client = if llm_config.providers.is_empty() {
         None
     } else {
@@ -677,7 +689,10 @@ pub async fn stream_chat(
         return Err(crate::auth::AuthError::bad_request(&detail));
     }
     let window_n = request.short_memory_n;
-    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    let request_provider = request.provider.clone();
+    let request_model = request.model.clone();
+    let request_retrieval_method = request.retrieval_method.clone();
+    let llm_config = llm_config_for_request(&state.config, &request);
     let llm_missing = llm_config.providers.is_empty();
     let llm_client = Arc::new(LlmClient::new(llm_config));
 
@@ -687,7 +702,10 @@ pub async fn stream_chat(
             "conversation_id": conversation_id,
             "session_id": session_id,
             "user_id": user_id,
+            "provider": request_provider,
+            "model": request_model,
             "use_retrieval": requested_retrieval,
+            "retrieval_method": request_retrieval_method,
             "short_memory_strategy": options.strategy,
             "short_memory_n": options.window_n,
             "short_memory_m": options.summary_m,
