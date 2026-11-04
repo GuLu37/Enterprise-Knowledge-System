@@ -317,13 +317,44 @@ fn planner_llm<'a>(config: &crate::config::Config, llm: &'a LlmClient) -> Option
     config.retrieval_planner_llm_decision_enabled.then_some(llm)
 }
 
-fn preferred_retrieval_method(value: Option<&str>) -> &str {
-    let method = value.unwrap_or(crate::planner::RETRIEVAL_METHOD_HYBRID).trim();
-    if method.is_empty() {
-        crate::planner::RETRIEVAL_METHOD_HYBRID
-    } else {
-        method
+/// 对齐 Python `_validate_chat_options`：空查询与 top_k 范围在进入业务前拒绝。
+fn validate_chat_options(query: &str, top_k: usize) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Err("查询文本不能为空".into());
     }
+    if !(1..=50).contains(&top_k) {
+        return Err("top_k 必须在 1 到 50 之间".into());
+    }
+    Ok(())
+}
+
+/// 对齐 Python `_validate_retrieval_method`：空值回落 hybrid，非法值直接报错。
+fn validate_retrieval_method(value: Option<&str>) -> Result<String, String> {
+    let original = value.unwrap_or("");
+    let normalized = original.trim().to_lowercase();
+    let method = if normalized.is_empty() {
+        crate::planner::RETRIEVAL_METHOD_HYBRID.to_string()
+    } else {
+        normalized
+    };
+    if matches!(
+        method.as_str(),
+        crate::planner::RETRIEVAL_METHOD_HYBRID
+            | crate::planner::RETRIEVAL_METHOD_DENSE
+            | crate::planner::RETRIEVAL_METHOD_SPARSE
+    ) {
+        Ok(method)
+    } else {
+        Err(format!("不支持的检索方式: {original}"))
+    }
+}
+
+fn prepare_chat_request(request: &ChatStreamRequest) -> Result<(String, String), String> {
+    let retrieval_method = validate_retrieval_method(request.retrieval_method.as_deref())?;
+    let query = request.query.trim().to_string();
+    validate_chat_options(&query, request.top_k)?;
+    memory_options(request).validate()?;
+    Ok((query, retrieval_method))
 }
 
 const RAG_QUERY_REWRITE_SYSTEM_PROMPT: &str = "你是企业知识库检索 query 改写器。\
@@ -1137,17 +1168,14 @@ pub async fn generate_chat(
     axum::Json(request): axum::Json<ChatStreamRequest>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
-    let query = request.query.trim().to_string();
-    if query.is_empty() {
-        return Err(crate::auth::AuthError::bad_request("问题不能为空"));
-    }
+    let (query, retrieval_method) = match prepare_chat_request(&request) {
+        Ok(value) => value,
+        Err(detail) => return Err(crate::auth::AuthError::bad_request(&detail)),
+    };
     let conversation_id = request.conversation_id.clone().unwrap_or_default();
     let session_id = request.session_id.clone().unwrap_or_default();
     let event_expiry_days = state.config.memory_event_expiry_days;
     let options = memory_options(&request);
-    if let Err(detail) = options.validate() {
-        return Err(crate::auth::AuthError::bad_request(&detail));
-    }
     let llm_config = llm_config_for_request(&state.config, &request);
     let llm_client = if llm_config.providers.is_empty() {
         None
@@ -1238,7 +1266,7 @@ pub async fn generate_chat(
         request.top_k,
         intent.needs_retrieval,
         request.short_memory_n,
-        preferred_retrieval_method(request.retrieval_method.as_deref()),
+        &retrieval_method,
         state.config.as_ref(),
     )
     .await
@@ -1311,7 +1339,10 @@ pub async fn stream_chat(
     axum::Json(request): axum::Json<ChatStreamRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
-    let query = request.query.trim().to_string();
+    let (query, retrieval_method) = match prepare_chat_request(&request) {
+        Ok(value) => value,
+        Err(detail) => return Err(crate::auth::AuthError::bad_request(&detail)),
+    };
     let requested_retrieval = request.use_retrieval;
     let top_k = request.top_k;
     let engine = state.engine.clone();
@@ -1321,13 +1352,10 @@ pub async fn stream_chat(
     let session_id = request.session_id.clone().unwrap_or_default();
     let history = request.history.clone();
     let options = memory_options(&request);
-    if let Err(detail) = options.validate() {
-        return Err(crate::auth::AuthError::bad_request(&detail));
-    }
     let window_n = request.short_memory_n;
     let request_provider = request.provider.clone();
     let request_model = request.model.clone();
-    let request_retrieval_method = request.retrieval_method.clone();
+    let request_retrieval_method = retrieval_method;
     let llm_config = llm_config_for_request(&state.config, &request);
     let llm_missing = llm_config.providers.is_empty();
     let llm_client = Arc::new(LlmClient::new(llm_config));
@@ -1568,7 +1596,7 @@ pub async fn stream_chat(
         let retrieval_query =
             resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &working_history).await;
         let use_retrieval = intent.needs_retrieval;
-        let preferred_method = preferred_retrieval_method(request_retrieval_method.as_deref());
+        let preferred_method = request_retrieval_method.as_str();
         if use_retrieval {
             let preview = crate::planner::select_initial_rule(&retrieval_query, top_k, preferred_method);
             yield Ok(sse_json("tool_call", json!({
@@ -1751,6 +1779,88 @@ mod tests {
                 content: (*content).into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn validates_chat_options_like_python() {
+        assert!(validate_chat_options("差旅报销标准", 5).is_ok());
+        assert!(validate_chat_options("差旅报销标准", 1).is_ok());
+        assert!(validate_chat_options("差旅报销标准", 50).is_ok());
+        assert_eq!(
+            validate_chat_options("  \n", 5).unwrap_err(),
+            "查询文本不能为空"
+        );
+        assert_eq!(
+            validate_chat_options("差旅报销标准", 0).unwrap_err(),
+            "top_k 必须在 1 到 50 之间"
+        );
+        assert_eq!(
+            validate_chat_options("差旅报销标准", 51).unwrap_err(),
+            "top_k 必须在 1 到 50 之间"
+        );
+    }
+
+    #[test]
+    fn validates_retrieval_method_like_python() {
+        assert_eq!(validate_retrieval_method(None).unwrap(), "hybrid");
+        assert_eq!(validate_retrieval_method(Some("")).unwrap(), "hybrid");
+        assert_eq!(validate_retrieval_method(Some(" DENSE ")).unwrap(), "dense");
+        assert_eq!(validate_retrieval_method(Some("sparse")).unwrap(), "sparse");
+        assert_eq!(
+            validate_retrieval_method(Some("bm25")).unwrap_err(),
+            "不支持的检索方式: bm25"
+        );
+        assert_eq!(
+            validate_retrieval_method(Some(" BM25 ")).unwrap_err(),
+            "不支持的检索方式:  BM25 "
+        );
+    }
+
+    #[test]
+    fn prepare_chat_request_rejects_before_short_memory() {
+        let mut request = ChatStreamRequest {
+            query: "差旅报销标准".into(),
+            history: Vec::new(),
+            conversation_id: None,
+            session_id: None,
+            top_k: 5,
+            use_retrieval: true,
+            retrieval_method: Some("hybrid".into()),
+            provider: None,
+            model: None,
+            temperature: None,
+            short_memory_strategy: "window".into(),
+            short_memory_n: 5,
+            short_memory_m: 10,
+        };
+        assert_eq!(
+            prepare_chat_request(&request).unwrap(),
+            ("差旅报销标准".into(), "hybrid".into())
+        );
+
+        request.top_k = 0;
+        assert_eq!(
+            prepare_chat_request(&request).unwrap_err(),
+            "top_k 必须在 1 到 50 之间"
+        );
+        request.top_k = 5;
+        request.retrieval_method = Some("keyword".into());
+        assert_eq!(
+            prepare_chat_request(&request).unwrap_err(),
+            "不支持的检索方式: keyword"
+        );
+        request.retrieval_method = Some("hybrid".into());
+        request.query = "   ".into();
+        assert_eq!(
+            prepare_chat_request(&request).unwrap_err(),
+            "查询文本不能为空"
+        );
+        request.query = "差旅报销标准".into();
+        request.short_memory_n = 0;
+        assert_eq!(
+            prepare_chat_request(&request).unwrap_err(),
+            "short_memory_n 必须大于 0"
+        );
     }
 
     #[test]
