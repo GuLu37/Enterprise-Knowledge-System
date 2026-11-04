@@ -424,6 +424,15 @@ fn reject_empty_query(query: &str) -> Result<(), AuthError> {
     crate::validate::string_min_length(query, 1)
 }
 
+/// 对齐 Python `_build_response(request.query, …)`：HTTP 回显原始查询串。
+fn echo_request_query(query: &str) -> &str {
+    query
+}
+
+fn retrieval_search_query(query: &str) -> &str {
+    query.trim()
+}
+
 pub async fn retrieval_dense(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -449,18 +458,18 @@ async fn retrieval_simple(
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
     let top_k = crate::validate::retrieval_top_k(request.top_k)?;
-    let query = request.query.trim().to_string();
+    let query = retrieval_search_query(&request.query);
     let mut results = if method == "dense" {
-        state.engine.search_dense(&query, top_k).await
+        state.engine.search_dense(query, top_k).await
     } else {
-        state.engine.search_sparse(&query, top_k).await
+        state.engine.search_sparse(query, top_k).await
     }
     .map_err(internal_error)?;
     if method == "dense" && state.config.similarity_threshold > 0.0 {
         results.retain(|item| item.score >= state.config.similarity_threshold);
     }
     Ok(Json(json!({
-        "query": query,
+        "query": echo_request_query(&request.query),
         "retrieval_method": method,
         "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
         "top_k": top_k,
@@ -595,11 +604,11 @@ pub async fn retrieval_hybrid(
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
     let top_k = crate::validate::retrieval_top_k(request.top_k)?;
-    let query = request.query.trim().to_string();
+    let query = retrieval_search_query(&request.query);
     let (recalled, _) = state
         .engine
         .retrieve_documents_multi_query(
-            &query,
+            query,
             top_k,
             crate::planner::RETRIEVAL_METHOD_HYBRID,
             None,
@@ -608,11 +617,11 @@ pub async fn retrieval_hybrid(
         .map_err(internal_error)?;
     let results = state
         .engine
-        .post_process(&query, recalled, top_k)
+        .post_process(query, recalled, top_k)
         .await
         .map_err(internal_error)?;
     Ok(Json(json!({
-        "query": query,
+        "query": echo_request_query(&request.query),
         "retrieval_method": "hybrid",
         "results": results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
         "top_k": top_k,
@@ -627,14 +636,14 @@ pub async fn retrieval_rag(
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
     let top_k = crate::validate::retrieval_top_k(request.top_k)?;
-    let query = request.query.trim().to_string();
+    let query = retrieval_search_query(&request.query);
     let planned = state
         .engine
-        .run_rag_workflow(&query, top_k)
+        .run_rag_workflow(query, top_k)
         .await
         .map_err(internal_error)?;
     Ok(Json(json!({
-        "query": query,
+        "query": echo_request_query(&request.query),
         "retrieval_method": "hybrid",
         "expanded_queries": planned.expanded_queries,
         "results": planned.results.iter().map(|item| item.to_json()).collect::<Vec<_>>(),
@@ -688,6 +697,8 @@ mod health_tests {
         assert_eq!(err.detail, "String should have at least 1 character");
         assert!(reject_empty_query("   ").is_ok());
         assert!(reject_empty_query("差旅").is_ok());
+        assert_eq!(echo_request_query("  差旅报销  "), "  差旅报销  ");
+        assert_eq!(retrieval_search_query("  差旅报销  "), "差旅报销");
     }
 }
 

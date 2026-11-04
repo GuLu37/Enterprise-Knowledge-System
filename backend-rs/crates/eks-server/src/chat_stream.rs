@@ -423,10 +423,10 @@ fn validate_retrieval_method(value: Option<&str>) -> Result<String, String> {
 
 fn prepare_chat_request(request: &ChatStreamRequest) -> Result<(String, String), String> {
     let retrieval_method = validate_retrieval_method(request.retrieval_method.as_deref())?;
-    let query = request.query.trim().to_string();
-    validate_chat_options(&query, request.top_k)?;
+    validate_chat_options(&request.query, request.top_k)?;
     memory_options(request).validate()?;
-    Ok((query, retrieval_method))
+    // 对齐 Python `ChatResponse.query` / SSE `start.query`：回显原始请求串，不 trim。
+    Ok((request.query.clone(), retrieval_method))
 }
 
 /// 对齐 FastAPI `ChatRequest` Pydantic 字段：越界/非法字面量在进入业务前 422。
@@ -2215,6 +2215,12 @@ mod tests {
             prepare_chat_request(&request).unwrap(),
             ("差旅报销标准".into(), "hybrid".into())
         );
+        request.query = "  差旅报销标准  ".into();
+        assert_eq!(
+            prepare_chat_request(&request).unwrap(),
+            ("  差旅报销标准  ".into(), "hybrid".into())
+        );
+        request.query = "差旅报销标准".into();
 
         request.top_k = 0;
         assert_eq!(
