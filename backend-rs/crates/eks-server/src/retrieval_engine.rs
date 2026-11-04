@@ -11,7 +11,7 @@ use eks_kernels::rerank::{
     score_result, is_reference_index_result,
 };
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::embedder::Embedder;
 use crate::milvus_lite::MilvusLiteStore;
@@ -87,6 +87,55 @@ fn assemble_processed_context(processed: &[RetrievalItem]) -> String {
         crate::retrieval::RAG_CONTEXT_MAX_CHARS
     };
     crate::retrieval::assemble_rag_context(processed, max_chars)
+}
+
+fn json_optional_str(value: &str) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else {
+        json!(value)
+    }
+}
+
+/// 对齐 Python `run_rag_workflow` 的 `RAG 检索诊断` JSON 日志。
+fn format_rag_diagnostic(
+    query: &str,
+    expanded_queries: &[String],
+    recalled_count: usize,
+    processed: &[RetrievalItem],
+    context: &str,
+) -> String {
+    let best_score = processed
+        .iter()
+        .map(|item| item.score)
+        .fold(0.0_f64, f64::max);
+    let result_chunks: Vec<Value> = processed
+        .iter()
+        .map(|item| {
+            json!({
+                "source_name": json_optional_str(&item.source_name),
+                "document_id": json_optional_str(&item.document_id),
+                "chunk_index": item.chunk_index,
+                "chunk_count": if item.chunk_indices.is_empty() {
+                    1
+                } else {
+                    item.chunk_indices.len()
+                },
+                "parent_id": json_optional_str(&item.parent_id),
+            })
+        })
+        .collect();
+    let payload = json!({
+        "query": query,
+        "identifier_query": eks_kernels::rerank::is_identifier_query(query),
+        "expanded_queries": expanded_queries,
+        "recalled_count": recalled_count,
+        "filtered_count": processed.len(),
+        "result_chunks": result_chunks,
+        "context_chars": context.chars().count(),
+        "best_score": best_score,
+    });
+    format!("RAG 检索诊断: {payload}")
 }
 
 fn is_structured_result(item: &RetrievalItem) -> bool {
@@ -560,8 +609,19 @@ impl RetrievalEngine {
             let (recalled, expanded_queries) = self
                 .retrieve_documents_multi_query(query, top_k, &method, llm)
                 .await?;
+            let recalled_count = recalled.len();
             let processed = self.post_process(query, recalled, top_k).await?;
             let context = assemble_processed_context(&processed);
+            tracing::info!(
+                "{}",
+                format_rag_diagnostic(
+                    query,
+                    &expanded_queries,
+                    recalled_count,
+                    &processed,
+                    &context
+                )
+            );
             self.result_cache.lock().await.put(
                 cache_key,
                 processed.clone(),
@@ -1445,5 +1505,42 @@ mod tests {
         item.rerank_stage = None;
         item.cross_encoder_score = Some(0.91);
         assert!(cross_encoder_used(&item));
+    }
+
+    #[test]
+    fn rag_diagnostic_log_matches_python_shape() {
+        let item = RetrievalItem {
+            content: "报销标准".into(),
+            score: 0.8,
+            source: "dense".into(),
+            document_id: "d1".into(),
+            source_name: "手册.md".into(),
+            chunk_index: 0,
+            child_id: "d1:c000000".into(),
+            parent_id: "d1:p000000".into(),
+            parent_index: 0,
+            file_type: "md".into(),
+            content_type: "text/markdown".into(),
+            signals: None,
+            parent_context_text: None,
+            rerank_stage: None,
+            cross_encoder_score: None,
+            rerank_trace: crate::retrieval::RerankTrace::default(),
+            structured_aggregation: false,
+            section_name: None,
+            chunk_indices: Vec::new(),
+        };
+        let line = format_rag_diagnostic("差旅报销", &["差旅报销".into()], 4, &[item], "上下文");
+        assert!(line.starts_with("RAG 检索诊断: "));
+        let payload: Value =
+            serde_json::from_str(line.strip_prefix("RAG 检索诊断: ").unwrap()).unwrap();
+        assert_eq!(payload["query"], "差旅报销");
+        assert_eq!(payload["identifier_query"], false);
+        assert_eq!(payload["recalled_count"], 4);
+        assert_eq!(payload["filtered_count"], 1);
+        assert_eq!(payload["result_chunks"][0]["chunk_count"], 1);
+        assert_eq!(payload["result_chunks"][0]["source_name"], "手册.md");
+        assert_eq!(payload["context_chars"], 3);
+        assert_eq!(payload["best_score"], 0.8);
     }
 }
