@@ -32,6 +32,26 @@ fn candidate_pool_limit(top_k: usize) -> usize {
     (top_k * 8).max(top_k + 20).max(MIN_RAG_CANDIDATE_POOL)
 }
 
+fn cross_encoder_used(item: &RetrievalItem) -> bool {
+    item.cross_encoder_score.is_some()
+        || item.rerank_stage.as_deref() == Some("rule_then_cross_encoder")
+}
+
+/// 对齐 Python `filter_retrieval_results` 的 ranking_pool：
+/// 结构化查询或 Cross-Encoder 已使用时取全量 reranked，否则优先关键词命中，空则回退全量。
+fn ranking_pool_indexes(
+    structured_lookup: bool,
+    has_cross_encoder: bool,
+    keyword_matched: &[usize],
+    reranked_len: usize,
+) -> Vec<usize> {
+    if structured_lookup || has_cross_encoder || keyword_matched.is_empty() {
+        (0..reranked_len).collect()
+    } else {
+        keyword_matched.to_vec()
+    }
+}
+
 fn assemble_processed_context(processed: &[RetrievalItem]) -> String {
     let max_chars = if processed.iter().any(|item| item.structured_aggregation) {
         crate::retrieval::STRUCTURED_CONTEXT_MAX_CHARS
@@ -858,11 +878,14 @@ impl RetrievalEngine {
             .map(|(index, _)| index)
             .collect();
 
-        let ranking_pool: Vec<usize> = if structured_lookup || keyword_matched.is_empty() {
-            (0..reranked.len()).collect()
-        } else {
-            keyword_matched.clone()
-        };
+        // 对齐 Python：结构化查询或 Cross-Encoder 已打分时，用全量 reranked
+        // 做 ranking_pool，避免关键词门控把语义精排结果清掉。
+        let ranking_pool: Vec<usize> = ranking_pool_indexes(
+            structured_lookup,
+            reranked.iter().any(cross_encoder_used),
+            &keyword_matched,
+            reranked.len(),
+        );
         let best_score = ranking_pool
             .iter()
             .map(|&i| reranked[i].score)
@@ -1271,5 +1294,53 @@ mod tests {
         assert!(!passes_similarity_threshold(0.49, 0.5));
         assert!(passes_similarity_threshold(0.01, 0.0));
         assert!(passes_similarity_threshold(-1.0, 0.0));
+    }
+
+    #[test]
+    fn ranking_pool_keeps_full_reranked_after_cross_encoder() {
+        let keyword_matched = vec![0usize];
+        assert_eq!(
+            ranking_pool_indexes(false, true, &keyword_matched, 3),
+            vec![0, 1, 2],
+            "CE 已打分时不能只保留关键词命中"
+        );
+        assert_eq!(ranking_pool_indexes(false, false, &keyword_matched, 3), vec![0]);
+        assert_eq!(
+            ranking_pool_indexes(true, false, &keyword_matched, 3),
+            vec![0, 1, 2]
+        );
+        assert_eq!(ranking_pool_indexes(false, false, &[], 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn cross_encoder_used_detects_score_or_stage() {
+        let mut item = RetrievalItem {
+            content: "报销标准".into(),
+            score: 0.8,
+            source: "dense".into(),
+            document_id: "d1".into(),
+            source_name: "手册.md".into(),
+            chunk_index: 0,
+            child_id: "d1:c000000".into(),
+            parent_id: "d1:p000000".into(),
+            parent_index: 0,
+            file_type: "md".into(),
+            content_type: "text/markdown".into(),
+            signals: None,
+            parent_context_text: None,
+            rerank_stage: None,
+            cross_encoder_score: None,
+            structured_aggregation: false,
+            section_name: None,
+            chunk_indices: Vec::new(),
+        };
+        assert!(!cross_encoder_used(&item));
+        item.rerank_stage = Some("rule_only_high_confidence".into());
+        assert!(!cross_encoder_used(&item));
+        item.rerank_stage = Some("rule_then_cross_encoder".into());
+        assert!(cross_encoder_used(&item));
+        item.rerank_stage = None;
+        item.cross_encoder_score = Some(0.91);
+        assert!(cross_encoder_used(&item));
     }
 }
