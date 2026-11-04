@@ -7,10 +7,15 @@
 
 use axum::{
     extract::State,
-    http::HeaderMap,
-    response::sse::{Event, KeepAlive, Sse},
+    http::{
+        HeaderMap, HeaderName, HeaderValue,
+        header::{CACHE_CONTROL, CONNECTION},
+    },
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
-use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -820,6 +825,25 @@ fn sse_json(event: &str, data: serde_json::Value) -> Event {
     Event::default().event(event).data(data.to_string())
 }
 
+/// 对齐 Python `/chat/stream`：Cache-Control / Connection / X-Accel-Buffering。
+fn apply_sse_anti_buffer_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+}
+
+fn sse_anti_buffer_header_values() -> [(&'static str, &'static str); 3] {
+    [
+        ("cache-control", "no-cache"),
+        ("connection", "keep-alive"),
+        ("x-accel-buffering", "no"),
+    ]
+}
+
 /// 对齐 Python `stream_chat` 的 tool_call：`name` / `args` / `reason`。
 fn sse_tool_call_payload(name: &str, args: serde_json::Value, reason: &str) -> serde_json::Value {
     json!({
@@ -1425,7 +1449,7 @@ pub async fn stream_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::Json(request): axum::Json<ChatStreamRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, crate::auth::AuthError> {
+) -> Result<Response, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     validate_chat_schema(&request)?;
     let (query, retrieval_method) = match prepare_chat_request(&request) {
@@ -1457,7 +1481,7 @@ pub async fn stream_chat(
     let event_expiry_days = config.memory_event_expiry_days;
 
     let stream = async_stream::stream! {
-        yield Ok(sse_json("start", json!({
+        yield Ok::<Event, Infallible>(sse_json("start", json!({
             "query": query,
             "conversation_id": conversation_id,
             "session_id": session_id,
@@ -1857,7 +1881,11 @@ pub async fn stream_chat(
         }
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    apply_sse_anti_buffer_headers(&mut response);
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -2091,6 +2119,35 @@ mod tests {
         let with_message = build_messages(&[], "", Vec::new(), "差旅报销", true, "资料过少");
         assert!(with_message[1].content.ends_with("资料过少"));
         assert!(with_message[1].content.starts_with("本轮已进入知识库检索，但没有找到足够相关的资料。"));
+    }
+
+    #[test]
+    fn sse_anti_buffer_headers_match_python() {
+        assert_eq!(
+            sse_anti_buffer_header_values(),
+            [
+                ("cache-control", "no-cache"),
+                ("connection", "keep-alive"),
+                ("x-accel-buffering", "no"),
+            ]
+        );
+        let mut response = axum::http::Response::new(axum::body::Body::empty());
+        apply_sse_anti_buffer_headers(&mut response);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-cache")
+        );
+        assert_eq!(
+            response.headers().get(CONNECTION).and_then(|v| v.to_str().ok()),
+            Some("keep-alive")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-accel-buffering")
+                .and_then(|v| v.to_str().ok()),
+            Some("no")
+        );
     }
 
     #[test]
