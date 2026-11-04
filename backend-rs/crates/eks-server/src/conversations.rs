@@ -60,6 +60,16 @@ fn normalize_messages(messages: &Value) -> String {
     serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// 对齐 Python `list_user_conversations`：`max(1, min(int(limit or 100), 500))`。
+/// HTTP 列表入口不接 query，与 FastAPI 一样走缺省 100。
+pub fn conversation_list_limit(limit: Option<i64>) -> i64 {
+    let raw = match limit {
+        Some(value) if value != 0 => value,
+        _ => 100,
+    };
+    raw.clamp(1, 500)
+}
+
 /// 对齐 Python `upsert_user_conversation`：`_parse_client_datetime(created_at) or now`。
 fn resolve_created_at(client: Option<&str>, now: &str) -> String {
     client
@@ -96,11 +106,13 @@ pub async fn list_conversations(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    let limit = conversation_list_limit(None);
     let rows: Vec<ConversationRow> = sqlx::query_as(
         "SELECT user_id, conversation_id, session_id, payload, created_at, updated_at \
-         FROM user_conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100",
+         FROM user_conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
     )
     .bind(&user.user_id)
+    .bind(limit)
     .fetch_all(&state.pool)
     .await
     .map_err(AuthError::from)?;
@@ -304,6 +316,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining_other, 1);
+    }
+
+    #[test]
+    fn conversation_list_limit_clamps_like_python() {
+        assert_eq!(conversation_list_limit(None), 100);
+        assert_eq!(conversation_list_limit(Some(0)), 100);
+        assert_eq!(conversation_list_limit(Some(50)), 50);
+        assert_eq!(conversation_list_limit(Some(1)), 1);
+        assert_eq!(conversation_list_limit(Some(500)), 500);
+        assert_eq!(conversation_list_limit(Some(501)), 500);
+        assert_eq!(conversation_list_limit(Some(1000)), 500);
+        assert_eq!(conversation_list_limit(Some(-5)), 1);
     }
 
     #[test]
