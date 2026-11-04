@@ -344,6 +344,15 @@ pub fn resolve_upload_dir(upload_dir: &str, sqlite_path: &str) -> PathBuf {
     }
 }
 
+/// 对齐 Python `int(os.getenv("CHAT_MAX_CONVERSATIONS"))`：不做 1–200 夹取。
+fn parse_chat_max_conversations(raw: &str, default: i64) -> i64 {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    trimmed.parse().unwrap_or(default)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -410,7 +419,10 @@ impl Config {
             anthropic_model: env_or("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             ollama_base_url: env_or("OLLAMA_BASE_URL", ""),
             ollama_model: env_or("OLLAMA_MODEL", ""),
-            chat_max_conversations: env_i64("CHAT_MAX_CONVERSATIONS", 20).clamp(1, 200),
+            chat_max_conversations: parse_chat_max_conversations(
+                &env::var("CHAT_MAX_CONVERSATIONS").unwrap_or_default(),
+                20,
+            ),
             cors_origins: parse_cors_origins(&env::var("CORS_ORIGINS").unwrap_or_default()),
             mcp_remote_tool_manifests: parse_dict_list(
                 &env::var("MCP_REMOTE_TOOL_MANIFESTS").unwrap_or_default(),
@@ -586,6 +598,15 @@ mod tests {
     }
 
     #[test]
+    fn chat_max_conversations_keeps_python_unbounded_values() {
+        assert_eq!(parse_chat_max_conversations("500", 20), 500);
+        assert_eq!(parse_chat_max_conversations("0", 20), 0);
+        assert_eq!(parse_chat_max_conversations("-3", 20), -3);
+        assert_eq!(parse_chat_max_conversations("", 20), 20);
+        assert_eq!(parse_chat_max_conversations("abc", 20), 20);
+    }
+
+    #[test]
     fn jwt_test_keeps_react_parallel_workers() {
         assert_eq!(Config::jwt_test().unified_react_parallel_workers, 4);
         assert!(Config::jwt_test().enable_cache);
@@ -611,6 +632,7 @@ mod tests {
         assert!(!Config::jwt_test().cross_encoder_enabled);
         assert_eq!(Config::jwt_test().bge_batch_size, 16);
         assert!(Config::jwt_test().bge_normalize_embeddings);
+        assert_eq!(Config::jwt_test().chat_max_conversations, 20);
         assert_eq!(Config::jwt_test().cross_encoder_max_length, 512);
         assert_eq!(Config::jwt_test().cross_encoder_batch_size, 8);
         assert_eq!(Config::jwt_test().milvus_child_collection, "doc_chunk");
