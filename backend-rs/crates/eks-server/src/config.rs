@@ -36,6 +36,42 @@ pub struct Config {
     pub openai_api_key: String,
     pub openai_model: String,
     pub chat_max_conversations: i64,
+    pub cors_origins: Vec<String>,
+}
+
+const DEFAULT_CORS_ORIGINS: &str =
+    r#"["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080"]"#;
+
+/// 对齐 Python `_parse_list`：JSON 数组，失败则按逗号拆。
+pub fn parse_cors_origins(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return parse_cors_origins(DEFAULT_CORS_ORIGINS);
+    }
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let items = match parsed {
+            serde_json::Value::Array(items) => items,
+            other => vec![other],
+        };
+        let origins: Vec<String> = items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(value) => Some(value),
+                other => Some(other.to_string()),
+            })
+            .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        if !origins.is_empty() {
+            return origins;
+        }
+    }
+    trimmed
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -120,6 +156,65 @@ impl Config {
             openai_api_key: env_or("OPENAI_API_KEY", ""),
             openai_model: env_or("OPENAI_MODEL", "gpt-4o-mini"),
             chat_max_conversations: env_i64("CHAT_MAX_CONVERSATIONS", 20).clamp(1, 200),
+            cors_origins: parse_cors_origins(&env::var("CORS_ORIGINS").unwrap_or_default()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn jwt_test() -> Self {
+        Config {
+            api_prefix: "/api/v1".into(),
+            host: "127.0.0.1".into(),
+            port: 8000,
+            sqlite_path: ":memory:".into(),
+            jwt_secret_key: "unit-test-secret".into(),
+            access_token_expire_minutes: 60,
+            refresh_token_expire_minutes: 120,
+            session_idle_timeout_minutes: 60,
+            bge_model_dir: String::new(),
+            bge_query_instruction: String::new(),
+            bge_max_length: 512,
+            milvus_lite_path: String::new(),
+            cross_encoder_enabled: false,
+            cross_encoder_onnx: String::new(),
+            cross_encoder_tokenizer: String::new(),
+            cross_encoder_candidate_k: 30,
+            cross_encoder_weight: 0.65,
+            rule_rerank_weight: 0.35,
+            cross_encoder_confidence_threshold: 0.6,
+            cross_encoder_confidence_margin: 0.08,
+            cross_encoder_trigger_mode: "adaptive".into(),
+            llm_temperature: 0.7,
+            llm_timeout: 60,
+            llm_max_fallback_attempts: 2,
+            deepseek_api_key: String::new(),
+            deepseek_base_url: String::new(),
+            deepseek_model: String::new(),
+            openrouter_api_key: String::new(),
+            openrouter_api_base: String::new(),
+            openrouter_model: String::new(),
+            openai_api_key: String::new(),
+            openai_model: String::new(),
+            chat_max_conversations: 20,
+            cors_origins: parse_cors_origins(""),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_and_csv_cors_origins() {
+        assert_eq!(
+            parse_cors_origins(r#"["http://localhost:5173", "http://127.0.0.1:5173"]"#),
+            vec!["http://localhost:5173", "http://127.0.0.1:5173"]
+        );
+        assert_eq!(
+            parse_cors_origins("http://localhost:3000, http://localhost:8080"),
+            vec!["http://localhost:3000", "http://localhost:8080"]
+        );
+        assert!(parse_cors_origins("").contains(&"http://localhost:5173".to_string()));
     }
 }

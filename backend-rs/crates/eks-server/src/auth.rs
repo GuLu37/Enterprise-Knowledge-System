@@ -1,4 +1,13 @@
 //! 认证域：PBKDF2 密码哈希、HS256 JWT（与 Python PyJWT 产物互通）、令牌与会话逻辑。
+//! 对齐 Python `request.state.renewed_access_token`：把续期 JWT 挂到任务局部，由中间件写入 `X-Access-Token`。
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    extract::Request,
+    http::{HeaderName, HeaderValue},
+    middleware::Next,
+    response::Response,
+};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::{RngCore, rngs::OsRng};
@@ -7,6 +16,85 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::db;
+
+pub const ACCESS_TOKEN_HEADER: HeaderName = HeaderName::from_static("x-access-token");
+
+#[derive(Clone, Default)]
+struct RenewedAccessSlot(Arc<Mutex<Option<String>>>);
+
+impl RenewedAccessSlot {
+    fn set(&self, token: String) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = Some(token);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut guard| guard.take())
+    }
+}
+
+tokio::task_local! {
+    static RENEWED_ACCESS_TOKEN: RenewedAccessSlot;
+}
+
+/// 供 `require_current_user` 写入续期 JWT；未包中间件时静默忽略。
+pub fn publish_renewed_access_token(token: impl Into<String>) {
+    let token = token.into();
+    if token.is_empty() {
+        return;
+    }
+    let _ = RENEWED_ACCESS_TOKEN.try_with(|slot| slot.set(token));
+}
+
+/// 对齐 Python HTTP 中间件：把 `request.state.renewed_access_token` 写到响应头。
+pub async fn access_token_renewal_middleware(request: Request, next: Next) -> Response {
+    let slot = RenewedAccessSlot::default();
+    let mut response = RENEWED_ACCESS_TOKEN
+        .scope(slot.clone(), next.run(request))
+        .await;
+    if let Some(token) = slot.take() {
+        if let Ok(value) = HeaderValue::try_from(token) {
+            response.headers_mut().insert(ACCESS_TOKEN_HEADER, value);
+        }
+    }
+    response
+}
+
+#[cfg(test)]
+pub(crate) async fn with_renewed_slot<F, Fut, T>(f: F) -> (T, Option<String>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let slot = RenewedAccessSlot::default();
+    let result = RENEWED_ACCESS_TOKEN.scope(slot.clone(), f()).await;
+    (result, slot.take())
+}
+
+pub fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+
+    let allow_origin = if origins.iter().any(|item| item.trim() == "*") {
+        AllowOrigin::mirror_request()
+    } else {
+        let values: Vec<HeaderValue> = origins
+            .iter()
+            .filter_map(|origin| origin.trim().parse().ok())
+            .collect();
+        if values.is_empty() {
+            AllowOrigin::mirror_request()
+        } else {
+            AllowOrigin::list(values)
+        }
+    };
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_credentials(true)
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers([ACCESS_TOKEN_HEADER])
+}
 
 const PBKDF2_ITERATIONS: u32 = 210_000;
 const PASSWORD_SALT_BYTES: usize = 16;
@@ -193,4 +281,83 @@ pub fn token_bundle_json(
         "refresh_expires_in": cfg.refresh_token_expire_minutes * 60,
         "user": user_json,
     })
+}
+
+#[cfg(test)]
+mod http_layer_tests {
+    use super::*;
+    use axum::{Json, Router, body::Body, http::{Request, StatusCode}, routing::get};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn middleware_writes_x_access_token() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    publish_renewed_access_token("renewed.jwt.value");
+                    Json(json!({"ok": true}))
+                }),
+            )
+            .layer(axum::middleware::from_fn(access_token_renewal_middleware));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(ACCESS_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("renewed.jwt.value")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allows_frontend_origin_and_exposes_access_token() {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(cors_layer(&["http://localhost:5173".into()]));
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/")
+                    .header("Origin", "http://localhost:5173")
+                    .header("Access-Control-Request-Method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success() || preflight.status() == StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("Origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(exposed.contains("x-access-token"), "{exposed}");
+    }
 }

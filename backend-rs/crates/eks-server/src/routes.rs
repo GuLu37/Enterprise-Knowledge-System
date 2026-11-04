@@ -81,14 +81,22 @@ pub async fn require_current_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<db::UserRow, AuthError> {
-    let token = bearer_token(headers)?;
-    let claims = decode_token(&token, "access", &state.config.jwt_secret_key)?;
+    authenticate_and_renew(&state.pool, &state.config, headers).await
+}
 
-    let user = db::get_user_by_id(&state.pool, &claims.uid)
+async fn authenticate_and_renew(
+    pool: &sqlx::SqlitePool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<db::UserRow, AuthError> {
+    let token = bearer_token(headers)?;
+    let claims = decode_token(&token, "access", &config.jwt_secret_key)?;
+
+    let user = db::get_user_by_id(pool, &claims.uid)
         .await?
         .filter(|user| user.is_active)
         .ok_or_else(|| AuthError::unauthorized("未登录或登录已失效"))?;
-    let session = db::get_session_by_id(&state.pool, &claims.sid)
+    let session = db::get_session_by_id(pool, &claims.sid)
         .await?
         .ok_or_else(|| AuthError::unauthorized("未登录或登录已失效"))?;
     let now = now_naive();
@@ -100,8 +108,11 @@ pub async fn require_current_user(
     if !valid {
         return Err(AuthError::unauthorized("未登录或登录已失效"));
     }
-    db::slide_session(&state.pool, &session.session_id, state.config.session_idle_timeout_minutes)
-        .await?;
+    db::slide_session(pool, &session.session_id, config.session_idle_timeout_minutes).await?;
+    match build_access_token(&user, &session.session_id, config) {
+        Ok(access_token) => crate::auth::publish_renewed_access_token(access_token),
+        Err(err) => tracing::warn!("滑动续期签发访问令牌失败: {err}"),
+    }
     Ok(user)
 }
 
@@ -358,7 +369,9 @@ pub fn router(state: AppState) -> axum::Router {
             &format!("{prefix}/skills/execute"),
             post(execute_skill),
         )
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(crate::auth::access_token_renewal_middleware))
+        .layer(crate::auth::cors_layer(&state.config.cors_origins))
 }
 
 #[derive(Deserialize)]
@@ -524,5 +537,64 @@ fn internal_error(detail: String) -> AuthError {
     AuthError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod auth_renewal_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    async fn setup_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE users (
+                user_id TEXT PRIMARY KEY, username TEXT, password_hash TEXT, password_salt TEXT,
+                role TEXT, is_active INTEGER, created_at TEXT, updated_at TEXT, last_login_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE auth_sessions (
+                session_id TEXT PRIMARY KEY, user_id TEXT, refresh_token_hash TEXT, expires_at TEXT,
+                revoked_at TEXT, created_at TEXT, updated_at TEXT, last_used_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn renews_access_token_into_slot() {
+        let pool = setup_pool().await;
+        let config = crate::config::Config::jwt_test();
+        db::insert_user(&pool, "u1", "admin", "hash", "salt", "admin")
+            .await
+            .unwrap();
+        let expires = fmt_dt(&(now_naive() + chrono::Duration::minutes(60)));
+        db::insert_session(&pool, "s1", "u1", "refresh-hash", &expires)
+            .await
+            .unwrap();
+        let user = db::get_user_by_id(&pool, "u1").await.unwrap().unwrap();
+        let old_token = build_access_token(&user, "s1", &config).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {old_token}")).unwrap(),
+        );
+
+        let (user, renewed) = crate::auth::with_renewed_slot(|| authenticate_and_renew(&pool, &config, &headers)).await;
+        let user = user.unwrap();
+        let renewed = renewed.expect("应签发续期访问令牌");
+        assert_eq!(user.username, "admin");
+        assert_ne!(renewed, old_token);
+        let claims = decode_token(&renewed, "access", &config.jwt_secret_key).unwrap();
+        assert_eq!(claims.uid, "u1");
+        assert_eq!(claims.sid, "s1");
+        assert_ne!(claims.jti, decode_token(&old_token, "access", &config.jwt_secret_key).unwrap().jti);
     }
 }
