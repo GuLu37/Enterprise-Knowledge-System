@@ -440,6 +440,20 @@ fn parse_unclamped_f64(raw: &str, default: f64) -> f64 {
     }
 }
 
+/// 对齐 Python `top_k or settings.SEARCH_TOP_K`：0 视为未指定。
+pub fn coalesce_search_top_k(top_k: i64, search_top_k: i64) -> i64 {
+    if top_k == 0 {
+        search_top_k
+    } else {
+        top_k
+    }
+}
+
+/// 对齐 Python `max(1, min(top_k or settings.SEARCH_TOP_K, 50))`。
+pub fn resolve_search_top_k(top_k: i64, search_top_k: i64) -> usize {
+    coalesce_search_top_k(top_k, search_top_k).clamp(1, 50) as usize
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -724,6 +738,18 @@ mod tests {
         assert_eq!(parse_unclamped_f64("0", 0.5), 0.0);
         assert_eq!(parse_unclamped_f64("", 0.5), 0.5);
         assert_eq!(parse_unclamped_f64("nope", 0.5), 0.5);
+    }
+
+    #[test]
+    fn search_top_k_falls_back_then_clamps_at_use() {
+        assert_eq!(resolve_search_top_k(0, 10), 10);
+        assert_eq!(resolve_search_top_k(0, 100), 50);
+        assert_eq!(resolve_search_top_k(0, 0), 1);
+        assert_eq!(resolve_search_top_k(8, 10), 8);
+        assert_eq!(resolve_search_top_k(51, 5), 50);
+        assert_eq!(resolve_search_top_k(-3, 10), 1);
+        assert_eq!(coalesce_search_top_k(0, 100), 100);
+        assert_eq!(coalesce_search_top_k(8, 100), 8);
     }
 
     #[test]

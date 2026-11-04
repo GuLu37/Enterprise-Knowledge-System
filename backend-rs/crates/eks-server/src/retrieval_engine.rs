@@ -219,6 +219,7 @@ pub struct RetrievalEngine {
     pub sparse_index_max_rows: usize,
     pub embedding_dimension: usize,
     pub similarity_threshold: f64,
+    pub search_top_k: i64,
     pub cross_encoder: Option<crate::cross_encoder::SharedCrossEncoder>,
     pub ce_candidate_k: usize,
     pub ce_weight: f64,
@@ -264,6 +265,7 @@ impl RetrievalEngine {
             sparse_index_max_rows: 50_000,
             embedding_dimension: crate::milvus_lite::DEFAULT_EMBEDDING_DIMENSION,
             similarity_threshold: 0.5,
+            search_top_k: 5,
             cross_encoder: None,
             ce_candidate_k: 30,
             ce_weight: 0.65,
@@ -287,6 +289,7 @@ impl RetrievalEngine {
         self.sparse_index_max_rows = config.sparse_index_max_rows;
         self.embedding_dimension = config.embedding_dimension;
         self.similarity_threshold = config.similarity_threshold;
+        self.search_top_k = config.search_top_k;
         self
     }
 
@@ -606,7 +609,8 @@ impl RetrievalEngine {
         }
         let method = crate::planner::resolve_method_for_query(query, method);
         let (want_dense, want_sparse) = multi_query_channels(&method, self.use_dense, self.use_sparse);
-        let resolved_top_k = top_k.clamp(1, 50);
+        let resolved_top_k =
+            crate::config::resolve_search_top_k(top_k as i64, self.search_top_k);
         let candidate_k = candidate_pool_limit(resolved_top_k);
 
         let snapshot = self
@@ -916,12 +920,13 @@ impl RetrievalEngine {
         let identifiers = canonical_identifier_terms(query);
         let structured_lookup = is_structured_lookup_query(query);
         let mut max_citation = if structured_lookup { STRUCTURED_QUERY_CITATION_RESULTS } else { MAX_CITATION_RESULTS };
-        let mut requested_top_k = top_k.max(1);
+        let mut requested_top_k =
+            crate::config::coalesce_search_top_k(top_k as i64, self.search_top_k);
         if !identifiers.is_empty() {
             max_citation = max_citation.max(identifiers.len());
-            requested_top_k = requested_top_k.max(identifiers.len());
+            requested_top_k = requested_top_k.max(identifiers.len() as i64);
         }
-        let resolved_top_k = requested_top_k.min(max_citation).max(1);
+        let resolved_top_k = requested_top_k.min(max_citation as i64).max(1) as usize;
 
         let candidates: Vec<RetrievalItem> = results
             .into_iter()
