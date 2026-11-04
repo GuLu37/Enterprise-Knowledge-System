@@ -571,6 +571,7 @@ pub async fn persist_turn(
     let mut wrote = false;
     for chunk in &chunks {
         let (importance, confidence) = calculate_event_importance(&chunk.text);
+        let local_index = chunk.chunk_index as i64;
         match insert_event_memory_with_confidence(
             pool,
             user_id,
@@ -583,6 +584,8 @@ pub async fn persist_turn(
             expiry_days,
             Some(chunk.turn_start + turn_offset),
             Some(chunk.turn_end + turn_offset),
+            Some(local_index + turn_offset),
+            Some(versioned_chunk_memory_id(user_id, conversation_id, local_index)),
         )
         .await
         {
@@ -1843,6 +1846,8 @@ async fn write_semantic_summary(
     turn_start: i64,
     turn_end: i64,
     expiry_days: i64,
+    chunk_index: i64,
+    memory_id: String,
 ) -> Result<String, sqlx::Error> {
     let content = format_memory_chunk(topic, summary, transcript);
     let (importance, confidence) = calculate_event_importance(&content);
@@ -1858,8 +1863,45 @@ async fn write_semantic_summary(
         expiry_days,
         Some(turn_start),
         Some(turn_end),
+        Some(chunk_index),
+        Some(memory_id),
     )
     .await
+}
+
+fn conversation_key(conversation_id: &str) -> &str {
+    if conversation_id.trim().is_empty() {
+        "unknown"
+    } else {
+        conversation_id.trim()
+    }
+}
+
+/// 对齐 Python `_build_insert_rows`：`{user}:{conv}:{chunk.chunk_index}:{uuid}`。
+fn versioned_chunk_memory_id(user_id: &str, conversation_id: &str, local_index: i64) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        user_id,
+        conversation_key(conversation_id),
+        local_index,
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// 对齐 Python `_write_semantic_summary_block`：`{user}:{conv}:L{level}:{start}:{end}:{uuid}`。
+fn semantic_level_memory_id(
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+    turn_start: i64,
+    turn_end: i64,
+) -> String {
+    format!(
+        "{}:{}:L{level}:{turn_start}:{turn_end}:{}",
+        user_id,
+        conversation_key(conversation_id),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 async fn consolidate_level(
@@ -1949,6 +1991,8 @@ async fn consolidate_level(
                 segment_start + chunk.turn_start,
                 segment_start + chunk.turn_end,
                 expiry_days,
+                chunk.chunk_index as i64 + segment_start,
+                versioned_chunk_memory_id(user_id, conversation_id, chunk.chunk_index as i64),
             )
             .await
             {
@@ -1994,6 +2038,7 @@ async fn consolidate_level(
         if summary.trim().is_empty() {
             return 0;
         }
+        let dialogue_turns = count_dialogue_turns(pool, user_id, conversation_id).await;
         match write_semantic_summary(
             pool,
             user_id,
@@ -2005,6 +2050,14 @@ async fn consolidate_level(
             segment_start,
             segment_start + threshold,
             expiry_days,
+            dialogue_turns + segment_start,
+            semantic_level_memory_id(
+                user_id,
+                conversation_id,
+                level,
+                segment_start,
+                segment_start + threshold,
+            ),
         )
         .await
         {
@@ -2191,6 +2244,8 @@ pub(crate) async fn insert_event_memory_at(
         expiry_days,
         turn_start,
         turn_end,
+        None,
+        None,
     )
     .await
 }
@@ -2207,6 +2262,8 @@ async fn insert_event_memory_with_confidence(
     expiry_days: i64,
     turn_start: Option<i64>,
     turn_end: Option<i64>,
+    chunk_index: Option<i64>,
+    memory_id: Option<String>,
 ) -> Result<String, sqlx::Error> {
     let now = crate::db::now_naive();
     let now_text = crate::db::fmt_dt(&now);
@@ -2216,19 +2273,21 @@ async fn insert_event_memory_with_confidence(
     } else {
         memory_key.trim()
     };
-    let chunk_index = turn_start.unwrap_or(0);
+    let chunk_index = chunk_index.unwrap_or_else(|| turn_start.unwrap_or(0));
     let conv_key = if conversation_id.trim().is_empty() {
         "unknown"
     } else {
         conversation_id.trim()
     };
-    let memory_id = format!(
-        "{}:{}:{}:{}",
-        user_id,
-        conv_key,
-        chunk_index,
-        uuid::Uuid::new_v4().simple()
-    );
+    let memory_id = memory_id.unwrap_or_else(|| {
+        format!(
+            "{}:{}:{}:{}",
+            user_id,
+            conv_key,
+            chunk_index,
+            uuid::Uuid::new_v4().simple()
+        )
+    });
     let stored_key = event_logical_key(user_id, conversation_id, chunk_type, &memory_id, chunk_index);
     let current: Option<(String, i64)> = sqlx::query_as(
         "SELECT memory_id, version FROM memory_records \
@@ -2636,6 +2695,60 @@ mod tests {
             "{}",
             row.1
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_l1_uses_chunk_index_memory_id_like_python() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        for index in 0..10 {
+            insert_event_memory_at(
+                &pool,
+                "u1",
+                "c-sem",
+                "s1",
+                "dialogue",
+                &format!("用户: 确认事项 {index}\n助手: 已经完成后续相关安排。"),
+                55.0,
+                DEFAULT_EVENT_EXPIRY_DAYS,
+                Some(index),
+                Some(index),
+            )
+            .await
+            .unwrap();
+        }
+        let summarizer = MemorySummarizer::Fixed {
+            topic: "确认".into(),
+            summary: "已确认十轮事项。".into(),
+        };
+        let merged = consolidate_with(
+            &pool,
+            Some(&summarizer),
+            "u1",
+            "c-sem",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            false,
+        )
+        .await;
+        assert!(merged >= 1, "merged={merged}");
+        let row: (String, String) = sqlx::query_as(
+            "SELECT memory_id, memory_key FROM memory_records WHERE conversation_id = 'c-sem' \
+             AND (memory_key = 'semantic_memory_l1' OR memory_key LIKE 'event:%:%:semantic_memory_l1:%')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            row.0.starts_with("u1:c-sem:0:"),
+            "L1 memory_id should use local chunk_index, got {}",
+            row.0
+        );
+        assert!(
+            !row.0.contains(":L1:"),
+            "L1 should not use L-level memory_id, got {}",
+            row.0
+        );
+        assert_eq!(row.1, "event:u1:c-sem:semantic_memory_l1:0");
     }
 
     #[tokio::test]
@@ -3462,6 +3575,19 @@ mod tests {
         assert!(turns.iter().all(|(_, start, end)| *start == 0 && *end == 0));
         assert_eq!(count_dialogue_turns(&pool, "u1", "c-long").await, 1);
         assert!(turns.iter().any(|(content, _, _)| content.contains("用户: 请详细说明")));
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT memory_id FROM memory_records WHERE conversation_id = 'c-long' \
+             AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+             ORDER BY created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(ids[0].starts_with("u1:c-long:0:"), "{}", ids[0]);
+        assert!(
+            ids.iter().any(|id| id.starts_with("u1:c-long:1:")),
+            "{ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -3645,6 +3771,19 @@ mod tests {
         assert_eq!(l2, 1);
         assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 1).await, 20);
         assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 2).await, 20);
+        let l2_row: (String, String) = sqlx::query_as(
+            "SELECT memory_id, memory_key FROM memory_records WHERE conversation_id = 'c-l2' \
+             AND (memory_key = 'semantic_memory_l2' OR memory_key LIKE 'event:%:%:semantic_memory_l2:%')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            l2_row.0.starts_with("u1:c-l2:L2:0:20:"),
+            "L2 memory_id should follow Python L-level shape, got {}",
+            l2_row.0
+        );
+        assert_eq!(l2_row.1, "event:u1:c-l2:semantic_memory_l2:20");
     }
 
     fn persist_job(
