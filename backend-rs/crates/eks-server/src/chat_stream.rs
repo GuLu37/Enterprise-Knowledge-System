@@ -670,9 +670,9 @@ pub async fn consolidate_chat(
         return Err(llm_unavailable());
     }
     let llm_client = LlmClient::new(llm_config);
-    let consolidated = crate::memory::consolidate_conversation(
+    let consolidated = crate::memory::consolidate_conversation_memory(
         &state.pool,
-        &llm_client,
+        Some(&llm_client),
         &user.user_id,
         &conversation_id,
         state.config.memory_event_expiry_days,
@@ -684,7 +684,7 @@ pub async fn consolidate_chat(
     })?;
     Ok(axum::Json(json!({
         "conversation_id": conversation_id,
-        "consolidated": if consolidated { 1 } else { 0 },
+        "consolidated": consolidated,
     })))
 }
 

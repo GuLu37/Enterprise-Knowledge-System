@@ -2,6 +2,10 @@
 //! 写入 SQLite `memory_records`，与 Python memory_service 共用同一张表；
 //! 召回用词法 + 可选 BGE 余弦，不依赖 Milvus 记忆 collection。
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 
 use crate::embedder::Embedder;
@@ -36,6 +40,18 @@ const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "
 const MEMORY_TYPE_EVENT: &str = "event";
 const MEMORY_STATUS_ACTIVE: &str = "active";
 const DEFAULT_EVENT_EXPIRY_DAYS: i64 = 90;
+pub const CONSOLIDATION_LEVELS: [(i64, i32); 3] = [(10, 1), (20, 2), (40, 3)];
+const CONSOLIDATION_RETRY_DELAYS: [u64; 3] = [60, 300, 1800];
+const L1_SUMMARY_SYSTEM_PROMPT: &str = "你是长期记忆摘要器。请将给定对话总结成适合长期记忆的一句话摘要，并给出主题。\
+只输出 JSON，格式为 {\"topic\": \"主题\", \"summary\": \"一句摘要\"}，不要输出额外解释。\
+主题要短，摘要要准确，不要编造。";
+const MERGE_SUMMARY_SYSTEM_PROMPT: &str = "你是长期记忆递进摘要器。把以下多个摘要块压缩成一段更精炼的高层摘要。\
+保留跨块共有的主题、结论、偏好和待办；丢弃单块琐碎细节。\
+只输出严格 JSON，格式：{\"topic\":\"主题\",\"summary\":\"一段摘要\"}";
+const LOW_INFORMATION_DIALOGUE: &[&str] = &[
+    "好", "好的", "收到", "明白", "了解", "知道了", "可以", "行", "嗯", "嗯嗯", "谢谢", "感谢",
+    "ok", "okay", "thanks", "thankyou",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryCleanupSettings {
@@ -144,6 +160,25 @@ pub async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS ix_memory_records_user_key_status \
          ON memory_records (user_id, memory_key, status)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_consolidation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            last_merged_turn INTEGER NOT NULL DEFAULT 0,
+            last_merged_at TEXT,
+            UNIQUE(user_id, conversation_id, level)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS ix_memory_consolidation_user_conv \
+         ON memory_consolidation (user_id, conversation_id)",
     )
     .execute(pool)
     .await?;
@@ -312,7 +347,8 @@ pub async fn persist_turn(
     }
     let _ = ensure_schema(pool).await;
     let content = format!("用户: {}\n助手: {}", query.trim(), answer.trim());
-    if let Err(err) = insert_event_memory(
+    let turn = count_dialogue_turns(pool, user_id, conversation_id).await;
+    if let Err(err) = insert_event_memory_at(
         pool,
         user_id,
         conversation_id,
@@ -321,10 +357,23 @@ pub async fn persist_turn(
         &content,
         55.0,
         expiry_days,
+        Some(turn),
+        Some(turn),
     )
     .await
     {
         tracing::warn!("长期记忆写入失败: {err}");
+    } else if !conversation_id.trim().is_empty() {
+        let summarizer = llm.map(MemorySummarizer::Llm);
+        let _ = consolidate_with(
+            pool,
+            summarizer.as_ref(),
+            user_id,
+            conversation_id,
+            expiry_days,
+            false,
+        )
+        .await;
     }
     if !should_extract_profile(query) {
         return;
@@ -1117,52 +1166,550 @@ pub async fn delete_user_event_memory(
     Ok(result.rows_affected())
 }
 
-pub async fn consolidate_conversation(
-    pool: &sqlx::SqlitePool,
-    llm: &LlmClient,
-    user_id: &str,
-    conversation_id: &str,
-    expiry_days: i64,
-) -> Result<bool, String> {
-    let _ = ensure_schema(pool).await.map_err(|err| err.to_string())?;
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT content FROM memory_records \
-         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' AND status = 'active' \
-         ORDER BY created_at DESC LIMIT 12",
+enum MemorySummarizer<'a> {
+    Llm(&'a LlmClient),
+    #[cfg(test)]
+    Fixed { topic: String, summary: String },
+}
+
+impl MemorySummarizer<'_> {
+    async fn summarize(&self, system: &str, user: &str) -> Option<(String, String)> {
+        match self {
+            MemorySummarizer::Llm(llm) => {
+                let text = llm
+                    .invoke(&[
+                        ChatMessage::new("system", system),
+                        ChatMessage::new("user", user),
+                    ])
+                    .await
+                    .ok()?
+                    .content;
+                let payload = parse_json_object(&text);
+                let topic = payload
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let mut summary = payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if summary.is_empty() {
+                    summary = text.trim().to_string();
+                }
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some((topic, summary))
+                }
+            }
+            #[cfg(test)]
+            MemorySummarizer::Fixed { topic, summary } => {
+                let _ = (system, user);
+                Some((topic.clone(), summary.clone()))
+            }
+        }
+    }
+}
+
+fn consolidation_in_flight() -> &'static Mutex<HashSet<(String, String)>> {
+    static LOCK: std::sync::OnceLock<Mutex<HashSet<(String, String)>>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn consolidation_retry_state() -> &'static Mutex<HashMap<(String, String, i32), (Instant, u32)>> {
+    static LOCK: std::sync::OnceLock<Mutex<HashMap<(String, String, i32), (Instant, u32)>>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_dialogue_token(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                '，' | '。' | '！' | '？' | '、' | ',' | '.' | '!' | '?' | '：' | ':' | '；' | ';'
+                    | '‘' | '’' | '“' | '”' | '"' | '\'' | '（' | '）' | '(' | ')' | '[' | ']'
+                    | '{' | '}'
+            )
+        })
+        .collect()
+}
+
+pub fn is_substantive_dialogue(messages: &[(String, String)]) -> bool {
+    messages.iter().any(|(role, content)| {
+        if role != "user" {
+            return false;
+        }
+        let normalized = normalize_dialogue_token(content);
+        !normalized.is_empty() && !LOW_INFORMATION_DIALOGUE.contains(&normalized.as_str())
+    })
+}
+
+fn format_memory_chunk(topic: &str, summary: &str, transcript: &str) -> String {
+    let mut parts = Vec::new();
+    if !topic.trim().is_empty() {
+        parts.push(format!("【主题】{}", topic.trim()));
+    }
+    parts.push(format!("【摘要】{}", summary.trim()));
+    parts.push("【原文】".into());
+    parts.push(transcript.trim().to_string());
+    parts.join("\n")
+}
+
+fn parse_dialogue_messages(content: &str) -> Vec<(String, String)> {
+    let mut messages = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("用户:") {
+            messages.push(("user".into(), rest.trim().to_string()));
+        } else if let Some(rest) = line.strip_prefix("助手:") {
+            messages.push(("assistant".into(), rest.trim().to_string()));
+        }
+    }
+    messages
+}
+
+pub async fn count_dialogue_turns(pool: &sqlx::SqlitePool, user_id: &str, conversation_id: &str) -> i64 {
+    if user_id.trim().is_empty() || conversation_id.trim().is_empty() {
+        return 0;
+    }
+    let rows: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT turn_start, turn_end FROM memory_records \
+         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
+         AND memory_key = 'dialogue' AND status = 'active'",
     )
     .bind(user_id)
     .bind(conversation_id)
     .fetch_all(pool)
     .await
-    .map_err(|err| err.to_string())?;
+    .unwrap_or_default();
     if rows.is_empty() {
-        return Ok(false);
+        return 0;
     }
-    let transcript = rows.into_iter().rev().collect::<Vec<_>>().join("\n\n");
-    let messages = vec![
-        ChatMessage::new(
-            "system",
-            "你是会话摘要器。把对话提炼成不超过 400 字的中文要点，保留人名、编号、结论和未完成事项。只输出摘要正文。",
-        ),
-        ChatMessage::new("user", transcript),
-    ];
-    let summary = llm.invoke(&messages).await?.content.trim().to_string();
-    if summary.is_empty() {
-        return Ok(false);
-    }
-    insert_event_memory(
+    let known_end: Vec<i64> = rows.iter().filter_map(|(_, turn_end)| *turn_end).collect();
+    let unknown_count = (rows.len() as i64) - (known_end.len() as i64);
+    let known = known_end.into_iter().max().map(|value| value + 1).unwrap_or(0);
+    known + unknown_count
+}
+
+async fn get_consolidation_cursor(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT last_merged_turn FROM memory_consolidation \
+         WHERE user_id = ? AND conversation_id = ? AND level = ?",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .bind(level)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+}
+
+async fn update_consolidation_cursor(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+    new_turn: i64,
+) -> Result<(), sqlx::Error> {
+    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    sqlx::query(
+        "INSERT INTO memory_consolidation (user_id, conversation_id, level, last_merged_turn, last_merged_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(user_id, conversation_id, level) DO UPDATE SET \
+         last_merged_turn = MAX(last_merged_turn, excluded.last_merged_turn), \
+         last_merged_at = excluded.last_merged_at",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .bind(level)
+    .bind(new_turn.max(0))
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn load_dialogue_range(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    start_turn: i64,
+    end_turn: i64,
+) -> Vec<(String, String)> {
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT content, turn_start, turn_end FROM memory_records \
+         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
+         AND memory_key = 'dialogue' AND status = 'active' \
+         AND (turn_end IS NULL OR turn_end >= ?) \
+         AND (turn_start IS NULL OR turn_start < ?) \
+         ORDER BY turn_start ASC, created_at ASC",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .bind(start_turn)
+    .bind(end_turn)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .flat_map(|(content, _, _)| parse_dialogue_messages(&content))
+        .collect()
+}
+
+async fn load_summary_chunks(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+    start_turn: i64,
+    end_turn: i64,
+) -> Vec<(String, String)> {
+    let memory_key = format!("semantic_memory_l{level}");
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT content FROM memory_records \
+         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
+         AND memory_key = ? AND status = 'active' \
+         AND (turn_end IS NULL OR turn_end >= ?) \
+         AND (turn_start IS NULL OR turn_start < ?) \
+         ORDER BY turn_start ASC, created_at ASC",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .bind(&memory_key)
+    .bind(start_turn)
+    .bind(end_turn)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|content| {
+            let mut topic = String::new();
+            let mut summary = String::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("【主题】") {
+                    topic = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("【摘要】") {
+                    summary = rest.trim().to_string();
+                }
+            }
+            if summary.is_empty() {
+                None
+            } else {
+                Some((topic, summary))
+            }
+        })
+        .collect()
+}
+
+async fn write_semantic_summary(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+    topic: &str,
+    summary: &str,
+    transcript: &str,
+    turn_start: i64,
+    turn_end: i64,
+    expiry_days: i64,
+) -> Result<String, sqlx::Error> {
+    let content = format_memory_chunk(topic, summary, transcript);
+    insert_event_memory_at(
         pool,
         user_id,
         conversation_id,
-        "",
-        "semantic_memory_l1",
-        &summary,
+        conversation_id,
+        &format!("semantic_memory_l{level}"),
+        &content,
         70.0,
         expiry_days,
+        Some(turn_start),
+        Some(turn_end),
     )
     .await
-    .map_err(|err| err.to_string())?;
-    Ok(true)
+}
+
+async fn consolidate_level(
+    pool: &sqlx::SqlitePool,
+    summarizer: Option<&MemorySummarizer<'_>>,
+    user_id: &str,
+    conversation_id: &str,
+    level: i32,
+    threshold: i64,
+    expiry_days: i64,
+) -> i64 {
+    let cursor = get_consolidation_cursor(pool, user_id, conversation_id, level).await;
+    let segment_start = (cursor / threshold) * threshold;
+    let inserted = if level == 1 {
+        let messages = load_dialogue_range(
+            pool,
+            user_id,
+            conversation_id,
+            segment_start,
+            segment_start + threshold,
+        )
+        .await;
+        if messages.is_empty() {
+            return 0;
+        }
+        if !is_substantive_dialogue(&messages) {
+            tracing::info!(
+                user_id,
+                conversation_id,
+                start = segment_start,
+                end = segment_start + threshold - 1,
+                "L1 摘要跳过低信息对话"
+            );
+            let _ = update_consolidation_cursor(
+                pool,
+                user_id,
+                conversation_id,
+                level,
+                segment_start + threshold,
+            )
+            .await;
+            return 0;
+        }
+        let Some(summarizer) = summarizer else {
+            return 0;
+        };
+        let transcript = messages
+            .iter()
+            .map(|(role, content)| {
+                if role == "user" {
+                    format!("用户: {content}")
+                } else {
+                    format!("助手: {content}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Some((topic, summary)) = summarizer
+            .summarize(
+                L1_SUMMARY_SYSTEM_PROMPT,
+                &format!("请基于下面的对话生成长期记忆摘要：\n\n{transcript}"),
+            )
+            .await
+        else {
+            return 0;
+        };
+        match write_semantic_summary(
+            pool,
+            user_id,
+            conversation_id,
+            1,
+            &topic,
+            &summary,
+            &transcript,
+            segment_start,
+            segment_start + threshold - 1,
+            expiry_days,
+        )
+        .await
+        {
+            Ok(_) => 1,
+            Err(err) => {
+                tracing::warn!("L1 合并失败，下次触发点重试: {err}");
+                0
+            }
+        }
+    } else {
+        let lower_chunks = load_summary_chunks(
+            pool,
+            user_id,
+            conversation_id,
+            level - 1,
+            segment_start,
+            segment_start + threshold,
+        )
+        .await;
+        if lower_chunks.is_empty() {
+            return 0;
+        }
+        let Some(summarizer) = summarizer else {
+            return 0;
+        };
+        let texts: Vec<String> = lower_chunks
+            .iter()
+            .map(|(topic, summary)| {
+                if topic.is_empty() {
+                    summary.clone()
+                } else {
+                    format!("[{topic}] {summary}")
+                }
+            })
+            .collect();
+        let joined = texts.join("\n\n");
+        let (topic, summary) = match summarizer.summarize(MERGE_SUMMARY_SYSTEM_PROMPT, &joined).await {
+            Some(pair) => pair,
+            None => (String::from("对话摘要"), texts.first().cloned().unwrap_or_default().chars().take(120).collect()),
+        };
+        if summary.trim().is_empty() {
+            return 0;
+        }
+        match write_semantic_summary(
+            pool,
+            user_id,
+            conversation_id,
+            level,
+            if topic.is_empty() { "对话摘要" } else { &topic },
+            &summary,
+            &joined,
+            segment_start,
+            segment_start + threshold,
+            expiry_days,
+        )
+        .await
+        {
+            Ok(_) => 1,
+            Err(err) => {
+                tracing::warn!("递进摘要 L{level} 写入失败: {err}");
+                0
+            }
+        }
+    };
+    if inserted <= 0 {
+        return 0;
+    }
+    let _ = update_consolidation_cursor(
+        pool,
+        user_id,
+        conversation_id,
+        level,
+        segment_start + threshold,
+    )
+    .await;
+    inserted
+}
+
+async fn consolidate_with(
+    pool: &sqlx::SqlitePool,
+    summarizer: Option<&MemorySummarizer<'_>>,
+    user_id: &str,
+    conversation_id: &str,
+    expiry_days: i64,
+    force: bool,
+) -> i64 {
+    let user_id = user_id.trim();
+    let conversation_id = conversation_id.trim();
+    if user_id.is_empty() || conversation_id.is_empty() {
+        return 0;
+    }
+    let _ = ensure_schema(pool).await;
+    let lock_key = (user_id.to_string(), conversation_id.to_string());
+    {
+        let mut in_flight = consolidation_in_flight().lock().unwrap_or_else(|err| err.into_inner());
+        if !in_flight.insert(lock_key.clone()) {
+            return 0;
+        }
+    }
+    let result = async {
+        let current_turn = count_dialogue_turns(pool, user_id, conversation_id).await;
+        if current_turn <= 0 {
+            return 0;
+        }
+        let mut merged = 0i64;
+        let now = Instant::now();
+        for (threshold, level) in CONSOLIDATION_LEVELS {
+            if !force && current_turn < threshold {
+                continue;
+            }
+            let cursor = get_consolidation_cursor(pool, user_id, conversation_id, level).await;
+            if !force && current_turn / threshold <= cursor / threshold {
+                continue;
+            }
+            let retry_key = (user_id.to_string(), conversation_id.to_string(), level);
+            if !force {
+                let retry = consolidation_retry_state()
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .get(&retry_key)
+                    .cloned();
+                if let Some((until, _)) = retry {
+                    if now < until {
+                        continue;
+                    }
+                }
+            }
+            let inserted = consolidate_level(
+                pool,
+                summarizer,
+                user_id,
+                conversation_id,
+                level,
+                threshold,
+                expiry_days,
+            )
+            .await;
+            let updated_cursor = get_consolidation_cursor(pool, user_id, conversation_id, level).await;
+            if inserted > 0 || updated_cursor > cursor {
+                merged += inserted;
+                consolidation_retry_state()
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .remove(&retry_key);
+            } else if !force {
+                let mut retry = consolidation_retry_state()
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                let previous = retry.get(&retry_key).map(|item| item.1).unwrap_or(0);
+                let delay_index = previous.min((CONSOLIDATION_RETRY_DELAYS.len() - 1) as u32);
+                retry.insert(
+                    retry_key,
+                    (
+                        Instant::now() + Duration::from_secs(CONSOLIDATION_RETRY_DELAYS[delay_index as usize]),
+                        previous + 1,
+                    ),
+                );
+            }
+        }
+        merged
+    }
+    .await;
+    consolidation_in_flight()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(&lock_key);
+    result
+}
+
+pub async fn consolidate_check(
+    pool: &sqlx::SqlitePool,
+    llm: Option<&LlmClient>,
+    user_id: &str,
+    conversation_id: &str,
+    expiry_days: i64,
+) -> i64 {
+    let summarizer = llm.map(MemorySummarizer::Llm);
+    consolidate_with(pool, summarizer.as_ref(), user_id, conversation_id, expiry_days, false).await
+}
+
+pub async fn consolidate_conversation_memory(
+    pool: &sqlx::SqlitePool,
+    llm: Option<&LlmClient>,
+    user_id: &str,
+    conversation_id: &str,
+    expiry_days: i64,
+) -> Result<i64, String> {
+    let summarizer = llm.map(MemorySummarizer::Llm);
+    Ok(consolidate_with(pool, summarizer.as_ref(), user_id, conversation_id, expiry_days, true).await)
 }
 
 pub(crate) async fn insert_event_memory(
@@ -1817,5 +2364,170 @@ mod tests {
         .await;
         assert_eq!(whole.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(2));
         assert!(whole.get("summary").and_then(Value::as_str).unwrap_or("").contains("当前会话"));
+    }
+
+    #[test]
+    fn consolidation_thresholds_are_10_20_40() {
+        assert_eq!(CONSOLIDATION_LEVELS, [(10, 1), (20, 2), (40, 3)]);
+        assert!(is_substantive_dialogue(&[("user".into(), "确认周五上线".into())]));
+        assert!(!is_substantive_dialogue(&[("user".into(), "好的".into()), ("assistant".into(), "收到".into())]));
+        assert!(!is_substantive_dialogue(&[("user".into(), "谢谢！".into())]));
+    }
+
+    #[tokio::test]
+    async fn persist_turn_numbers_dialogue_turns() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        persist_turn(&pool, None, "u1", "c-turns", "s1", "第一问", "第一答", DEFAULT_EVENT_EXPIRY_DAYS).await;
+        persist_turn(&pool, None, "u1", "c-turns", "s1", "第二问", "第二答", DEFAULT_EVENT_EXPIRY_DAYS).await;
+        persist_turn(&pool, None, "u1", "c-turns", "s1", "第三问", "第三答", DEFAULT_EVENT_EXPIRY_DAYS).await;
+        assert_eq!(count_dialogue_turns(&pool, "u1", "c-turns").await, 3);
+        let turns: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT turn_start, turn_end FROM memory_records \
+             WHERE conversation_id = 'c-turns' AND memory_key = 'dialogue' ORDER BY turn_start",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(turns, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn l1_skips_low_information_and_advances_cursor() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        for _ in 0..10 {
+            persist_turn(&pool, None, "u1", "c-low", "s1", "好的", "收到", DEFAULT_EVENT_EXPIRY_DAYS).await;
+        }
+        let l1: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-low' AND memory_key = 'semantic_memory_l1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(l1, 0);
+        assert_eq!(get_consolidation_cursor(&pool, "u1", "c-low", 1).await, 10);
+    }
+
+    #[tokio::test]
+    async fn cursor_waits_for_successful_write() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        for index in 0..10 {
+            insert_event_memory_at(
+                &pool,
+                "u1",
+                "c-wait",
+                "s1",
+                "dialogue",
+                &format!("用户: 确认 Alpha 上线计划 {index}\n助手: 已记录"),
+                55.0,
+                DEFAULT_EVENT_EXPIRY_DAYS,
+                Some(index),
+                Some(index),
+            )
+            .await
+            .unwrap();
+        }
+        let merged = consolidate_level(
+            &pool,
+            None,
+            "u1",
+            "c-wait",
+            1,
+            10,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await;
+        assert_eq!(merged, 0);
+        assert_eq!(get_consolidation_cursor(&pool, "u1", "c-wait", 1).await, 0);
+
+        let summarizer = MemorySummarizer::Fixed {
+            topic: "Alpha".into(),
+            summary: "已确认 Alpha 上线计划。".into(),
+        };
+        let written = consolidate_with(
+            &pool,
+            Some(&summarizer),
+            "u1",
+            "c-wait",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            false,
+        )
+        .await;
+        assert_eq!(written, 1);
+        assert_eq!(get_consolidation_cursor(&pool, "u1", "c-wait", 1).await, 10);
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM memory_records WHERE conversation_id = 'c-wait' AND memory_key = 'semantic_memory_l1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(content.contains("【主题】Alpha"));
+        assert!(content.contains("【摘要】已确认 Alpha 上线计划。"));
+        assert!(content.contains("【原文】"));
+        assert!(content.contains("确认 Alpha 上线计划"));
+    }
+
+    #[tokio::test]
+    async fn higher_levels_merge_lower_summaries() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        for index in 0..20 {
+            insert_event_memory_at(
+                &pool,
+                "u1",
+                "c-l2",
+                "s1",
+                "dialogue",
+                &format!("用户: 讨论项目进度 {index}\n助手: 记下了"),
+                55.0,
+                DEFAULT_EVENT_EXPIRY_DAYS,
+                Some(index),
+                Some(index),
+            )
+            .await
+            .unwrap();
+        }
+        let summarizer = MemorySummarizer::Fixed {
+            topic: "项目进度".into(),
+            summary: "持续跟踪项目进度。".into(),
+        };
+        let first = consolidate_with(
+            &pool,
+            Some(&summarizer),
+            "u1",
+            "c-l2",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            false,
+        )
+        .await;
+        let second = consolidate_with(
+            &pool,
+            Some(&summarizer),
+            "u1",
+            "c-l2",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+            false,
+        )
+        .await;
+        assert_eq!(first, 2);
+        assert_eq!(second, 1);
+        let l1: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' AND memory_key = 'semantic_memory_l1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let l2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' AND memory_key = 'semantic_memory_l2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(l1, 2);
+        assert_eq!(l2, 1);
+        assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 1).await, 20);
+        assert_eq!(get_consolidation_cursor(&pool, "u1", "c-l2", 2).await, 20);
     }
 }
