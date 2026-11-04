@@ -49,6 +49,22 @@ pub enum ReactAttempt {
     Ran(ReactOutcome),
 }
 
+fn format_rag_react_round(iteration: usize, max_iterations: usize, method: &str) -> String {
+    format!("智能体正在尝试第 {iteration}/{max_iterations} 次调用 RAG：方式={method}")
+}
+
+fn format_unified_react_round(iteration: usize, max_iterations: usize, tools: &str) -> String {
+    format!("统一 ReAct 编排第 {iteration}/{max_iterations} 轮，模型选择：{tools}")
+}
+
+fn format_react_sufficient(kind: &str, reason: &str) -> String {
+    if kind == "unified_react" {
+        format!("统一 ReAct 编排：证据评估充分（{reason}），提前结束")
+    } else {
+        format!("证据评估充分（{reason}），提前结束 ReAct 检索")
+    }
+}
+
 pub async fn run_unified_react(
     engine: &RetrievalEngine,
     pool: &sqlx::SqlitePool,
@@ -67,6 +83,11 @@ pub async fn run_unified_react(
         tracing::info!("统一 ReAct 编排已关闭，回退 rag 专用循环");
         return ReactAttempt::Unavailable;
     }
+    let tools = skills::function_calling_tools_from(mcp_manifests);
+    if tools.is_empty() {
+        tracing::warn!("统一 ReAct 编排工具表为空，回退 rag 专用循环");
+        return ReactAttempt::Unavailable;
+    }
     let context = unified_react_context(context);
     run_react_loop(
         engine,
@@ -77,7 +98,7 @@ pub async fn run_unified_react(
         history,
         top_k,
         first_results,
-        skills::function_calling_tools_from(mcp_manifests),
+        tools,
         UNIFIED_REACT_SYSTEM_PROMPT,
         mcp_manifests,
         max_iterations,
@@ -157,7 +178,11 @@ async fn run_react_loop(
             Ok(result) => result,
             Err(err) => {
                 if !used_react {
-                    tracing::warn!("{kind} bind_tools 失败: {err}");
+                    if kind == "unified_react" {
+                        tracing::warn!("统一 ReAct 编排 bind_tools 失败，回退 rag 专用循环: {err}");
+                    } else {
+                        tracing::warn!("{kind} bind_tools 失败: {err}");
+                    }
                     return ReactAttempt::Unavailable;
                 }
                 tracing::warn!("{kind} 后续轮次失败，使用已有观察: {err}");
@@ -191,30 +216,24 @@ async fn run_react_loop(
             pending.push(index);
         }
         let workers = parallel_worker_limit(pending.len(), max_workers);
-        tracing::info!(
-            kind,
-            iteration = iteration + 1,
-            max_iterations = max_iterations.max(1),
-            tools = tool_names.as_str(),
-            pending = pending.len(),
-            workers,
-            "ReAct 本轮工具调用"
-        );
+        let round = iteration + 1;
+        let max_rounds = max_iterations.max(1);
+        if kind == "unified_react" {
+            tracing::info!("{}", format_unified_react_round(round, max_rounds, &tool_names));
+        } else if calls.iter().any(|call| call.name == "search_knowledge_base") {
+            let method = calls
+                .iter()
+                .find(|call| call.name == "search_knowledge_base")
+                .and_then(|call| call.arguments.get("retrieval_method"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("默认");
+            tracing::info!("{}", format_rag_react_round(round, max_rounds, method));
+        }
         if !pending.is_empty() {
             let mut stream = stream::iter(pending).map(|index| {
                 let call = calls[index].clone();
                 async move {
-                    tracing::info!(
-                        kind,
-                        iteration = iteration + 1,
-                        tool = call.name.as_str(),
-                        method = call
-                            .arguments
-                            .get("retrieval_method")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("默认"),
-                        "ReAct 工具执行"
-                    );
                     let (observation, extra) = execute_tool(
                         engine,
                         pool,
@@ -244,8 +263,9 @@ async fn run_react_loop(
             merge_sources(&mut sources, std::mem::take(&mut extras[index]));
             searched |= call.name == "search_knowledge_base";
         }
-        if searched && planner::assess_evidence_rule(query, &sources).sufficient {
-            tracing::info!(kind, "证据评估充分，提前结束 ReAct");
+        let assessment = planner::assess_evidence_rule(query, &sources);
+        if searched && assessment.sufficient {
+            tracing::info!("{}", format_react_sufficient(kind, &assessment.reason));
             return ReactAttempt::Ran(finish(sources, notes, used_react, kind));
         }
     }
@@ -596,6 +616,26 @@ mod tests {
     fn truncates_and_dedupes_args() {
         assert_eq!(truncate("abcdef", 3), "abc…");
         assert_eq!(compact_args(&json!({"query":"a"})), "{\"query\":\"a\"}");
+    }
+
+    #[test]
+    fn react_round_logs_match_python() {
+        assert_eq!(
+            format_rag_react_round(1, 2, "hybrid"),
+            "智能体正在尝试第 1/2 次调用 RAG：方式=hybrid"
+        );
+        assert_eq!(
+            format_unified_react_round(1, 3, "search_knowledge_base、memory_query"),
+            "统一 ReAct 编排第 1/3 轮，模型选择：search_knowledge_base、memory_query"
+        );
+        assert_eq!(
+            format_react_sufficient("rag_react", "high_confidence"),
+            "证据评估充分（high_confidence），提前结束 ReAct 检索"
+        );
+        assert_eq!(
+            format_react_sufficient("unified_react", "enough_results"),
+            "统一 ReAct 编排：证据评估充分（enough_results），提前结束"
+        );
     }
 
     #[test]
