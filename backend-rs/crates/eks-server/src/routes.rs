@@ -73,6 +73,20 @@ pub async fn root(State(state): State<AppState>) -> impl IntoResponse {
     Json(root_payload(&state.config))
 }
 
+pub async fn docs() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8",
+        )],
+        crate::openapi::docs_html(),
+    )
+}
+
+pub async fn openapi_json(State(state): State<AppState>) -> impl IntoResponse {
+    Json(crate::openapi::spec(&state.config))
+}
+
 /// 从请求头解析 Bearer 令牌（与 Python `HTTPBearer(auto_error=False)` + scheme 检查一致）。
 fn bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
     let value = headers
@@ -272,6 +286,9 @@ pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/docs", get(docs))
+        .route("/redoc", get(docs))
+        .route("/openapi.json", get(openapi_json))
         .route(
             &format!("{prefix}/auth/login"),
             post(login),
@@ -635,6 +652,55 @@ mod health_tests {
         assert_eq!(root["docs"], "/docs");
         assert!(root.get("service").is_none());
         assert!(root.get("health").is_none());
+    }
+}
+
+#[cfg(test)]
+mod docs_tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn docs_and_openapi_routes_are_public() {
+        let app = Router::new()
+            .route("/docs", get(docs))
+            .route("/openapi.json", get(|| async {
+                Json(crate::openapi::spec(&crate::config::Config::jwt_test()))
+            }));
+        let docs_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(docs_response.status(), StatusCode::OK);
+        let content_type = docs_response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("text/html"), "{content_type}");
+        let body = axum::body::to_bytes(docs_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("/openapi.json"));
+
+        let spec_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spec_response.status(), StatusCode::OK);
+        let spec_body = axum::body::to_bytes(spec_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let spec: Value = serde_json::from_slice(&spec_body).unwrap();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert!(spec["paths"].get("/health").is_some());
     }
 }
 
