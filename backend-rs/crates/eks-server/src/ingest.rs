@@ -69,6 +69,14 @@ pub fn extract_text(filename: &str, data: &[u8]) -> Result<String, String> {
     }
 }
 
+/// 当前内核可抽取的后缀（不含需 unstructured/OCR 的 .doc/.ppt/.rtf）。
+pub fn is_extractable_type(file_type: &str) -> bool {
+    matches!(
+        file_type.trim().trim_start_matches('.').to_lowercase().as_str(),
+        "txt" | "md" | "csv" | "tsv" | "html" | "htm" | "docx" | "xlsx" | "xls" | "pdf" | "pptx"
+    )
+}
+
 fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -746,55 +754,127 @@ fn extract_html_text(data: &[u8]) -> Result<String, String> {
 
 // ==================== 切块 ====================
 
-fn is_break_char(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '。' | '.' | '；' | ';' | '！' | '？' | '!' | '?' | '：' | ':' | '，' | ','
-    )
+const DEFAULT_TEXT_SEPARATORS: &[&str] = &["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""];
+const ARTICLE_TEXT_SEPARATORS: &[&str] = &[
+    "\n\n", "\n", "。", "！", "？", "；", "：", "，", ".", "!", "?", ";", ":", " ", "",
+];
+
+fn char_len(text: &str) -> usize {
+    text.chars().count()
 }
 
-/// 简化版递归文本切分（对齐 split_text_chunks 的核心逻辑）。
-fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= chunk_size {
-        return vec![text.to_string()];
+fn split_keep_nonempty(text: &str, separator: &str) -> Vec<String> {
+    if separator.is_empty() {
+        return text.chars().map(|ch| ch.to_string()).filter(|item| !item.is_empty()).collect();
     }
+    text.split(separator)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let end = (start + chunk_size).min(chars.len());
-        // 尝试在段落/句子/空格处断开
-        let break_at = if end < chars.len() {
-            let window = &chars[(end - 50).max(start)..end];
-            let mut best = end;
-            for (i, c) in window.iter().enumerate().rev() {
-                if is_break_char(*c) {
-                    best = (end - 50).max(start) + i + 1;
-                    break;
-                }
+fn join_docs(parts: &[String], separator: &str) -> Option<String> {
+    let joined = parts.join(separator);
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn merge_splits(splits: &[String], separator: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    let separator_len = char_len(separator);
+    let mut docs = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for piece in splits {
+        let piece_len = char_len(piece);
+        let extra = if current.is_empty() { 0 } else { separator_len };
+        if total + piece_len + extra > chunk_size && !current.is_empty() {
+            if let Some(doc) = join_docs(&current, separator) {
+                docs.push(doc);
             }
-            best
-        } else {
-            end
-        };
-
-        let chunk: String = chars[start..break_at].iter().collect();
-        let trimmed = chunk.trim();
-        if !trimmed.is_empty() {
-            chunks.push(trimmed.to_string());
+            while !current.is_empty()
+                && (total > overlap
+                    || total + piece_len + (if current.is_empty() { 0 } else { separator_len })
+                        > chunk_size)
+            {
+                let first_len = char_len(&current[0]);
+                let sep = if current.len() > 1 { separator_len } else { 0 };
+                total = total.saturating_sub(first_len + sep);
+                current.remove(0);
+            }
         }
+        current.push(piece.clone());
+        total += piece_len + if current.len() > 1 { separator_len } else { 0 };
+    }
+    if let Some(doc) = join_docs(&current, separator) {
+        docs.push(doc);
+    }
+    docs
+}
 
-        if break_at >= chars.len() {
+fn recursive_split(text: &str, separators: &[&str], chunk_size: usize, overlap: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut separator = separators.last().copied().unwrap_or("");
+    let mut rest: &[&str] = &[];
+    for (index, candidate) in separators.iter().enumerate() {
+        if candidate.is_empty() {
+            separator = "";
+            rest = &separators[index + 1..];
             break;
         }
-        start = if break_at > overlap {
-            break_at - overlap
-        } else {
-            break_at
-        };
+        if text.contains(candidate) {
+            separator = candidate;
+            rest = &separators[index + 1..];
+            break;
+        }
     }
-    chunks
+    let pieces = split_keep_nonempty(text, separator);
+    let mut final_chunks = Vec::new();
+    let mut good = Vec::new();
+    for piece in pieces {
+        if char_len(&piece) <= chunk_size {
+            good.push(piece);
+            continue;
+        }
+        if !good.is_empty() {
+            final_chunks.extend(merge_splits(&good, separator, chunk_size, overlap));
+            good.clear();
+        }
+        if rest.is_empty() {
+            final_chunks.push(piece);
+        } else {
+            final_chunks.extend(recursive_split(&piece, rest, chunk_size, overlap));
+        }
+    }
+    if !good.is_empty() {
+        final_chunks.extend(merge_splits(&good, separator, chunk_size, overlap));
+    }
+    final_chunks
+}
+
+/// 对齐 Python `split_text_chunks` / LangChain RecursiveCharacterTextSplitter。
+fn split_text_with_separators(text: &str, chunk_size: usize, overlap: usize, separators: &[&str]) -> Vec<String> {
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    if char_len(normalized) <= chunk_size {
+        return vec![normalized.to_string()];
+    }
+    recursive_split(normalized, separators, chunk_size.max(1), overlap)
+        .into_iter()
+        .map(|chunk| chunk.trim().to_string())
+        .filter(|chunk| !chunk.is_empty())
+        .collect()
+}
+
+fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    split_text_with_separators(text, chunk_size, overlap, DEFAULT_TEXT_SEPARATORS)
 }
 
 struct HeadingRegexes {
@@ -918,11 +998,16 @@ fn split_section_chunks(heading: &str, body: &str, chunk_size: usize, chunk_over
         return Vec::new();
     }
     if prefix.is_empty() {
-        return split_text(normalized_body, chunk_size, chunk_overlap);
+        return split_text_with_separators(
+            normalized_body,
+            chunk_size,
+            chunk_overlap,
+            ARTICLE_TEXT_SEPARATORS,
+        );
     }
     let available_size = 120.max(chunk_size.saturating_sub(prefix.chars().count().saturating_add(1)));
     let overlap = chunk_overlap.min(available_size / 3);
-    split_text(normalized_body, available_size, overlap)
+    split_text_with_separators(normalized_body, available_size, overlap, ARTICLE_TEXT_SEPARATORS)
         .into_iter()
         .map(|chunk| format!("{prefix}\n{chunk}").trim().to_string())
         .collect()
@@ -960,7 +1045,7 @@ fn split_document_text(text: &str, chunk_size: usize, chunk_overlap: usize, file
         if let Some(chunks) = split_document_text_by_sections(text, resolved_size, resolved_overlap) {
             return chunks;
         }
-        return split_text(text, resolved_size, resolved_overlap);
+        return split_text_with_separators(text, resolved_size, resolved_overlap, ARTICLE_TEXT_SEPARATORS);
     }
     split_text(text, chunk_size, chunk_overlap)
 }
@@ -1538,5 +1623,20 @@ mod tests {
         assert!(text.contains("出差需提前申请。"));
         assert!(!text.contains("alert"));
         assert!(!text.contains("color:red"));
+    }
+
+    #[test]
+    fn recursive_split_breaks_on_paragraph_separators() {
+        let text = "第一段说明。\n\n第二段内容需要单独成块。\n\n第三段收尾。";
+        let chunks = split_text(text, 18, 4);
+        assert!(chunks.len() >= 2, "{chunks:?}");
+        assert!(chunks.iter().any(|chunk| chunk.contains("第一段")));
+        assert!(chunks.iter().any(|chunk| chunk.contains("第二段")));
+        let joined = chunks.join("");
+        assert!(joined.contains("第三段"));
+        assert!(!is_extractable_type("doc"));
+        assert!(!is_extractable_type("ppt"));
+        assert!(is_extractable_type("pptx"));
+        assert!(is_extractable_type("html"));
     }
 }
