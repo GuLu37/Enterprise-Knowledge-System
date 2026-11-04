@@ -26,11 +26,8 @@ impl RuntimeWarmup {
             embedding_warmed: false,
             cross_encoder_enabled: config.cross_encoder_enabled,
             cross_encoder_warmed: false,
-            cross_encoder_model: if config.cross_encoder_onnx.trim().is_empty() {
-                None
-            } else {
-                Some(config.cross_encoder_onnx.clone())
-            },
+            // 对齐 Python `settings.CROSS_ENCODER_MODEL_NAME`：禁用时也回填模型名。
+            cross_encoder_model: Some(config.cross_encoder_model_name.clone()),
             cross_encoder_device: Some("cpu".into()),
             cross_encoder_error: None,
             provider: None,

@@ -2692,6 +2692,26 @@ mod tests {
     }
 
     #[test]
+    fn warmup_reports_cross_encoder_model_name_even_when_disabled() {
+        let cfg = crate::config::Config::jwt_test();
+        assert!(cfg.cross_encoder_onnx.is_empty());
+        assert!(!cfg.cross_encoder_enabled);
+        let warmup = RuntimeWarmup::initializing(&cfg);
+        assert_eq!(
+            warmup.cross_encoder_model.as_deref(),
+            Some("BAAI/bge-reranker-base")
+        );
+        assert_eq!(
+            runtime_status_payload(&warmup)["cross_encoder_model"],
+            "BAAI/bge-reranker-base"
+        );
+        assert_eq!(
+            warmup_response_payload(&warmup)["cross_encoder_model"],
+            "BAAI/bge-reranker-base"
+        );
+    }
+
+    #[test]
     fn runtime_ready_requires_llm_embedding_and_optional_ce() {
         let mut warmup = RuntimeWarmup {
             llm_warmed: true,

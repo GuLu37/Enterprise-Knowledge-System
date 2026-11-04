@@ -23,6 +23,8 @@ pub struct Config {
     pub bge_normalize_embeddings: bool,
     pub milvus_lite_path: String,
     pub cross_encoder_enabled: bool,
+    /// 对齐 Python `CROSS_ENCODER_MODEL_NAME`（本地目录或 HuggingFace 模型 id）。
+    pub cross_encoder_model_name: String,
     pub cross_encoder_onnx: String,
     pub cross_encoder_tokenizer: String,
     pub cross_encoder_max_length: usize,
@@ -318,6 +320,73 @@ fn load_bge_model_dir() -> String {
     )
 }
 
+/// 对齐 Python `CROSS_ENCODER_MODEL_NAME` 默认 `BAAI/bge-reranker-base`。
+fn load_cross_encoder_model_name() -> String {
+    resolve_backend_model_path(
+        &env::var("CROSS_ENCODER_MODEL_NAME").unwrap_or_default(),
+        "BAAI/bge-reranker-base",
+    )
+}
+
+/// 当 `EKS_CROSS_ENCODER_ONNX` / `TOKENIZER` 为空时，从本地模型目录解析
+/// `onnx/model.onnx` 与 `tokenizer.json`（含 HuggingFace snapshot 布局）。
+/// 不从 Hub 下载。
+pub fn resolve_cross_encoder_artifacts(model_dir: &str) -> Option<(String, String)> {
+    let root = Path::new(model_dir.trim());
+    if model_dir.trim().is_empty() || !root.exists() {
+        return None;
+    }
+    let direct_onnx = root.join("onnx").join("model.onnx");
+    let direct_tokenizer = root.join("tokenizer.json");
+    if direct_onnx.exists() && direct_tokenizer.exists() {
+        return Some((
+            direct_onnx.to_string_lossy().into_owned(),
+            direct_tokenizer.to_string_lossy().into_owned(),
+        ));
+    }
+    let snapshots = root.join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&snapshots) else {
+        return None;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let onnx = dir.join("onnx").join("model.onnx");
+        let tokenizer = dir.join("tokenizer.json");
+        if onnx.exists() && tokenizer.exists() {
+            return Some((
+                onnx.to_string_lossy().into_owned(),
+                tokenizer.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    None
+}
+
+fn load_cross_encoder_paths(model_name: &str) -> (String, String) {
+    let onnx = env_or("EKS_CROSS_ENCODER_ONNX", "");
+    let tokenizer = env_or("EKS_CROSS_ENCODER_TOKENIZER", "");
+    match resolve_cross_encoder_artifacts(model_name) {
+        Some((fallback_onnx, fallback_tokenizer)) => (
+            if onnx.trim().is_empty() {
+                fallback_onnx
+            } else {
+                onnx
+            },
+            if tokenizer.trim().is_empty() {
+                fallback_tokenizer
+            } else {
+                tokenizer
+            },
+        ),
+        None => (onnx, tokenizer),
+    }
+}
+
 fn load_milvus_lite_path() -> String {
     if let Ok(value) = env::var("EKS_MILVUS_LITE_PATH") {
         if !value.trim().is_empty() {
@@ -369,6 +438,9 @@ impl Config {
     pub fn load() -> Self {
         let env_file = env_or("EKS_ENV_FILE", "../backend/.env");
         let _ = dotenvy::from_filename(&env_file);
+        let cross_encoder_model_name = load_cross_encoder_model_name();
+        let (cross_encoder_onnx, cross_encoder_tokenizer) =
+            load_cross_encoder_paths(&cross_encoder_model_name);
         let config = Config {
             app_name: env_or("APP_NAME", "Enterprise Knowledge System"),
             app_version: env_or("APP_VERSION", "1.0.0"),
@@ -392,8 +464,9 @@ impl Config {
             bge_normalize_embeddings: env_bool("BGE_NORMALIZE_EMBEDDINGS", true),
             milvus_lite_path: load_milvus_lite_path(),
             cross_encoder_enabled: env_bool("CROSS_ENCODER_ENABLED", false),
-            cross_encoder_onnx: env_or("EKS_CROSS_ENCODER_ONNX", ""),
-            cross_encoder_tokenizer: env_or("EKS_CROSS_ENCODER_TOKENIZER", ""),
+            cross_encoder_model_name,
+            cross_encoder_onnx,
+            cross_encoder_tokenizer,
             cross_encoder_max_length: env_i64("CROSS_ENCODER_MAX_LENGTH", 512).max(16) as usize,
             cross_encoder_batch_size: env_i64("CROSS_ENCODER_BATCH_SIZE", 8).max(1) as usize,
             cross_encoder_candidate_k: env_i64("CROSS_ENCODER_CANDIDATE_K", 30).max(1) as usize,
@@ -504,6 +577,7 @@ impl Config {
             bge_normalize_embeddings: true,
             milvus_lite_path: String::new(),
             cross_encoder_enabled: false,
+            cross_encoder_model_name: "BAAI/bge-reranker-base".into(),
             cross_encoder_onnx: String::new(),
             cross_encoder_tokenizer: String::new(),
             cross_encoder_max_length: 512,
@@ -633,6 +707,10 @@ mod tests {
         assert_eq!(Config::jwt_test().similarity_threshold, 0.5);
         assert!(Config::jwt_test().upload_dir.is_empty());
         assert!(!Config::jwt_test().cross_encoder_enabled);
+        assert_eq!(
+            Config::jwt_test().cross_encoder_model_name,
+            "BAAI/bge-reranker-base"
+        );
         assert_eq!(Config::jwt_test().bge_batch_size, 16);
         assert!(Config::jwt_test().bge_normalize_embeddings);
         assert_eq!(Config::jwt_test().chat_max_conversations, 20);
@@ -669,6 +747,11 @@ mod tests {
             resolve_backend_model_path("BAAI/bge-base-zh-v1.5", "def"),
             "BAAI/bge-base-zh-v1.5"
         );
+        assert_eq!(
+            resolve_backend_model_path("", "BAAI/bge-reranker-base"),
+            "BAAI/bge-reranker-base"
+        );
+        assert!(resolve_cross_encoder_artifacts("BAAI/bge-reranker-base").is_none());
         assert_eq!(
             resolve_app_path("./data/milvus_lite.db", "data/milvus_lite.db"),
             "../backend/app/data/milvus_lite.db"
@@ -753,5 +836,41 @@ mod tests {
             resolve_app_path("logs", "logs"),
             "../backend/app/logs"
         );
+    }
+
+    #[test]
+    fn resolves_cross_encoder_onnx_and_tokenizer_from_local_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-ce-artifacts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("onnx")).unwrap();
+        std::fs::write(root.join("onnx").join("model.onnx"), b"onnx").unwrap();
+        std::fs::write(root.join("tokenizer.json"), b"{}").unwrap();
+        let (onnx, tokenizer) = resolve_cross_encoder_artifacts(root.to_str().unwrap()).unwrap();
+        assert_eq!(PathBuf::from(&onnx), root.join("onnx").join("model.onnx"));
+        assert_eq!(PathBuf::from(&tokenizer), root.join("tokenizer.json"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_cross_encoder_artifacts_from_hf_snapshot_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-ce-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let snapshot = root.join("snapshots").join("abc123");
+        std::fs::create_dir_all(snapshot.join("onnx")).unwrap();
+        std::fs::write(snapshot.join("onnx").join("model.onnx"), b"onnx").unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
+        let (onnx, tokenizer) = resolve_cross_encoder_artifacts(root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(&onnx),
+            snapshot.join("onnx").join("model.onnx")
+        );
+        assert_eq!(PathBuf::from(&tokenizer), snapshot.join("tokenizer.json"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
