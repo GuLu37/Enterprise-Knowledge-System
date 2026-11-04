@@ -353,8 +353,22 @@ fn skill_tool_result_payload(wrapped: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-fn planner_llm<'a>(config: &crate::config::Config, llm: &'a LlmClient) -> Option<&'a LlmClient> {
-    config.retrieval_planner_llm_decision_enabled.then_some(llm)
+/// 对齐 Python `_resolve_rag_query` 空值回落到原 query。
+fn first_pass_planner_query<'a>(query: &'a str, retrieval_query: &'a str) -> &'a str {
+    if retrieval_query.trim().is_empty() {
+        query
+    } else {
+        retrieval_query
+    }
+}
+
+/// 对齐 Python 聊天第一轮：`_select_initial_decision(..., llm=None)` 纯规则零 LLM。
+fn first_pass_retrieval_plan(
+    query: &str,
+    top_k: usize,
+    retrieval_method: &str,
+) -> crate::planner::RetrievalPlan {
+    crate::planner::select_initial_rule(query, top_k, retrieval_method)
 }
 
 /// 对齐 Python `_validate_chat_options`：空查询与 top_k 范围在进入业务前拒绝。
@@ -1046,13 +1060,8 @@ async fn collect_rag(
             expanded_queries: Vec::new(),
         });
     }
-    let planner_llm = planner_llm(config, llm);
-    let planner_query = if retrieval_query.trim().is_empty() {
-        query
-    } else {
-        retrieval_query
-    };
-    let plan = crate::planner::select_initial(planner_query, top_k, preferred_method, planner_llm).await;
+    let planner_query = first_pass_planner_query(query, retrieval_query);
+    let plan = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
     tracing::info!(
         strategy = plan.strategy.as_str(),
         method = plan.retrieval_method.as_str(),
@@ -1066,7 +1075,7 @@ async fn collect_rag(
     let first_results = planned.results;
     let context = planned.context;
     let expanded_queries = planned.expanded_queries;
-    let evidence = crate::planner::assess_evidence(query, &first_results, planner_llm).await;
+    let evidence = crate::planner::assess_evidence_rule(query, &first_results);
     tracing::info!(
         sufficient = evidence.sufficient,
         reason = evidence.reason.as_str(),
@@ -1844,13 +1853,14 @@ pub async fn stream_chat(
         let use_retrieval = intent.needs_retrieval;
         let preferred_method = request_retrieval_method.as_str();
         if use_retrieval {
-            let preview = crate::planner::select_initial_rule(&retrieval_query, top_k, preferred_method);
+            let planner_query = first_pass_planner_query(&query, &retrieval_query);
+            let preview = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
             yield Ok(sse_json(
                 "tool_call",
                 sse_tool_call_payload(
                     "search_knowledge_base",
                     json!({
-                        "query": retrieval_query,
+                        "query": preview.query,
                         "top_k": preview.top_k,
                         "retrieval_method": preview.retrieval_method,
                     }),
@@ -2297,6 +2307,36 @@ mod tests {
         assert_eq!(payload["args"]["query"], "我叫什么");
         assert_eq!(payload["reason"], "rule");
         assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn first_pass_plan_is_rule_only_and_matches_sse_tool_call() {
+        assert_eq!(first_pass_planner_query("差旅报销", "改写后的差旅报销"), "改写后的差旅报销");
+        assert_eq!(first_pass_planner_query("差旅报销", "  "), "差旅报销");
+
+        let default = first_pass_retrieval_plan("公司今年的目标是什么", 5, "hybrid");
+        assert_eq!(default.strategy, "default_hybrid");
+        assert_eq!(default.retrieval_method, "hybrid");
+        assert_eq!(default.top_k, 5);
+
+        let identifier = first_pass_retrieval_plan("员工号 E0011 的姓名", 5, "hybrid");
+        assert_eq!(identifier.strategy, "identifier_exact");
+        assert_eq!(identifier.retrieval_method, "sparse");
+
+        let planner_query = first_pass_planner_query("员工号 E0011 的姓名", "员工号 E0011 的姓名");
+        let plan = first_pass_retrieval_plan(planner_query, 5, "hybrid");
+        let payload = sse_tool_call_payload(
+            "search_knowledge_base",
+            json!({
+                "query": plan.query,
+                "top_k": plan.top_k,
+                "retrieval_method": plan.retrieval_method,
+            }),
+            "rule",
+        );
+        assert_eq!(payload["args"]["query"], plan.query.as_str());
+        assert_eq!(payload["args"]["top_k"], json!(plan.top_k));
+        assert_eq!(payload["args"]["retrieval_method"], "sparse");
     }
 
     #[test]
