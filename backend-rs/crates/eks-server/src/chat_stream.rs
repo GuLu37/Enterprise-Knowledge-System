@@ -820,6 +820,15 @@ fn sse_json(event: &str, data: serde_json::Value) -> Event {
     Event::default().event(event).data(data.to_string())
 }
 
+/// 对齐 Python `stream_chat` 的 tool_call：`name` / `args` / `reason`。
+fn sse_tool_call_payload(name: &str, args: serde_json::Value, reason: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "args": args,
+        "reason": reason,
+    })
+}
+
 fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
     items.iter().map(|item| item.to_json()).collect()
 }
@@ -1486,10 +1495,10 @@ pub async fn stream_chat(
                     break;
                 }
                 let skill_name = intent.skill_name.clone().unwrap_or_default();
-                yield Ok(sse_json("tool_call", json!({
-                    "name": skill_name,
-                    "arguments": intent.skill_arguments,
-                })));
+                yield Ok(sse_json(
+                    "tool_call",
+                    sse_tool_call_payload(&skill_name, intent.skill_arguments.clone(), &intent.reason),
+                ));
                 match prepare_skill_action(
                     &SkillActionInput {
                         pool: &pool,
@@ -1683,14 +1692,18 @@ pub async fn stream_chat(
         let preferred_method = request_retrieval_method.as_str();
         if use_retrieval {
             let preview = crate::planner::select_initial_rule(&retrieval_query, top_k, preferred_method);
-            yield Ok(sse_json("tool_call", json!({
-                "name": "search_knowledge_base",
-                "arguments": {
-                    "query": retrieval_query,
-                    "top_k": preview.top_k,
-                    "retrieval_method": preview.retrieval_method,
-                },
-            })));
+            yield Ok(sse_json(
+                "tool_call",
+                sse_tool_call_payload(
+                    "search_knowledge_base",
+                    json!({
+                        "query": retrieval_query,
+                        "top_k": preview.top_k,
+                        "retrieval_method": preview.retrieval_method,
+                    }),
+                    &intent.reason,
+                ),
+            ));
         }
 
         let turn = match collect_rag(
@@ -1725,10 +1738,14 @@ pub async fn stream_chat(
         }
         if turn.used_react {
             let react_name = turn.react_kind.as_deref().unwrap_or("unified_react");
-            yield Ok(sse_json("tool_call", json!({
-                "name": react_name,
-                "arguments": {"query": query, "notes": turn.react_notes},
-            })));
+            yield Ok(sse_json(
+                "tool_call",
+                sse_tool_call_payload(
+                    react_name,
+                    json!({"query": query, "notes": turn.react_notes}),
+                    &intent.reason,
+                ),
+            ));
             yield Ok(sse_json("tool_result", json!({
                 "skill": react_name,
                 "notes": turn.react_notes,
@@ -2074,6 +2091,15 @@ mod tests {
         let with_message = build_messages(&[], "", Vec::new(), "差旅报销", true, "资料过少");
         assert!(with_message[1].content.ends_with("资料过少"));
         assert!(with_message[1].content.starts_with("本轮已进入知识库检索，但没有找到足够相关的资料。"));
+    }
+
+    #[test]
+    fn sse_tool_call_uses_args_and_reason_like_python() {
+        let payload = sse_tool_call_payload("memory_query", json!({"query": "我叫什么"}), "rule");
+        assert_eq!(payload["name"], "memory_query");
+        assert_eq!(payload["args"]["query"], "我叫什么");
+        assert_eq!(payload["reason"], "rule");
+        assert!(payload.get("arguments").is_none());
     }
 
     #[test]
