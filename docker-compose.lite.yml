@@ -1,4 +1,14 @@
 services:
+  eks-server:
+    environment:
+      VECTOR_STORE_TYPE: milvus_lite
+      MILVUS_LITE_PATH: /app/data/milvus_lite.db
+      EKS_MILVUS_LITE_PATH: /app/data/milvus_lite.db
+      BGE_DEVICE: cpu
+      BGE_BATCH_SIZE: 4
+      BGE_MAX_LENGTH: 256
+      BGE_LOCAL_FILES_ONLY: true
+
   backend:
     environment:
       VECTOR_STORE_TYPE: milvus_lite

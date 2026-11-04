@@ -162,14 +162,14 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 | Chat | `DELETE /api/v1/chat/conversations` | 清空当前账号的全部对话记录与长期记忆 |
 | Chat | `DELETE /api/v1/chat/conversations/{conversation_id}` | 删除会话及关联长期记忆 |
 
-根路径 `/` 返回应用信息，`/health` 提供健康检查，FastAPI 文档位于 `/docs`。
+根路径 `/` 返回应用信息，`/health` 提供健康检查，OpenAPI 文档位于 `/docs`。
 
 ## 技术栈
 
 | 模块 | 技术 |
 | --- | --- |
 | 前端 | Vue 3、Vite、Lucide Vue |
-| 后端 | Rust、Axum、SQLite（`backend-rs`，默认服务）；Python FastAPI 仍保留为对照实现 |
+| 后端 | Rust、Axum、SQLite、Milvus Lite（`backend-rs`，默认服务）；Python FastAPI 仍保留为对照实现 |
 | LLM 编排 | LangChain Core、Function Calling、ReAct 检索循环 |
 | 检索 | Milvus、BGE Embedding、BM25、RRF、规则重排、可选 Cross-Encoder |
 | 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |
@@ -181,32 +181,20 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 
 ### 环境要求
 
-- Python 3.10+；Docker 镜像使用 Python 3.13。
+- Rust 1.92（推荐后端）；Python 3.10+ 仍可作为对照实现。
 - Node.js 18+；Docker 前端构建使用 Node.js 22。
 - 可访问的 LLM 服务。
-- 服务端 Milvus 2.x，或使用 Milvus Lite。
+- 默认使用 Milvus Lite 本地文件库；服务端 Milvus gRPC 仍由 Python 对照实现覆盖。
 
 ### 本地开发
 
-1. 准备后端环境：
+1. 复制环境变量：
 
 ```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
+Copy-Item backend/.env.example backend/.env
 ```
 
-2. 编辑 `backend/.env`，至少配置 LLM、Embedding 和向量库。开发时可以使用服务端 Milvus：
-
-```env
-VECTOR_STORE_TYPE=milvus
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-```
-
-如果使用 Milvus Lite：
+2. 编辑 `backend/.env`，至少配置 LLM 与 Embedding。Rust 后端会复用同名键，Milvus Lite 路径示例：
 
 ```env
 VECTOR_STORE_TYPE=milvus_lite
@@ -215,10 +203,30 @@ BGE_DEVICE=cpu
 BGE_LOCAL_FILES_ONLY=true
 ```
 
-3. 启动后端：
+3. 启动 Rust 后端：
 
 ```powershell
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+cd backend-rs
+$env:LIBRARY_PATH="/usr/lib/gcc/x86_64-linux-gnu/13"
+cargo +1.92.0 run -p eks-server
+```
+
+Linux/macOS：
+
+```bash
+cd backend-rs
+export LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13
+cargo +1.92.0 run -p eks-server
+```
+
+对照用的 Python 后端仍可用：
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 4. 新开终端启动前端：
@@ -271,7 +279,7 @@ docker compose -f docker-compose.yml -f docker-compose.lite.yml up -d --build
 docker compose --profile mysql up -d --build
 ```
 
-注意：`docker-compose.yml` 本身不会启动服务端 Milvus。使用 `VECTOR_STORE_TYPE=milvus` 时，需要提前提供可访问的 Milvus 服务；Lite 模式的数据默认持久化在 `backend/app/data/milvus_lite.db`。
+`docker-compose.yml` 默认启动 `eks-server`（Rust）。`docker-compose.lite.yml` 会给 Rust 主服务和可选 Python 对照服务同时写入 Milvus Lite 路径。数据默认持久化在 `backend/app/data/milvus_lite.db`。
 
 ## 关键配置
 
@@ -302,7 +310,11 @@ docker compose --profile mysql up -d --build
 
 ```text
 .
-├── backend/
+├── backend-rs/           # Rust 后端（默认服务 eks-server）
+│   └── crates/
+│       ├── eks-kernels/  # 分词、BM25、融合与重排内核
+│       └── eks-server/   # Axum API、检索、记忆、认证
+├── backend/              # Python 对照实现
 │   ├── app/
 │   │   ├── api/          # FastAPI 路由和请求模型
 │   │   ├── core/         # LLM、Embedding、常量
