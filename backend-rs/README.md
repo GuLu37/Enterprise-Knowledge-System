@@ -35,7 +35,9 @@
 → 结构化同 Sheet 聚合（xlsx 按行展开 + 表头还原）
 → 父块上下文批量回填（SQLite IN 查询）
 → 上下文组装（6.5K/30K 字符限制）
+→ 证据不足时统一 ReAct（全量本地工具，最多 3 轮；失败回退 query 改写）
 → SSE 流式推送 (start/sources/token/done)
+→ 回合写入 SQLite `memory_records`（事件记忆 + 触发词画像抽取）
 ```
 
 ## 快速启动
@@ -64,6 +66,7 @@ docker compose up eks-server
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/` | 服务标识 |
 | POST | `/api/v1/auth/login` | 登录（与 Python 互通） |
 | POST | `/api/v1/auth/register` | 注册 |
 | POST | `/api/v1/auth/refresh` | 刷新令牌 |
@@ -79,6 +82,7 @@ docker compose up eks-server
 | POST | `/api/v1/chat/warmup` | 返回当前运行时状态 |
 | POST | `/api/v1/chat/generate` | 同步生成回答 |
 | POST | `/api/v1/chat/stream` | SSE 流式聊天（`message`/`done` 与前端一致，并保留 `token`） |
+| POST | `/api/v1/chat/consolidate` | 会话摘要写入长期记忆 |
 | GET | `/api/v1/chat/conversations` | 对话列表 |
 | PUT | `/api/v1/chat/conversations/{id}` | 保存对话 |
 | DELETE | `/api/v1/chat/conversations/{id}` | 删除对话 |

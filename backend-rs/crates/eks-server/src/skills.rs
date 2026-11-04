@@ -405,6 +405,206 @@ fn tool_entry(name: &str, category: &str, description: &str) -> Value {
     })
 }
 
+fn function_spec(name: &str, description: &str, parameters: Value) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    })
+}
+
+pub fn function_calling_tools() -> Vec<Value> {
+    vec![
+        function_spec(
+            "search_knowledge_base",
+            "在企业知识库中检索相关文档片段。支持按制度名、流程、编号、人名等关键词检索，也可按文件名查询某份文档是否存在。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索关键词或文件名"},
+                    "top_k": {"type": "integer", "description": "返回条数(1-50)", "default": 5},
+                    "retrieval_method": {"type": "string", "enum": ["dense", "sparse", "hybrid"], "default": "hybrid"},
+                },
+                "required": ["query"],
+            }),
+        ),
+        function_spec(
+            "list_knowledge_base_files",
+            "列出、筛选并概括已上传文档。",
+            json!({"type": "object", "properties": {
+                "file_name": {"type": "string"},
+                "summarize": {"type": "boolean", "default": true},
+                "limit": {"type": "integer", "default": 20},
+            }}),
+        ),
+        function_spec(
+            "document_hot_word_statistics",
+            "统计指定文档的高频词。",
+            json!({"type": "object", "properties": {
+                "file_name": {"type": "string"},
+                "top_k": {"type": "integer", "default": 10},
+            }}),
+        ),
+        function_spec(
+            "memory_query",
+            "查询当前用户的画像记忆和长期记忆。",
+            json!({"type": "object", "properties": {
+                "query": {"type": "string"},
+                "memory_scope": {"type": "string", "enum": ["all", "profile", "event"], "default": "all"},
+                "top_k": {"type": "integer", "default": 5},
+            }}),
+        ),
+        function_spec(
+            "memory_retrieve_original",
+            "按摘要线索展开原始对话。",
+            json!({"type": "object", "properties": {
+                "query": {"type": "string"},
+                "max_chars": {"type": "integer", "default": 12000},
+            }}),
+        ),
+        function_spec(
+            "delete_profile_memory",
+            "删除当前用户指定的画像记忆。",
+            json!({"type": "object", "properties": {
+                "memory_keys": {"type": "array", "items": {"type": "string"}},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+            }}),
+        ),
+        function_spec(
+            "list_available_tools",
+            "展示当前可用工具。",
+            json!({"type": "object", "properties": {}}),
+        ),
+    ]
+}
+
+pub async fn load_active_profile_lines(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    Ok(load_memories(pool, user_id, Some("profile"), 100)
+        .await?
+        .into_iter()
+        .filter(memory_active)
+        .take(limit)
+        .map(|row| {
+            let key = row.memory_key.unwrap_or_else(|| "profile".into());
+            format!("- {key}：{}", row.content)
+        })
+        .collect())
+}
+
+pub async fn soft_delete_profile_key(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    memory_key: &str,
+) -> Result<usize, sqlx::Error> {
+    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    let result = sqlx::query(
+        "UPDATE memory_records SET status = 'deleted', updated_at = ? \
+         WHERE user_id = ? AND memory_type = 'profile' AND memory_key = ? AND status = 'active'",
+    )
+    .bind(&now)
+    .bind(user_id)
+    .bind(memory_key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as usize)
+}
+
+pub async fn upsert_profile_memory(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    memory_key: &str,
+    content: &str,
+    conversation_id: &str,
+    session_id: &str,
+    importance: f64,
+    confidence: f64,
+) -> Result<(), sqlx::Error> {
+    let now = crate::db::fmt_dt(&crate::db::now_naive());
+    let current: Option<(String, i64, String)> = sqlx::query_as(
+        "SELECT memory_id, version, content FROM memory_records \
+         WHERE user_id = ? AND memory_type = 'profile' AND memory_key = ? AND status = 'active' \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(memory_key)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((memory_id, version, old_content)) = current {
+        if old_content.trim() == content.trim() {
+            sqlx::query(
+                "UPDATE memory_records SET importance_score = ?, base_importance_score = ?, \
+                 confidence_score = ?, updated_at = ? WHERE memory_id = ?",
+            )
+            .bind(importance)
+            .bind(importance)
+            .bind(confidence)
+            .bind(&now)
+            .bind(&memory_id)
+            .execute(pool)
+            .await?;
+            return Ok(());
+        }
+        sqlx::query("UPDATE memory_records SET status = 'superseded', updated_at = ? WHERE memory_id = ?")
+            .bind(&now)
+            .bind(&memory_id)
+            .execute(pool)
+            .await?;
+        let memory_id_new = format!("profile:{user_id}:{memory_key}:{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO memory_records (
+                memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
+                importance_score, base_importance_score, confidence_score, access_count, status,
+                version, supersedes_memory_id, created_at, updated_at
+            ) VALUES (?, ?, 'profile', ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?)",
+        )
+        .bind(&memory_id_new)
+        .bind(user_id)
+        .bind(memory_key)
+        .bind(content)
+        .bind(if conversation_id.is_empty() { None } else { Some(conversation_id) })
+        .bind(if session_id.is_empty() { None } else { Some(session_id) })
+        .bind(importance)
+        .bind(importance)
+        .bind(confidence)
+        .bind(version + 1)
+        .bind(&memory_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    let memory_id = format!("profile:{user_id}:{memory_key}:{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO memory_records (
+            memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
+            importance_score, base_importance_score, confidence_score, access_count, status,
+            version, created_at, updated_at
+        ) VALUES (?, ?, 'profile', ?, ?, ?, ?, ?, ?, ?, 0, 'active', 1, ?, ?)",
+    )
+    .bind(&memory_id)
+    .bind(user_id)
+    .bind(memory_key)
+    .bind(content)
+    .bind(if conversation_id.is_empty() { None } else { Some(conversation_id) })
+    .bind(if session_id.is_empty() { None } else { Some(session_id) })
+    .bind(importance)
+    .bind(importance)
+    .bind(confidence)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct SkillDocument {
     document_id: String,
@@ -887,6 +1087,14 @@ mod tests {
         let files = route_local_skill("知识库里有哪些文档").expect("files");
         assert_eq!(files.name, "list_knowledge_base_files");
         assert!(route_local_skill("差旅报销流程是什么").is_none());
+        let catalog = function_calling_tools();
+        let names: Vec<&str> = catalog
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|value| value.as_str()))
+            .collect();
+        assert!(names.contains(&"search_knowledge_base"));
+        assert!(names.contains(&"memory_query"));
+        assert_eq!(names.len(), 7);
     }
 
     #[test]

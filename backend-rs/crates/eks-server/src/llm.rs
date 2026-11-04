@@ -18,7 +18,44 @@ const FALLBACK_ORDER: &[&str] = &["deepseek", "openrouter", "openai", "anthropic
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn to_api_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("role".into(), json!(self.role));
+        object.insert("content".into(), json!(self.content));
+        if let Some(calls) = &self.tool_calls {
+            object.insert("tool_calls".into(), calls.clone());
+        }
+        if let Some(id) = &self.tool_call_id {
+            object.insert("tool_call_id".into(), json!(id));
+        }
+        Value::Object(object)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub raw: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +132,7 @@ pub struct ChatCompletion {
     pub content: String,
     pub provider: String,
     pub model: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// 流式 chunk。
@@ -161,15 +199,24 @@ impl LlmClient {
             .insert(provider.to_string(), Instant::now());
     }
 
-    fn build_request_body(&self, provider: &ProviderConfig, messages: &[ChatMessage]) -> Value {
-        json!({
+    fn build_request_body(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+    ) -> Value {
+        let mut body = json!({
             "model": provider.model,
             "temperature": self.config.temperature,
-            "messages": messages.iter().map(|m| json!({
-                "role": m.role,
-                "content": m.content,
-            })).collect::<Vec<_>>(),
-        })
+            "messages": messages.iter().map(ChatMessage::to_api_json).collect::<Vec<_>>(),
+        });
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+                body["tool_choice"] = json!("auto");
+            }
+        }
+        body
     }
 
     /// 非流式调用（带兜底链）。
@@ -182,7 +229,7 @@ impl LlmClient {
 
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
-            match self.invoke_provider(provider, messages, per_timeout).await {
+            match self.invoke_provider(provider, messages, None, per_timeout).await {
                 Ok(result) => {
                     *self.active_provider.lock().await = Some(provider.name.clone());
                     return Ok(result);
@@ -197,13 +244,45 @@ impl LlmClient {
         Err(format!("所有 LLM 提供商均不可用: {}", errors.join(" | ")))
     }
 
+    /// 绑定工具后的非流式调用。供应商不支持 tools 时返回错误，由调用方降级。
+    pub async fn invoke_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+    ) -> Result<ChatCompletion, String> {
+        let providers = self.candidate_providers().await;
+        if providers.is_empty() {
+            return Err("没有可用的 LLM 提供商，请检查配置".into());
+        }
+        let per_timeout = self.config.timeout_secs / providers.len() as u64;
+        let mut errors: Vec<String> = Vec::new();
+        for provider in &providers {
+            match self
+                .invoke_provider(provider, messages, Some(tools), per_timeout)
+                .await
+            {
+                Ok(result) => {
+                    *self.active_provider.lock().await = Some(provider.name.clone());
+                    return Ok(result);
+                }
+                Err(exc) => {
+                    tracing::warn!("带工具 LLM 调用失败: {} -> {exc}", provider.name);
+                    self.mark_failure(&provider.name).await;
+                    errors.push(format!("{}: {exc}", provider.name));
+                }
+            }
+        }
+        Err(format!("所有 LLM 提供商均不可用: {}", errors.join(" | ")))
+    }
+
     async fn invoke_provider(
         &self,
         provider: &ProviderConfig,
         messages: &[ChatMessage],
+        tools: Option<&[Value]>,
         timeout_secs: u64,
     ) -> Result<ChatCompletion, String> {
-        let body = self.build_request_body(provider, messages);
+        let body = self.build_request_body(provider, messages, tools);
         let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
 
         let response = self
@@ -229,10 +308,12 @@ impl LlmClient {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let tool_calls = parse_tool_calls(payload.pointer("/choices/0/message/tool_calls"));
         Ok(ChatCompletion {
             content,
             provider: provider.name.clone(),
             model: provider.model.clone(),
+            tool_calls,
         })
     }
 
@@ -248,7 +329,7 @@ impl LlmClient {
         let per_timeout = self.config.timeout_secs / providers.len() as u64;
         let provider = providers[0].clone(); // 简化: 流式先用首选，失败由调用方 fallback 到 invoke
 
-        let body = self.build_request_body(&provider, messages);
+        let body = self.build_request_body(&provider, messages, None);
         let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
 
         let request = self
@@ -328,5 +409,82 @@ impl LlmClient {
         });
 
         Ok(rx)
+    }
+}
+
+fn parse_tool_calls(value: Option<&Value>) -> Vec<ToolCall> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let arguments = item
+                .pointer("/function/arguments")
+                .and_then(|v| {
+                    if let Some(text) = v.as_str() {
+                        serde_json::from_str::<Value>(text).ok()
+                    } else {
+                        Some(v.clone())
+                    }
+                })
+                .unwrap_or_else(|| json!({}));
+            Some(ToolCall {
+                id: if id.is_empty() {
+                    format!("call_{name}")
+                } else {
+                    id
+                },
+                name,
+                arguments,
+                raw: item.clone(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_openai_tool_calls() {
+        let payload = json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "search_knowledge_base",
+                "arguments": "{\"query\":\"报销\"}"
+            }
+        }]);
+        let calls = parse_tool_calls(Some(&payload));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search_knowledge_base");
+        assert_eq!(calls[0].arguments["query"], "报销");
+        assert_eq!(calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn chat_message_omits_empty_tool_fields() {
+        let message = ChatMessage::new("user", "你好");
+        let encoded = message.to_api_json();
+        assert_eq!(encoded["role"], "user");
+        assert_eq!(encoded["content"], "你好");
+        assert!(encoded.get("tool_calls").is_none());
+        assert!(encoded.get("tool_call_id").is_none());
     }
 }

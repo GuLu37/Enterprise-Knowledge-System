@@ -173,9 +173,14 @@ pub async fn delete_conversation(
     .execute(&state.pool)
     .await
     .map_err(AuthError::from)?;
+    let memory_deleted = crate::memory::delete_conversation_memory(&state.pool, &user.user_id, &cid)
+        .await
+        .map_err(AuthError::from)?
+        > 0;
     Ok(Json(json!({
         "conversation_id": cid,
         "deleted": result.rows_affected() > 0,
+        "memory_deleted": memory_deleted,
     })))
 }
 
@@ -190,5 +195,12 @@ pub async fn clear_conversations(
         .execute(&state.pool)
         .await
         .map_err(AuthError::from)?;
-    Ok(Json(json!({ "deleted_count": result.rows_affected() })))
+    let memory_deleted_count =
+        crate::memory::delete_user_event_memory(&state.pool, &user.user_id)
+            .await
+            .map_err(AuthError::from)?;
+    Ok(Json(json!({
+        "deleted_count": result.rows_affected(),
+        "memory_deleted_count": memory_deleted_count,
+    })))
 }

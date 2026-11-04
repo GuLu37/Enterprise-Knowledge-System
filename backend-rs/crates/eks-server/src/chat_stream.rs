@@ -1,7 +1,7 @@
 //! SSE 聊天端点（对齐 Python /chat/stream 事件协议）。
 //!
 //! 事件序列: start → (intent/query_rewrite 事件可选) → sources → token* → done | error
-//! 简化 ReAct: 首轮检索质量不足时 LLM 改写查询 + 二轮检索，合并上下文。
+//! 首轮检索质量不足时先走统一 ReAct 工具循环，bind_tools 失败再回退 query 改写。
 
 use axum::{
     extract::State,
@@ -101,17 +101,14 @@ async fn rewrite_query(
     }
 
     let messages = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: system_prompt.into(),
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: format!(
+        ChatMessage::new("system", system_prompt),
+        ChatMessage::new(
+            "user",
+            format!(
                 "用户原始问题：\n{}\n\n最近对话上下文：\n{}\n请输出适合企业知识库检索的书面化 query。",
                 query, context_hint
             ),
-        },
+        ),
     ];
 
     match llm.invoke(&messages).await {
@@ -174,6 +171,8 @@ struct RagTurn {
     sources: Vec<RetrievalItem>,
     direct: Option<String>,
     retrieval_method: Option<String>,
+    used_react: bool,
+    react_notes: Vec<String>,
 }
 
 fn sse_json(event: &str, data: serde_json::Value) -> Event {
@@ -184,32 +183,67 @@ fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
     items.iter().map(|item| item.to_json()).collect()
 }
 
-fn build_messages(context: &str, history: &[HistoryMessage], query: &str) -> Vec<ChatMessage> {
+fn build_messages(
+    profile: &str,
+    context: &str,
+    history: &[HistoryMessage],
+    query: &str,
+) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    if !profile.is_empty() {
+        messages.push(ChatMessage::new("system", profile));
+    }
     if !context.is_empty() {
-        messages.push(ChatMessage {
-            role: "system".into(),
-            content: build_rag_system_message(context),
-        });
+        messages.push(ChatMessage::new("system", build_rag_system_message(context)));
     }
     for item in history {
         if item.role == "system" || item.role == "user" || item.role == "assistant" {
-            messages.push(ChatMessage {
-                role: item.role.clone(),
-                content: item.content.clone(),
-            });
+            messages.push(ChatMessage::new(&item.role, item.content.clone()));
         }
     }
-    messages.push(ChatMessage {
-        role: "user".into(),
-        content: query.to_string(),
-    });
+    messages.push(ChatMessage::new("user", query));
     messages
+}
+
+fn spawn_persist_turn(
+    pool: sqlx::SqlitePool,
+    llm: Option<Arc<LlmClient>>,
+    user_id: String,
+    conversation_id: String,
+    session_id: String,
+    query: String,
+    answer: String,
+) {
+    if answer.trim().is_empty() || user_id.trim().is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        crate::memory::persist_turn(
+            &pool,
+            llm.as_deref(),
+            &user_id,
+            &conversation_id,
+            &session_id,
+            &query,
+            &answer,
+        )
+        .await;
+    });
+}
+
+fn history_pairs(history: &[HistoryMessage]) -> Vec<(String, String)> {
+    history
+        .iter()
+        .filter(|item| item.role == "user" || item.role == "assistant")
+        .map(|item| (item.role.clone(), item.content.clone()))
+        .collect()
 }
 
 async fn collect_rag(
     engine: &crate::retrieval_engine::RetrievalEngine,
+    pool: &sqlx::SqlitePool,
     llm: &LlmClient,
+    user_id: &str,
     query: &str,
     history: &[HistoryMessage],
     top_k: usize,
@@ -221,17 +255,11 @@ async fn collect_rag(
             sources: Vec::new(),
             direct: None,
             retrieval_method: None,
+            used_react: false,
+            react_notes: Vec::new(),
         });
     }
     let (first_results, _) = engine.run_rag_workflow(query, top_k).await?;
-    if first_results.is_empty() {
-        return Ok(RagTurn {
-            context: String::new(),
-            sources: Vec::new(),
-            direct: Some(no_result_answer(query)),
-            retrieval_method: Some("hybrid".into()),
-        });
-    }
     if retrieval_quality_ok(&first_results) {
         let context = crate::retrieval::assemble_rag_context(&first_results, 6500);
         return Ok(RagTurn {
@@ -239,34 +267,77 @@ async fn collect_rag(
             sources: first_results,
             direct: None,
             retrieval_method: Some("hybrid".into()),
+            used_react: false,
+            react_notes: Vec::new(),
         });
     }
+
+    let mut working = first_results;
+    let mut used_react = false;
+    let mut react_notes = Vec::new();
+    match crate::react::run_unified_react(
+        engine,
+        pool,
+        llm,
+        user_id,
+        query,
+        &history_pairs(history),
+        top_k,
+        working.clone(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            used_react = outcome.used_react;
+            react_notes = outcome.notes;
+            if outcome.used_react && retrieval_quality_ok(&outcome.sources) {
+                return Ok(RagTurn {
+                    context: outcome.context,
+                    sources: outcome.sources,
+                    direct: None,
+                    retrieval_method: Some("hybrid".into()),
+                    used_react,
+                    react_notes,
+                });
+            }
+            if !outcome.sources.is_empty() {
+                working = outcome.sources;
+            }
+        }
+        Err(err) => tracing::warn!("统一 ReAct 失败，回退改写检索: {err}"),
+    }
+
     if let Some(rewritten) = rewrite_query(llm, query, history).await {
         let second = engine
             .run_rag_workflow(&rewritten, top_k)
             .await
             .map(|(results, _)| results)
             .unwrap_or_default();
-        let merged = merge_results(first_results, second);
-        let max_chars = if merged.iter().any(|item| item.structured_aggregation) {
-            30000
-        } else {
-            6500
-        };
-        let context = crate::retrieval::assemble_rag_context(&merged, max_chars);
+        working = merge_results(working, second);
+    }
+    if working.is_empty() {
         return Ok(RagTurn {
-            context,
-            sources: merged,
-            direct: None,
+            context: String::new(),
+            sources: Vec::new(),
+            direct: Some(no_result_answer(query)),
             retrieval_method: Some("hybrid".into()),
+            used_react,
+            react_notes,
         });
     }
-    let context = crate::retrieval::assemble_rag_context(&first_results, 6500);
+    let max_chars = if working.iter().any(|item| item.structured_aggregation) {
+        30000
+    } else {
+        6500
+    };
+    let context = crate::retrieval::assemble_rag_context(&working, max_chars);
     Ok(RagTurn {
         context,
-        sources: first_results,
+        sources: working,
         direct: None,
         retrieval_method: Some("hybrid".into()),
+        used_react,
+        react_notes,
     })
 }
 
@@ -321,6 +392,43 @@ pub async fn chat_runtime_status(
     Ok(axum::Json(runtime_payload(&state)))
 }
 
+#[derive(Deserialize)]
+pub struct ConsolidateQuery {
+    pub conversation_id: String,
+}
+
+pub async fn consolidate_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ConsolidateQuery>,
+) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
+    let user = crate::routes::require_current_user(&state, &headers).await?;
+    let conversation_id = query.conversation_id.trim().to_string();
+    if conversation_id.is_empty() {
+        return Err(crate::auth::AuthError::bad_request("conversation_id 不能为空"));
+    }
+    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    if llm_config.providers.is_empty() {
+        return Err(llm_unavailable());
+    }
+    let llm_client = LlmClient::new(llm_config);
+    let consolidated = crate::memory::consolidate_conversation(
+        &state.pool,
+        &llm_client,
+        &user.user_id,
+        &conversation_id,
+    )
+    .await
+    .map_err(|detail| crate::auth::AuthError {
+        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        detail,
+    })?;
+    Ok(axum::Json(json!({
+        "conversation_id": conversation_id,
+        "consolidated": if consolidated { 1 } else { 0 },
+    })))
+}
+
 pub async fn chat_warmup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -339,10 +447,28 @@ pub async fn generate_chat(
     if query.is_empty() {
         return Err(crate::auth::AuthError::bad_request("问题不能为空"));
     }
+    let conversation_id = request.conversation_id.clone().unwrap_or_default();
+    let session_id = request.session_id.clone().unwrap_or_default();
+    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
+    let llm_client = if llm_config.providers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(LlmClient::new(llm_config)))
+    };
+
     if let Some(route) = crate::skills::route_local_skill(&query) {
         let answer = crate::skills::answer_routed_skill(&state.pool, &user.user_id, &route)
             .await
             .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+        spawn_persist_turn(
+            state.pool.clone(),
+            llm_client,
+            user.user_id.clone(),
+            conversation_id,
+            session_id,
+            query.clone(),
+            answer.clone(),
+        );
         return Ok(axum::Json(json!({
             "query": query,
             "response": answer,
@@ -352,15 +478,15 @@ pub async fn generate_chat(
         })));
     }
 
-    let llm_config = crate::llm::LlmConfig::from_env(&state.config);
-    if llm_config.providers.is_empty() {
+    let Some(llm_client) = llm_client else {
         return Err(llm_unavailable());
-    }
-    let llm_client = LlmClient::new(llm_config);
+    };
     let use_retrieval = request.use_retrieval && needs_retrieval(&query);
     let turn = collect_rag(
         &state.engine,
+        &state.pool,
         &llm_client,
+        &user.user_id,
         &query,
         &request.history,
         request.top_k,
@@ -372,6 +498,15 @@ pub async fn generate_chat(
         detail,
     })?;
     if let Some(answer) = turn.direct {
+        spawn_persist_turn(
+            state.pool.clone(),
+            Some(llm_client),
+            user.user_id.clone(),
+            conversation_id,
+            session_id,
+            query.clone(),
+            answer.clone(),
+        );
         return Ok(axum::Json(json!({
             "query": query,
             "response": answer,
@@ -380,11 +515,21 @@ pub async fn generate_chat(
             "retrieval_method": turn.retrieval_method,
         })));
     }
-    let messages = build_messages(&turn.context, &request.history, &query);
+    let profile = crate::memory::profile_prompt(&state.pool, &user.user_id).await;
+    let messages = build_messages(&profile, &turn.context, &request.history, &query);
     let result = llm_client.invoke(&messages).await.map_err(|detail| crate::auth::AuthError {
         status: axum::http::StatusCode::BAD_GATEWAY,
         detail,
     })?;
+    spawn_persist_turn(
+        state.pool.clone(),
+        Some(llm_client),
+        user.user_id.clone(),
+        conversation_id,
+        session_id,
+        query.clone(),
+        result.content.clone(),
+    );
     Ok(axum::Json(json!({
         "query": query,
         "response": result.content,
@@ -429,6 +574,15 @@ pub async fn stream_chat(
             })));
             match crate::skills::answer_routed_skill(&pool, &user_id, &route).await {
                 Ok(answer) => {
+                    spawn_persist_turn(
+                        pool.clone(),
+                        if llm_missing { None } else { Some(llm_client.clone()) },
+                        user_id.clone(),
+                        conversation_id.clone(),
+                        session_id.clone(),
+                        query.clone(),
+                        answer.clone(),
+                    );
                     yield Ok(sse_json("tool_result", json!({"skill": route.name, "sources": []})));
                     yield Ok(sse_json("message", json!({"content": answer})));
                     yield Ok(sse_json("done", json!({
@@ -456,7 +610,18 @@ pub async fn stream_chat(
             })));
         }
 
-        let turn = match collect_rag(&engine, &llm_client, &query, &history, top_k, use_retrieval).await {
+        let turn = match collect_rag(
+            &engine,
+            &pool,
+            &llm_client,
+            &user_id,
+            &query,
+            &history,
+            top_k,
+            use_retrieval,
+        )
+        .await
+        {
             Ok(turn) => turn,
             Err(detail) => {
                 yield Ok(sse_json("error", json!({"message": format!("检索失败: {detail}")})));
@@ -471,7 +636,27 @@ pub async fn stream_chat(
             })));
             yield Ok(sse_json("sources", json!({"sources": sources})));
         }
+        if turn.used_react {
+            yield Ok(sse_json("tool_call", json!({
+                "name": "unified_react",
+                "arguments": {"query": query, "notes": turn.react_notes},
+            })));
+            yield Ok(sse_json("tool_result", json!({
+                "skill": "unified_react",
+                "notes": turn.react_notes,
+                "sources": sources,
+            })));
+        }
         if let Some(answer) = turn.direct.clone() {
+            spawn_persist_turn(
+                pool.clone(),
+                Some(llm_client.clone()),
+                user_id.clone(),
+                conversation_id.clone(),
+                session_id.clone(),
+                query.clone(),
+                answer.clone(),
+            );
             yield Ok(sse_json("message", json!({"content": answer})));
             yield Ok(sse_json("token", json!({"content": answer})));
             yield Ok(sse_json("done", json!({
@@ -483,7 +668,8 @@ pub async fn stream_chat(
             return;
         }
 
-        let messages = build_messages(&turn.context, &history, &query);
+        let profile = crate::memory::profile_prompt(&pool, &user_id).await;
+        let messages = build_messages(&profile, &turn.context, &history, &query);
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 let mut full_response = String::new();
@@ -492,6 +678,15 @@ pub async fn stream_chat(
                     yield Ok(sse_json("message", json!({"content": chunk.delta})));
                     yield Ok(sse_json("token", json!({"content": chunk.delta})));
                 }
+                spawn_persist_turn(
+                    pool.clone(),
+                    Some(llm_client.clone()),
+                    user_id.clone(),
+                    conversation_id.clone(),
+                    session_id.clone(),
+                    query.clone(),
+                    full_response.clone(),
+                );
                 yield Ok(sse_json("done", json!({
                     "content": full_response,
                     "response": full_response,
@@ -503,6 +698,15 @@ pub async fn stream_chat(
                 tracing::warn!("流式调用失败，尝试非流式: {exc}");
                 match llm_client.invoke(&messages).await {
                     Ok(result) => {
+                        spawn_persist_turn(
+                            pool.clone(),
+                            Some(llm_client.clone()),
+                            user_id.clone(),
+                            conversation_id.clone(),
+                            session_id.clone(),
+                            query.clone(),
+                            result.content.clone(),
+                        );
                         yield Ok(sse_json("message", json!({"content": result.content})));
                         yield Ok(sse_json("token", json!({"content": result.content})));
                         yield Ok(sse_json("done", json!({

@@ -52,6 +52,15 @@ pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "eks-rs" }))
 }
 
+pub async fn root() -> impl IntoResponse {
+    Json(json!({
+        "name": "Enterprise Knowledge System",
+        "version": env!("CARGO_PKG_VERSION"),
+        "service": "eks-rs",
+        "health": "/health",
+    }))
+}
+
 /// 从请求头解析 Bearer 令牌（与 Python `HTTPBearer(auto_error=False)` + scheme 检查一致）。
 fn bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
     let value = headers
@@ -238,6 +247,7 @@ pub async fn auth_fallback(Path(_rest): Path<String>) -> impl IntoResponse {
 pub fn router(state: AppState) -> axum::Router {
     let prefix = state.config.api_prefix.clone();
     axum::Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
         .route(
             &format!("{prefix}/auth/login"),
@@ -289,6 +299,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             &format!("{prefix}/chat/generate"),
             post(crate::chat_stream::generate_chat),
+        )
+        .route(
+            &format!("{prefix}/chat/consolidate"),
+            post(crate::chat_stream::consolidate_chat),
         )
         .route(
             &format!("{prefix}/chat/stream"),
