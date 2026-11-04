@@ -338,13 +338,21 @@ pub async fn maybe_disclose_original_memory(
     )
     .await?
     {
-        Some(disclosure) => Ok(json!({
-            "memory_query": memory_query_result,
-            "original_conversation": disclosure.result,
-            "progressive_disclosure": true,
-        })),
+        Some(disclosure) => Ok(merge_progressive_disclosure_payload(
+            memory_query_result,
+            disclosure.result,
+        )),
         None => Ok(memory_query_result),
     }
+}
+
+/// 对齐 Python `_run_skill_action`：generate 把 memory_query 与原文合并进同一 result。
+pub fn merge_progressive_disclosure_payload(memory_query: Value, original: Value) -> Value {
+    json!({
+        "memory_query": memory_query,
+        "original_conversation": original,
+        "progressive_disclosure": true,
+    })
 }
 
 pub async fn execute_named(

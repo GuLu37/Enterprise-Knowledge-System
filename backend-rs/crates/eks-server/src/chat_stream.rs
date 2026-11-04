@@ -209,6 +209,7 @@ struct PreparedSkill {
     wrapped: serde_json::Value,
     fallback: String,
     messages: Option<Vec<ChatMessage>>,
+    generate_messages: Option<Vec<ChatMessage>>,
     sufficient: bool,
     disclosure: Option<PreparedDisclosure>,
 }
@@ -264,9 +265,10 @@ async fn prepare_skill_action(
     .await?;
     let query_sufficient = tool_result_has_signal(name, &result);
     let wrapped = wrap_prepared_skill(input, name, &arguments, result.clone())?;
+    let mut stream_wrapped = wrapped.clone();
+    let mut generate_wrapped = wrapped.clone();
     let mut answer_name = name.to_string();
     let mut answer_result = result.clone();
-    let mut answer_wrapped = wrapped.clone();
     let mut disclosure = None;
     if name == "memory_query" {
         if let Some(item) = crate::skills::maybe_run_progressive_disclosure(
@@ -286,9 +288,14 @@ async fn prepare_skill_action(
                 &item.arguments,
                 item.result.clone(),
             )?;
+            let merged_result = crate::skills::merge_progressive_disclosure_payload(
+                result.clone(),
+                item.result.clone(),
+            );
+            generate_wrapped = wrap_prepared_skill(input, name, &arguments, merged_result)?;
             answer_name = "memory_retrieve_original".into();
             answer_result = item.result.clone();
-            answer_wrapped = disclosure_wrapped.clone();
+            stream_wrapped = disclosure_wrapped.clone();
             disclosure = Some(PreparedDisclosure {
                 arguments: item.arguments,
                 wrapped: disclosure_wrapped,
@@ -296,7 +303,7 @@ async fn prepare_skill_action(
         }
     }
     let fallback = crate::skills::format_skill_answer(&answer_name, &answer_result);
-    let messages = if input.llm.is_some() {
+    let (messages, generate_messages) = if input.llm.is_some() {
         let long_term = crate::memory::build_long_term_memory_messages(
             input.pool,
             input.user_id,
@@ -314,20 +321,28 @@ async fn prepare_skill_action(
             input.options,
             input.llm.clone(),
         )?;
-        Some(crate::skills::build_skill_messages(
+        let stream_messages = crate::skills::build_skill_messages(
             input.query,
-            &answer_wrapped,
+            &stream_wrapped,
+            &long_term,
+            history_messages.clone(),
+        );
+        let generate_messages = crate::skills::build_skill_messages(
+            input.query,
+            &generate_wrapped,
             &long_term,
             history_messages,
-        ))
+        );
+        (Some(stream_messages), Some(generate_messages))
     } else {
-        None
+        (None, None)
     };
     Ok(PreparedSkill {
         name: name.to_string(),
         wrapped,
         fallback,
         messages,
+        generate_messages,
         sufficient: agent_turn_complete_after_disclosure(disclosure.is_some(), query_sufficient),
         disclosure,
     })
@@ -337,7 +352,7 @@ async fn resolve_skill_answer(
     prepared: &PreparedSkill,
     llm: Option<&Arc<LlmClient>>,
 ) -> (String, String) {
-    if let (Some(messages), Some(llm)) = (prepared.messages.as_ref(), llm) {
+    if let (Some(messages), Some(llm)) = (prepared.generate_messages.as_ref(), llm) {
         return invoke_llm_safely(llm, messages).await;
     }
     (prepared.fallback.clone(), prepared.name.clone())
@@ -2571,6 +2586,28 @@ mod tests {
             &json!({"tools": []})
         ));
         assert!(!tool_result_has_signal("list_available_tools", &json!({})));
+    }
+
+    #[test]
+    fn generate_disclosure_merges_memory_query_like_python() {
+        let query = json!({"matched_memories": [{"memory_id": "m1"}]});
+        let original = json!({"original_chunks": [{"content": "原文"}]});
+        let merged = crate::skills::merge_progressive_disclosure_payload(query.clone(), original.clone());
+        assert_eq!(merged["memory_query"], query);
+        assert_eq!(merged["original_conversation"], original);
+        assert_eq!(merged["progressive_disclosure"], true);
+
+        let generate_wrap = json!({"skill": "memory_query", "result": merged});
+        let stream_wrap = json!({"skill": "memory_retrieve_original", "result": original});
+        let generate_msg = crate::skills::skill_result_message(&generate_wrap);
+        let stream_msg = crate::skills::skill_result_message(&stream_wrap);
+        assert_eq!(generate_wrap["skill"], "memory_query");
+        assert!(generate_msg.content.contains("memory_query"));
+        assert!(generate_msg.content.contains("original_conversation"));
+        assert!(generate_msg.content.contains("progressive_disclosure"));
+        assert_eq!(stream_wrap["skill"], "memory_retrieve_original");
+        assert!(stream_msg.content.contains("original_chunks"));
+        assert!(!stream_msg.content.contains("\"memory_query\""));
     }
 
     #[test]
