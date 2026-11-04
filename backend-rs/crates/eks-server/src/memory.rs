@@ -48,6 +48,17 @@ const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "
 const MEMORY_TYPE_EVENT: &str = "event";
 const MEMORY_STATUS_ACTIVE: &str = "active";
 const DEFAULT_EVENT_EXPIRY_DAYS: i64 = 90;
+const EMPTY_USER_ID_MESSAGE: &str = "user_id 不能为空，长期记忆必须绑定到用户";
+
+/// 对齐 Python `_require_user_id`。
+pub fn require_user_id(user_id: &str) -> Result<&str, String> {
+    let normalized = user_id.trim();
+    if normalized.is_empty() {
+        Err(EMPTY_USER_ID_MESSAGE.into())
+    } else {
+        Ok(normalized)
+    }
+}
 pub const MEMORY_PERSIST_QUEUE_SIZE: usize = 100;
 pub const CONSOLIDATION_LEVELS: [(i64, i32); 3] = [(10, 1), (20, 2), (40, 3)];
 const CONSOLIDATION_RETRY_DELAYS: [u64; 3] = [60, 300, 1800];
@@ -764,15 +775,13 @@ pub async fn search_event_memories(
     session_id: Option<&str>,
     top_k: usize,
     embedder: Option<&Embedder>,
-) -> Vec<EventMemoryHit> {
-    if user_id.trim().is_empty() {
-        return Vec::new();
-    }
+) -> Result<Vec<EventMemoryHit>, String> {
+    let user_id = require_user_id(user_id)?;
     let _ = ensure_schema(pool).await;
     let conversation_id = conversation_id.map(str::trim).filter(|item| !item.is_empty());
     let session_id = session_id.map(str::trim).filter(|item| !item.is_empty());
     let query = query.trim();
-    if let Some(hits) = search_event_memories_ann(
+    match search_event_memories_ann(
         pool,
         user_id,
         query,
@@ -782,7 +791,9 @@ pub async fn search_event_memories(
     )
     .await
     {
-        return hits;
+        AnnSearch::Hits(hits) => return Ok(hits),
+        AnnSearch::Failed(err) => return Err(err),
+        AnnSearch::Unavailable => {}
     }
 
     let now_text = crate::db::fmt_dt(&crate::db::now_naive());
@@ -811,11 +822,11 @@ pub async fn search_event_memories(
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!("长期记忆读取失败: {err}");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
     if rows.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let query_tokens = if query.is_empty() {
@@ -875,7 +886,7 @@ pub async fn search_event_memories(
     let limit = top_k.max(1);
     scored.truncate(limit);
     mark_accessed(pool, user_id, &scored).await;
-    scored
+    Ok(scored)
 }
 
 /// 对齐 Python `_build_hierarchical_memory_lines`：有命中才生成 system 提示。
@@ -892,7 +903,7 @@ pub async fn hierarchical_prompt(
     if !should_retrieve_event_memory(query, route) {
         return String::new();
     }
-    let hits = search_event_memories(
+    let hits = match search_event_memories(
         pool,
         user_id,
         query,
@@ -901,7 +912,14 @@ pub async fn hierarchical_prompt(
         if top_k == 0 { LONG_TERM_MEMORY_TOP_K } else { top_k },
         embedder,
     )
-    .await;
+    .await
+    {
+        Ok(hits) => hits,
+        Err(err) => {
+            tracing::warn!("长期记忆层级召回失败: {err}");
+            Vec::new()
+        }
+    };
     format_hierarchical_prompt(&hits)
 }
 
@@ -1129,14 +1147,14 @@ pub async fn retrieve_original_conversation(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     query: OriginalConversationQuery,
-) -> Value {
-    if user_id.trim().is_empty() {
-        return empty_original_conversation("请提供摘要 memory_id、检索提示或 conversation_id。");
-    }
+) -> Result<Value, String> {
+    let user_id = require_user_id(user_id)?;
     let _ = ensure_schema(pool).await;
     let query = clamp_original_query(&query);
     if query.memory_ids.is_empty() && query.query.is_empty() && query.conversation_id.is_empty() {
-        return empty_original_conversation("请提供摘要 memory_id、检索提示或 conversation_id。");
+        return Ok(empty_original_conversation(
+            "请提供摘要 memory_id、检索提示或 conversation_id。",
+        ));
     }
 
     let mut summary_references: Vec<Value> = Vec::new();
@@ -1173,13 +1191,13 @@ pub async fn retrieve_original_conversation(
                 .collect::<Vec<_>>(),
         )
         .await;
-        return json!({
+        return Ok(json!({
             "mode": "original_conversation",
             "summary": format!("已展开当前会话的 {} 个原始对话块。", bounded.len()),
             "summary_references": [],
             "original_chunks": bounded,
             "truncated": truncated,
-        });
+        }));
     } else if !query.query.is_empty() {
         let hits = search_event_memories(
             pool,
@@ -1194,7 +1212,7 @@ pub async fn retrieve_original_conversation(
             query.top_k,
             None,
         )
-        .await;
+        .await?;
         summary_references.extend(hits.iter().filter(|hit| hit.memory_key.starts_with("semantic_memory")).map(|hit| {
             json!({
                 "memory_id": hit.memory_id,
@@ -1223,12 +1241,12 @@ pub async fn retrieve_original_conversation(
                     })
                 })
                 .collect();
-            return json!({
+            return Ok(json!({
                 "mode": "original_conversation",
                 "summary": format!("已按语义找到 {} 个原始对话块。", raw_chunks.len()),
                 "summary_references": [],
                 "original_chunks": raw_chunks,
-            });
+            }));
         }
     }
 
@@ -1324,13 +1342,13 @@ pub async fn retrieve_original_conversation(
             })
         })
         .collect();
-    json!({
+    Ok(json!({
         "mode": "original_conversation",
         "summary": format!("已展开 {} 个原始对话块。", bounded.len()),
         "summary_references": summary_preview,
         "original_chunks": bounded,
         "truncated": truncated,
-    })
+    }))
 }
 
 pub fn format_hierarchical_prompt(hits: &[EventMemoryHit]) -> String {
@@ -2408,6 +2426,12 @@ async fn write_memory_vector(
     sink.store.invalidate(&sink.collection).await;
 }
 
+enum AnnSearch {
+    Hits(Vec<EventMemoryHit>),
+    Unavailable,
+    Failed(String),
+}
+
 async fn search_event_memories_ann(
     pool: &sqlx::SqlitePool,
     user_id: &str,
@@ -2415,32 +2439,37 @@ async fn search_event_memories_ann(
     conversation_id: Option<&str>,
     session_id: Option<&str>,
     top_k: usize,
-) -> Option<Vec<EventMemoryHit>> {
-    let sink = memory_vector_sink()?;
+) -> AnnSearch {
+    let Some(sink) = memory_vector_sink() else {
+        return AnnSearch::Unavailable;
+    };
     if query.is_empty() || !sink.store.has_collection(&sink.collection).await {
-        return None;
+        return AnnSearch::Unavailable;
     }
     if let Err(err) = crate::milvus_lite::ensure_collection_dimension(
         &sink.store.root,
         &sink.collection,
         sink.embedding_dimension,
     ) {
-        tracing::warn!("长期记忆向量召回跳过: {err}");
-        return None;
+        return AnnSearch::Failed(err);
     }
-    let vectors = sink.embedder.embed_queries(&[query.to_string()]).ok()?;
-    let vector = vectors.into_iter().next()?;
+    let vectors = match sink.embedder.embed_queries(&[query.to_string()]) {
+        Ok(vectors) => vectors,
+        Err(_) => return AnnSearch::Unavailable,
+    };
+    let Some(vector) = vectors.into_iter().next() else {
+        return AnnSearch::Unavailable;
+    };
     if let Err(err) = crate::milvus_lite::validate_vector_dimension(
         &sink.collection,
         vector.len(),
         sink.embedding_dimension,
     ) {
-        tracing::warn!("长期记忆向量召回跳过: {err}");
-        return None;
+        return AnnSearch::Failed(err);
     }
     let conv = conversation_id;
     let sess = session_id;
-    let hits = sink
+    let hits = match sink
         .store
         .search_cosine_filtered(
             &sink.collection,
@@ -2479,8 +2508,14 @@ async fn search_event_memories_ann(
             },
         )
         .await
-        .ok()?;
-    let snapshot = sink.store.collection(&sink.collection).await.ok()?;
+    {
+        Ok(hits) => hits,
+        Err(_) => return AnnSearch::Unavailable,
+    };
+    let snapshot = match sink.store.collection(&sink.collection).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return AnnSearch::Unavailable,
+    };
     let now_text = crate::db::fmt_dt(&crate::db::now_naive());
     let mut scored = Vec::new();
     for (index, score) in hits {
@@ -2551,7 +2586,7 @@ async fn search_event_memories_ann(
     });
     scored.truncate(top_k.max(1));
     mark_accessed(pool, user_id, &scored).await;
-    Some(scored)
+    AnnSearch::Hits(scored)
 }
 
 fn empty_to_none(value: &str) -> Option<&str> {
@@ -2671,6 +2706,46 @@ fn parse_json_object(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_user_id_matches_python() {
+        assert_eq!(require_user_id("u1").unwrap(), "u1");
+        assert_eq!(require_user_id("  u1  ").unwrap(), "u1");
+        assert_eq!(
+            require_user_id("").unwrap_err(),
+            "user_id 不能为空，长期记忆必须绑定到用户"
+        );
+        assert_eq!(
+            require_user_id("   ").unwrap_err(),
+            "user_id 不能为空，长期记忆必须绑定到用户"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_user_id_hard_fails_search_and_original() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let err = search_event_memories(&pool, "", "报销时限", None, None, 3, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "user_id 不能为空，长期记忆必须绑定到用户");
+        let original_err = retrieve_original_conversation(
+            &pool,
+            "  ",
+            OriginalConversationQuery {
+                memory_ids: vec!["m1".into()],
+                top_k: 8,
+                max_chars: 12000,
+                ..OriginalConversationQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            original_err,
+            "user_id 不能为空，长期记忆必须绑定到用户"
+        );
+    }
 
     #[test]
     fn detects_profile_trigger_and_validates_keys() {
@@ -2918,7 +2993,8 @@ mod tests {
 
         let hits =
             search_event_memories(&pool, "u1", "报销时限是多久", Some("c1"), Some("s1"), 8, None)
-                .await;
+                .await
+                .unwrap();
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|hit| hit.conversation_id.as_deref() == Some("c1")));
         assert!(hits.iter().all(|hit| hit.session_id.as_deref() == Some("s1")));
@@ -3182,7 +3258,9 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = search_event_memories(&pool, "u1", "报销时限是多久", Some("c1"), Some("s1"), 3, None).await;
+        let hits = search_event_memories(&pool, "u1", "报销时限是多久", Some("c1"), Some("s1"), 3, None)
+            .await
+            .unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].memory_key, "semantic_memory_l1");
         assert!(hits[0].content.contains("3 天"));
@@ -3240,7 +3318,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let hits = search_event_memories(&pool, "u1", "差旅报销时限", None, None, 2, None).await;
+        let hits = search_event_memories(&pool, "u1", "差旅报销时限", None, None, 2, None)
+            .await
+            .unwrap();
         assert_eq!(hits[0].memory_key, "semantic_memory_l3");
         assert_eq!(hits[1].memory_key, "dialogue");
     }
@@ -3433,7 +3513,8 @@ mod tests {
                 ..OriginalConversationQuery::default()
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             result.pointer("/summary_references/0/memory_id").and_then(Value::as_str),
             Some(summary_id.as_str())
@@ -3455,7 +3536,8 @@ mod tests {
                 ..OriginalConversationQuery::default()
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(hidden.get("summary_references").and_then(Value::as_array).map(Vec::len), Some(0));
         assert_eq!(hidden.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(0));
     }
@@ -3489,7 +3571,8 @@ mod tests {
                 ..OriginalConversationQuery::default()
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             recovered.pointer("/original_chunks/0/chunk_type").and_then(Value::as_str),
             Some("dialogue_recovered")
@@ -3535,7 +3618,8 @@ mod tests {
                 ..OriginalConversationQuery::default()
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(whole.get("original_chunks").and_then(Value::as_array).map(Vec::len), Some(2));
         assert!(whole.get("summary").and_then(Value::as_str).unwrap_or("").contains("当前会话"));
     }

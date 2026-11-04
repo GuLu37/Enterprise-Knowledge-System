@@ -1704,6 +1704,7 @@ async fn memory_query(
     recent_history: &[crate::short_memory::MemoryMessage],
     embedder: Option<&crate::embedder::Embedder>,
 ) -> Result<Value, String> {
+    let user_id = crate::memory::require_user_id(user_id)?;
     let query = arg_str(arguments, "query");
     let top_k = arg_usize(arguments, "top_k", 5, 1, 50);
     let mut scope = arg_str(arguments, "memory_scope").to_lowercase();
@@ -1756,7 +1757,7 @@ async fn memory_query(
             top_k,
             embedder,
         )
-            .await
+            .await?
             .into_iter()
             .map(|hit| json!({
                 "memory_id": hit.memory_id,
@@ -1807,7 +1808,7 @@ async fn memory_original(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Val
     if memory_ids.is_empty() {
         memory_ids = arg_strings(arguments, "summary_memory_ids");
     }
-    Ok(crate::memory::retrieve_original_conversation(
+    crate::memory::retrieve_original_conversation(
         pool,
         user_id,
         crate::memory::OriginalConversationQuery {
@@ -1822,7 +1823,7 @@ async fn memory_original(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Val
             max_chars: arg_usize(arguments, "max_chars", 12000, 500, 50000),
         },
     )
-    .await)
+    .await
 }
 
 async fn delete_profile_memory(pool: &sqlx::SqlitePool, user_id: &str, arguments: &Value) -> Result<Value, String> {
