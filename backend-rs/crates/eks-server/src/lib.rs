@@ -13,6 +13,7 @@ pub mod intent;
 pub mod llm;
 pub mod logging;
 pub mod memory;
+pub mod memory_chunk;
 pub mod openapi;
 pub mod milvus_lite;
 pub mod planner;

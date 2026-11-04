@@ -877,6 +877,11 @@ fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     split_text_with_separators(text, chunk_size, overlap, DEFAULT_TEXT_SEPARATORS)
 }
 
+/// 对齐 Python `split_text_chunks`，供对话记忆切块复用。
+pub(crate) fn split_text_chunks(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    split_text(text, chunk_size, overlap)
+}
+
 struct HeadingRegexes {
     markdown: Regex,
     numbered: Regex,

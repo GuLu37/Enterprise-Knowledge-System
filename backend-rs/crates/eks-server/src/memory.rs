@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 
 use crate::embedder::Embedder;
 use crate::llm::{ChatMessage, LlmClient};
+use crate::memory_chunk::{
+    build_conversation_chunks, build_semantic_memory_chunks, high_confidence_topic_continuation,
+    normalize_conversation_message, user_assistant_messages, CHAT_CHUNK_OVERLAP, CHAT_CHUNK_SIZE,
+    LONG_TERM_MEMORY_TOKEN_LIMIT, ConversationMessage,
+};
 use crate::milvus_lite::MilvusLiteStore;
 
 const LONG_TERM_MEMORY_TOP_K: usize = 3;
@@ -49,6 +54,8 @@ const CONSOLIDATION_RETRY_DELAYS: [u64; 3] = [60, 300, 1800];
 const L1_SUMMARY_SYSTEM_PROMPT: &str = "你是长期记忆摘要器。请将给定对话总结成适合长期记忆的一句话摘要，并给出主题。\
 只输出 JSON，格式为 {\"topic\": \"主题\", \"summary\": \"一句摘要\"}，不要输出额外解释。\
 主题要短，摘要要准确，不要编造。";
+const TOPIC_CHANGE_SYSTEM_PROMPT: &str = "你是对话话题判断器。请判断下面两段对话是否已经发生明显话题切换。\
+只输出 JSON，格式为 {\"changed\": true/false}，不要输出额外解释。";
 const MERGE_SUMMARY_SYSTEM_PROMPT: &str = "你是长期记忆递进摘要器。把以下多个摘要块压缩成一段更精炼的高层摘要。\
 保留跨块共有的主题、结论、偏好和待办；丢弃单块琐碎细节。\
 只输出严格 JSON，格式：{\"topic\":\"主题\",\"summary\":\"一段摘要\"}";
@@ -547,26 +554,38 @@ pub async fn persist_turn(
         return;
     }
     let _ = ensure_schema(pool).await;
-    let content = format!("用户: {}\n助手: {}", query.trim(), answer.trim());
-    let turn = count_dialogue_turns(pool, user_id, conversation_id).await;
-    let (importance, confidence) = calculate_event_importance(&content);
-    if let Err(err) = insert_event_memory_with_confidence(
-        pool,
-        user_id,
-        conversation_id,
-        session_id,
-        "dialogue",
-        &content,
-        importance,
-        confidence,
-        expiry_days,
-        Some(turn),
-        Some(turn),
-    )
-    .await
-    {
-        tracing::warn!("长期记忆写入失败: {err}");
-    } else if !conversation_id.trim().is_empty() {
+    let messages = user_assistant_messages(query, answer);
+    if messages.is_empty() {
+        return;
+    }
+    let chunks = build_conversation_chunks(&messages, CHAT_CHUNK_SIZE, CHAT_CHUNK_OVERLAP, false);
+    if chunks.is_empty() {
+        return;
+    }
+    let turn_offset = count_dialogue_turns(pool, user_id, conversation_id).await;
+    let mut wrote = false;
+    for chunk in &chunks {
+        let (importance, confidence) = calculate_event_importance(&chunk.text);
+        match insert_event_memory_with_confidence(
+            pool,
+            user_id,
+            conversation_id,
+            session_id,
+            "dialogue",
+            &chunk.text,
+            importance,
+            confidence,
+            expiry_days,
+            Some(chunk.turn_start + turn_offset),
+            Some(chunk.turn_end + turn_offset),
+        )
+        .await
+        {
+            Ok(_) => wrote = true,
+            Err(err) => tracing::warn!("长期记忆写入失败: {err}"),
+        }
+    }
+    if wrote && !conversation_id.trim().is_empty() {
         let summarizer = llm.map(MemorySummarizer::Llm);
         let _ = consolidate_with(
             pool,
@@ -1559,6 +1578,46 @@ impl MemorySummarizer<'_> {
             }
         }
     }
+
+    #[allow(dead_code)]
+    async fn topic_changed(&self, current_text: &str, next_text: &str) -> bool {
+        if high_confidence_topic_continuation(current_text, next_text) {
+            return false;
+        }
+        match self {
+            MemorySummarizer::Llm(llm) => {
+                let text = llm
+                    .invoke(&[
+                        ChatMessage::new("system", TOPIC_CHANGE_SYSTEM_PROMPT),
+                        ChatMessage::new(
+                            "user",
+                            &format!(
+                                "当前缓冲区对话：\n{}\n\n候选新增对话：\n{}\n\n如果已经明显换题，请返回 changed=true；否则返回 changed=false。",
+                                current_text.trim(),
+                                next_text.trim()
+                            ),
+                        ),
+                    ])
+                    .await
+                    .ok()
+                    .map(|message| message.content)
+                    .unwrap_or_default();
+                let payload = parse_json_object(&text);
+                if payload.get("changed").is_some() {
+                    return payload
+                        .get("changed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                }
+                let lowered = text.trim().to_lowercase();
+                ["true", "yes", "changed", "是", "切换", "换题"]
+                    .iter()
+                    .any(|token| lowered.contains(token))
+            }
+            #[cfg(test)]
+            MemorySummarizer::Fixed { .. } => true,
+        }
+    }
 }
 
 fn consolidation_in_flight() -> &'static Mutex<HashSet<(String, String)>> {
@@ -1842,46 +1901,60 @@ async fn consolidate_level(
         let Some(summarizer) = summarizer else {
             return 0;
         };
-        let transcript = messages
+        let conv_messages: Vec<ConversationMessage> = messages
             .iter()
-            .map(|(role, content)| {
-                if role == "user" {
-                    format!("用户: {content}")
-                } else {
-                    format!("助手: {content}")
-                }
+            .filter_map(|(role, content)| {
+                normalize_conversation_message(role, content, false)
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let Some((topic, summary)) = summarizer
-            .summarize(
-                L1_SUMMARY_SYSTEM_PROMPT,
-                &format!("请基于下面的对话生成长期记忆摘要：\n\n{transcript}"),
+            .collect();
+        // L1 按固定轮次窗口切块，不再对每个相邻轮次调用话题判断 LLM。
+        let skeletons = build_semantic_memory_chunks(
+            &conv_messages,
+            |_current, _next| false,
+            |_| (String::new(), String::new()),
+            LONG_TERM_MEMORY_TOKEN_LIMIT,
+            false,
+        );
+        if skeletons.is_empty() {
+            return 0;
+        }
+        let mut inserted = 0i64;
+        for chunk in skeletons {
+            let (topic, summary) = match summarizer
+                .summarize(
+                    L1_SUMMARY_SYSTEM_PROMPT,
+                    &format!("请基于下面的对话生成长期记忆摘要：\n\n{}", chunk.transcript),
+                )
+                .await
+            {
+                Some(pair) => pair,
+                None => {
+                    let fallback: String = chunk.transcript.chars().take(120).collect();
+                    (fallback.clone(), fallback)
+                }
+            };
+            match write_semantic_summary(
+                pool,
+                user_id,
+                conversation_id,
+                1,
+                &topic,
+                &summary,
+                &chunk.transcript,
+                segment_start + chunk.turn_start,
+                segment_start + chunk.turn_end,
+                expiry_days,
             )
             .await
-        else {
-            return 0;
-        };
-        match write_semantic_summary(
-            pool,
-            user_id,
-            conversation_id,
-            1,
-            &topic,
-            &summary,
-            &transcript,
-            segment_start,
-            segment_start + threshold - 1,
-            expiry_days,
-        )
-        .await
-        {
-            Ok(_) => 1,
-            Err(err) => {
-                tracing::warn!("L1 合并失败，下次触发点重试: {err}");
-                0
+            {
+                Ok(_) => inserted += 1,
+                Err(err) => {
+                    tracing::warn!("L1 合并失败，下次触发点重试: {err}");
+                    return 0;
+                }
             }
         }
+        inserted
     } else {
         let lower_chunks = load_summary_chunks(
             pool,
@@ -3234,6 +3307,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_turn_splits_long_answer_into_same_turn_chunks() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let answer = "甲".repeat(600);
+        persist_turn(
+            &pool,
+            None,
+            "u1",
+            "c-long",
+            "s1",
+            "请详细说明",
+            &answer,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await;
+        let turns: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT content, turn_start, turn_end FROM memory_records \
+             WHERE conversation_id = 'c-long' \
+             AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+             ORDER BY created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(turns.len() >= 2);
+        assert!(turns.iter().all(|(_, start, end)| *start == 0 && *end == 0));
+        assert_eq!(count_dialogue_turns(&pool, "u1", "c-long").await, 1);
+        assert!(turns.iter().any(|(content, _, _)| content.contains("用户: 请详细说明")));
+    }
+
+    #[tokio::test]
+    async fn topic_changed_skips_high_confidence_continuation() {
+        let summarizer = MemorySummarizer::Fixed {
+            topic: "t".into(),
+            summary: "s".into(),
+        };
+        assert!(!summarizer.topic_changed("差旅报销标准", "那住宿费怎么报").await);
+        assert!(summarizer.topic_changed("差旅报销标准", "服务器发布窗口").await);
+    }
+
+    #[tokio::test]
     async fn persist_turn_uses_content_importance() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         ensure_schema(&pool).await.unwrap();
@@ -3256,7 +3370,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let content = "用户: 必须明确这是长期目标\n助手: 已经完成后续相关安排和检查事项。";
+        let content = "用户: 必须明确这是长期目标\n\n助手: 已经完成后续相关安排和检查事项。";
         let expected = calculate_event_importance(content);
         assert_eq!(row, (expected.0, expected.0, expected.1));
         assert_eq!(expected.0, 70.0);
