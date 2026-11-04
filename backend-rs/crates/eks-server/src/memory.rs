@@ -1,6 +1,6 @@
 //! 长期记忆：对话块、画像抽取、会话删除级联、分层召回。
-//! 写入 SQLite `memory_records`，与 Python memory_service 共用同一张表；
-//! 召回用词法 + 可选 BGE 余弦，不依赖 Milvus 记忆 collection。
+//! SQLite `memory_records` 管生命周期；有 milvus_lite `memory_chunks` 时写入并 ANN 召回，
+//! 否则回退词法 + 可选 BGE 余弦。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::embedder::Embedder;
 use crate::llm::{ChatMessage, LlmClient};
+use crate::milvus_lite::MilvusLiteStore;
 
 const LONG_TERM_MEMORY_TOP_K: usize = 3;
 const LONG_TERM_MEMORY_SNIPPET_LIMIT: usize = 240;
@@ -185,7 +186,80 @@ pub async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    migrate_memory_turn_columns(pool).await?;
     Ok(())
+}
+
+async fn migrate_memory_turn_columns(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = crate::db::table_column_names(pool, "memory_records").await?;
+    if !columns.contains("turn_start") {
+        sqlx::query("ALTER TABLE memory_records ADD COLUMN turn_start INTEGER")
+            .execute(pool)
+            .await?;
+    }
+    if !columns.contains("turn_end") {
+        sqlx::query("ALTER TABLE memory_records ADD COLUMN turn_end INTEGER")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// 对齐 Python milvus `memory_chunks` 写入/召回。测试不配置时走 SQLite 词法回退。
+#[derive(Clone)]
+pub struct MemoryVectorSink {
+    pub store: MilvusLiteStore,
+    pub collection: String,
+    pub embedder: Arc<Embedder>,
+}
+
+static MEMORY_VECTOR_SINK: OnceLock<MemoryVectorSink> = OnceLock::new();
+
+pub fn configure_memory_vectors(sink: MemoryVectorSink) {
+    let _ = MEMORY_VECTOR_SINK.set(sink);
+}
+
+fn memory_vector_sink() -> Option<&'static MemoryVectorSink> {
+    MEMORY_VECTOR_SINK.get()
+}
+
+/// SQLite `memory_key` 在 Rust 历史行里是 chunk_type，在 Python 行里是 logical_key。
+pub fn event_chunk_type(memory_key: Option<&str>) -> String {
+    let key = memory_key.unwrap_or("dialogue").trim();
+    if key.is_empty() {
+        return "dialogue".into();
+    }
+    if key == "dialogue" || key.starts_with("semantic_memory") {
+        return key.to_string();
+    }
+    let parts: Vec<&str> = key.split(':').collect();
+    if parts.len() >= 4 && parts[0] == "event" {
+        return parts[3].to_string();
+    }
+    key.to_string()
+}
+
+fn event_logical_key(
+    user_id: &str,
+    conversation_id: &str,
+    chunk_type: &str,
+    memory_id: &str,
+    chunk_index: i64,
+) -> String {
+    let conv = if conversation_id.trim().is_empty() {
+        "unknown"
+    } else {
+        conversation_id.trim()
+    };
+    if chunk_type == "dialogue" {
+        format!("event:{user_id}:{conv}:dialogue:{memory_id}")
+    } else {
+        format!("event:{user_id}:{conv}:{chunk_type}:{chunk_index}")
+    }
+}
+
+fn chunk_type_like(chunk_type: &str) -> String {
+    format!("event:%:%:{chunk_type}:%")
 }
 
 pub fn clamp_score(value: f64) -> f64 {
@@ -667,18 +741,45 @@ pub async fn search_event_memories(
         return Vec::new();
     }
     let _ = ensure_schema(pool).await;
-    let rows: Vec<EventMemoryRow> = match sqlx::query_as(
+    let conversation_id = conversation_id.map(str::trim).filter(|item| !item.is_empty());
+    let session_id = session_id.map(str::trim).filter(|item| !item.is_empty());
+    let query = query.trim();
+    if let Some(hits) = search_event_memories_ann(
+        pool,
+        user_id,
+        query,
+        conversation_id,
+        session_id,
+        top_k,
+    )
+    .await
+    {
+        return hits;
+    }
+
+    let now_text = crate::db::fmt_dt(&crate::db::now_naive());
+    let mut builder = sqlx::QueryBuilder::new(
         "SELECT memory_id, memory_key, content, conversation_id, session_id, \
          turn_start, turn_end, importance_score \
          FROM memory_records \
-         WHERE user_id = ? AND memory_type = 'event' AND status = 'active' \
-         ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(user_id)
-    .bind(CANDIDATE_LIMIT)
-    .fetch_all(pool)
-    .await
-    {
+         WHERE user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(" AND memory_type = 'event' AND status = 'active'");
+    builder.push(" AND (expires_at IS NULL OR expires_at > ");
+    builder.push_bind(&now_text);
+    builder.push(")");
+    if let Some(conversation_id) = conversation_id {
+        builder.push(" AND conversation_id = ");
+        builder.push_bind(conversation_id);
+    }
+    if let Some(session_id) = session_id {
+        builder.push(" AND session_id = ");
+        builder.push_bind(session_id);
+    }
+    builder.push(" ORDER BY created_at DESC LIMIT ");
+    builder.push_bind(CANDIDATE_LIMIT);
+    let rows: Vec<EventMemoryRow> = match builder.build_query_as().fetch_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!("长期记忆读取失败: {err}");
@@ -689,36 +790,22 @@ pub async fn search_event_memories(
         return Vec::new();
     }
 
-    let query = query.trim();
     let query_tokens = if query.is_empty() {
         Vec::new()
     } else {
         eks_kernels::tokenize_cjk(query)
     };
-    let conversation_id = conversation_id.map(str::trim).filter(|item| !item.is_empty());
-    let session_id = session_id.map(str::trim).filter(|item| !item.is_empty());
     let mut scored: Vec<EventMemoryHit> = rows
         .into_iter()
         .map(|row| {
-            let memory_key = row
-                .memory_key
-                .as_deref()
-                .unwrap_or("dialogue")
-                .trim()
-                .to_string();
+            let memory_key = event_chunk_type(row.memory_key.as_deref());
             let lexical_score = if query.is_empty() {
                 0.0
             } else {
                 let row_tokens = eks_kernels::tokenize_cjk(&row.content);
                 eks_kernels::lexical::lexical_match_score(&query_tokens, &row_tokens, query, &row.content)
             };
-            let mut score = lexical_score * 0.55 + (row.importance_score / 100.0).clamp(0.0, 1.0) * 0.20;
-            if conversation_id.is_some() && row.conversation_id.as_deref() == conversation_id {
-                score += 0.12;
-            }
-            if session_id.is_some() && row.session_id.as_deref() == session_id {
-                score += 0.04;
-            }
+            let score = lexical_score * 0.55 + (row.importance_score / 100.0).clamp(0.0, 1.0) * 0.20;
             EventMemoryHit {
                 memory_id: row.memory_id,
                 content: row.content,
@@ -831,7 +918,7 @@ fn serialize_original_row(row: &OriginalMemoryRow) -> Value {
         "content": row.content,
         "conversation_id": row.conversation_id,
         "session_id": row.session_id,
-        "chunk_type": row.memory_key.as_deref().unwrap_or("dialogue"),
+        "chunk_type": event_chunk_type(row.memory_key.as_deref()),
         "topic": "",
         "turn_start": row.turn_start,
         "turn_end": row.turn_end,
@@ -976,7 +1063,7 @@ async fn load_active_event_rows(
         builder.push_bind(conversation_id);
     }
     if dialogue_only {
-        builder.push(" AND memory_key = 'dialogue'");
+        builder.push(" AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%')");
     }
     builder.push(" ORDER BY created_at ASC LIMIT ");
     builder.push_bind(limit);
@@ -1362,6 +1449,15 @@ pub async fn delete_conversation_memory(
     conversation_id: &str,
 ) -> Result<u64, sqlx::Error> {
     let _ = ensure_schema(pool).await;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT memory_id FROM memory_records \
+         WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' AND status = 'active'",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await?;
+    delete_memory_vectors(&ids).await;
     let now = crate::db::fmt_dt(&crate::db::now_naive());
     let result = sqlx::query(
         "UPDATE memory_records SET status = 'deleted', updated_at = ? \
@@ -1380,6 +1476,14 @@ pub async fn delete_user_event_memory(
     user_id: &str,
 ) -> Result<u64, sqlx::Error> {
     let _ = ensure_schema(pool).await;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT memory_id FROM memory_records \
+         WHERE user_id = ? AND memory_type = 'event' AND status = 'active'",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    delete_memory_vectors(&ids).await;
     let now = crate::db::fmt_dt(&crate::db::now_naive());
     let result = sqlx::query(
         "UPDATE memory_records SET status = 'deleted', updated_at = ? \
@@ -1390,6 +1494,22 @@ pub async fn delete_user_event_memory(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+async fn delete_memory_vectors(memory_ids: &[String]) {
+    let Some(sink) = memory_vector_sink() else {
+        return;
+    };
+    if memory_ids.is_empty() {
+        return;
+    }
+    if let Err(err) = sink
+        .store
+        .delete_by_field_values(&sink.collection, "memory_id", memory_ids)
+        .await
+    {
+        tracing::warn!("长期记忆向量删除失败: {err}");
+    }
 }
 
 enum MemorySummarizer<'a> {
@@ -1510,7 +1630,8 @@ pub async fn count_dialogue_turns(pool: &sqlx::SqlitePool, user_id: &str, conver
     let rows: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT turn_start, turn_end FROM memory_records \
          WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
-         AND memory_key = 'dialogue' AND status = 'active'",
+         AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+         AND status = 'active'",
     )
     .bind(user_id)
     .bind(conversation_id)
@@ -1581,7 +1702,8 @@ async fn load_dialogue_range(
     let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT content, turn_start, turn_end FROM memory_records \
          WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
-         AND memory_key = 'dialogue' AND status = 'active' \
+         AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+         AND status = 'active' \
          AND (turn_end IS NULL OR turn_end >= ?) \
          AND (turn_start IS NULL OR turn_start < ?) \
          ORDER BY turn_start ASC, created_at ASC",
@@ -1607,10 +1729,11 @@ async fn load_summary_chunks(
     end_turn: i64,
 ) -> Vec<(String, String)> {
     let memory_key = format!("semantic_memory_l{level}");
+    let like_pattern = chunk_type_like(&memory_key);
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT content FROM memory_records \
          WHERE user_id = ? AND conversation_id = ? AND memory_type = 'event' \
-         AND memory_key = ? AND status = 'active' \
+         AND (memory_key = ? OR memory_key LIKE ?) AND status = 'active' \
          AND (turn_end IS NULL OR turn_end >= ?) \
          AND (turn_start IS NULL OR turn_start < ?) \
          ORDER BY turn_start ASC, created_at ASC",
@@ -1618,6 +1741,7 @@ async fn load_summary_chunks(
     .bind(user_id)
     .bind(conversation_id)
     .bind(&memory_key)
+    .bind(&like_pattern)
     .bind(start_turn)
     .bind(end_turn)
     .fetch_all(pool)
@@ -2009,12 +2133,38 @@ async fn insert_event_memory_with_confidence(
     let now = crate::db::now_naive();
     let now_text = crate::db::fmt_dt(&now);
     let expires_at = crate::db::fmt_dt(&(now + chrono::Duration::days(expiry_days.max(1))));
+    let chunk_type = if memory_key.trim().is_empty() {
+        "dialogue"
+    } else {
+        memory_key.trim()
+    };
+    let chunk_index = turn_start.unwrap_or(0);
+    let conv_key = if conversation_id.trim().is_empty() {
+        "unknown"
+    } else {
+        conversation_id.trim()
+    };
     let memory_id = format!(
-        "event:{}:{}:{}",
+        "{}:{}:{}:{}",
         user_id,
-        memory_key,
+        conv_key,
+        chunk_index,
         uuid::Uuid::new_v4().simple()
     );
+    let stored_key = event_logical_key(user_id, conversation_id, chunk_type, &memory_id, chunk_index);
+    write_memory_vector(
+        &memory_id,
+        chunk_index,
+        content,
+        user_id,
+        conversation_id,
+        session_id,
+        chunk_type,
+        turn_start.unwrap_or(0),
+        turn_end.unwrap_or(turn_start.unwrap_or(0)),
+        &now_text,
+    )
+    .await;
     sqlx::query(
         "INSERT INTO memory_records (
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
@@ -2024,7 +2174,7 @@ async fn insert_event_memory_with_confidence(
     )
     .bind(&memory_id)
     .bind(user_id)
-    .bind(memory_key)
+    .bind(&stored_key)
     .bind(content)
     .bind(empty_to_none(conversation_id))
     .bind(empty_to_none(session_id))
@@ -2039,6 +2189,183 @@ async fn insert_event_memory_with_confidence(
     .execute(pool)
     .await?;
     Ok(memory_id)
+}
+
+async fn write_memory_vector(
+    memory_id: &str,
+    chunk_index: i64,
+    content: &str,
+    user_id: &str,
+    conversation_id: &str,
+    session_id: &str,
+    chunk_type: &str,
+    turn_start: i64,
+    turn_end: i64,
+    created_at: &str,
+) {
+    let Some(sink) = memory_vector_sink() else {
+        return;
+    };
+    let vectors = match sink.embedder.embed_documents(&[content.to_string()]) {
+        Ok(vectors) => vectors,
+        Err(err) => {
+            tracing::warn!("长期记忆向量化失败，仅写入 SQLite: {err}");
+            return;
+        }
+    };
+    let Some(vector) = vectors.into_iter().next() else {
+        return;
+    };
+    let row = crate::milvus_lite::MemoryChunkRow {
+        memory_id: memory_id.to_string(),
+        chunk_index,
+        source_name: "conversation".into(),
+        chunk_text: content.to_string(),
+        user_id: user_id.to_string(),
+        conversation_id: conversation_id.trim().to_string(),
+        session_id: session_id.trim().to_string(),
+        chunk_type: chunk_type.to_string(),
+        topic: String::new(),
+        turn_start,
+        turn_end,
+        created_at: created_at.to_string(),
+        vector,
+    };
+    if let Err(err) = crate::milvus_lite::append_memory_chunks(&sink.store.root, &sink.collection, &[row]) {
+        tracing::warn!("长期记忆向量写入失败: {err}");
+        return;
+    }
+    sink.store.invalidate(&sink.collection).await;
+}
+
+async fn search_event_memories_ann(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+) -> Option<Vec<EventMemoryHit>> {
+    let sink = memory_vector_sink()?;
+    if query.is_empty() || !sink.store.has_collection(&sink.collection).await {
+        return None;
+    }
+    let vectors = sink.embedder.embed_queries(&[query.to_string()]).ok()?;
+    let vector = vectors.into_iter().next()?;
+    let conv = conversation_id;
+    let sess = session_id;
+    let hits = sink
+        .store
+        .search_cosine_filtered(
+            &sink.collection,
+            &vector,
+            (top_k.max(1) * 3).max(6),
+            |row| {
+                let row_user = row
+                    .fields
+                    .get("user_id")
+                    .and_then(crate::milvus_lite::FieldValue::as_str)
+                    .unwrap_or("");
+                if row_user != user_id {
+                    return false;
+                }
+                if let Some(conversation_id) = conv {
+                    let row_conv = row
+                        .fields
+                        .get("conversation_id")
+                        .and_then(crate::milvus_lite::FieldValue::as_str)
+                        .unwrap_or("");
+                    if row_conv != conversation_id {
+                        return false;
+                    }
+                }
+                if let Some(session_id) = sess {
+                    let row_sess = row
+                        .fields
+                        .get("session_id")
+                        .and_then(crate::milvus_lite::FieldValue::as_str)
+                        .unwrap_or("");
+                    if row_sess != session_id {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await
+        .ok()?;
+    let snapshot = sink.store.collection(&sink.collection).await.ok()?;
+    let now_text = crate::db::fmt_dt(&crate::db::now_naive());
+    let mut scored = Vec::new();
+    for (index, score) in hits {
+        let Some(row) = snapshot.rows.get(index) else {
+            continue;
+        };
+        let memory_id = row
+            .fields
+            .get("memory_id")
+            .and_then(crate::milvus_lite::FieldValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if memory_id.is_empty() {
+            continue;
+        }
+        let record: Option<EventMemoryRow> = match sqlx::query_as(
+            "SELECT memory_id, memory_key, content, conversation_id, session_id, \
+             turn_start, turn_end, importance_score \
+             FROM memory_records \
+             WHERE user_id = ? AND memory_id = ? AND memory_type = 'event' AND status = 'active' \
+             AND (expires_at IS NULL OR expires_at > ?)",
+        )
+        .bind(user_id)
+        .bind(&memory_id)
+        .bind(&now_text)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!("长期记忆生命周期读取失败: {err}");
+                continue;
+            }
+        };
+        let Some(record) = record else {
+            continue;
+        };
+        let content = row
+            .fields
+            .get("chunk_text")
+            .or_else(|| row.fields.get("text"))
+            .and_then(crate::milvus_lite::FieldValue::as_str)
+            .unwrap_or(&record.content)
+            .to_string();
+        scored.push(EventMemoryHit {
+            memory_id: record.memory_id,
+            content,
+            memory_key: event_chunk_type(record.memory_key.as_deref()),
+            conversation_id: record.conversation_id,
+            session_id: record.session_id,
+            turn_start: record.turn_start,
+            turn_end: record.turn_end,
+            score,
+            lexical_score: 0.0,
+            importance_score: record.importance_score,
+        });
+    }
+    scored.sort_by(|left, right| {
+        level_rank(&left.memory_key)
+            .cmp(&level_rank(&right.memory_key))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    scored.truncate(top_k.max(1));
+    mark_accessed(pool, user_id, &scored).await;
+    Some(scored)
 }
 
 fn empty_to_none(value: &str) -> Option<&str> {
@@ -2166,6 +2493,102 @@ mod tests {
         assert!(is_profile_key("profile.name"));
         assert!(!is_profile_key("Name"));
         assert!(!is_profile_key("x"));
+        assert_eq!(event_chunk_type(Some("dialogue")), "dialogue");
+        assert_eq!(
+            event_chunk_type(Some("event:u1:c1:dialogue:u1:c1:0:abc")),
+            "dialogue"
+        );
+        assert_eq!(
+            event_chunk_type(Some("event:u1:c1:semantic_memory_l1:0")),
+            "semantic_memory_l1"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_uses_python_memory_id_and_logical_key() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        persist_turn(
+            &pool,
+            None,
+            "u1",
+            "c1",
+            "s1",
+            "你好",
+            "你好，我在。",
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await;
+        let row: (String, String) = sqlx::query_as(
+            "SELECT memory_id, memory_key FROM memory_records WHERE user_id = 'u1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0.starts_with("u1:c1:0:"), "{}", row.0);
+        assert!(
+            row.1.starts_with("event:u1:c1:dialogue:"),
+            "{}",
+            row.1
+        );
+    }
+
+    #[tokio::test]
+    async fn search_hard_filters_conversation_and_expired_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限是几天？\n助手: 差旅报销需要在发生后 3 天内提交。",
+            70.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c2",
+            "s2",
+            "dialogue",
+            "用户: 报销时限是几天？\n助手: 另一会话说差旅报销时限是 7 天。",
+            90.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        let expired_id = insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限是几天？\n助手: 已过期的 1 天说法。",
+            99.0,
+            DEFAULT_EVENT_EXPIRY_DAYS,
+        )
+        .await
+        .unwrap();
+        let past = crate::db::fmt_dt(&(crate::db::now_naive() - chrono::Duration::days(1)));
+        sqlx::query("UPDATE memory_records SET expires_at = ? WHERE memory_id = ?")
+            .bind(&past)
+            .bind(&expired_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hits =
+            search_event_memories(&pool, "u1", "报销时限是多久", Some("c1"), Some("s1"), 8, None)
+                .await;
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.conversation_id.as_deref() == Some("c1")));
+        assert!(hits.iter().all(|hit| hit.session_id.as_deref() == Some("s1")));
+        assert!(hits.iter().all(|hit| !hit.content.contains("7 天")));
+        assert!(hits.iter().all(|hit| !hit.content.contains("已过期")));
     }
 
     #[tokio::test]
@@ -2448,7 +2871,8 @@ mod tests {
 
         let access: i64 = sqlx::query_scalar(
             "SELECT access_count FROM memory_records \
-             WHERE user_id = 'u1' AND memory_key = 'semantic_memory_l1' AND content LIKE '%3 天%'",
+             WHERE user_id = 'u1' AND content LIKE '%3 天%' \
+             AND (memory_key = 'semantic_memory_l1' OR memory_key LIKE 'event:%:%:semantic_memory_l1:%')",
         )
         .fetch_one(&pool)
         .await
@@ -2799,7 +3223,9 @@ mod tests {
         assert_eq!(count_dialogue_turns(&pool, "u1", "c-turns").await, 3);
         let turns: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT turn_start, turn_end FROM memory_records \
-             WHERE conversation_id = 'c-turns' AND memory_key = 'dialogue' ORDER BY turn_start",
+             WHERE conversation_id = 'c-turns' \
+             AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+             ORDER BY turn_start",
         )
         .fetch_all(&pool)
         .await
@@ -2824,7 +3250,8 @@ mod tests {
         .await;
         let row: (f64, f64, f64) = sqlx::query_as(
             "SELECT importance_score, base_importance_score, confidence_score \
-             FROM memory_records WHERE conversation_id = 'c-imp' AND memory_key = 'dialogue'",
+             FROM memory_records WHERE conversation_id = 'c-imp' \
+             AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%')",
         )
         .fetch_one(&pool)
         .await
@@ -2844,7 +3271,8 @@ mod tests {
             persist_turn(&pool, None, "u1", "c-low", "s1", "好的", "收到", DEFAULT_EVENT_EXPIRY_DAYS).await;
         }
         let l1: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-low' AND memory_key = 'semantic_memory_l1'",
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-low' \
+             AND (memory_key = 'semantic_memory_l1' OR memory_key LIKE 'event:%:%:semantic_memory_l1:%')",
         )
         .fetch_one(&pool)
         .await
@@ -2902,7 +3330,8 @@ mod tests {
         assert_eq!(written, 1);
         assert_eq!(get_consolidation_cursor(&pool, "u1", "c-wait", 1).await, 10);
         let content: String = sqlx::query_scalar(
-            "SELECT content FROM memory_records WHERE conversation_id = 'c-wait' AND memory_key = 'semantic_memory_l1'",
+            "SELECT content FROM memory_records WHERE conversation_id = 'c-wait' \
+             AND (memory_key = 'semantic_memory_l1' OR memory_key LIKE 'event:%:%:semantic_memory_l1:%')",
         )
         .fetch_one(&pool)
         .await
@@ -2958,13 +3387,15 @@ mod tests {
         assert_eq!(first, 2);
         assert_eq!(second, 1);
         let l1: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' AND memory_key = 'semantic_memory_l1'",
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' \
+             AND (memory_key = 'semantic_memory_l1' OR memory_key LIKE 'event:%:%:semantic_memory_l1:%')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         let l2: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' AND memory_key = 'semantic_memory_l2'",
+            "SELECT COUNT(*) FROM memory_records WHERE conversation_id = 'c-l2' \
+             AND (memory_key = 'semantic_memory_l2' OR memory_key LIKE 'event:%:%:semantic_memory_l2:%')",
         )
         .fetch_one(&pool)
         .await
@@ -3031,7 +3462,9 @@ mod tests {
         .expect("串行写入超时");
         let turns: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT turn_start, turn_end FROM memory_records \
-             WHERE conversation_id = 'c-serial' AND memory_key = 'dialogue' ORDER BY turn_start",
+             WHERE conversation_id = 'c-serial' \
+             AND (memory_key = 'dialogue' OR memory_key LIKE 'event:%:%:dialogue:%') \
+             ORDER BY turn_start",
         )
         .fetch_all(&pool)
         .await

@@ -161,6 +161,49 @@ impl MilvusLiteStore {
         self.cache.write().await.remove(name);
     }
 
+    pub async fn has_collection(&self, name: &str) -> bool {
+        self.root.join("collections").join(name).join("manifest.json").is_file()
+    }
+
+    /// 按字段等值删除，对齐 Python `client.delete(filter=memory_id in [...])`。
+    pub async fn delete_by_field_values(
+        &self,
+        collection: &str,
+        field: &str,
+        values: &[String],
+    ) -> Result<bool, String> {
+        let wanted: HashSet<&str> = values
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(self.has_collection(collection).await);
+        }
+        let snapshot = match self.collection(collection).await {
+            Ok(snapshot) => snapshot,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.to_string()),
+        };
+        let pks: Vec<i64> = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.fields
+                    .get(field)
+                    .and_then(FieldValue::as_str)
+                    .map(str::trim)
+                    .is_some_and(|value| wanted.contains(value))
+            })
+            .map(|row| row.pk)
+            .collect();
+        if !pks.is_empty() {
+            append_delta_pks(&self.root, collection, &pks)?;
+        }
+        self.invalidate(collection).await;
+        Ok(true)
+    }
+
     /// 按 document_id 写入 delta PK，对齐 Python `client.delete(filter=document_id == ...)`。
     /// 集合不存在时返回 false；存在则返回 true（即使没有匹配行）。
     pub async fn delete_by_document_id(
@@ -252,6 +295,222 @@ impl MilvusLiteStore {
         scored.truncate(top_k);
         Ok(scored)
     }
+
+    /// COSINE 检索并按行字段过滤（长期记忆 user/conversation/session）。
+    pub async fn search_cosine_filtered(
+        &self,
+        collection: &str,
+        query: &[f32],
+        top_k: usize,
+        predicate: impl Fn(&Row) -> bool,
+    ) -> std::io::Result<Vec<(usize, f64)>> {
+        let snapshot = match self.collection(collection).await {
+            Ok(snapshot) => snapshot,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut scored: Vec<(usize, f64)> = snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| predicate(row))
+            .map(|(index, row)| (index, cosine(query, &row.vector)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+}
+
+const MEMORY_EMBEDDING_DIM: usize = 768;
+
+#[derive(Debug, Clone)]
+pub struct MemoryChunkRow {
+    pub memory_id: String,
+    pub chunk_index: i64,
+    pub source_name: String,
+    pub chunk_text: String,
+    pub user_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub chunk_type: String,
+    pub topic: String,
+    pub turn_start: i64,
+    pub turn_end: i64,
+    pub created_at: String,
+    pub vector: Vec<f32>,
+}
+
+/// 创建空的 milvus_lite collection 目录与 manifest。
+pub fn ensure_collection(root: &Path, collection: &str) -> Result<(), String> {
+    let collection_dir = root.join("collections").join(collection);
+    let manifest_path = collection_dir.join("manifest.json");
+    if manifest_path.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(collection_dir.join("partitions").join("_default").join("data"))
+        .map_err(|err| err.to_string())?;
+    std::fs::create_dir_all(collection_dir.join("partitions").join("_default").join("delta"))
+        .map_err(|err| err.to_string())?;
+    let manifest = serde_json::json!({
+        "version": 1,
+        "current_seq": 0,
+        "partitions": {
+            "_default": {
+                "data_files": [],
+                "delta_files": []
+            }
+        }
+    });
+    std::fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+pub fn append_memory_chunks(
+    root: &Path,
+    collection: &str,
+    rows: &[MemoryChunkRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    ensure_collection(root, collection)?;
+    let collection_dir = root.join("collections").join(collection);
+    let manifest_path = collection_dir.join("manifest.json");
+    let manifest_str =
+        std::fs::read_to_string(&manifest_path).map_err(|err| format!("manifest 读取失败: {err}"))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&manifest_str).map_err(|err| format!("manifest 解析失败: {err}"))?;
+
+    let current_seq = manifest["current_seq"].as_i64().unwrap_or(0);
+    let data_dir = collection_dir.join("partitions").join("_default").join("data");
+    std::fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
+    let start_seq = current_seq + 1;
+    let end_seq = current_seq + rows.len() as i64;
+    let new_file = format!("data_{:06}_{:06}.parquet", start_seq, end_seq);
+    let new_path = data_dir.join(&new_file);
+
+    let n = rows.len();
+    let pk_start = current_seq + 100;
+    let pk_values: Vec<i64> = (0..n).map(|i| pk_start + i as i64).collect();
+    let seq_values: Vec<i64> = (0..n).map(|i| start_seq + i as i64).collect();
+    let mut flat_vectors = Vec::with_capacity(n * MEMORY_EMBEDDING_DIM);
+    for row in rows {
+        let mut vector = row.vector.clone();
+        vector.resize(MEMORY_EMBEDDING_DIM, 0.0);
+        flat_vectors.extend_from_slice(&vector);
+    }
+    let vector_array = FixedSizeListArray::new(
+        std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
+        MEMORY_EMBEDDING_DIM as i32,
+        std::sync::Arc::new(arrow_array::Float32Array::from(flat_vectors)) as ArrayRef,
+        None,
+    );
+    let fields = vec![
+        Field::new("_seq", DataType::Int64, false),
+        Field::new("pk", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
+                MEMORY_EMBEDDING_DIM as i32,
+            ),
+            false,
+        ),
+        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("chunk_index", DataType::Int64, false),
+        Field::new("source_name", DataType::Utf8, false),
+        Field::new("chunk_text", DataType::Utf8, false),
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("conversation_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("chunk_type", DataType::Utf8, false),
+        Field::new("topic", DataType::Utf8, false),
+        Field::new("turn_start", DataType::Int64, false),
+        Field::new("turn_end", DataType::Int64, false),
+        Field::new("created_at", DataType::Utf8, false),
+    ];
+    let columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(Int64Array::from(seq_values)),
+        std::sync::Arc::new(Int64Array::from(pk_values)),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.chunk_text.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(vector_array) as ArrayRef,
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.memory_id.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.chunk_index).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.source_name.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.chunk_text.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.user_id.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.conversation_id.clone())
+                .collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.session_id.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.chunk_type.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.topic.clone()).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.turn_start).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.turn_end).collect::<Vec<_>>(),
+        )),
+        std::sync::Arc::new(StringArray::from(
+            rows.iter().map(|row| row.created_at.clone()).collect::<Vec<_>>(),
+        )),
+    ];
+    let schema = Schema::new(fields);
+    let batch = RecordBatch::try_new(std::sync::Arc::new(schema), columns)
+        .map_err(|err| format!("RecordBatch 构建失败: {err}"))?;
+    let file = std::fs::File::create(&new_path).map_err(|err| err.to_string())?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
+        .map_err(|err| format!("Parquet writer 创建失败: {err}"))?;
+    writer
+        .write(&batch)
+        .map_err(|err| format!("Parquet 写入失败: {err}"))?;
+    writer
+        .close()
+        .map_err(|err| format!("Parquet 关闭失败: {err}"))?;
+
+    manifest["current_seq"] = serde_json::json!(end_seq);
+    let version = manifest.get("version").and_then(|value| value.as_i64()).unwrap_or(0) + 1;
+    manifest["version"] = serde_json::json!(version);
+    if let Some(files) = manifest
+        .pointer_mut("/partitions/_default/data_files")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        files.push(serde_json::json!(format!("data/{new_file}")));
+    } else {
+        manifest["partitions"]["_default"]["data_files"] = serde_json::json!([format!("data/{new_file}")]);
+    }
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -608,6 +867,91 @@ mod tests {
             .delete_by_document_id("doc_chunk", "any")
             .await
             .unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn memory_chunks_write_filter_search_and_delete() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-memory-chunks-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let mut keep = vec![0.0f32; MEMORY_EMBEDDING_DIM];
+        keep[0] = 1.0;
+        let mut other = vec![0.0f32; MEMORY_EMBEDDING_DIM];
+        other[1] = 1.0;
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[
+                MemoryChunkRow {
+                    memory_id: "u1:c1:0:aaa".into(),
+                    chunk_index: 0,
+                    source_name: "conversation".into(),
+                    chunk_text: "差旅报销时限三天".into(),
+                    user_id: "u1".into(),
+                    conversation_id: "c1".into(),
+                    session_id: "s1".into(),
+                    chunk_type: "dialogue".into(),
+                    topic: String::new(),
+                    turn_start: 0,
+                    turn_end: 0,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    vector: keep.clone(),
+                },
+                MemoryChunkRow {
+                    memory_id: "u1:c2:0:bbb".into(),
+                    chunk_index: 0,
+                    source_name: "conversation".into(),
+                    chunk_text: "另一会话".into(),
+                    user_id: "u1".into(),
+                    conversation_id: "c2".into(),
+                    session_id: "s2".into(),
+                    chunk_type: "dialogue".into(),
+                    topic: String::new(),
+                    turn_start: 0,
+                    turn_end: 0,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    vector: other,
+                },
+            ],
+        )
+        .unwrap();
+        let store = MilvusLiteStore::open(&root);
+        let hits = store
+            .search_cosine_filtered("memory_chunks", &keep, 4, |row| {
+                row.fields.get("user_id").and_then(FieldValue::as_str) == Some("u1")
+                    && row.fields.get("conversation_id").and_then(FieldValue::as_str) == Some("c1")
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let snapshot = store.collection("memory_chunks").await.unwrap();
+        let memory_id = snapshot.rows[hits[0].0]
+            .fields
+            .get("memory_id")
+            .and_then(FieldValue::as_str);
+        assert_eq!(memory_id, Some("u1:c1:0:aaa"));
+        assert!(store
+            .delete_by_field_values(
+                "memory_chunks",
+                "memory_id",
+                &["u1:c1:0:aaa".into()]
+            )
+            .await
+            .unwrap());
+        let remaining = store.collection("memory_chunks").await.unwrap();
+        assert_eq!(remaining.rows.len(), 1);
+        assert_eq!(
+            remaining.rows[0]
+                .fields
+                .get("memory_id")
+                .and_then(FieldValue::as_str),
+            Some("u1:c2:0:bbb")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

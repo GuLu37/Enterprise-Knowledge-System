@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::SqlitePool::connect_with(db_options).await?;
     eks_server::db::ensure_auth_schema(&pool).await?;
     eks_server::db::ensure_document_schema(&pool).await?;
+    eks_server::db::ensure_conversation_schema(&pool).await?;
     match eks_server::auth::seed_bootstrap_admin(
         &pool,
         &config.bootstrap_admin_username,
@@ -50,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Embedding 内核初始化失败: {e}"))?;
     let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
     let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
-        store, embedder, pool.clone(),
+        store.clone(), embedder, pool.clone(),
     )
     .with_result_cache(config.enable_cache, config.cache_ttl)
     .with_retrieval_options(&config);
@@ -83,6 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let engine = std::sync::Arc::new(engine);
+    eks_server::memory::configure_memory_vectors(eks_server::memory::MemoryVectorSink {
+        store: store.clone(),
+        collection: config.milvus_memory_collection.clone(),
+        embedder: engine.embedder.clone(),
+    });
 
     eks_server::memory::spawn_memory_maintenance(
         pool.clone(),

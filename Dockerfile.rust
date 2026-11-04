@@ -42,7 +42,8 @@ ENV EKS_HOST=0.0.0.0 \
     EKS_ENV_FILE=/app/.env \
     EKS_BGE_MODEL_DIR=/app/models/bge-base-zh-v1.5 \
     EKS_MILVUS_LITE_PATH=/app/data/milvus_lite.db \
-    EKS_SQLITE_PATH=/app/data/rag_metadata.db
+    EKS_SQLITE_PATH=/app/data/rag_metadata.db \
+    LOG_DIR=/app/logs
 
 EXPOSE 8000
 
