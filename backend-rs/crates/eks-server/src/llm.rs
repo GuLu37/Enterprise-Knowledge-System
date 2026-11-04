@@ -200,6 +200,13 @@ fn promote_active_provider(providers: &mut Vec<ProviderConfig>, active: Option<&
     }
 }
 
+/// 对齐 Python `FallbackLLM._attempt_timeout`：把总超时整除分摊到本次候选数。
+fn attempt_timeout(total_timeout_secs: u64, attempt_count: usize) -> u64 {
+    let total = total_timeout_secs.max(1);
+    let count = attempt_count.max(1) as u64;
+    (total / count).max(1)
+}
+
 pub struct LlmClient {
     http: reqwest::Client,
     config: LlmConfig,
@@ -350,7 +357,7 @@ impl LlmClient {
         if providers.is_empty() {
             return Err("没有可用的 LLM 提供商，请检查配置".into());
         }
-        let per_timeout = self.config.timeout_secs / providers.len() as u64;
+        let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
 
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
@@ -379,7 +386,7 @@ impl LlmClient {
         if providers.is_empty() {
             return Err("没有可用的 LLM 提供商，请检查配置".into());
         }
-        let per_timeout = self.config.timeout_secs / providers.len() as u64;
+        let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
             match self
@@ -509,7 +516,7 @@ impl LlmClient {
         if providers.is_empty() {
             return Err("没有可用的 LLM 提供商，请检查配置".into());
         }
-        let per_timeout = self.config.timeout_secs / providers.len() as u64;
+        let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
             match self.open_stream_response(provider, messages, per_timeout).await {
@@ -586,7 +593,7 @@ impl LlmClient {
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(timeout_secs.max(1) * 4))
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
             .json(&body);
         if let Some(key) = bearer.filter(|item| !item.is_empty()) {
             request = request.header("Authorization", format!("Bearer {key}"));
@@ -1379,6 +1386,69 @@ mod tests {
             is_anthropic: false,
             is_ollama: false,
         }
+    }
+
+    #[test]
+    fn attempt_timeout_matches_python_integer_division() {
+        assert_eq!(attempt_timeout(60, 1), 60);
+        assert_eq!(attempt_timeout(60, 2), 30);
+        assert_eq!(attempt_timeout(60, 4), 15);
+        assert_eq!(attempt_timeout(8, 3), 2);
+        assert_eq!(attempt_timeout(1, 4), 1);
+        assert_eq!(attempt_timeout(0, 2), 1);
+        assert_eq!(attempt_timeout(8, 0), 8);
+        let stream_old_quadruple = attempt_timeout(8, 2).max(1) * 4;
+        assert_eq!(attempt_timeout(8, 2), 4);
+        assert_eq!(stream_old_quadruple, 16);
+    }
+
+    #[tokio::test]
+    async fn stream_times_out_per_attempt_then_falls_back() {
+        const SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\ndata: [DONE]\n\n";
+        let hang = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "never"
+            }),
+        );
+        let hang_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hang_addr = hang_listener.local_addr().unwrap();
+        let hang_handle = tokio::spawn(async move {
+            axum::serve(hang_listener, hang).await.unwrap();
+        });
+        let (ok_url, ok_handle) =
+            serve_chat_completions(axum::http::StatusCode::OK, SSE, "text/event-stream").await;
+
+        let client = std::sync::Arc::new(LlmClient::new(LlmConfig {
+            preferred_provider: "openai".into(),
+            temperature: 0.2,
+            timeout_secs: 2,
+            max_tokens: 64,
+            max_fallback_attempts: 4,
+            providers: vec![
+                named_provider("openai", &format!("http://{hang_addr}")),
+                named_provider("deepseek", &ok_url),
+            ],
+        }));
+        let started = Instant::now();
+        let mut rx = client
+            .stream(&[ChatMessage::new("user", "hi")])
+            .await
+            .expect("hanging first provider should time out and fall back");
+        let mut deltas = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            deltas.push((chunk.provider, chunk.delta));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(deltas, vec![("deepseek".into(), "fallback".into())]);
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "per-attempt timeout is 1s (2/2), old *4 budget would wait 4s, elapsed={elapsed:?}"
+        );
+        hang_handle.abort();
+        ok_handle.abort();
     }
 
     #[test]
