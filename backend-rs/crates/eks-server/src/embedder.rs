@@ -30,6 +30,7 @@ pub struct Embedder {
     pad_id: i64,
     pub query_instruction: String,
     max_length: usize,
+    batch_size: usize,
 }
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ pub struct EmbedderConfig {
     pub model_dir: PathBuf,
     pub query_instruction: String,
     pub max_length: usize,
+    pub batch_size: usize,
 }
 
 impl EmbedderConfig {
@@ -45,6 +47,7 @@ impl EmbedderConfig {
             model_dir: PathBuf::from(&config.bge_model_dir),
             query_instruction: config.bge_query_instruction.clone(),
             max_length: config.bge_max_length as usize,
+            batch_size: config.bge_batch_size.max(1),
         }
     }
 
@@ -93,10 +96,12 @@ impl Embedder {
             pad_id,
             query_instruction: config.query_instruction.clone(),
             max_length: config.max_length.max(3),
+            batch_size: config.batch_size.max(1),
         })
     }
 
     /// 批量向量化（分词 + 前向 + CLS 池化 + L2）。is_query 时前置查询指令。
+    /// 按 `BGE_BATCH_SIZE` 切批，批内补齐到该批最长序列（对齐 Python）。
     pub fn embed(&self, texts: &[String], is_query: bool) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -112,9 +117,16 @@ impl Embedder {
             })
             .collect();
 
-        // 逐条编码（no padding），批内补齐到最长 —— 与 Python 路径一致
+        let mut result = Vec::with_capacity(prepared.len());
+        for chunk in prepared.chunks(self.batch_size) {
+            result.extend(self.embed_prepared_batch(chunk)?);
+        }
+        Ok(result)
+    }
+
+    fn embed_prepared_batch(&self, prepared: &[String]) -> Result<Vec<Vec<f32>>, String> {
         let mut encodings = Vec::with_capacity(prepared.len());
-        for text in &prepared {
+        for text in prepared {
             let encoding = self
                 .tokenizer
                 .encode(text.as_str(), true)
@@ -215,5 +227,18 @@ pub fn embedder_for(model_dir: &Path, instruction: &str, max_length: usize) -> R
         model_dir: model_dir.to_path_buf(),
         query_instruction: instruction.to_string(),
         max_length,
+        batch_size: 16,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_env_reads_bge_batch_size() {
+        let config = EmbedderConfig::from_env(&crate::config::Config::jwt_test());
+        assert_eq!(config.batch_size, 16);
+        assert_eq!(config.max_length, 512);
+    }
 }
