@@ -375,110 +375,343 @@ fn format_original(result: &Value) -> String {
     format!("按你的要求展开原始对话：\n\n{content}")
 }
 
-fn list_available_tools() -> Value {
-    let tools = vec![
-        tool_entry("search_knowledge_base", "retrieval", "在企业知识库中检索相关文档片段。"),
-        tool_entry("list_knowledge_base_files", "document", "列出、筛选并概括已上传文档。"),
-        tool_entry("document_hot_word_statistics", "document", "统计指定文档的高频词。"),
-        tool_entry("memory_query", "memory", "查询当前用户的画像记忆和长期记忆。"),
-        tool_entry("memory_retrieve_original", "memory", "按摘要线索展开原始对话。"),
-        tool_entry("delete_profile_memory", "memory", "删除当前用户指定的画像记忆。"),
-        tool_entry("list_available_tools", "catalog", "展示当前可用工具。"),
-    ];
-    json!({
-        "summary": {
-            "tool_count": tools.len(),
-            "message": "以下是当前 Rust 后端可执行的本地工具。",
-        },
-        "tools": tools,
-    })
+#[derive(Clone)]
+pub struct SkillDefinition {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub kind: String,
+    pub tags: Vec<String>,
+    pub provider: Option<String>,
+    pub parameters: Value,
+    pub metadata: Value,
 }
 
-fn tool_entry(name: &str, category: &str, description: &str) -> Value {
-    json!({
-        "name": name,
-        "description": description,
-        "category": category,
-        "kind": "local",
-        "source": "skill",
-        "provider": null,
-    })
+impl SkillDefinition {
+    fn to_function_calling(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        })
+    }
+
+    fn to_public_dict(&self) -> Value {
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "category": self.category,
+            "kind": self.kind,
+            "tags": self.tags,
+            "provider": self.provider,
+            "metadata": self.metadata,
+            "function_calling": self.to_function_calling(),
+        })
+    }
 }
 
-fn function_spec(name: &str, description: &str, parameters: Value) -> Value {
+fn skill_def(
+    name: &str,
+    description: &str,
+    category: &str,
+    tags: &[&str],
+    parameters: Value,
+    returns: &str,
+) -> SkillDefinition {
+    SkillDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        category: category.to_string(),
+        kind: "local".into(),
+        tags: tags.iter().map(|item| item.to_string()).collect(),
+        provider: None,
+        parameters,
+        metadata: json!({"returns": returns, "executor_ready": true}),
+    }
+}
+
+fn rag_tool_definition() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-        },
+            "name": "search_knowledge_base",
+            "description": "检索企业知识库，适用于文档内容、制度流程、上传资料、内部事实核验，以及按文件名/文档名查询某份文档是否存在。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "用于知识库检索的改写问题。当用户提到文件名/文档名时，可直接用文件名作为检索词。"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 5,
+                        "description": "返回多少条检索结果。"
+                    },
+                    "retrieval_method": {
+                        "type": "string",
+                        "enum": ["hybrid", "dense", "sparse"],
+                        "default": "hybrid",
+                        "description": "检索方式。"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
     })
 }
 
-pub fn function_calling_tools() -> Vec<Value> {
-    vec![
-        function_spec(
-            "search_knowledge_base",
-            "在企业知识库中检索相关文档片段。支持按制度名、流程、编号、人名等关键词检索，也可按文件名查询某份文档是否存在。",
+fn local_skill_catalog() -> Vec<SkillDefinition> {
+    let mut skills = vec![
+        skill_def(
+            "list_available_tools",
+            "展示当前 Agent Function Calling 注册表中的全部可用工具和 Skill，包括知识库检索、本地 Skill 以及已注册的远程 MCP Skill。适用于用户询问『列出你的工具』『你有什么技能』『有哪些可用能力』等问题。",
+            "system",
+            &["tools", "skills", "function_calling", "registry"],
+            json!({"type": "object", "additionalProperties": false, "properties": {}}),
+            "registered_agent_tools",
+        ),
+        skill_def(
+            "document_hot_word_statistics",
+            "按文件名或文档 ID 定位文档并统计高频热词。适用于用户询问具体文件中的热词、关键词或出现频率；不用于回答文档正文、制度流程或内部事实。",
+            "document",
+            &["statistics", "documents", "keywords"],
             json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
-                    "query": {"type": "string", "description": "检索关键词或文件名"},
-                    "top_k": {"type": "integer", "description": "返回条数(1-50)", "default": 5},
-                    "retrieval_method": {"type": "string", "enum": ["dense", "sparse", "hybrid"], "default": "hybrid"},
-                },
-                "required": ["query"],
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "返回前多少个热点词。"},
+                    "file_name": {"type": "string", "description": "可选，按原始文件名或存储文件名模糊定位目标文档。"},
+                    "document_ids": {"type": "array", "items": {"type": "string"}},
+                    "file_types": {"type": "array", "items": {"type": "string"}},
+                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"]}},
+                    "include_samples": {"type": "boolean", "default": true}
+                }
             }),
+            "hot_word_statistics",
         ),
-        function_spec(
-            "list_knowledge_base_files",
-            "列出、筛选并概括已上传文档。",
-            json!({"type": "object", "properties": {
-                "file_name": {"type": "string"},
-                "summarize": {"type": "boolean", "default": true},
-                "limit": {"type": "integer", "default": 20},
-            }}),
-        ),
-        function_spec(
-            "document_hot_word_statistics",
-            "统计指定文档的高频词。",
-            json!({"type": "object", "properties": {
-                "file_name": {"type": "string"},
-                "top_k": {"type": "integer", "default": 10},
-            }}),
-        ),
-        function_spec(
+        skill_def(
             "memory_query",
-            "查询当前用户的画像记忆和长期记忆。",
-            json!({"type": "object", "properties": {
-                "query": {"type": "string"},
-                "memory_scope": {"type": "string", "enum": ["all", "profile", "event"], "default": "all"},
-                "top_k": {"type": "integer", "default": 5},
-            }}),
+            "查询当前用户自己的长期记忆或画像记忆。适用于‘你记得什么’、‘我之前说过什么’、‘我的偏好是什么’等问题；不用于查询企业文档，也不能跨用户读取记忆。",
+            "memory",
+            &["memory", "profile", "search"],
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+                    "memory_scope": {"type": "string", "enum": ["all", "profile", "event"], "default": "all"}
+                }
+            }),
+            "memory_query_result",
         ),
-        function_spec(
+        skill_def(
             "memory_retrieve_original",
-            "按摘要线索展开原始对话。",
-            json!({"type": "object", "properties": {
-                "query": {"type": "string"},
-                "max_chars": {"type": "integer", "default": 12000},
-            }}),
+            "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，或需要核对原始措辞时使用。",
+            "memory",
+            &["memory", "conversation", "original", "progressive_disclosure"],
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "memory_ids": {"type": "array", "items": {"type": "string"}},
+                    "query": {"type": "string"},
+                    "conversation_id": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 12000}
+                }
+            }),
+            "original_conversation_result",
         ),
-        function_spec(
+        skill_def(
             "delete_profile_memory",
-            "删除当前用户指定的画像记忆。",
-            json!({"type": "object", "properties": {
-                "memory_keys": {"type": "array", "items": {"type": "string"}},
-                "keywords": {"type": "array", "items": {"type": "string"}},
-            }}),
+            "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除某条个人信息时使用。",
+            "memory",
+            &["memory", "profile", "delete", "privacy"],
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "memory_keys": {"type": "array", "items": {"type": "string"}},
+                    "keywords": {"type": "array", "items": {"type": "string"}},
+                    "max_deletes": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+                }
+            }),
+            "delete_profile_memory_result",
         ),
-        function_spec(
-            "list_available_tools",
-            "展示当前可用工具。",
-            json!({"type": "object", "properties": {}}),
+        skill_def(
+            "list_knowledge_base_files",
+            "列出知识库中已上传的文档，可按文件名、文档 ID、文件类型或状态筛选，并可概括指定文档的内容。不用于按内容检索具体答案，那应使用 search_knowledge_base。",
+            "document",
+            &["documents", "list", "summary", "overview"],
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "file_name": {"type": "string"},
+                    "document_ids": {"type": "array", "items": {"type": "string"}},
+                    "file_types": {"type": "array", "items": {"type": "string"}},
+                    "statuses": {"type": "array", "items": {"type": "string"}},
+                    "summarize": {"type": "boolean", "default": true},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+                }
+            }),
+            "knowledge_base_file_list",
         ),
-    ]
+    ];
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    skills
+}
+
+pub fn get_skill_definition(name: &str) -> Option<SkillDefinition> {
+    let normalized = name.trim();
+    local_skill_catalog()
+        .into_iter()
+        .find(|item| item.name == normalized)
+}
+
+/// GET /skills：技能定义数组（不含 RAG 工具）。
+pub fn list_skill_definitions() -> Vec<Value> {
+    local_skill_catalog()
+        .iter()
+        .map(SkillDefinition::to_public_dict)
+        .collect()
+}
+
+/// GET /skills/function-calling：RAG + 本地 Skill 的 Function Calling schema。
+pub fn function_calling_tools() -> Vec<Value> {
+    let mut tools = vec![rag_tool_definition()];
+    tools.extend(
+        local_skill_catalog()
+            .iter()
+            .map(SkillDefinition::to_function_calling),
+    );
+    tools
+}
+
+/// GET /skills/capabilities：统一能力目录（含 RAG）。
+pub fn list_agent_capabilities() -> Vec<Value> {
+    let rag = rag_tool_definition();
+    let mut capabilities = vec![json!({
+        "name": "search_knowledge_base",
+        "description": rag.pointer("/function/description").cloned().unwrap_or(json!("")),
+        "category": "retrieval",
+        "kind": "tool",
+        "source": "rag",
+        "available": true,
+        "location": "app.tools.rag.run_rag_tool",
+        "function_calling": rag,
+    })];
+    for skill in local_skill_catalog() {
+        let mut item = skill.to_public_dict();
+        if let Some(object) = item.as_object_mut() {
+            object.insert("source".into(), json!("skill"));
+            object.insert("available".into(), json!(true));
+            object.insert(
+                "location".into(),
+                json!(format!("backend/app/skills/{0}/{0}.md", skill.name)),
+            );
+        }
+        capabilities.push(item);
+    }
+    capabilities
+}
+
+pub fn skill_capabilities_payload() -> Value {
+    let tools = function_calling_tools();
+    json!({
+        "capabilities": list_agent_capabilities(),
+        "tools": tools,
+        "function_calling": tools,
+    })
+}
+
+pub fn wrap_skill_execution(
+    name: &str,
+    arguments: &Value,
+    user_id: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    query: Option<&str>,
+    trace_id: Option<&str>,
+    metadata: Value,
+    result: Value,
+) -> Result<Value, String> {
+    let definition = get_skill_definition(name).ok_or_else(|| format!("未找到技能: {name}"))?;
+    let executed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    Ok(json!({
+        "skill": definition.name,
+        "category": definition.category,
+        "kind": definition.kind,
+        "provider": definition.provider,
+        "arguments": arguments,
+        "context": {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "query": query,
+            "trace_id": trace_id,
+            "metadata": if metadata.is_null() { json!({}) } else { metadata },
+        },
+        "result": result,
+        "executed_at": executed_at,
+    }))
+}
+
+fn list_available_tools() -> Value {
+    let schemas = function_calling_tools();
+    let capabilities: HashMap<String, Value> = list_agent_capabilities()
+        .into_iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(|value| value.as_str())?.to_string();
+            Some((name, item))
+        })
+        .collect();
+    let mut tools = Vec::new();
+    let mut categories: HashMap<String, u64> = HashMap::new();
+    for schema in schemas {
+        let function = schema.get("function").cloned().unwrap_or(json!({}));
+        let name = function
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let capability = capabilities.get(&name).cloned().unwrap_or(json!({}));
+        let category = capability
+            .get("category")
+            .and_then(|value| value.as_str())
+            .unwrap_or("general")
+            .to_string();
+        *categories.entry(category.clone()).or_insert(0) += 1;
+        tools.push(json!({
+            "name": name,
+            "description": capability.get("description").cloned().unwrap_or_else(|| function.get("description").cloned().unwrap_or(json!(""))),
+            "category": category,
+            "kind": capability.get("kind").cloned().unwrap_or(json!("skill")),
+            "source": capability.get("source").cloned().unwrap_or(json!("skill")),
+            "provider": capability.get("provider").cloned().unwrap_or(Value::Null),
+            "location": capability.get("location").cloned().unwrap_or(Value::Null),
+            "parameters": function.get("parameters").cloned().unwrap_or(json!({})),
+        }));
+    }
+    json!({
+        "summary": {
+            "tool_count": tools.len(),
+            "categories": categories,
+            "message": "以下是当前统一 Agent Function Calling 注册表中的全部工具。",
+        },
+        "tools": tools,
+    })
 }
 
 pub async fn load_active_profile_lines(
@@ -1097,6 +1330,60 @@ mod tests {
         assert!(names.contains(&"search_knowledge_base"));
         assert!(names.contains(&"memory_query"));
         assert_eq!(names.len(), 7);
+        assert_eq!(names[0], "search_knowledge_base");
+    }
+
+    #[test]
+    fn skill_catalog_shapes_match_python() {
+        let definitions = list_skill_definitions();
+        assert_eq!(definitions.len(), 6);
+        let names: Vec<&str> = definitions
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert!(!names.contains(&"search_knowledge_base"));
+        assert!(definitions[0].get("function_calling").is_some());
+        assert_eq!(definitions[0].get("kind").and_then(|value| value.as_str()), Some("local"));
+
+        let tools = function_calling_tools();
+        assert_eq!(
+            tools[0].pointer("/function/name").and_then(|value| value.as_str()),
+            Some("search_knowledge_base")
+        );
+        assert_eq!(tools.len(), 7);
+
+        let capabilities = list_agent_capabilities();
+        assert_eq!(capabilities.len(), 7);
+        assert_eq!(capabilities[0].get("source").and_then(|value| value.as_str()), Some("rag"));
+        assert_eq!(capabilities[1].get("source").and_then(|value| value.as_str()), Some("skill"));
+        let payload = skill_capabilities_payload();
+        assert_eq!(payload.get("tools"), payload.get("function_calling"));
+        assert!(payload.get("capabilities").and_then(|value| value.as_array()).is_some());
+
+        let wrapped = wrap_skill_execution(
+            "memory_query",
+            &json!({"query": "我的名字"}),
+            "u1",
+            Some("c1"),
+            None,
+            Some("我叫什么"),
+            None,
+            json!({}),
+            json!({"ok": true}),
+        )
+        .unwrap();
+        assert_eq!(wrapped.get("skill").and_then(|value| value.as_str()), Some("memory_query"));
+        assert_eq!(wrapped.get("category").and_then(|value| value.as_str()), Some("memory"));
+        assert_eq!(wrapped.get("kind").and_then(|value| value.as_str()), Some("local"));
+        assert!(wrapped.get("executed_at").and_then(|value| value.as_str()).is_some());
+        assert_eq!(
+            wrapped.pointer("/context/conversation_id").and_then(|value| value.as_str()),
+            Some("c1")
+        );
+        assert!(wrap_skill_execution("missing", &json!({}), "u1", None, None, None, None, json!({}), json!({})).is_err());
     }
 
     #[test]

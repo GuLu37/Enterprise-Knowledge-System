@@ -1,4 +1,4 @@
-//! 文档与技能路由（列表/删除/技能发现）。
+//! 文档路由（列表/正文/上传/删除）。
 
 use axum::{
     Json,
@@ -226,17 +226,6 @@ pub async fn get_document_content(
         "content": content,
         "content_type": row.content_type,
         "updated_at": db::dt_to_iso(&row.updated_at),
-    })))
-}
-
-// GET /api/v1/skills
-pub async fn list_skills(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, AuthError> {
-    require_current_user(&state, &headers).await?;
-    Ok(Json(json!({
-        "skills": crate::skills::function_calling_tools(),
     })))
 }
 

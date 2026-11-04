@@ -355,11 +355,11 @@ pub fn router(state: AppState) -> axum::Router {
         )
         .route(
             &format!("{prefix}/skills"),
-            get(crate::documents::list_skills),
+            get(list_skills),
         )
         .route(
             &format!("{prefix}/skills/function-calling"),
-            get(crate::documents::list_skills),
+            get(list_skill_function_calling),
         )
         .route(
             &format!("{prefix}/skills/capabilities"),
@@ -425,11 +425,45 @@ async fn retrieval_simple(
     })))
 }
 
-#[derive(Deserialize)]
-struct SkillExecuteBody {
-    name: String,
+#[derive(Deserialize, Default)]
+pub struct SkillExecuteContext {
     #[serde(default)]
-    arguments: Value,
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Deserialize)]
+pub struct SkillExecuteBody {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default)]
+    pub context: SkillExecuteContext,
+}
+
+pub async fn list_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    Ok(Json(Value::Array(crate::skills::list_skill_definitions())))
+}
+
+pub async fn list_skill_function_calling(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AuthError> {
+    require_current_user(&state, &headers).await?;
+    Ok(Json(json!({
+        "tools": crate::skills::function_calling_tools(),
+    })))
 }
 
 pub async fn skill_capabilities(
@@ -437,10 +471,7 @@ pub async fn skill_capabilities(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    let catalog = crate::skills::execute_named(&state.pool, "", "list_available_tools", &json!({}))
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(catalog))
+    Ok(Json(crate::skills::skill_capabilities_payload()))
 }
 
 pub async fn execute_skill(
@@ -449,20 +480,37 @@ pub async fn execute_skill(
     Json(request): Json<SkillExecuteBody>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
+    let name = request.name.trim();
+    if crate::skills::get_skill_definition(name).is_none() {
+        return Err(AuthError {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("未找到技能: {name}"),
+        });
+    }
     let result = crate::skills::execute_named(
         &state.pool,
         &user.user_id,
-        request.name.trim(),
+        name,
         &request.arguments,
     )
     .await
     .map_err(|detail| AuthError::bad_request(&detail))?;
-    Ok(Json(json!({
-        "skill": request.name,
-        "kind": "local",
-        "arguments": request.arguments,
-        "result": result,
-    })))
+    let payload = crate::skills::wrap_skill_execution(
+        name,
+        &request.arguments,
+        &user.user_id,
+        request.context.conversation_id.as_deref(),
+        request.context.session_id.as_deref(),
+        request.context.query.as_deref(),
+        request.context.trace_id.as_deref(),
+        request.context.metadata,
+        result,
+    )
+    .map_err(|detail| AuthError {
+        status: StatusCode::NOT_FOUND,
+        detail,
+    })?;
+    Ok(Json(payload))
 }
 
 pub async fn retrieval_hybrid(
