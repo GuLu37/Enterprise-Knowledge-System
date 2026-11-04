@@ -17,6 +17,7 @@ pub mod react;
 pub mod retrieval;
 pub mod retrieval_engine;
 pub mod routes;
+pub mod short_memory;
 pub mod skills;
 pub mod state;
 

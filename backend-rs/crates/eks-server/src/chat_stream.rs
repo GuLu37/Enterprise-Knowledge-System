@@ -39,6 +39,12 @@ pub struct ChatStreamRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    #[serde(default = "default_short_memory_strategy")]
+    pub short_memory_strategy: String,
+    #[serde(default = "default_short_memory_n")]
+    pub short_memory_n: usize,
+    #[serde(default = "default_short_memory_m")]
+    pub short_memory_m: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -53,6 +59,37 @@ fn default_top_k() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_short_memory_strategy() -> String {
+    "window".into()
+}
+
+fn default_short_memory_n() -> usize {
+    5
+}
+
+fn default_short_memory_m() -> usize {
+    10
+}
+
+fn memory_history(history: &[HistoryMessage]) -> Vec<crate::short_memory::MemoryMessage> {
+    history
+        .iter()
+        .map(|item| crate::short_memory::MemoryMessage {
+            role: item.role.clone(),
+            content: item.content.clone(),
+        })
+        .collect()
+}
+
+fn memory_options(request: &ChatStreamRequest) -> crate::short_memory::ShortMemoryOptions {
+    crate::short_memory::ShortMemoryOptions {
+        strategy: request.short_memory_strategy.clone(),
+        window_n: request.short_memory_n,
+        summary_m: request.short_memory_m,
+        conversation_id: request.conversation_id.clone().unwrap_or_default(),
+    }
 }
 
 fn clarify_text(intent: &crate::intent::QueryIntent) -> String {
@@ -192,7 +229,7 @@ fn source_payload(items: &[RetrievalItem]) -> Vec<serde_json::Value> {
 fn build_messages(
     profile: &str,
     context: &str,
-    history: &[HistoryMessage],
+    history_messages: Vec<ChatMessage>,
     query: &str,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
@@ -202,11 +239,7 @@ fn build_messages(
     if !context.is_empty() {
         messages.push(ChatMessage::new("system", build_rag_system_message(context)));
     }
-    for item in history {
-        if item.role == "system" || item.role == "user" || item.role == "assistant" {
-            messages.push(ChatMessage::new(&item.role, item.content.clone()));
-        }
-    }
+    messages.extend(history_messages);
     messages.push(ChatMessage::new("user", query));
     messages
 }
@@ -237,12 +270,8 @@ fn spawn_persist_turn(
     });
 }
 
-fn history_pairs(history: &[HistoryMessage]) -> Vec<(String, String)> {
-    history
-        .iter()
-        .filter(|item| item.role == "user" || item.role == "assistant")
-        .map(|item| (item.role.clone(), item.content.clone()))
-        .collect()
+fn history_pairs(history: &[HistoryMessage], window_n: usize) -> Vec<(String, String)> {
+    crate::short_memory::recent_pairs(&memory_history(history), window_n)
 }
 
 async fn collect_rag(
@@ -254,6 +283,7 @@ async fn collect_rag(
     history: &[HistoryMessage],
     top_k: usize,
     use_retrieval: bool,
+    window_n: usize,
 ) -> Result<RagTurn, String> {
     if !use_retrieval {
         return Ok(RagTurn {
@@ -287,7 +317,7 @@ async fn collect_rag(
         llm,
         user_id,
         query,
-        &history_pairs(history),
+        &history_pairs(history, window_n),
         top_k,
         working.clone(),
     )
@@ -455,6 +485,10 @@ pub async fn generate_chat(
     }
     let conversation_id = request.conversation_id.clone().unwrap_or_default();
     let session_id = request.session_id.clone().unwrap_or_default();
+    let options = memory_options(&request);
+    if let Err(detail) = options.validate() {
+        return Err(crate::auth::AuthError::bad_request(&detail));
+    }
     let llm_config = crate::llm::LlmConfig::from_env(&state.config);
     let llm_client = if llm_config.providers.is_empty() {
         None
@@ -466,7 +500,7 @@ pub async fn generate_chat(
         &query,
         request.use_retrieval,
         llm_client.as_deref(),
-        &history_pairs(&request.history),
+        &history_pairs(&request.history, request.short_memory_n),
     )
     .await;
     if intent.route == "skill" {
@@ -523,6 +557,7 @@ pub async fn generate_chat(
         &request.history,
         request.top_k,
         intent.needs_retrieval,
+        request.short_memory_n,
     )
     .await
     .map_err(|detail| crate::auth::AuthError {
@@ -548,7 +583,13 @@ pub async fn generate_chat(
         })));
     }
     let profile = crate::memory::profile_prompt(&state.pool, &user.user_id).await;
-    let messages = build_messages(&profile, &turn.context, &request.history, &query);
+    let history_messages = crate::short_memory::assemble(
+        &memory_history(&request.history),
+        &options,
+        Some(llm_client.clone()),
+    )
+    .map_err(|detail| crate::auth::AuthError::bad_request(&detail))?;
+    let messages = build_messages(&profile, &turn.context, history_messages, &query);
     let result = llm_client.invoke(&messages).await.map_err(|detail| crate::auth::AuthError {
         status: axum::http::StatusCode::BAD_GATEWAY,
         detail,
@@ -586,6 +627,11 @@ pub async fn stream_chat(
     let conversation_id = request.conversation_id.clone().unwrap_or_default();
     let session_id = request.session_id.clone().unwrap_or_default();
     let history = request.history.clone();
+    let options = memory_options(&request);
+    if let Err(detail) = options.validate() {
+        return Err(crate::auth::AuthError::bad_request(&detail));
+    }
+    let window_n = request.short_memory_n;
     let llm_config = crate::llm::LlmConfig::from_env(&state.config);
     let llm_missing = llm_config.providers.is_empty();
     let llm_client = Arc::new(LlmClient::new(llm_config));
@@ -597,13 +643,16 @@ pub async fn stream_chat(
             "session_id": session_id,
             "user_id": user_id,
             "use_retrieval": requested_retrieval,
+            "short_memory_strategy": options.strategy,
+            "short_memory_n": options.window_n,
+            "short_memory_m": options.summary_m,
         })));
 
         let intent = crate::intent::route_query_action(
             &query,
             requested_retrieval,
             if llm_missing { None } else { Some(llm_client.as_ref()) },
-            &history_pairs(&history),
+            &history_pairs(&history, window_n),
         )
         .await;
         yield Ok(sse_json("intent", intent.to_json()));
@@ -683,6 +732,7 @@ pub async fn stream_chat(
             &history,
             top_k,
             use_retrieval,
+            window_n,
         )
         .await
         {
@@ -733,7 +783,18 @@ pub async fn stream_chat(
         }
 
         let profile = crate::memory::profile_prompt(&pool, &user_id).await;
-        let messages = build_messages(&profile, &turn.context, &history, &query);
+        let history_messages = match crate::short_memory::assemble(
+            &memory_history(&history),
+            &options,
+            if llm_missing { None } else { Some(llm_client.clone()) },
+        ) {
+            Ok(messages) => messages,
+            Err(detail) => {
+                yield Ok(sse_json("error", json!({"message": detail})));
+                return;
+            }
+        };
+        let messages = build_messages(&profile, &turn.context, history_messages, &query);
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 let mut full_response = String::new();

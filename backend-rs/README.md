@@ -37,6 +37,7 @@
 → 父块上下文批量回填（SQLite IN 查询）
 → 上下文组装（6.5K/30K 字符限制）
 → 证据不足时统一 ReAct（全量本地工具，最多 3 轮；失败回退 query 改写）
+→ 短期记忆（默认最近 5 轮窗口；summary 模式对更早轮次递进摘要并缓存）
 → SSE 流式推送 (start/intent/sources/token/done)
 → 回合写入 SQLite `memory_records`（事件记忆 + 触发词画像抽取）
 ```
