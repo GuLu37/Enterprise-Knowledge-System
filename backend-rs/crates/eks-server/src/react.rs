@@ -36,12 +36,21 @@ const RAG_REACT_SYSTEM_PROMPT: &str = "你是企业知识库检索决策者。�
 示例：当用户问『04_产品与账号常见问题呢』这类文件名查询时，直接用文件名作为 query 调用 search_knowledge_base；若未检索到，说明该文档未在知识库中。\n\
 当你认为已经检索到足够资料时，直接输出简短说明（如「检索完成」）并停止调用工具。";
 
+/// 最后一次 search_knowledge_base 执行的实参与产物（对齐 Python tool_runs[-1]）。
+#[derive(Clone, Debug)]
+pub struct LastSearchRun {
+    pub arguments: Value,
+    pub resolved_method: String,
+    pub context: String,
+}
+
 pub struct ReactOutcome {
     pub sources: Vec<RetrievalItem>,
     pub context: String,
     pub notes: Vec<String>,
     pub used_react: bool,
     pub kind: String,
+    pub last_search: Option<LastSearchRun>,
 }
 
 pub enum ReactAttempt {
@@ -182,8 +191,9 @@ async fn run_react_loop(
             .replace("{signal}", &signal)
             .replace("{max_iterations}", &max_iterations.max(1).to_string()),
     )];
-    for (role, content) in history.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
-        if role == "user" || role == "assistant" {
+    for (role, content) in history {
+        // 对齐 Python `_history_to_langchain_messages`：注入完整历史（含 system）。
+        if role == "user" || role == "assistant" || role == "system" {
             messages.push(ChatMessage::new(role, content));
         }
     }
@@ -191,6 +201,7 @@ async fn run_react_loop(
 
     let mut seen = std::collections::HashSet::new();
     let mut used_react = false;
+    let mut last_search: Option<LastSearchRun> = None;
     for iteration in 0..max_iterations.max(1) {
         let completion = match llm.invoke_with_tools(&messages, &tools).await {
             Ok(result) => result,
@@ -223,7 +234,11 @@ async fn run_react_loop(
         let mut extras: Vec<Vec<RetrievalItem>> = vec![Vec::new(); calls.len()];
         let mut pending = Vec::new();
         for (index, call) in calls.iter().enumerate() {
-            if !seen.insert(call_dedupe_key(call)) {
+            let fresh = match call_dedupe_key(kind, call) {
+                Some(key) => seen.insert(key),
+                None => true,
+            };
+            if !fresh {
                 observations[index] = json!({"skipped": "duplicate"});
                 continue;
             }
@@ -248,7 +263,7 @@ async fn run_react_loop(
             let mut stream = stream::iter(pending).map(|index| {
                 let call = calls[index].clone();
                 async move {
-                    let (observation, extra) = execute_tool(
+                    let (observation, extra, search_run) = execute_tool(
                         engine,
                         pool,
                         context,
@@ -260,15 +275,18 @@ async fn run_react_loop(
                         history,
                     )
                     .await;
-                    (index, observation, extra)
+                    (index, observation, extra, search_run)
                 }
             }).buffer_unordered(workers);
-            while let Some((index, observation, extra)) = stream.next().await {
+            while let Some((index, observation, extra, search_run)) = stream.next().await {
                 if let Some(err) = observation.get("error").and_then(Value::as_str) {
                     tracing::warn!(
                         "{}",
                         format_react_tool_exec_fail(kind, &calls[index].name, err)
                     );
+                }
+                if search_run.is_some() {
+                    last_search = search_run;
                 }
                 observations[index] = observation;
                 extras[index] = extra;
@@ -286,33 +304,41 @@ async fn run_react_loop(
         let assessment = planner::assess_evidence_rule(query, &sources);
         if searched && assessment.sufficient {
             tracing::info!("{}", format_react_sufficient(kind, &assessment.reason));
-            return ReactAttempt::Ran(finish(sources, notes, used_react, kind));
+            return ReactAttempt::Ran(finish(sources, notes, used_react, kind, last_search));
         }
     }
-    ReactAttempt::Ran(finish(sources, notes, used_react, kind))
+    ReactAttempt::Ran(finish(sources, notes, used_react, kind, last_search))
 }
 
 pub fn rule_retrieval_signal(query: &str) -> String {
     planner::select_initial_rule(query, 5, planner::RETRIEVAL_METHOD_HYBRID).signal_text()
 }
 
-fn finish(sources: Vec<RetrievalItem>, notes: Vec<String>, used_react: bool, kind: &str) -> ReactOutcome {
+fn finish(
+    sources: Vec<RetrievalItem>,
+    notes: Vec<String>,
+    used_react: bool,
+    kind: &str,
+    last_search: Option<LastSearchRun>,
+) -> ReactOutcome {
     let max_chars = if sources.iter().any(|item| item.structured_aggregation) {
         30000
     } else {
         6500
     };
-    let mut context = crate::retrieval::assemble_rag_context(&sources, max_chars);
-    if !notes.is_empty() && context.chars().count() < max_chars {
-        context.push_str("\n\n工具观察：\n");
-        context.push_str(&notes.join("\n"));
-    }
+    // 对齐 Python：最终回答的 context 取最后一次检索 run 的 payload context，
+    // 工具观察只进日志，不拼进回答上下文。
+    let context = match &last_search {
+        Some(run) if !run.context.is_empty() => run.context.clone(),
+        _ => crate::retrieval::assemble_rag_context(&sources, max_chars),
+    };
     ReactOutcome {
         sources,
         context,
         notes,
         used_react,
         kind: kind.to_string(),
+        last_search,
     }
 }
 
@@ -495,19 +521,43 @@ fn unified_react_context<'a>(
     context
 }
 
-fn call_dedupe_key(call: &ToolCall) -> String {
-    if call.name == "search_knowledge_base" {
-        let query_key = eks_kernels::normalize_text(
-            call.arguments
-                .get("query")
-                .and_then(|value| value.as_str())
-                .unwrap_or(""),
-        );
-        if !query_key.is_empty() {
-            return format!("search_knowledge_base:{query_key}");
+/// 去重键。对齐 Python：rag 循环只按归一化 query 对检索调用去重；
+/// unified 循环对全部调用按 (工具名, 键排序参数 JSON) 去重。
+fn call_dedupe_key(kind: &str, call: &ToolCall) -> Option<String> {
+    if kind == "rag_react" {
+        if call.name == "search_knowledge_base" {
+            let query_key = eks_kernels::normalize_text(
+                call.arguments
+                    .get("query")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            );
+            return Some(format!("search_knowledge_base:{query_key}"));
         }
+        return None;
     }
-    format!("{}:{}", call.name, compact_args(&call.arguments))
+    Some(format!(
+        "{}:{}",
+        call.name,
+        serde_json::to_string(&sorted_value(&call.arguments)).unwrap_or_default()
+    ))
+}
+
+/// 对齐 Python `json.dumps(..., sort_keys=True)`：递归按键序序列化。
+fn sorted_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(key.clone(), sorted_value(&map[key]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_value).collect()),
+        other => other.clone(),
+    }
 }
 
 async fn execute_tool(
@@ -520,7 +570,7 @@ async fn execute_tool(
     mcp_manifests: &[Value],
     llm: &LlmClient,
     history: &[(String, String)],
-) -> (Value, Vec<RetrievalItem>) {
+) -> (Value, Vec<RetrievalItem>, Option<LastSearchRun>) {
     let arguments = skills::normalize_action_arguments(&call.name, &call.arguments, original_query);
     if call.name == "search_knowledge_base" {
         let query = arguments
@@ -538,15 +588,23 @@ async fn execute_tool(
             .get("retrieval_method")
             .and_then(|v| v.as_str())
             .unwrap_or("hybrid");
+        // 对齐 Python：payload 回显按查询解析后的实际检索方式。
+        let resolved_method = crate::planner::resolve_method_for_query(query, method);
         return match engine.retrieve_planned(query, method, top_k, Some(llm)).await {
             Ok(planned) => {
                 let payload: Vec<Value> = planned.results.iter().map(|item| item.to_json()).collect();
+                let run = LastSearchRun {
+                    arguments: arguments.clone(),
+                    resolved_method: resolved_method.clone(),
+                    context: planned.context.clone(),
+                };
                 (
                     json!({
                         "ok": true,
+                        "query": query,
                         "count": payload.len(),
                         "results": payload,
-                        "retrieval_method": method,
+                        "retrieval_method": resolved_method,
                         "expanded_queries": planned.expanded_queries,
                         "context": planned.context,
                         "message": if planned.results.is_empty() {
@@ -556,9 +614,10 @@ async fn execute_tool(
                         },
                     }),
                     planned.results,
+                    Some(run),
                 )
             }
-            Err(err) => (json!({"error": err}), Vec::new()),
+            Err(err) => (json!({"error": err}), Vec::new(), None),
         };
     }
     let recent_history: Vec<crate::short_memory::MemoryMessage> = history
@@ -591,14 +650,14 @@ async fn execute_tool(
                 .await
                 {
                     Ok(merged) => merged,
-                    Err(err) => return (json!({"error": err}), Vec::new()),
+                    Err(err) => return (json!({"error": err}), Vec::new(), None),
                 }
             } else {
                 result
             };
-            (json!({"ok": true, "result": result}), Vec::new())
+            (json!({"ok": true, "result": result}), Vec::new(), None)
         }
-        Err(err) => (json!({"error": err}), Vec::new()),
+        Err(err) => (json!({"error": err}), Vec::new(), None),
     }
 }
 
@@ -763,14 +822,20 @@ mod tests {
             arguments: json!({"query": "差旅报销", "retrieval_method": "sparse"}),
             raw: json!({}),
         };
-        assert_eq!(call_dedupe_key(&search), call_dedupe_key(&search_again));
+        assert_eq!(
+            call_dedupe_key("rag_react", &search),
+            call_dedupe_key("rag_react", &search_again)
+        );
         let skill = ToolCall {
             id: "3".into(),
             name: "memory_query".into(),
             arguments: json!({"query": "偏好", "top_k": 5}),
             raw: json!({}),
         };
-        assert!(call_dedupe_key(&skill).starts_with("memory_query:"));
+        // rag 循环只对检索调用去重，非检索调用不去重。
+        assert_eq!(call_dedupe_key("rag_react", &skill), None);
+        let unified_key = call_dedupe_key("unified_react", &skill).unwrap();
+        assert!(unified_key.starts_with("memory_query:"));
     }
 
     #[test]

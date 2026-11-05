@@ -161,6 +161,8 @@ mod tests {
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
         }
     }
 

@@ -32,8 +32,22 @@ fn candidate_pool_limit(top_k: usize) -> usize {
     (top_k * 8).max(top_k + 20).max(MIN_RAG_CANDIDATE_POOL)
 }
 
-/// 对齐 Python `_build_retriever`：按规划方式选择 dense / sparse 通道。
-fn multi_query_channels(method: &str, use_dense: bool, use_sparse: bool) -> (bool, bool) {
+/// 对齐 Python `_create_retriever`：hybrid 开启且双路可用时按方式选通道；
+/// 否则退化为可用单路（dense 优先）。
+fn multi_query_channels(
+    method: &str,
+    use_dense: bool,
+    use_sparse: bool,
+    use_hybrid: bool,
+) -> (bool, bool) {
+    if use_hybrid && use_dense && use_sparse {
+        return match method {
+            crate::planner::RETRIEVAL_METHOD_DENSE => (true, false),
+            crate::planner::RETRIEVAL_METHOD_SPARSE => (false, true),
+            _ => (true, true),
+        };
+    }
+    // 对齐 Python `dense_retriever or sparse_retriever` / `sparse_retriever or dense_retriever`。
     match method {
         crate::planner::RETRIEVAL_METHOD_DENSE => {
             if use_dense {
@@ -49,7 +63,13 @@ fn multi_query_channels(method: &str, use_dense: bool, use_sparse: bool) -> (boo
                 (use_dense, false)
             }
         }
-        _ => (use_dense, use_sparse),
+        _ => {
+            if use_dense {
+                (true, false)
+            } else {
+                (false, use_sparse)
+            }
+        }
     }
 }
 
@@ -389,7 +409,13 @@ impl RetrievalEngine {
                 return snapshot.clone();
             }
         }
+        let started = std::time::Instant::now();
         let built = Arc::new(SparseIndexSnapshot::build(rows));
+        tracing::info!(
+            "稀疏持久索引构建完成: rows={} kernel=rust elapsed={:.2}s",
+            rows.len(),
+            started.elapsed().as_secs_f64()
+        );
         *self.sparse.write().await = Some(built.clone());
         built
     }
@@ -412,9 +438,9 @@ impl RetrievalEngine {
             && rows.len() > self.sparse_index_max_rows
         {
             tracing::warn!(
-                rows = rows.len(),
-                max_rows = self.sparse_index_max_rows,
-                "child 行数超过稀疏持久索引上限，回退词法预筛"
+                "child 行数 {} 超过稀疏持久索引上限 {}，继续使用 LIKE 路径",
+                rows.len(),
+                self.sparse_index_max_rows
             );
         }
         legacy_like_search(rows, query, limit.max(1))
@@ -432,9 +458,9 @@ impl RetrievalEngine {
             .map_err(|err| err.to_string())?;
         if snapshot.rows.len() > self.sparse_index_max_rows {
             tracing::warn!(
-                rows = snapshot.rows.len(),
-                max_rows = self.sparse_index_max_rows,
-                "稀疏持久索引预热跳过：超过行数上限，检索将走词法预筛"
+                "child 行数 {} 超过稀疏持久索引上限 {}，继续使用 LIKE 路径",
+                snapshot.rows.len(),
+                self.sparse_index_max_rows
             );
             return Ok(0);
         }
@@ -456,17 +482,32 @@ impl RetrievalEngine {
             .await
     }
 
+    /// 对齐 Python `_is_collection_ready`：集合缺失/未加载时告警并软跳过。
+    async fn collection_snapshot(&self, channel: &str) -> Result<Option<Arc<crate::milvus_lite::CollectionSnapshot>>, String> {
+        match self.store.collection(self.child_collection()).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    "collection {} 尚未加载完成，跳过本次{}检索",
+                    self.child_collection(),
+                    channel
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     async fn search_dense_inner(
         &self,
         query: &str,
         top_k: usize,
         enforce_similarity_threshold: bool,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let snapshot = self
-            .store
-            .collection(self.child_collection())
-            .await
-            .map_err(|err| err.to_string())?;
+        let snapshot = match self.collection_snapshot("密集").await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        };
         let vectors = self.embedder.embed_queries(&[query.to_string()])?;
         let vector = vectors.first().ok_or_else(|| "查询向量为空".to_string())?;
         let hits = self
@@ -485,11 +526,10 @@ impl RetrievalEngine {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let snapshot = self
-            .store
-            .collection(self.child_collection())
-            .await
-            .map_err(|err| err.to_string())?;
+        let snapshot = match self.collection_snapshot("稀疏").await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        };
         let hits = self
             .sparse_hits(&snapshot.rows, query, sparse_candidate_limit(top_k))
             .await;
@@ -499,8 +539,8 @@ impl RetrievalEngine {
             .collect())
     }
 
-    /// 单次 Dense 检索，不对齐 Hybrid 的多查询融合与重排。
-    /// 对齐 Python：对应检索器关闭时回退到另一路。
+    /// 单次 Dense 检索（HTTP /search/dense）。
+    /// 对齐 Python 路由：直接实例化 DenseRetriever，不看 USE_* 开关、不回退另一路。
     pub async fn search_dense(
         &self,
         query: &str,
@@ -511,13 +551,7 @@ impl RetrievalEngine {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        if self.use_dense {
-            self.search_dense_inner(query, top_k, true).await
-        } else if self.use_sparse {
-            self.search_sparse_inner(query, top_k).await
-        } else {
-            Ok(Vec::new())
-        }
+        self.search_dense_inner(query, top_k, true).await
     }
 
     /// 聊天/规划器 Dense：高召回，不在召回阶段用 SIMILARITY_THRESHOLD 硬过滤。
@@ -540,7 +574,8 @@ impl RetrievalEngine {
         }
     }
 
-    /// 单次 Sparse（BM25）检索。
+    /// 单次 Sparse（BM25）检索（HTTP /search/sparse）。
+    /// 对齐 Python 路由：直接实例化 SparseRetriever，不看 USE_* 开关、不回退另一路。
     pub async fn search_sparse(
         &self,
         query: &str,
@@ -551,13 +586,7 @@ impl RetrievalEngine {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        if self.use_sparse {
-            self.search_sparse_inner(query, top_k).await
-        } else if self.use_dense {
-            self.search_dense_inner(query, top_k, true).await
-        } else {
-            Ok(Vec::new())
-        }
+        self.search_sparse_inner(query, top_k).await
     }
 
     /// 完整 RAG 工作流（对齐 run_rag_workflow）。HTTP 检索入口不传 LLM，聊天/ReAct 传入。
@@ -669,16 +698,22 @@ impl RetrievalEngine {
             return Ok((Vec::new(), queries));
         }
         let method = crate::planner::resolve_method_for_query(query, method);
-        let (want_dense, want_sparse) = multi_query_channels(&method, self.use_dense, self.use_sparse);
+        let (want_dense, want_sparse) =
+            multi_query_channels(&method, self.use_dense, self.use_sparse, self.use_hybrid);
         let resolved_top_k =
             crate::config::resolve_search_top_k(top_k as i64, self.search_top_k);
         let candidate_k = candidate_pool_limit(resolved_top_k);
 
-        let snapshot = self
-            .store
-            .collection(self.child_collection())
-            .await
-            .map_err(|e| e.to_string())?;
+        let snapshot = match self.collection_snapshot("密集").await? {
+            Some(snapshot) => snapshot,
+            None => {
+                tracing::warn!(
+                    "collection {} 尚未加载完成，跳过本次稀疏检索",
+                    self.child_collection()
+                );
+                return Ok((Vec::new(), queries));
+            }
+        };
 
         let query_vectors = if want_dense {
             match self.embedder.embed_queries(&queries) {
@@ -723,17 +758,17 @@ impl RetrievalEngine {
                 }
             }
             if want_sparse {
-                let sparse_hits = self
-                    .sparse_hits(&snapshot.rows, q, candidate_k.max(80))
+                let hits = self
+                    .sparse_hits(&snapshot.rows, q, sparse_candidate_limit(candidate_k))
                     .await;
-                let sparse: Vec<FuseItem<RetrievalItem>> = sparse_hits
-                    .iter()
-                    .map(|(row_index, bm25, lexical)| {
-                        let final_score = bm25.max(0.0) + lexical;
-                        RetrievalItem::from_row(&snapshot.rows[*row_index], final_score, "sparse")
-                            .to_fuse_item()
-                    })
-                    .collect();
+                let sparse: Vec<FuseItem<RetrievalItem>> =
+                    rank_sparse_hits(&snapshot.rows, hits, candidate_k)
+                        .into_iter()
+                        .map(|(row_index, score)| {
+                            RetrievalItem::from_row(&snapshot.rows[row_index], score, "sparse")
+                                .to_fuse_item()
+                        })
+                        .collect();
                 if !sparse.is_empty() {
                     channel_sets.push(sparse);
                     channel_weights.push(self.sparse_weight);
@@ -748,8 +783,16 @@ impl RetrievalEngine {
             variant_sets.push(
                 fused
                     .into_iter()
-                    .take(resolved_top_k)
-                    .map(|out| out.value)
+                    .take(candidate_k)
+                    .map(|out| {
+                        // 对齐 Python fuse_ranked_results：融合产物 source=hybrid
+                        // 并携带 matched_sources/fusion_score（进 metadata）。
+                        let mut item = out.value;
+                        item.source = "hybrid".into();
+                        item.matched_sources = out.sources;
+                        item.fusion_score = Some(out.fused_score);
+                        item
+                    })
                     .collect(),
             );
         }
@@ -768,7 +811,17 @@ impl RetrievalEngine {
         let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
         let fused = fuse_ranked_results(sets, &weights, &label_refs, 60.0);
 
-        let mut selected: Vec<RetrievalItem> = fused.into_iter().take(candidate_k).map(|out| out.value).collect();
+        let mut selected: Vec<RetrievalItem> = fused
+            .into_iter()
+            .take(candidate_k)
+            .map(|out| {
+                let mut item = out.value;
+                item.source = "hybrid".into();
+                item.matched_sources = out.sources;
+                item.fusion_score = Some(out.fused_score);
+                item
+            })
+            .collect();
         let mut seen: HashSet<(String, String, String)> = selected.iter().map(citation_chunk_key).collect();
 
         let keep_candidate = |item: &RetrievalItem,
@@ -892,6 +945,9 @@ impl RetrievalEngine {
                     exact_match: signals[index].exact_match,
                     is_reference_index: signals[index].is_reference_index,
                     keyword_specificity: specificity[index],
+                    keyword_hits: signals[index].keyword_hits.clone(),
+                    focus_hits: signals[index].focus_hits.clone(),
+                    long_keyword_hit_count: signals[index].long_keyword_hit_count,
                 });
                 item.rerank_stage = Some("rule_only_rust".into());
                 item
@@ -1172,7 +1228,18 @@ impl RetrievalEngine {
                 output.push(item);
                 continue;
             }
-            let key = citation_chunk_key(&item);
+            // 对齐 Python `_expand_parent_evidence` 去重键：
+            // (document_id, child_id/chunk_index, content.strip())。
+            let child = if !item.child_id.is_empty() {
+                item.child_id.clone()
+            } else {
+                item.chunk_index.to_string()
+            };
+            let key = (
+                item.document_id.clone(),
+                child,
+                item.content.trim().to_string(),
+            );
             if seen.contains(&key) {
                 continue;
             }
@@ -1370,10 +1437,6 @@ fn format_structured_parent_load_fail(err: &str) -> String {
     format!("结构化 SQLite Parent 扩展读取失败，继续使用原始命中: {err}")
 }
 
-fn key_for_parent(item: &RetrievalItem) -> (String, String) {
-    (item.document_id.clone(), item.parent_id.clone())
-}
-
 impl RetrievalItem {
     fn to_fuse_item(&self) -> FuseItem<RetrievalItem> {
         FuseItem {
@@ -1563,20 +1626,24 @@ mod tests {
 
     #[test]
     fn multi_query_channels_follow_planned_method() {
-        assert_eq!(multi_query_channels("dense", true, true), (true, false));
-        assert_eq!(multi_query_channels("sparse", true, true), (false, true));
-        assert_eq!(multi_query_channels("hybrid", true, true), (true, true));
+        assert_eq!(multi_query_channels("dense", true, true, true), (true, false));
+        assert_eq!(multi_query_channels("sparse", true, true, true), (false, true));
+        assert_eq!(multi_query_channels("hybrid", true, true, true), (true, true));
         assert_eq!(
-            multi_query_channels("dense", false, true),
+            multi_query_channels("dense", false, true, true),
             (false, true),
-            "无 dense 时回退 sparse，对齐 search_dense_high_recall"
+            "无 dense 时回退 sparse，对齐 _create_retriever"
         );
         assert_eq!(
-            multi_query_channels("sparse", true, false),
+            multi_query_channels("sparse", true, false, true),
             (true, false),
-            "无 sparse 时回退 dense，对齐 search_sparse"
+            "无 sparse 时回退 dense，对齐 _create_retriever"
         );
-        assert_eq!(multi_query_channels("hybrid", true, false), (true, false));
+        assert_eq!(multi_query_channels("hybrid", true, false, true), (true, false));
+        // USE_HYBRID_RETRIEVER=false：对齐 Python 退化为可用单路（dense 优先）。
+        assert_eq!(multi_query_channels("hybrid", true, true, false), (true, false));
+        assert_eq!(multi_query_channels("hybrid", false, true, false), (false, true));
+        assert_eq!(multi_query_channels("hybrid", false, false, false), (false, false));
     }
 
     #[test]
@@ -1617,6 +1684,8 @@ mod tests {
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
         };
         assert!(!cross_encoder_used(&item));
         item.rerank_stage = Some("rule_only_high_confidence".into());
@@ -1646,12 +1715,14 @@ mod tests {
             parent_context_text: None,
             rerank_stage: None,
             cross_encoder_score: None,
-            rerank_trace: crate::retrieval::RerankTrace::default(),
-            structured_aggregation: false,
-            section_name: None,
-            chunk_indices: Vec::new(),
-        };
-        let line = format_rag_diagnostic("差旅报销", &["差旅报销".into()], 4, &[item], "上下文");
+                rerank_trace: crate::retrieval::RerankTrace::default(),
+                structured_aggregation: false,
+                section_name: None,
+                chunk_indices: Vec::new(),
+                matched_sources: Vec::new(),
+                fusion_score: None,
+            };
+            let line = format_rag_diagnostic("差旅报销", &["差旅报销".into()], 4, &[item], "上下文");
         assert!(line.starts_with("RAG 检索诊断: "));
         let payload: Value =
             serde_json::from_str(line.strip_prefix("RAG 检索诊断: ").unwrap()).unwrap();

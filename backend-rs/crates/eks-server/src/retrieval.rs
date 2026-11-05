@@ -84,6 +84,9 @@ pub struct RetrievalItem {
     pub structured_aggregation: bool,
     pub section_name: Option<String>,
     pub chunk_indices: Vec<i64>,
+    /// 融合来源标记与融合分（fuse_ranked_results 产物，进 metadata）。
+    pub matched_sources: Vec<String>,
+    pub fusion_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,6 +109,10 @@ pub struct ItemSignals {
     pub exact_match: bool,
     pub is_reference_index: bool,
     pub keyword_specificity: f64,
+    /// 对齐 Python signals：命中词列表与计数（序列化进 metadata）。
+    pub keyword_hits: Vec<String>,
+    pub focus_hits: Vec<String>,
+    pub long_keyword_hit_count: usize,
 }
 
 impl RetrievalItem {
@@ -124,12 +131,18 @@ impl RetrievalItem {
                 .unwrap_or(-1)
         };
         RetrievalItem {
-            content: row
-                .fields
-                .get("child_text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            // 对齐 Python：内容取 child_text/chunk_text/text 逐级兜底。
+            content: ["child_text", "chunk_text", "text"]
+                .into_iter()
+                .map(|key| {
+                    row.fields
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .find(|value| !value.is_empty())
+                .unwrap_or_default(),
             score,
             source: source.to_string(),
             document_id: get_str("document_id"),
@@ -148,6 +161,8 @@ impl RetrievalItem {
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
         }
     }
 
@@ -164,7 +179,25 @@ impl RetrievalItem {
             "content_type": self.content_type,
         });
         let map = metadata.as_object_mut().unwrap();
+        if let Some(fusion_score) = self.fusion_score {
+            map.insert("matched_sources".into(), json!(self.matched_sources));
+            map.insert("fusion_score".into(), json!(fusion_score));
+        }
         if let Some(signals) = &self.signals {
+            map.insert(
+                "keyword_hits".into(),
+                json!(signals.keyword_hits),
+            );
+            map.insert("focus_hits".into(), json!(signals.focus_hits));
+            map.insert(
+                "keyword_hit_count".into(),
+                json!(signals.keyword_hits.len()),
+            );
+            map.insert("focus_hit_count".into(), json!(signals.focus_hits.len()));
+            map.insert(
+                "long_keyword_hit_count".into(),
+                json!(signals.long_keyword_hit_count),
+            );
             map.insert("keyword_coverage".into(), json!(signals.keyword_coverage));
             map.insert("focus_coverage".into(), json!(signals.focus_coverage));
             map.insert("heading_coverage".into(), json!(signals.heading_coverage));
@@ -323,43 +356,38 @@ fn strip_middle_phrase(cleaned: &str) -> String {
     ];
     let tails = ["里面", "中", "里"];
     let mut result = cleaned.to_string();
-    // 逐位置扫描第一个可匹配组合
-    'outer: for start in 0..result.chars().count() {
-        let mut rest: String = result.chars().skip(start).collect();
-        let mut head_offset = 0usize;
-        for head in optional_head {
-            if let Some(after) = rest.strip_prefix(head) {
-                head_offset = head.chars().count();
-                rest = after.to_string();
-                break;
-            }
-        }
-        let _ = head_offset;
-        for mid in body {
-            if let Some(after_mid) = rest.strip_prefix(mid) {
-                let mut tail_len = 0;
-                for tail in tails {
-                    if let Some(after_tail) = after_mid.strip_prefix(tail) {
-                        tail_len = tail.chars().count();
-                        let after_all = after_tail;
-                        let prefix: String = result.chars().take(start).collect();
-                        let replacement: String =
-                            prefix + after_all;
-                        result = replacement
-                            .trim_matches(|c: char| " ：:，,。？?".contains(c))
-                            .to_string();
-                        break 'outer;
-                    }
+    // 对齐 Python re.sub：删除全部匹配（循环删除直到无匹配），不只删第一处。
+    for _ in 0..16 {
+        let chars: Vec<char> = result.chars().collect();
+        let mut replaced = false;
+        'scan: for start in 0..chars.len() {
+            let mut rest: String = chars[start..].iter().collect();
+            for head in optional_head {
+                if let Some(after) = rest.strip_prefix(head) {
+                    rest = after.to_string();
+                    break;
                 }
-                if tail_len == 0 {
-                    let prefix: String = result.chars().take(start).collect();
-                    let replacement = prefix + after_mid;
-                    result = replacement
+            }
+            for mid in body {
+                if let Some(after_mid) = rest.strip_prefix(mid) {
+                    let mut after_all = after_mid;
+                    for tail in tails {
+                        if let Some(after_tail) = after_all.strip_prefix(tail) {
+                            after_all = after_tail;
+                            break;
+                        }
+                    }
+                    let prefix: String = chars[..start].iter().collect();
+                    result = (prefix + after_all)
                         .trim_matches(|c: char| " ：:，,。？?".contains(c))
                         .to_string();
-                    break 'outer;
+                    replaced = true;
+                    break 'scan;
                 }
             }
+        }
+        if !replaced {
+            break;
         }
     }
     result
@@ -416,7 +444,9 @@ fn heuristic_multi_query_variants(query: &str, max_queries: usize) -> Vec<String
     let dropped = drop_stop_terms(&semantic_source);
     let terms = extract_semantic_terms(&dropped);
     if !terms.is_empty() {
-        candidates.push(terms.join(" "));
+        // 对齐 Python：语义片段只保留前 8 个词。
+        let head: Vec<String> = terms.iter().take(8).cloned().collect();
+        candidates.push(head.join(" "));
     }
 
     normalize_query_variants(&candidates, &normalized_query, max_queries)
@@ -493,14 +523,15 @@ fn push_term(terms: &mut Vec<String>, term: &str) {
 }
 
 fn structured_query_aliases(query: &str) -> Vec<String> {
-    let normalized: String = query.split_whitespace().collect();
+    // 对齐 Python re.sub(r"\s+","",...)：删除全部空白（不是合并成单空格）。
+    let normalized: String = query.chars().filter(|c| !c.is_whitespace()).collect();
     if normalized.is_empty() {
         return Vec::new();
     }
     let mut aliases: Vec<String> = Vec::new();
     let has = |terms: &[&str]| terms.iter().any(|t| normalized.contains(t));
     let mut add = |value: &str, aliases: &mut Vec<String>| {
-        let cleaned: String = value.split_whitespace().collect();
+        let cleaned: String = value.chars().filter(|c| !c.is_whitespace()).collect();
         if cleaned.is_empty() || cleaned == normalized {
             return;
         }
@@ -931,7 +962,10 @@ pub fn assemble_rag_context(results: &[RetrievalItem], max_chars: usize) -> Stri
             "未知来源".to_string()
         };
         let mut header = format!("[资料{number}] 来源: {source}");
-        header.push_str(&format!(" / chunk: {}", item.chunk_index));
+        // 对齐 Python：chunk_index 缺失（-1）时不追加 chunk 后缀。
+        if item.chunk_index >= 0 {
+            header.push_str(&format!(" / chunk: {}", item.chunk_index));
+        }
         let mut content = collapse_spaces(item.content.trim());
         if let Some(parent) = &item.parent_context_text {
             let parent = collapse_spaces(parent.trim());

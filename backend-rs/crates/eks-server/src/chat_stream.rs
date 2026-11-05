@@ -199,6 +199,8 @@ struct SkillActionInput<'a> {
     options: &'a crate::short_memory::ShortMemoryOptions,
     mcp_manifests: &'a [serde_json::Value],
     llm: Option<Arc<LlmClient>>,
+    /// 渐进披露的整会话兜底：Python 仅非流式路径启用，流式路径不兜底。
+    conversation_fallback: bool,
 }
 
 impl<'a> SkillActionInput<'a> {
@@ -281,7 +283,7 @@ async fn prepare_skill_action(
             input.query,
             &result,
             input.mcp_manifests,
-            true,
+            input.conversation_fallback,
         )
         .await?
         {
@@ -895,6 +897,8 @@ struct RagTurn {
     retrieval_method: Option<String>,
     expanded_queries: Vec<String>,
     exhausted: bool,
+    /// 最后一次检索 run 的实参（SSE tool_call 回显与 rewritten_query 用）。
+    search_run: Option<crate::react::LastSearchRun>,
 }
 
 /// 对齐 Python stream：exhausted 只发 message/done，不发 RAG tool 事件。
@@ -1086,7 +1090,7 @@ async fn collect_rag(
     history: &[HistoryMessage],
     top_k: usize,
     use_retrieval: bool,
-    window_n: usize,
+    _window_n: usize,
     preferred_method: &str,
     config: &crate::config::Config,
 ) -> Result<RagTurn, String> {
@@ -1098,6 +1102,7 @@ async fn collect_rag(
             retrieval_method: None,
             expanded_queries: Vec::new(),
             exhausted: false,
+            search_run: None,
         });
     }
     let planner_query = first_pass_planner_query(query, retrieval_query);
@@ -1109,11 +1114,21 @@ async fn collect_rag(
         top_k = plan.top_k,
         "常规检索规划器初始决策"
     );
+    // 对齐 Python tool_runs：首轮检索也记录实参，ReAct 未再检索时它就是最后一轮。
+    let first_pass_run = crate::react::LastSearchRun {
+        arguments: json!({
+            "query": plan.query,
+            "top_k": plan.top_k,
+            "retrieval_method": plan.retrieval_method,
+        }),
+        resolved_method: plan.retrieval_method.clone(),
+        context: String::new(),
+    };
     let planned = engine
         .retrieve_planned(&plan.query, &plan.retrieval_method, plan.top_k, Some(llm))
         .await?;
     let first_results = planned.results;
-    let context = planned.context;
+    let first_pass_context = planned.context;
     let expanded_queries = planned.expanded_queries;
     let evidence = crate::planner::assess_evidence_rule(query, &first_results);
     tracing::info!(
@@ -1123,20 +1138,26 @@ async fn collect_rag(
         "常规检索证据评估"
     );
     if evidence.sufficient {
+        let mut run = first_pass_run;
+        run.context = first_pass_context.clone();
         return Ok(RagTurn {
-            context,
+            context: first_pass_context,
             sources: first_results,
             direct: None,
             retrieval_method: Some(plan.retrieval_method.clone()),
             expanded_queries,
             exhausted: false,
+            search_run: Some(run),
         });
     }
 
     let mut working = first_results;
-    let history_pairs = history_pairs(history, window_n);
+    // 对齐 Python：ReAct 提示注入完整历史（窗口化只发生在最终回答的短期记忆）。
+    let full_history: Vec<(String, String)> = history
+        .iter()
+        .map(|item| (item.role.clone(), item.content.clone()))
+        .collect();
     let mcp_manifests = &config.mcp_remote_tool_manifests;
-    let retrieval_method = plan.retrieval_method.clone();
 
     let mut attempt = crate::react::run_unified_react(
         engine,
@@ -1144,7 +1165,7 @@ async fn collect_rag(
         llm,
         skill_context,
         query,
-        &history_pairs,
+        &full_history,
         plan.top_k,
         working.clone(),
         mcp_manifests,
@@ -1161,7 +1182,7 @@ async fn collect_rag(
             llm,
             skill_context,
             query,
-            &history_pairs,
+            &full_history,
             plan.top_k,
             working.clone(),
             config.react_max_iterations,
@@ -1171,14 +1192,18 @@ async fn collect_rag(
     }
     if let crate::react::ReactAttempt::Ran(outcome) = attempt {
         if outcome.used_react {
+            // 对齐 Python tool_runs[-1]：检索 run 排最后，回显它的实参与实际检索方式。
+            let last_run = outcome.last_search.clone().unwrap_or(first_pass_run);
+            let resolved_method = last_run.resolved_method.clone();
             if crate::planner::assess_evidence_rule(query, &outcome.sources).sufficient {
                 return Ok(RagTurn {
                     context: outcome.context,
                     sources: outcome.sources,
                     direct: None,
-                    retrieval_method: Some(retrieval_method),
+                    retrieval_method: Some(resolved_method),
                     expanded_queries,
                     exhausted: false,
+                    search_run: Some(last_run),
                 });
             }
             if outcome.sources.is_empty() {
@@ -1186,9 +1211,10 @@ async fn collect_rag(
                     context: String::new(),
                     sources: Vec::new(),
                     direct: Some(no_result_answer(query)),
-                    retrieval_method: Some(retrieval_method),
+                    retrieval_method: Some(resolved_method),
                     expanded_queries,
                     exhausted: false,
+                    search_run: Some(last_run),
                 });
             }
             working = outcome.sources;
@@ -1202,9 +1228,10 @@ async fn collect_rag(
                 context,
                 sources: working,
                 direct: None,
-                retrieval_method: Some(retrieval_method),
+                retrieval_method: Some(resolved_method),
                 expanded_queries,
                 exhausted: false,
+                search_run: Some(last_run),
             });
         }
     }
@@ -1219,6 +1246,7 @@ async fn collect_rag(
         retrieval_method: None,
         expanded_queries,
         exhausted: true,
+        search_run: None,
     })
 }
 
@@ -1249,7 +1277,7 @@ fn status_for_runtime(warmup: &RuntimeWarmup) -> String {
 }
 
 fn runtime_status_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "ready": warmup.is_ready(),
         "status": status_for_runtime(warmup),
         "llm_warmed": warmup.llm_warmed,
@@ -1258,13 +1286,17 @@ fn runtime_status_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
         "cross_encoder_warmed": warmup.cross_encoder_warmed,
         "cross_encoder_model": warmup.cross_encoder_model,
         "cross_encoder_device": warmup.cross_encoder_device,
-        "cross_encoder_error": warmup.cross_encoder_error,
         "provider": warmup.provider,
-    })
+    });
+    // 对齐 Python：cross_encoder_error 仅在出错时输出。
+    if let Some(error) = &warmup.cross_encoder_error {
+        payload["cross_encoder_error"] = json!(error);
+    }
+    payload
 }
 
 fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "status": warmup.status,
         "llm_warmed": warmup.llm_warmed,
         "embedding_warmed": warmup.embedding_warmed,
@@ -1272,9 +1304,13 @@ fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
         "cross_encoder_warmed": warmup.cross_encoder_warmed,
         "cross_encoder_model": warmup.cross_encoder_model,
         "cross_encoder_device": warmup.cross_encoder_device,
-        "cross_encoder_error": warmup.cross_encoder_error,
         "provider": warmup.provider,
-    })
+    });
+    // 对齐 Python：cross_encoder_error 仅在出错时输出。
+    if let Some(error) = &warmup.cross_encoder_error {
+        payload["cross_encoder_error"] = json!(error);
+    }
+    payload
 }
 
 /// 对齐 Python `warmup_chat_runtime`：构造 LLM、跑一次 embedding、探测 Cross-Encoder。
@@ -1407,12 +1443,14 @@ pub async fn consolidate_chat(
     axum::extract::Query(query): axum::extract::Query<ConsolidateQuery>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
+    // 对齐 Python 路由求值顺序：先构造默认 LLM（无 provider 时 500），再由服务层
+    // 对空 conversation_id 返回 consolidated=0。
+    require_configured_llm(&state.default_llm)?;
     let conversation_id = query.conversation_id;
     // 对齐 Python：空白 conversation_id 不 400，服务层返回 0；响应回显原始 query。
     if conversation_id.trim().is_empty() {
         return Ok(axum::Json(empty_consolidate_payload(&conversation_id)));
     }
-    require_configured_llm(&state.default_llm)?;
     let llm_client = state.default_llm.clone();
     let consolidated = crate::memory::consolidate_conversation_memory(
         &state.pool,
@@ -1472,7 +1510,11 @@ pub async fn generate_chat(
         request.model.as_deref(),
         request.temperature,
     );
-    require_configured_llm(&llm_client)?;
+    // 对齐 Python get_llm：带 provider/model/temperature 覆盖时懒加载，
+    // 失败走兜底话术（200）；仅无覆盖的默认客户端做 eager 500 校验。
+    if request.provider.is_none() && request.model.is_none() && request.temperature.is_none() {
+        require_configured_llm(&llm_client)?;
+    }
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
 
     let intent = crate::intent::route_query_action(
@@ -1498,6 +1540,7 @@ pub async fn generate_chat(
                 options: &options,
                 mcp_manifests: &mcp_manifests,
                 llm: Some(llm_client.clone()),
+                conversation_fallback: true,
             },
             &intent,
         )
@@ -1648,9 +1691,12 @@ pub async fn stream_chat(
 ) -> Result<Response, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     validate_chat_schema(&request)?;
-    let (query, retrieval_method) = match prepare_chat_request(&request) {
+    // 对齐 Python：业务校验发生在流内（ValueError → start 后发 error 事件，HTTP 200）。
+    let prepared = prepare_chat_request(&request);
+    let prepare_error = prepared.as_ref().err().cloned();
+    let (query, retrieval_method) = match prepared {
         Ok(value) => value,
-        Err(detail) => return Err(crate::auth::AuthError::bad_request(&detail)),
+        Err(_) => (request.query.clone(), request.retrieval_method.clone().unwrap_or_default()),
     };
     let requested_retrieval = request.use_retrieval;
     let top_k = request.top_k;
@@ -1664,6 +1710,7 @@ pub async fn stream_chat(
     let window_n = request.short_memory_n;
     let request_provider = request.provider.clone();
     let request_model = request.model.clone();
+    let request_temperature = request.temperature;
     let request_retrieval_method = retrieval_method;
     let llm_client = crate::llm::resolve_llm_client(
         &state.default_llm,
@@ -1691,7 +1738,17 @@ pub async fn stream_chat(
             "short_memory_m": options.summary_m,
         })));
 
-        if !llm_client.has_configured_providers() {
+        if let Some(detail) = &prepare_error {
+            yield Ok(sse_json("error", json!({"message": detail})));
+            return;
+        }
+
+        // 对齐 Python get_llm：带覆盖参数时懒加载，不在路由前发 error；
+        // 无覆盖的默认客户端对齐 get_default_llm 的 eager 校验。
+        let has_llm_overrides = request_provider.is_some()
+            || request_model.is_some()
+            || request_temperature.is_some();
+        if !llm_client.has_configured_providers() && !has_llm_overrides {
             yield Ok(sse_json("error", json!({"message": crate::llm::LLM_NO_PROVIDER_MESSAGE})));
             return;
         }
@@ -1738,6 +1795,7 @@ pub async fn stream_chat(
                         options: &options,
                         mcp_manifests: &mcp_manifests,
                         llm: Some(llm_client.clone()),
+                        conversation_fallback: false,
                     },
                     &intent,
                 )
@@ -1928,9 +1986,13 @@ pub async fn stream_chat(
             return;
         }
 
-        let retrieval_query =
-            resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &working_history).await;
+        // 对齐 Python：direct 路由不做检索，也不触发 query 改写 LLM 调用。
         let use_retrieval = intent.needs_retrieval;
+        let retrieval_query = if use_retrieval {
+            resolve_rag_query(&query, &intent, Some(llm_client.as_ref()), &working_history).await
+        } else {
+            query.clone()
+        };
         let preferred_method = request_retrieval_method.as_str();
         let turn = match collect_rag(
             &engine,
@@ -1957,7 +2019,8 @@ pub async fn stream_chat(
         {
             Ok(turn) => turn,
             Err(detail) => {
-                yield Ok(sse_json("error", json!({"message": format!("检索失败: {detail}")})));
+                // 对齐 Python：错误事件透传原始异常文本，不加前缀。
+                yield Ok(sse_json("error", json!({"message": detail})));
                 return;
             }
         };
@@ -1986,26 +2049,38 @@ pub async fn stream_chat(
         }
         let sources = source_payload(&turn.sources);
         if emit_rag_sse_tools(use_retrieval, turn.exhausted) {
-            let planner_query = first_pass_planner_query(&query, &retrieval_query);
-            let preview = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
+            // 对齐 Python tool_runs[-1].tool_arguments：回显实际执行的检索参数。
+            let fallback_args = || {
+                let planner_query = first_pass_planner_query(&query, &retrieval_query);
+                let preview = first_pass_retrieval_plan(planner_query, top_k, preferred_method);
+                json!({
+                    "query": preview.query,
+                    "top_k": preview.top_k,
+                    "retrieval_method": preview.retrieval_method,
+                })
+            };
+            let search_args = turn
+                .search_run
+                .as_ref()
+                .map(|run| run.arguments.clone())
+                .unwrap_or_else(fallback_args);
+            let executed_query = turn
+                .search_run
+                .as_ref()
+                .and_then(|run| run.arguments.get("query").and_then(|v| v.as_str()))
+                .map(|v| v.to_string())
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| retrieval_query.clone());
             yield Ok(sse_json(
                 "tool_call",
-                sse_tool_call_payload(
-                    "search_knowledge_base",
-                    json!({
-                        "query": preview.query,
-                        "top_k": preview.top_k,
-                        "retrieval_method": preview.retrieval_method,
-                    }),
-                    &intent.reason,
-                ),
+                sse_tool_call_payload("search_knowledge_base", search_args, &intent.reason),
             ));
             yield Ok(sse_json(
                 "tool_result",
                 sse_rag_tool_result_payload(
                     &sources,
                     turn.retrieval_method.as_deref(),
-                    &retrieval_query,
+                    &executed_query,
                     &turn.expanded_queries,
                     !turn.sources.is_empty(),
                 ),
@@ -2071,55 +2146,45 @@ pub async fn stream_chat(
                 ""
             },
         );
+        let mut full_response = String::new();
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
-                let mut full_response = String::new();
                 while let Some(chunk) = rx.recv().await {
                     full_response.push_str(&chunk.delta);
                     yield Ok(sse_json("message", json!({"content": chunk.delta})));
                     yield Ok(sse_json("token", json!({"content": chunk.delta})));
                 }
-                let answer = clean_rag_response_text(&full_response);
-                spawn_persist_turn(
-                    pool.clone(),
-                    Some(llm_client.clone()),
-                    user_id.clone(),
-                    conversation_id.clone(),
-                    session_id.clone(),
-                    query.clone(),
-                    answer.clone(),
-                    event_expiry_days,
-                );
-                yield Ok(sse_json("done", json!({
-                    "content": answer,
-                    "response": answer,
-                    "sources": sources,
-                    "retrieval_method": turn.retrieval_method,
-                })));
             }
             Err(exc) => {
+                // 对齐 Python `_stream_llm_safely`：中途断开时兜底话术追加到已流出文本后。
                 tracing::warn!("LLM 流式生成失败，使用静态繁忙兜底: {exc}");
-                let answer = LLM_UNAVAILABLE_MESSAGE.to_string();
-                spawn_persist_turn(
-                    pool.clone(),
-                    Some(llm_client.clone()),
-                    user_id.clone(),
-                    conversation_id.clone(),
-                    session_id.clone(),
-                    query.clone(),
-                    answer.clone(),
-                    event_expiry_days,
-                );
-                yield Ok(sse_json("message", json!({"content": answer})));
-                yield Ok(sse_json("token", json!({"content": answer})));
-                yield Ok(sse_json("done", json!({
-                    "content": answer,
-                    "response": answer,
-                    "sources": sources,
-                    "retrieval_method": turn.retrieval_method,
-                })));
+                yield Ok(sse_json("message", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                yield Ok(sse_json("token", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                full_response.push_str(LLM_UNAVAILABLE_MESSAGE);
             }
         }
+        let answer = clean_rag_response_text(&full_response);
+        let answer = if answer.is_empty() {
+            LLM_UNAVAILABLE_MESSAGE.to_string()
+        } else {
+            answer
+        };
+        spawn_persist_turn(
+            pool.clone(),
+            Some(llm_client.clone()),
+            user_id.clone(),
+            conversation_id.clone(),
+            session_id.clone(),
+            query.clone(),
+            answer.clone(),
+            event_expiry_days,
+        );
+        yield Ok(sse_json("done", json!({
+            "content": answer,
+            "response": answer,
+            "sources": sources,
+            "retrieval_method": turn.retrieval_method,
+        })));
     };
 
     let mut response = Sse::new(stream)
@@ -2511,6 +2576,8 @@ mod tests {
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
         }
     }
 

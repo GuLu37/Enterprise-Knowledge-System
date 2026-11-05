@@ -578,6 +578,9 @@ mod tests {
                 exact_match: exact,
                 is_reference_index: false,
                 keyword_specificity: 0.0,
+                keyword_hits: Vec::new(),
+                focus_hits: Vec::new(),
+                long_keyword_hit_count: 0,
             }),
             parent_context_text: None,
             rerank_stage: None,
@@ -586,6 +589,8 @@ mod tests {
             structured_aggregation: false,
             section_name: None,
             chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
         }
     }
 
