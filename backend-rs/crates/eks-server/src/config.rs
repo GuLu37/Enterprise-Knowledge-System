@@ -251,7 +251,9 @@ pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
         });
     }
     let parsed = Path::new(path);
-    if parsed.is_absolute() {
+    // 目标语义与 Python/Linux 一致：sqlite:////var/... 形式的绝对路径直接采用；
+    // Windows 的 is_absolute 不认无盘符的 / 前缀，这里显式放行。
+    if parsed.is_absolute() || path.starts_with('/') {
         return Some(path.to_string());
     }
     parsed
@@ -310,7 +312,8 @@ pub fn resolve_backend_model_path(raw: &str, default: &str) -> String {
     let relative = value.strip_prefix("./").unwrap_or(value);
     let candidate = PathBuf::from("../backend").join(relative);
     if looks_like_path || candidate.exists() {
-        return candidate.to_string_lossy().into_owned();
+        // 统一输出正斜杠，与 Python/Linux 侧路径口径一致（Windows join 会产生反斜杠）。
+        return candidate.to_string_lossy().replace('\\', "/");
     }
     value.to_string()
 }
@@ -327,10 +330,11 @@ pub fn resolve_app_path(raw: &str, default: &str) -> String {
         return value.to_string();
     }
     let relative = value.strip_prefix("./").unwrap_or(value);
+    // 统一输出正斜杠，与 Python/Linux 侧路径口径一致（Windows join 会产生反斜杠）。
     PathBuf::from("../backend/app")
         .join(relative)
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 fn load_sqlite_path() -> String {

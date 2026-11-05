@@ -721,9 +721,10 @@ mod tests {
     #[test]
     fn action_and_intent_logs_match_python() {
         let skill = intent_from_routed_skill(&skills::route_local_skill("列出你的工具").unwrap());
+        // reason 对齐 Python `_rule_route_skill_intent` 的语义值（工具目录类查询）。
         assert_eq!(
             format_action_route_result(&skill, false),
-            "动作路由结果: source=rule route=skill reason=rule_skill:list_available_tools skill=list_available_tools"
+            "动作路由结果: source=rule route=skill reason=tool_catalog_query skill=list_available_tools"
         );
         let mut rag = QueryIntent::rag("knowledge_keyword", "rule", "差旅报销");
         assert_eq!(

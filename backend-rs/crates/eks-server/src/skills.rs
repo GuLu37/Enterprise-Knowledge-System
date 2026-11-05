@@ -1061,7 +1061,10 @@ fn ensure_document_within_skills_root(
 
 fn normalize_path(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
-        return canonical;
+        // Windows canonicalize 会加 \\?\ 前缀，与未 canonicalize 的绝对路径比较会失配；
+        // 去掉前缀保证两侧口径一致（Linux 无前缀，行为不变）。
+        let text = canonical.to_string_lossy().into_owned();
+        return PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_string());
     }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
