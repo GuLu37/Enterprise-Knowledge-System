@@ -181,7 +181,7 @@ fn intent_from_routed_skill(skill: &skills::RoutedSkill) -> QueryIntent {
     QueryIntent {
         route: "skill".into(),
         needs_retrieval: false,
-        reason: format!("rule_skill:{}", skill.name),
+        reason: skill.reason.to_string(),
         source: "rule".into(),
         confidence: None,
         rewritten_query: String::new(),
@@ -392,12 +392,16 @@ async fn llm_select_action(
     mcp_manifests: &[Value],
 ) -> Result<Option<QueryIntent>, String> {
     let tools = skills::function_calling_tools_from(mcp_manifests);
-    let catalog: Vec<Value> = tools
+    // 对齐 Python `_build_agent_selection_messages` 的工具目录（五字段）。
+    let catalog: Vec<Value> = skills::list_agent_capabilities_from(mcp_manifests)
         .iter()
-        .map(|tool| {
+        .map(|item| {
             json!({
-                "name": tool.pointer("/function/name"),
-                "description": tool.pointer("/function/description"),
+                "name": item.get("name"),
+                "kind": item.get("kind"),
+                "category": item.get("category"),
+                "description": item.get("description"),
+                "location": item.get("location"),
             })
         })
         .collect();
@@ -412,9 +416,12 @@ async fn llm_select_action(
             ),
         ),
     ];
-    let history_hint = render_history(history, 5);
-    if !history_hint.is_empty() {
-        messages.push(ChatMessage::new("user", format!("最近对话上下文：\n{history_hint}")));
+    let history_hint = render_history(history);
+    if !history_hint.trim().is_empty() {
+        messages.push(ChatMessage::new(
+            "user",
+            format!("最近对话上下文：\n{}", history_hint.trim()),
+        ));
     }
 
     let completion = match llm.invoke_with_tools(&messages, &tools).await {
@@ -422,14 +429,30 @@ async fn llm_select_action(
         Err(_) => llm.invoke(&messages).await?,
     };
     if let Some(call) = completion.tool_calls.first() {
-        if let Some(intent) = intent_from_tool_call(&call.name, &call.arguments, query) {
+        let skill_names = local_skill_names(mcp_manifests);
+        if let Some(intent) = intent_from_tool_call(&call.name, &call.arguments, query, &skill_names) {
             return Ok(Some(intent));
         }
     }
     Ok(intent_from_action_payload(&parse_json_object(&completion.content), query))
 }
 
-fn intent_from_tool_call(name: &str, arguments: &Value, query: &str) -> Option<QueryIntent> {
+/// 对齐 Python `_tool_call_to_intent`：只接受能力表中 source=skill 的已知技能名。
+fn local_skill_names(mcp_manifests: &[Value]) -> Vec<String> {
+    skills::list_agent_capabilities_from(mcp_manifests)
+        .iter()
+        .filter(|item| item.get("source").and_then(|value| value.as_str()) == Some("skill"))
+        .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+        .map(|name| name.to_string())
+        .collect()
+}
+
+fn intent_from_tool_call(
+    name: &str,
+    arguments: &Value,
+    query: &str,
+    skill_names: &[String],
+) -> Option<QueryIntent> {
     let name = name.trim();
     if name.is_empty() {
         return None;
@@ -455,6 +478,10 @@ fn intent_from_tool_call(name: &str, arguments: &Value, query: &str) -> Option<Q
             clarify_question: String::new(),
         });
     }
+    // 对齐 Python：未知工具名不作为 skill 意图，交由后续兜底。
+    if !skill_names.iter().any(|item| item == name) {
+        return None;
+    }
     Some(QueryIntent {
         route: "skill".into(),
         needs_retrieval: false,
@@ -468,7 +495,7 @@ fn intent_from_tool_call(name: &str, arguments: &Value, query: &str) -> Option<Q
     })
 }
 
-fn intent_from_action_payload(payload: &Value, query: &str) -> Option<QueryIntent> {
+fn intent_from_action_payload(payload: &Value, _query: &str) -> Option<QueryIntent> {
     let route = payload
         .get("route")
         .or_else(|| payload.get("intent"))
@@ -488,14 +515,19 @@ fn intent_from_action_payload(payload: &Value, query: &str) -> Option<QueryInten
         .get("confidence")
         .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|item| item as f64)))
         .map(|value| value.clamp(0.0, 1.0));
-    let reason = payload
+    // 对齐 Python：`f"{source}:{reason}" if payload.get("reason") else source`。
+    let raw_reason = payload
         .get("reason")
         .and_then(|value| value.as_str())
-        .unwrap_or(&route)
-        .trim()
-        .to_string();
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let reason = if raw_reason.is_empty() {
+        "llm".to_string()
+    } else {
+        format!("llm:{raw_reason}")
+    };
     if matches!(route.as_str(), "direct" | "chat" | "answer" | "none" | "no_rag") {
-        let mut intent = QueryIntent::direct(&format!("llm:{reason}"), "llm");
+        let mut intent = QueryIntent::direct(&reason, "llm");
         intent.confidence = confidence;
         return Some(intent);
     }
@@ -503,7 +535,7 @@ fn intent_from_action_payload(payload: &Value, query: &str) -> Option<QueryInten
         return Some(QueryIntent {
             route: "clarify".into(),
             needs_retrieval: false,
-            reason: format!("llm:{reason}"),
+            reason,
             source: "llm".into(),
             confidence,
             rewritten_query: String::new(),
@@ -534,7 +566,7 @@ fn intent_from_action_payload(payload: &Value, query: &str) -> Option<QueryInten
         return Some(QueryIntent {
             route: "skill".into(),
             needs_retrieval: false,
-            reason: format!("llm:{reason}"),
+            reason,
             source: "llm".into(),
             confidence,
             rewritten_query: String::new(),
@@ -548,20 +580,21 @@ fn intent_from_action_payload(payload: &Value, query: &str) -> Option<QueryInten
             clarify_question: String::new(),
         });
     }
+    // 对齐 Python：候选只来自 payload 本身，取不到即 None（不回退原始 query）。
     let rewritten = payload
         .get("query")
         .or_else(|| payload.get("rewritten_query"))
         .or_else(|| payload.get("search_query"))
         .or_else(|| payload.get("retrieval_query"))
         .and_then(|value| value.as_str())
-        .unwrap_or(query)
+        .unwrap_or("")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
     if rewritten.is_empty() {
         return None;
     }
-    let mut intent = QueryIntent::rag(&format!("llm:{reason}"), "llm", &rewritten);
+    let mut intent = QueryIntent::rag(&reason, "llm", &rewritten);
     intent.confidence = confidence;
     Some(intent)
 }
@@ -576,18 +609,21 @@ fn parse_json_object(text: &str) -> Value {
     serde_json::from_str(&trimmed[start..end]).unwrap_or_else(|_| json!({}))
 }
 
-fn render_history(history: &[(String, String)], turns: usize) -> String {
+/// 对齐 Python `_render_conversation_blocks`：中文角色标签、块间空行连接。
+fn render_history(history: &[(String, String)]) -> String {
     history
         .iter()
-        .rev()
-        .filter(|(role, _)| role == "user" || role == "assistant")
-        .take(turns)
+        .filter(|(role, _)| matches!(role.as_str(), "user" | "assistant" | "system"))
+        .map(|(role, content)| {
+            let label = match role.as_str() {
+                "user" => "用户",
+                "assistant" => "助手",
+                _ => "系统",
+            };
+            format!("{label}: {content}")
+        })
         .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|(role, content)| format!("{role}: {content}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -675,6 +711,7 @@ mod tests {
             "search_knowledge_base",
             &json!({"query": "差旅报销"}),
             "这个怎么报",
+            &["memory_query".to_string()],
         )
         .unwrap();
         assert_eq!(tool.route, "rag");

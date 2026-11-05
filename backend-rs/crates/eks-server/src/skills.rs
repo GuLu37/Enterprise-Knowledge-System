@@ -83,6 +83,8 @@ const FILE_EXTENSIONS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct RoutedSkill {
     pub name: &'static str,
+    /// 对齐 Python `_rule_route_skill_intent` 的 reason 语义值。
+    pub reason: &'static str,
     pub arguments: Value,
 }
 
@@ -97,6 +99,7 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
     if is_profile_name_query(normalized) {
         return Some(RoutedSkill {
             name: "memory_query",
+            reason: "profile_name_query",
             arguments: json!({
                 "query": normalized,
                 "top_k": 5,
@@ -107,6 +110,7 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
     if TOOL_CATALOG_HINTS.iter().any(|hint| lowered.contains(hint)) {
         return Some(RoutedSkill {
             name: "list_available_tools",
+            reason: "tool_catalog_query",
             arguments: json!({}),
         });
     }
@@ -117,6 +121,7 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
     if wants_original && memory_context {
         return Some(RoutedSkill {
             name: "memory_retrieve_original",
+            reason: "original_conversation_disclosure",
             arguments: json!({
                 "query": normalized,
                 "top_k": 8,
@@ -127,6 +132,7 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
     if MEMORY_QUERY_HINTS.iter().any(|hint| lowered.contains(hint)) {
         return Some(RoutedSkill {
             name: "memory_query",
+            reason: "memory_keyword",
             arguments: json!({
                 "query": normalized,
                 "top_k": 5,
@@ -142,6 +148,7 @@ pub fn route_local_skill(query: &str) -> Option<RoutedSkill> {
         }
         return Some(RoutedSkill {
             name: "document_hot_word_statistics",
+            reason: "document_hot_word_keyword",
             arguments,
         });
     }
@@ -720,7 +727,8 @@ fn skill_def(
         tags: tags.iter().map(|item| item.to_string()).collect(),
         provider: None,
         parameters,
-        metadata: json!({"returns": returns, "executor_ready": true}),
+        // 对齐 Python 本地技能 metadata：只有 returns；executor_ready 缺省视为 true。
+        metadata: json!({"returns": returns}),
     }
 }
 
@@ -782,11 +790,11 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
                 "additionalProperties": false,
                 "properties": {
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "返回前多少个热点词。"},
-                    "file_name": {"type": "string", "description": "可选，按原始文件名或存储文件名模糊定位目标文档。"},
-                    "document_ids": {"type": "array", "items": {"type": "string"}},
-                    "file_types": {"type": "array", "items": {"type": "string"}},
-                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"]}},
-                    "include_samples": {"type": "boolean", "default": true}
+                    "file_name": {"type": "string", "description": "可选，按原始文件名或存储文件名模糊定位目标文档；用户提到文件名时优先填写。"},
+                    "document_ids": {"type": "array", "items": {"type": "string"}, "description": "可选，只统计指定文档。"},
+                    "file_types": {"type": "array", "items": {"type": "string"}, "description": "可选，只统计指定文件类型。"},
+                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"]}, "description": "可选，只统计指定状态。"},
+                    "include_samples": {"type": "boolean", "default": true, "description": "是否返回示例文档。"}
                 }
             }),
             "hot_word_statistics",
@@ -800,9 +808,9 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
-                    "memory_scope": {"type": "string", "enum": ["all", "profile", "event"], "default": "all"}
+                    "query": {"type": "string", "description": "可选，按语义召回长期记忆时使用。"},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5, "description": "最多返回多少条记忆。"},
+                    "memory_scope": {"type": "string", "enum": ["all", "profile", "event"], "default": "all", "description": "记忆范围：画像记忆、事件记忆或两者都查。"}
                 }
             }),
             "memory_query_result",
@@ -810,23 +818,22 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
         {
             let mut skill = skill_def(
                 "memory_retrieve_original",
-                "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，或需要核对原始措辞时使用。",
+                "按长期记忆摘要的引用渐进式披露当前用户对应的原始对话。当摘要不足以回答问题、用户要求查看原文/完整上下文/具体细节，或需要核对原始措辞时使用；只能读取当前用户自己的对话。",
                 "memory",
                 &["memory", "conversation", "original", "progressive_disclosure"],
                 json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "memory_ids": {"type": "array", "items": {"type": "string"}},
-                        "summary_memory_ids": {"type": "array", "items": {"type": "string"}},
-                        "query": {"type": "string"},
-                        "conversation_id": {"type": "string"},
-                        "turn_start": {"type": "integer", "minimum": 0},
-                        "turn_end": {"type": "integer", "minimum": 0},
-                        "include_neighbors": {"type": "integer", "minimum": 0, "maximum": 5, "default": 0},
-                        "include_all_conversation": {"type": "boolean", "default": false},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 8},
-                        "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 12000}
+                        "memory_ids": {"type": "array", "items": {"type": "string"}, "description": "可选，摘要注入中提供的 memory_id 列表；优先使用。"},
+                        "query": {"type": "string", "description": "可选，摘要 memory_id 不明确时用于语义定位原始对话。"},
+                        "conversation_id": {"type": "string", "description": "可选，限定某个会话；默认使用当前会话。"},
+                        "turn_start": {"type": "integer", "minimum": 0, "description": "可选，原始对话起始轮次。"},
+                        "turn_end": {"type": "integer", "minimum": 0, "description": "可选，原始对话结束轮次。"},
+                        "include_neighbors": {"type": "integer", "minimum": 0, "maximum": 5, "default": 0, "description": "可选，在定位范围前后各多取几块上下文。"},
+                        "include_all_conversation": {"type": "boolean", "default": false, "description": "可选，无摘要引用时是否展开当前会话的全部原始对话。"},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 8, "description": "最多展开多少个摘要对应的原始块。"},
+                        "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 12000, "description": "本次最多返回的原文字符数。"}
                     }
                 }),
                 "original_conversation_result",
@@ -836,38 +843,39 @@ fn local_skill_catalog() -> Vec<SkillDefinition> {
         },
         skill_def(
             "delete_profile_memory",
-            "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除某条个人信息时使用。",
+            "删除用户的个性化记忆（画像记忆）。当用户明确要求删除、遗忘、清除某条个人信息（如名字、偏好、地点、习惯等）时使用。可指定 memory_key 精确删除，或提供 keywords 按内容模糊匹配删除；用户表达模糊时先查询并确认，不能删除事件记忆或其他用户数据。",
             "memory",
             &["memory", "profile", "delete", "privacy"],
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "memory_keys": {"type": "array", "items": {"type": "string"}},
-                    "keywords": {"type": "array", "items": {"type": "string"}},
-                    "max_deletes": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+                    "memory_keys": {"type": "array", "items": {"type": "string"}, "description": "可选，精确删除的 memory_key 列表，如 profile.location、profile.name。"},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "可选，按内容关键词模糊匹配要删除的记忆，如 ['北京']。"},
+                    "max_deletes": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "单次最多删除条数，超过会拒绝并要求更精确条件。"}
                 }
             }),
             "delete_profile_memory_result",
         ),
         skill_def(
             "list_knowledge_base_files",
-            "列出知识库中已上传的文档，可按文件名、文档 ID、文件类型或状态筛选，并可概括指定文档的内容。不用于按内容检索具体答案，那应使用 search_knowledge_base。",
+            "列出知识库中已上传的文档，可按文件名、文档 ID、文件类型或状态筛选；并可概括指定文档的内容（章节大纲、内容预览、主题关键词）。适用于『知识库里有哪些文件』『帮我看看 04_产品与账号常见问题 这个文档讲了什么』『列出全部已上传文档』『这份文档包含哪些章节』等需求；不用于按内容检索具体答案，那应使用 search_knowledge_base。",
             "document",
             &["documents", "list", "summary", "overview"],
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "file_name": {"type": "string"},
-                    "document_ids": {"type": "array", "items": {"type": "string"}},
-                    "file_types": {"type": "array", "items": {"type": "string"}},
-                    "statuses": {"type": "array", "items": {"type": "string"}},
-                    "summarize": {"type": "boolean", "default": true},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+                    "file_name": {"type": "string", "description": "可选，按文件名模糊筛选；用户提到具体文件名时填写，如『产品与账号常见问题』。"},
+                    "document_ids": {"type": "array", "items": {"type": "string"}, "description": "可选，只列出指定 document_id 的文档。"},
+                    "file_types": {"type": "array", "items": {"type": "string"}, "description": "可选，只列出指定文件类型，如 ['pdf','docx','md']。"},
+                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"]}, "description": "可选，按状态筛选，默认只列已入库(ready)的文档。"},
+                    "summarize": {"type": "boolean", "default": true, "description": "是否概括内容（章节大纲、内容预览、主题关键词）。"},
+                    "preview_chars": {"type": "integer", "minimum": 200, "maximum": 6000, "default": 1500, "description": "每个文档内容预览的最大字符数。"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "最多返回多少条文档。"}
                 }
             }),
-            "knowledge_base_file_list",
+            "knowledge_base_files",
         ),
     ];
     skills.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1559,11 +1567,12 @@ async fn hot_words(pool: &sqlx::SqlitePool, arguments: &Value) -> Result<Value, 
     }
 
     let mut ranked: Vec<(String, usize)> = term_frequency.into_iter().collect();
+    // 对齐 Python 排序键 (-count, -len(term), term)：len 按字符数而非字节数。
     ranked.sort_by(|left, right| {
         right
             .1
             .cmp(&left.1)
-            .then_with(|| right.0.len().cmp(&left.0.len()))
+            .then_with(|| right.0.chars().count().cmp(&left.0.chars().count()))
             .then_with(|| left.0.cmp(&right.0))
     });
     let top_words: Vec<Value> = ranked
@@ -1868,28 +1877,56 @@ async fn delete_profile_memory(pool: &sqlx::SqlitePool, user_id: &str, arguments
         return Ok(json!({
             "deleted_count": 0,
             "matched": [],
-            "summary": "未提供删除条件，请指定 memory_keys 或 keywords。",
+            "summary": "未提供任何删除条件，请指定 memory_key 或 keywords。",
         }));
     }
     let normalized_keys: Vec<String> = keys.iter().map(|key| key.trim().to_lowercase()).filter(|key| !key.is_empty()).collect();
     let normalized_keywords: Vec<String> = keywords.iter().map(|word| eks_kernels::normalize_text(word)).filter(|word| !word.is_empty()).collect();
     let rows = load_memories(pool, user_id, Some("profile"), 200).await?;
-    let matched: Vec<MemoryRow> = rows
+    let active: Vec<MemoryRow> = rows.into_iter().filter(memory_active).collect();
+    if active.is_empty() {
+        return Ok(json!({
+            "deleted_count": 0,
+            "matched": [],
+            "summary": "当前没有可删除的个性化记忆。",
+        }));
+    }
+    let matched: Vec<MemoryRow> = active
         .into_iter()
-        .filter(memory_active)
         .filter(|row| {
             let key = row.memory_key.as_deref().unwrap_or("").trim().to_lowercase();
             let content = eks_kernels::normalize_text(&row.content);
             normalized_keys.iter().any(|item| item == &key)
                 || normalized_keywords.iter().any(|word| content.contains(word) || key.contains(word))
         })
-        .take(max_deletes)
         .collect();
     if matched.is_empty() {
         return Ok(json!({
             "deleted_count": 0,
             "matched": [],
-            "summary": "当前没有匹配的画像记忆。",
+            "summary": "没有匹配到符合条件的个性化记忆。",
+        }));
+    }
+    if matched.len() > max_deletes {
+        // 对齐 Python：超限时一条都不删，只返回预览，避免误删。
+        let previews: Vec<Value> = matched
+            .iter()
+            .take(max_deletes)
+            .map(|row| {
+                json!({
+                    "memory_key": row.memory_key.clone().unwrap_or_default(),
+                    "content": row.content.chars().take(200).collect::<String>(),
+                })
+            })
+            .collect();
+        return Ok(json!({
+            "deleted_count": 0,
+            "matched": previews,
+            "summary": format!(
+                "匹配到 {} 条记忆，超过单次删除上限 {}，为避免误删请用更精确的 memory_key 或关键词重试。",
+                matched.len(),
+                max_deletes
+            ),
         }));
     }
     let now = crate::db::fmt_dt(&crate::db::now_naive());
@@ -1904,12 +1941,19 @@ async fn delete_profile_memory(pool: &sqlx::SqlitePool, user_id: &str, arguments
     }
     let matched_json: Vec<Value> = matched
         .iter()
-        .map(|row| json!({"memory_id": row.memory_id, "memory_key": row.memory_key, "content": row.content}))
+        .map(|row| {
+            json!({
+                "memory_id": row.memory_id,
+                "memory_key": row.memory_key,
+                "content": row.content.chars().take(400).collect::<String>(),
+                "confidence_score": row.confidence_score,
+            })
+        })
         .collect();
     Ok(json!({
         "deleted_count": matched_json.len(),
         "matched": matched_json,
-        "summary": format!("已删除 {} 条画像记忆。", matched.len()),
+        "summary": format!("已删除 {} 条个性化记忆。", matched.len()),
     }))
 }
 
@@ -1989,21 +2033,47 @@ fn arg_str(arguments: &Value, key: &str) -> String {
     arguments.get(key).and_then(|value| value.as_str()).unwrap_or("").trim().to_string()
 }
 
+/// 对齐 Python `_normalize_string_list`：字符串是单元素（不按逗号拆分），
+/// 大小写不敏感去重、跳过空项。
 fn arg_strings(arguments: &Value, key: &str) -> Vec<String> {
-    match arguments.get(key) {
-        Some(Value::Array(items)) => items.iter().filter_map(|item| item.as_str()).map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect(),
-        Some(Value::String(item)) => item.split(',').map(str::trim).filter(|item| !item.is_empty()).map(str::to_string).collect(),
-        _ => Vec::new(),
+    let items: Vec<Value> = match arguments.get(key) {
+        Some(Value::Array(list)) => list.clone(),
+        Some(Value::Null) | None => return Vec::new(),
+        Some(other) => vec![other.clone()],
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+    for item in items {
+        // 对齐 Python `str(item or "")`：0/False/空串归一为空后跳过。
+        let text = match &item {
+            Value::String(value) => value.trim().to_string(),
+            Value::Number(value) if value.as_f64() == Some(0.0) => continue,
+            Value::Bool(false) => continue,
+            Value::Null => continue,
+            other => other.to_string().trim().to_string(),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if seen.insert(text.to_lowercase()) {
+            normalized.push(text);
+        }
     }
+    normalized
 }
 
+/// 对齐 Python `_coerce_int`：接受数字/数字字符串/布尔，失败取默认，最后夹取。
 fn arg_usize(arguments: &Value, key: &str, default: usize, min: usize, max: usize) -> usize {
-    arguments
-        .get(key)
-        .and_then(|value| value.as_u64().or_else(|| value.as_i64().map(|item| item as u64)))
-        .map(|value| value as usize)
-        .unwrap_or(default)
-        .clamp(min, max)
+    let resolved: i64 = match arguments.get(key) {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value.trunc() as i64))
+            .unwrap_or(default as i64),
+        Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(default as i64),
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => default as i64,
+    };
+    resolved.clamp(min as i64, max as i64) as usize
 }
 
 fn arg_i64(arguments: &Value, key: &str) -> Option<i64> {
@@ -2016,11 +2086,15 @@ fn arg_i64(arguments: &Value, key: &str) -> Option<i64> {
 }
 
 fn arg_bool(arguments: &Value, key: &str, default: bool) -> bool {
+    // 对齐 Python `bool(value)` 真值语义：非空字符串/非零数字为真。
     match arguments.get(key) {
+        None => default,
         Some(Value::Bool(value)) => *value,
-        Some(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
-        Some(Value::String(value)) => matches!(value.trim().to_lowercase().as_str(), "true" | "1" | "yes"),
-        _ => default,
+        Some(Value::Number(value)) => value.as_f64().unwrap_or(0.0) != 0.0,
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(Value::Null) => false,
     }
 }
 
