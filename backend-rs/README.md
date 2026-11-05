@@ -69,7 +69,7 @@ docker compose up eks-server
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 服务标识 |
-| POST | `/api/v1/auth/login` | 登录（与 Python 互通） |
+| POST | `/api/v1/auth/login` | 登录 |
 | POST | `/api/v1/auth/register` | 注册 |
 | POST | `/api/v1/auth/refresh` | 刷新令牌 |
 | POST | `/api/v1/auth/password` | 修改密码 |
@@ -112,14 +112,14 @@ docker compose up eks-server
 
 | 配置 | mean | P95 | recall@5 | MRR@10 |
 |---|---|---|---|---|
-| Python 原始基线 | 2.92s | 4.79s | 0.9024 | 0.8618 |
+| 迁移前 Python 基线（历史数据） | 2.92s | 4.79s | 0.9024 | 0.8618 |
 | **Rust 后端** | **0.104s** | **0.120s** | **0.9512** | **0.9024** |
 
-## 与 Python 后端的关系
+## 与 Python 基线的关系
 
-- **共享同一数据**：SQLite（rag_metadata.db）+ milvus_lite.db 可双向读写
-- **令牌互通**：Python 签发的 JWT 在 Rust 可验，反之亦然
-- **无需迁移**：两个后端可并行运行（不同端口），随时切换
+后端已从 Python 全量重写为 Rust 并移除 Python 实现。迁移期以 Python 行为为基线逐项对齐
+（约 150 个「全量Rust化」提交，含检索打分逐位一致、日志文案、SSE 协议与错误语义），
+对齐记录见提交历史。`backend/` 目录保留为运行时资产家（.env 模板、技能文档、模型与数据目录）。
 
 ## 项目结构
 
@@ -153,7 +153,7 @@ backend-rs/
 │           ├── ingest.rs      # 文档入库（解析/切块/向量化/写入）
 │           └── routes.rs      # 路由注册
 ├── scripts/
-│   └── contract_auth.py       # 双端契约测试
+│   └── bench_retrieval.py     # 纯 HTTP 检索基准（打 eks-server）
 └── tests/
     └── fixtures/              # 金向量/tokenizer 对拍数据
 ```
@@ -164,14 +164,8 @@ backend-rs/
 # Rust 单元 + 集成测试
 cd backend-rs && cargo test
 
-# Python parity 测试（需编译 pyo3 扩展）
-cd backend && python -m pytest tests/test_rust_kernels_parity.py
-
-# 性能基准（进程内）
-cd backend && PYTHONPATH=. python scripts/bench_retrieval.py
-
-# 性能基准（HTTP → Rust 后端）
-cd backend && python scripts/bench_retrieval.py --base-url http://127.0.0.1:8001
+# 性能基准（HTTP → eks-server，需先启动服务并配置好模型/数据）
+cd backend-rs/scripts && python bench_retrieval.py --base-url http://127.0.0.1:8000
 ```
 
 ## 部署

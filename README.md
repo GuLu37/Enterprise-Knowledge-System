@@ -52,7 +52,7 @@ flowchart TD
 
 ### 1. 统一 Skill / Tool 注册与执行
 
-`backend/app/skills/registry.py` 统一维护能力定义、公开目录、Function Calling schema 和执行入口。所有模型选择的工具都经过 `execute_agent_tool`，RAG 也不再有独立的旁路执行协议。
+`backend-rs/crates/eks-server/src/skills.rs` 统一维护能力定义、公开目录、Function Calling schema 和执行入口。所有模型选择的工具都经过统一执行入口，RAG 也不再有独立的旁路执行协议。
 
 当前内置 Skill：
 
@@ -114,10 +114,10 @@ RAG 使用统一工具名 `search_knowledge_base`。工具描述和参数 schema
 ```mermaid
 flowchart LR
     U[用户] --> F[Vue 3 前端]
-    F -->|HTTP / SSE| A[FastAPI 后端]
+    F -->|HTTP / SSE| A[Rust 后端 eks-server]
     A --> I[文档解析与 Parent-Child 切块]
-    I --> S[(SQLite / MySQL 元数据库)]
-    I --> M[(Milvus / Milvus Lite)]
+    I --> S[(SQLite 元数据库)]
+    I --> M[(Milvus Lite)]
     M -->|Child 向量与检索元数据| R[Dense / Sparse / Hybrid 检索]
     R --> P[按 parent_id 回查 Parent]
     S --> P
@@ -127,10 +127,10 @@ flowchart LR
 
 | 存储 | 表或 collection | 内容 | 用途 |
 | --- | --- | --- | --- |
-| SQLite / MySQL | `document_records` | 文件元数据和生命周期状态 | 文档列表、上传状态、删除状态 |
-| SQLite / MySQL | `document_chunks` | Parent 正文、`document_id`、`parent_id`、块序号 | 文档预览、Parent 上下文回填 |
-| Milvus / Milvus Lite | `doc_chunk` | Child 文本、向量、`document_id`、`child_id`、`parent_id` 等 | Dense、Sparse、Hybrid 检索 |
-| Milvus / Milvus Lite | `memory_chunks` | 画像、摘要和对话记忆向量 | 当前用户记忆召回 |
+| SQLite | `document_records` | 文件元数据和生命周期状态 | 文档列表、上传状态、删除状态 |
+| SQLite | `document_chunks` | Parent 正文、`document_id`、`parent_id`、块序号 | 文档预览、Parent 上下文回填 |
+| Milvus Lite | `doc_chunk` | Child 文本、向量、`document_id`、`child_id`、`parent_id` 等 | Dense、Sparse、Hybrid 检索 |
+| Milvus Lite | `memory_chunks` | 画像、摘要和对话记忆向量 | 当前用户记忆召回 |
 
 Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent collection。`doc_chunk.parent_id` 与元数据数据库中的 `document_chunks.parent_id` 对应。
 
@@ -169,22 +169,22 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 | 模块 | 技术 |
 | --- | --- |
 | 前端 | Vue 3、Vite、Lucide Vue |
-| 后端 | Rust、Axum、SQLite、Milvus Lite（`backend-rs`，默认服务）；Python FastAPI 仍保留为对照实现 |
-| LLM 编排 | LangChain Core、Function Calling、ReAct 检索循环 |
-| 检索 | Milvus、BGE Embedding、BM25、RRF、规则重排、可选 Cross-Encoder |
+| 后端 | Rust、Axum、SQLite、Milvus Lite（`backend-rs`，单一后端服务 eks-server） |
+| LLM 编排 | Rust 原生多供应商客户端、Function Calling、ReAct 检索循环 |
+| 检索 | Milvus Lite、BGE ONNX Embedding、BM25、RRF、规则重排、可选 Cross-Encoder（ONNX） |
 | 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |
-| 文档解析 | Unstructured、pypdf、python-docx、python-pptx、openpyxl 等 |
-| 数据存储 | SQLite（默认）、MySQL（可选）、Milvus / Milvus Lite |
+| 文档解析 | 纯 Rust 解析：zip+XML（docx/pptx）、calamine（xlsx/xls）、pdf-extract（PDF） |
+| 数据存储 | SQLite（元数据）、Milvus Lite（向量） |
 | 部署 | Docker、Docker Compose、Nginx |
 
 ## 快速开始
 
 ### 环境要求
 
-- Rust 1.92（推荐后端）；Python 3.10+ 仍可作为对照实现。
+- Rust 1.92（后端工具链）。
 - Node.js 18+；Docker 前端构建使用 Node.js 22。
 - 可访问的 LLM 服务。
-- 默认使用 Milvus Lite 本地文件库；服务端 Milvus gRPC 仍由 Python 对照实现覆盖。
+- 默认使用 Milvus Lite 本地文件库（Rust 版不连接服务端 Milvus gRPC，也不支持 MySQL 元数据库）。
 
 ### 本地开发
 
@@ -217,16 +217,6 @@ Linux/macOS：
 cd backend-rs
 export LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13
 cargo +1.92.0 run -p eks-server
-```
-
-对照用的 Python 后端仍可用：
-
-```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 4. 新开终端启动前端：
@@ -279,7 +269,7 @@ docker compose -f docker-compose.yml -f docker-compose.lite.yml up -d --build
 docker compose --profile mysql up -d --build
 ```
 
-`docker-compose.yml` 默认启动 `eks-server`（Rust）。`docker-compose.lite.yml` 会给 Rust 主服务和可选 Python 对照服务同时写入 Milvus Lite 路径。数据默认持久化在 `backend/app/data/milvus_lite.db`。
+`docker-compose.yml` 启动 `eks-server`（Rust）与前端。`docker-compose.lite.yml` 为 Rust 主服务写入 Milvus Lite 的低配参数。数据默认持久化在 `backend/app/data/milvus_lite.db`。
 
 ## 关键配置
 
@@ -289,11 +279,11 @@ docker compose --profile mysql up -d --build
 | --- | --- |
 | `LLM_PROVIDER` | 默认 LLM 提供商 |
 | `LLM_MAX_FALLBACK_ATTEMPTS` | LLM 供应商失败时最多尝试的供应商数量 |
-| `VECTOR_STORE_TYPE` | `milvus` 或 `milvus_lite` |
+| `VECTOR_STORE_TYPE` | 仅 `milvus_lite` / `lite`（Rust 版本地文件库） |
 | `MILVUS_DOC_COLLECTION_NAME` | 文档 Child collection，默认 `doc_chunk` |
 | `MILVUS_CHILD_COLLECTION_NAME` | Child 检索 collection，默认 `doc_chunk` |
 | `MILVUS_MEMORY_COLLECTION_NAME` | 记忆 collection，默认 `memory_chunks` |
-| `DATABASE_URL` | 文档元数据和 Parent 文本数据库 |
+| `DATABASE_URL` | 文档元数据和 Parent 文本数据库（Rust 版仅支持 sqlite） |
 | `BGE_MODEL_NAME` | BGE 模型名或本地路径 |
 | `SEARCH_TOP_K` | 默认检索数量 |
 | `SIMILARITY_THRESHOLD` | Dense 检索阈值配置 |
@@ -310,23 +300,18 @@ docker compose --profile mysql up -d --build
 
 ```text
 .
-├── backend-rs/           # Rust 后端（默认服务 eks-server）
-│   └── crates/
-│       ├── eks-kernels/  # 分词、BM25、融合与重排内核
-│       └── eks-server/   # Axum API、检索、记忆、认证
-├── backend/              # Python 对照实现
-│   ├── app/
-│   │   ├── api/          # FastAPI 路由和请求模型
-│   │   ├── core/         # LLM、Embedding、常量
-│   │   ├── rag/          # 常规检索规划（planner.py）、检索器和重排器
-│   │   ├── services/     # 聊天、检索、文档、记忆和认证服务
-│   │   ├── skills/       # Skill 注册、内置 Skill、详细规则和 MCP 适配
-│   │   ├── storage/      # SQLite / Milvus 访问
-│   │   ├── tools/        # RAG 工具和 tracing
-│   │   └── main.py       # 应用入口和生命周期管理
-│   ├── tests/            # 单元测试
-│   ├── Dockerfile
-│   └── requirements.txt
+├── backend-rs/           # Rust 后端（单一服务 eks-server）
+│   ├── crates/
+│   │   ├── eks-kernels/  # 分词、BM25、融合与重排内核
+│   │   └── eks-server/   # Axum API、检索、记忆、认证
+│   └── scripts/          # 纯 HTTP 检索基准（bench_retrieval.py）
+├── backend/              # 运行时资产目录（无后端代码）
+│   ├── .env.example      # 环境变量模板（复制为 .env 使用）
+│   └── app/
+│       ├── skills/       # 技能详细规则文档（运行时由 Rust 读取）
+│       ├── models/       # BGE / Cross-Encoder ONNX 模型（不入库）
+│       ├── data/         # SQLite 与 milvus_lite.db（不入库）
+│       └── logs/         # 运行日志（不入库）
 ├── frontend/
 │   ├── src/              # Vue 页面、API 封装和样式
 │   ├── Dockerfile
