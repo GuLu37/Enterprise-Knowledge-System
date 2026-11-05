@@ -666,7 +666,7 @@ async fn persist_turn_result(
             .await
             {
                 Ok(_) => written += 1,
-                Err(err) => tracing::warn!("长期记忆写入失败: {err}"),
+                Err(err) => tracing::warn!("长期记忆写入失败，已跳过: {err}"),
             }
         }
         if written > 0 {
@@ -924,7 +924,7 @@ pub async fn search_event_memories(
     let rows: Vec<EventMemoryRow> = match builder.build_query_as().fetch_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
-            tracing::warn!("长期记忆读取失败: {err}");
+            tracing::warn!("长期记忆检索失败，已跳过: {err}");
             return Ok(Vec::new());
         }
     };
@@ -2488,10 +2488,14 @@ async fn insert_event_memory_with_confidence(
         memory_key.trim()
     };
     let chunk_index = chunk_index.unwrap_or_else(|| turn_start.unwrap_or(0));
-    let conv_key = if conversation_id.trim().is_empty() {
-        "unknown"
+    // 对齐 Python：conversation_key = conversation_id or session_id or uuid，
+    // SQL/向量侧 conversation_id 均写该兜底键，保证按 session 仍可召回/删除。
+    let conv_key = if !conversation_id.trim().is_empty() {
+        conversation_id.trim().to_string()
+    } else if !session_id.trim().is_empty() {
+        session_id.trim().to_string()
     } else {
-        conversation_id.trim()
+        uuid::Uuid::new_v4().simple().to_string()
     };
     let memory_id = memory_id.unwrap_or_else(|| {
         format!(
@@ -2502,7 +2506,7 @@ async fn insert_event_memory_with_confidence(
             uuid::Uuid::new_v4().simple()
         )
     });
-    let stored_key = event_logical_key(user_id, conversation_id, chunk_type, &memory_id, chunk_index);
+    let stored_key = event_logical_key(user_id, &conv_key, chunk_type, &memory_id, chunk_index);
     let current: Option<(String, i64)> = sqlx::query_as(
         "SELECT memory_id, version FROM memory_records \
          WHERE user_id = ? AND memory_type = 'event' AND memory_key = ? AND status = 'active' \
@@ -2530,7 +2534,7 @@ async fn insert_event_memory_with_confidence(
         chunk_index,
         content,
         user_id,
-        conversation_id,
+        &conv_key,
         session_id,
         chunk_type,
         turn_start.unwrap_or(0),
@@ -2549,7 +2553,7 @@ async fn insert_event_memory_with_confidence(
     .bind(user_id)
     .bind(&stored_key)
     .bind(content)
-    .bind(empty_to_none(conversation_id))
+    .bind(&conv_key)
     .bind(empty_to_none(session_id))
     .bind(turn_start)
     .bind(turn_end)

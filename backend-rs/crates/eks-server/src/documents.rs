@@ -229,10 +229,12 @@ fn format_document_route_error(action: &str, err: &str) -> String {
 }
 
 fn document_sql_error(action: &str, err: sqlx::Error) -> AuthError {
-    tracing::error!("{}", format_document_route_error(action, &err.to_string()));
+    // 对齐 Python 路由：500 detail 回传真实错误信息（仅日志再叠加动作前缀）。
+    let detail = err.to_string();
+    tracing::error!("{}", format_document_route_error(action, &detail));
     AuthError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail: "服务器内部错误".to_string(),
+        detail,
     }
 }
 
@@ -321,12 +323,12 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
     let row = load_document(&state.pool, document_id)
         .await
         .map_err(|err| err.to_string())?;
-    let Some(row) = row else {
-        return Ok(());
+    // 对齐 Python：记录缺失或已删除时按删除失败处理（走失败日志与状态恢复路径）。
+    let row = match row {
+        Some(row) if row.status != "deleted" => row,
+        Some(_) => return Err("文档当前状态为 deleted，无法重复删除".to_string()),
+        None => return Err("文档不存在".to_string()),
     };
-    if row.status == "deleted" {
-        return Ok(());
-    }
 
     log_delete_step(document_id, "1/4", "开始执行后台删除");
     log_delete_step(document_id, "2/4", "开始删除 Milvus 文档切块");
@@ -423,7 +425,7 @@ pub async fn delete_document(
     let document_id = document_id.clone();
     tokio::spawn(async move {
         if let Err(err) = finalize_document_deletion(&state, &document_id).await {
-            tracing::error!(document_id = %document_id, "文档后台删除失败: {err}");
+            tracing::error!("文档删除失败 (document_id={document_id}): {err}");
             restore_document_after_delete_failure(&state.pool, &document_id, &err).await;
         }
     });
@@ -840,12 +842,14 @@ pub async fn upload_document(
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
     let mut declared_content_type: Option<String> = None;
+    let mut saw_file_field = false;
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| AuthError::bad_request(&format!("multipart 读取失败: {e}")))?
     {
         if field.name() == Some("file") {
+            saw_file_field = true;
             filename = field.file_name().unwrap_or("unknown").to_string();
             declared_content_type = field.content_type().map(str::to_string);
             file_data = field
@@ -855,6 +859,10 @@ pub async fn upload_document(
                 .to_vec();
             break;
         }
+    }
+    // 对齐 FastAPI `file: UploadFile = File(...)`：缺字段是 422 而非 400。
+    if !saw_file_field {
+        return Err(AuthError::unprocessable("Field required"));
     }
 
     let filename = sanitize_original_filename(&filename);
@@ -866,10 +874,8 @@ pub async fn upload_document(
     {
         return Err(AuthError::bad_request(&detail));
     }
-    if let Some(detail) = reject_oversized_upload(file_data.len(), state.config.max_upload_size) {
-        return Err(AuthError::bad_request(detail));
-    }
 
+    // 对齐 Python 时序：两条 [1/3] 日志先于大小校验，超限请求留有日志痕迹。
     let document_id = uuid::Uuid::new_v4().simple().to_string();
     log_upload_step(
         &document_id,
@@ -892,6 +898,10 @@ pub async fn upload_document(
         "1/3",
         &format!("本地文件保存成功: {filename} -> {file_path_text}"),
     );
+    if let Some(detail) = reject_oversized_upload(file_data.len(), state.config.max_upload_size) {
+        let _ = std::fs::remove_file(&file_path);
+        return Err(AuthError::bad_request(detail));
+    }
     let file_size = file_data.len() as i64;
     drop(file_data);
 

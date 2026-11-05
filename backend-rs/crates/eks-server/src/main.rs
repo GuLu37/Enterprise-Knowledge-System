@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(eks_server::auth::BootstrapAdminOutcome::Created) => {
             tracing::info!(
-                username = eks_server::auth::normalize_username(&config.bootstrap_admin_username),
-                "已创建 bootstrap 管理员账号"
+                "✓ 已创建 bootstrap 管理员账号: {}",
+                eks_server::auth::normalize_username(&config.bootstrap_admin_username)
             );
         }
         Ok(eks_server::auth::BootstrapAdminOutcome::Exists) => {}
@@ -89,9 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let warm_engine = engine.clone();
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
             match warm_engine.warm_sparse_index().await {
-                Ok(rows) => tracing::info!(rows, "稀疏持久索引预热完成"),
-                Err(err) => tracing::warn!("稀疏持久索引预热失败，检索将回退词法预筛: {err}"),
+                Ok(rows) => tracing::info!(
+                    "稀疏持久索引预热完成: rows={rows} elapsed={:.2}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(err) => tracing::warn!("稀疏持久索引预热失败，检索将回退 LIKE 路径: {err}"),
             }
         });
     }
@@ -161,7 +165,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
-    tracing::info!("🛑 关闭应用...");
     Ok(())
+}
+
+/// Ctrl+C / SIGTERM / Ctrl+Break 时先打关闭横幅再退出，
+/// 对齐 Python lifespan 的「🛑 关闭应用...」日志可达性。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("🛑 关闭应用...");
 }

@@ -1171,7 +1171,9 @@ fn split_structured_text_chunks(text: &str, chunk_size: usize) -> Vec<String> {
 fn split_structured_row_chunks(text: &str) -> Vec<String> {
     let sections = parse_structured_sections(text);
     if !sections.iter().any(|(name, _)| !name.is_empty()) {
-        return Vec::new();
+        // 对齐 Python：无 [Sheet] 标记时回退通用递归切块（child 粒度）。
+        let overlap = CHILD_CHUNK_OVERLAP.min(CHILD_CHUNK_SIZE / 3);
+        return split_text_chunks(text, CHILD_CHUNK_SIZE, overlap);
     }
     let mut chunks = Vec::new();
     for (sheet_name, sheet_lines) in sections {
@@ -1394,7 +1396,10 @@ pub async fn append_to_milvus_lite(
     let columns: Vec<ArrayRef> = vec![
         std::sync::Arc::new(Int64Array::from(seq_values)),
         std::sync::Arc::new(Int64Array::from(pk_values)),
-        std::sync::Arc::new(StringArray::from(vec![""; n])),
+        // 对齐 Python child_payload：text 列同样写 child_text（与 chunk_text 一致）。
+        std::sync::Arc::new(StringArray::from(
+            child_rows.iter().map(|c| c.child_text.clone()).collect::<Vec<_>>(),
+        )),
         std::sync::Arc::new(vector_array) as ArrayRef,
         std::sync::Arc::new(StringArray::from(child_rows.iter().map(|c| c.document_id.clone()).collect::<Vec<_>>())),
         std::sync::Arc::new(Int64Array::from(chunk_indexes)),

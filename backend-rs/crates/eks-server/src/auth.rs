@@ -130,8 +130,20 @@ pub fn hash_password(password: &str, salt_hex: Option<&str>) -> (String, String)
 
 pub fn verify_password(password: &str, salt_hex: &str, expected_hash_hex: &str) -> bool {
     let (_, computed) = hash_password(password, Some(salt_hex));
-    // 恒定时间比较（与 Python hmac.compare_digest 等价语义）
-    computed == expected_hash_hex
+    // 恒定时间比较（与 Python hmac.compare_digest 等价语义）：
+    // 逐字节异或累积，避免提前返回造成时序侧信道。
+    constant_time_eq(computed.as_bytes(), expected_hash_hex.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn hash_token(token: &str) -> String {

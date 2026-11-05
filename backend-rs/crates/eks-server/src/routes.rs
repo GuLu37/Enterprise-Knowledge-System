@@ -538,16 +538,12 @@ pub async fn execute_skill(
     crate::validate::skill_name_field(&request.name)?;
     let name = request.name.trim();
     let manifests = &state.config.mcp_remote_tool_manifests;
-    let Some(definition) = crate::skills::get_skill_definition_from(name, manifests) else {
+    // 未知技能 404；remote_mcp 不在此提前返回，统一走 execute_named_from，
+    // 对齐 Python execute_skill 的三段 trace 日志（调用开始/调用异常）。
+    if crate::skills::get_skill_definition_from(name, manifests).is_none() {
         return Err(AuthError {
             status: StatusCode::NOT_FOUND,
             detail: crate::skills::skill_not_found_http_detail(name),
-        });
-    };
-    if definition.kind == "remote_mcp" {
-        return Err(AuthError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            detail: crate::remote_mcp::execution_error_message(&definition),
         });
     }
     let context = crate::skills::SkillExecutionContext {
