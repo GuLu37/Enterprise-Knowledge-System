@@ -1332,6 +1332,8 @@ pub async fn append_to_milvus_lite(
         return Ok(());
     }
     let embedding_dimension = embedding_dimension.max(1);
+    // 全新 milvus_lite.db 首次写入时集合尚不存在，先确保布局（对齐 append_memory_chunks）。
+    crate::milvus_lite::ensure_collection(&store.root, collection)?;
     crate::milvus_lite::ensure_collection_dimension(&store.root, collection, embedding_dimension)?;
     for vector in vectors {
         crate::milvus_lite::validate_vector_dimension(collection, vector.len(), embedding_dimension)?;
@@ -1441,6 +1443,30 @@ pub async fn append_to_milvus_lite(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn append_to_milvus_lite_creates_collection_on_fresh_store() {
+        // 回归：全新 milvus_lite.db（无任何集合）首次写入不应报「manifest 读取失败」。
+        let root = std::env::temp_dir().join(format!("eks-milvus-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = crate::milvus_lite::MilvusLiteStore::open(&root);
+        let rows = vec![ChildRow {
+            child_id: "doc:c000001".into(),
+            parent_id: "doc:p000001".into(),
+            document_id: "doc".into(),
+            parent_index: 0,
+            child_index: 0,
+            child_text: "出差结束后最晚 15 天内提交报销单。".into(),
+        }];
+        let vectors = vec![vec![0.1f32; 4]];
+        append_to_milvus_lite(&store, "doc_chunk", &rows, "手册.md", "md", "text", &vectors, 4)
+            .await
+            .expect("全新库首次写入应自动创建集合布局");
+        assert!(root.join("collections").join("doc_chunk").join("manifest.json").is_file());
+        let manifest = std::fs::read_to_string(root.join("collections").join("doc_chunk").join("manifest.json")).unwrap();
+        assert!(manifest.contains("data_000001_000001.parquet"), "manifest 应登记新数据文件: {manifest}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn decodes_utf8_and_gbk_text_files() {
