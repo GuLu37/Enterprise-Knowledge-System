@@ -1,21 +1,23 @@
-"""检索链路延迟基准脚本（零文件 I/O 版）。
+"""RAG 检索延迟基准（纯 HTTP 版，仅依赖 eks-server）。
 
-用法（在 backend/ 目录下执行）:
-    PYTHONPATH=. python scripts/bench_retrieval.py
-    PYTHONPATH=. python scripts/bench_retrieval.py --limit 10
-    PYTHONPATH=. python scripts/bench_retrieval.py --no-cross-encoder   # 关精排对照
-    PYTHONPATH=. python scripts/bench_retrieval.py | tee bench_out.json # 需留档时重定向
+用法（先启动 Rust 后端，如 cargo run --release）:
+    python scripts/bench_retrieval.py
+    python scripts/bench_retrieval.py --limit 10
+    python scripts/bench_retrieval.py --base-url http://127.0.0.1:8000
+    python scripts/bench_retrieval.py | tee bench_out.json   # 需留档时重定向
 
-本脚本不读写任何文件、不接受路径参数：41 条查询内联自
-docs/rrf_ablation_eval.json（更新数据集时同步此常量），结果仅打印 stdout。
+原 Python 进程内基准已随 Python 后端退役；本脚本打 /api/v1/retrieval/rag，
+逐查询清缓存计时。41 条查询内联自 docs/rrf_ablation_eval.json（更新数据集时同步）。
 
-指标: 每条查询端到端耗时（清缓存后计时）、P50/P95/均值、
-      recall@k / MRR@10（依据 relevant_sources 判断命中）。
+指标: 每条查询端到端耗时、P50/P95/均值、recall@k / MRR@10（依据 relevant_sources 判断命中）。
 """
 import argparse
+import http.client
 import json
+import os
 import statistics
 import time
+from urllib.parse import urlparse
 
 # (id, query, relevant_sources) — 源: docs/rrf_ablation_eval.json
 EVAL_QUERIES = [
@@ -77,43 +79,43 @@ def _is_hit(result_meta: dict, relevant_sources: list) -> bool:
     )
 
 
-def run_bench_http(args: argparse.Namespace) -> dict:
-    """HTTP 模式：打 /api/v1/retrieval/rag（Rust 或 Python 后端），逐查询清缓存计时。"""
-    import http.client
-    from urllib.parse import urlparse
+def _load_admin_password() -> str:
+    """优先环境变量，其次 backend/.env（eks-server 与其共享同一配置文件）。"""
+    from_env = os.environ.get("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    if from_env:
+        return from_env
+    for env_path in ("../../backend/.env", "../backend/.env", ".env"):
+        try:
+            with open(env_path, encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("BOOTSTRAP_ADMIN_PASSWORD="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return ""
 
+
+def run_bench(args: argparse.Namespace) -> dict:
     parsed = urlparse(args.base_url)
     host, port = parsed.hostname, parsed.port or 80
-    prefix = args.base_url.rstrip("/").split(host)[-1].lstrip(":0123456789") or ""
-    base_prefix = prefix or "/api/v1"
-
     conn = http.client.HTTPConnection(host, port, timeout=120)
 
     def call(method, path, body=None, token=None):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        conn.request(method, base_prefix + path, json.dumps(body) if body else None, headers)
+        conn.request(method, args.prefix + path, json.dumps(body) if body else None, headers)
         resp = conn.getresponse()
         payload = resp.read().decode()
         return resp.status, json.loads(payload) if payload else {}
 
-    pw = ""
-    for env_path in (".env", "../backend/.env"):
-        try:
-            for line in open(env_path, encoding="utf-8"):
-                if line.startswith("BOOTSTRAP_ADMIN_PASSWORD="):
-                    pw = line.split("=", 1)[1].strip()
-                    break
-        except OSError:
-            continue
-        if pw:
-            break
-    assert pw, "未找到 BOOTSTRAP_ADMIN_PASSWORD"
-    status, login = call("POST", "/auth/login", {"username": "admin", "password": pw})
+    pw = args.password or _load_admin_password()
+    assert pw, "未找到 BOOTSTRAP_ADMIN_PASSWORD（环境变量或 backend/.env）"
+    status, login = call("POST", "/auth/login", {"username": args.username, "password": pw})
     assert status == 200, f"登录失败: {status} {login}"
     token = login["access_token"]
-    print(f"[bench-http] 目标 {host}:{port}{base_prefix} 登录成功，预热一次请求...")
+    print(f"[bench] 目标 {host}:{port}{args.prefix} 登录成功，预热一次请求...")
+    _, runtime = call("GET", "/chat/runtime-status", token=token)
     call("POST", "/retrieval/cache-clear", {}, token)
     call("POST", "/retrieval/rag", {"query": "预热", "top_k": args.top_k}, token)
 
@@ -124,6 +126,7 @@ def run_bench_http(args: argparse.Namespace) -> dict:
         t0 = time.perf_counter()
         status, rag = call("POST", "/retrieval/rag", {"query": query, "top_k": args.top_k}, token)
         elapsed = time.perf_counter() - t0
+        assert status == 200, f"查询失败: {status} {rag}"
         results = rag.get("results") or []
         hit_rank = None
         for rank, entry in enumerate(results, start=1):
@@ -141,17 +144,9 @@ def run_bench_http(args: argparse.Namespace) -> dict:
             "result_count": len(results), "hit_rank": hit_rank,
             "top_sources": [(e.get("metadata") or {}).get("source_name") for e in results[:3]],
         })
-        print(f"[bench-http] {index}/{len(dataset)} {elapsed*1000:8.1f}ms "
+        print(f"[bench] {index}/{len(dataset)} {elapsed*1000:8.1f}ms "
               f"hit@{args.top_k}={'Y' if hit_rank else 'N'} q={query[:24]}")
 
-    summary = _summarize(records, rerank_stage_counter, args)
-    print("\n[bench-http] ===== 汇总 =====")
-    print(json.dumps({k: v for k, v in summary.items() if k != "records"},
-                     ensure_ascii=False, indent=2))
-    return summary
-
-
-def _summarize(records, rerank_stage_counter, args) -> dict:
     seconds = [item["seconds"] for item in records]
     sorted_seconds = sorted(seconds)
     total = len(records)
@@ -166,9 +161,10 @@ def _summarize(records, rerank_stage_counter, args) -> dict:
         )
         return sorted_seconds[position]
 
-    return {
+    summary = {
         "config": {
-            "cross_encoder_enabled": False,
+            "cross_encoder_enabled": runtime.get("cross_encoder_enabled"),
+            "cross_encoder_device": runtime.get("cross_encoder_device"),
             "query_count": total,
             "top_k": args.top_k,
             "method": args.method,
@@ -190,136 +186,20 @@ def _summarize(records, rerank_stage_counter, args) -> dict:
         "records": records,
     }
 
-
-def run_bench(args: argparse.Namespace) -> dict:
-    if args.base_url:
-        return run_bench_http(args)
-    from app.config import settings
-    from app.storage.sqlite_metadata import init_metadata_db
-    from app.storage.milvus_store import initialize_collections, warmup_collections
-    from app.core.embeddings import get_default_embeddings
-    from app.services.retrieval_service import (
-        clear_rag_result_cache,
-        run_rag_workflow,
-    )
-
-    dataset = EVAL_QUERIES[: args.limit or None]
-    if args.no_cross_encoder:
-        settings.CROSS_ENCODER_ENABLED = False
-
-    print("[bench] 初始化元数据库与 Milvus collection...")
-    init_metadata_db()
-    if not initialize_collections():
-        raise RuntimeError("Milvus collection 初始化失败，无法运行基准")
-    warmup_collections()
-    print("[bench] 预热 embedding 模型...")
-    get_default_embeddings()
-    print(
-        f"[bench] 配置: cross_encoder={settings.CROSS_ENCODER_ENABLED}, "
-        f"queries={len(dataset)}, top_k={args.top_k}, method={args.method}"
-    )
-
-    records = []
-    rerank_stage_counter: dict = {}
-    for index, (item_id, query, relevant_sources) in enumerate(dataset, start=1):
-        clear_rag_result_cache()
-        started_at = time.perf_counter()
-        result = run_rag_workflow(
-            query=query,
-            top_k=args.top_k,
-            retrieval_method=args.method,
-            llm=None,
-        )
-        elapsed = time.perf_counter() - started_at
-
-        results = result.results or []
-        hit_rank = None
-        for rank, entry in enumerate(results, start=1):
-            if _is_hit(entry.metadata or {}, relevant_sources):
-                hit_rank = rank
-                break
-            if rank >= 10:
-                break
-        for entry in results:
-            stage = (entry.metadata or {}).get("rerank_stage")
-            if stage:
-                rerank_stage_counter[stage] = rerank_stage_counter.get(stage, 0) + 1
-
-        records.append(
-            {
-                "id": item_id,
-                "query": query,
-                "seconds": round(elapsed, 4),
-                "result_count": len(results),
-                "hit_rank": hit_rank,
-                "top_sources": [
-                    (entry.metadata or {}).get("source_name") for entry in results[:3]
-                ],
-            }
-        )
-        print(
-            f"[bench] {index}/{len(dataset)} {elapsed*1000:8.1f}ms "
-            f"hit@{args.top_k}={'Y' if hit_rank else 'N'} q={query[:24]}"
-        )
-
-    seconds = [item["seconds"] for item in records]
-    sorted_seconds = sorted(seconds)
-    total = len(records)
-    hits = sum(1 for item in records if item["hit_rank"] is not None)
-
-    def percentile(fraction: float) -> float:
-        if not sorted_seconds:
-            return 0.0
-        position = min(
-            len(sorted_seconds) - 1,
-            max(0, round(fraction * (len(sorted_seconds) - 1))),
-        )
-        return sorted_seconds[position]
-
-    summary = {
-        "config": {
-            "cross_encoder_enabled": settings.CROSS_ENCODER_ENABLED,
-            "query_count": total,
-            "top_k": args.top_k,
-            "method": args.method,
-        },
-        "latency": {
-            "mean_seconds": round(statistics.mean(seconds), 4) if seconds else 0.0,
-            "p50_seconds": round(percentile(0.50), 4),
-            "p95_seconds": round(percentile(0.95), 4),
-            "total_seconds": round(sum(seconds), 3),
-        },
-        "quality": {
-            f"recall@{args.top_k}": round(hits / total, 4) if total else 0.0,
-            "mrr@10": round(
-                sum(1.0 / item["hit_rank"] for item in records if item["hit_rank"])
-                / total,
-                4,
-            )
-            if total
-            else 0.0,
-        },
-        "rerank_stages": rerank_stage_counter,
-        "records": records,
-    }
-
     print("\n[bench] ===== 汇总 =====")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG 检索延迟基准")
+    parser = argparse.ArgumentParser(description="RAG 检索延迟基准（纯 HTTP，打 eks-server）")
+    parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8000")
+    parser.add_argument("--prefix", type=str, default="/api/v1")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--method", type=str, default="hybrid")
-    parser.add_argument("--no-cross-encoder", action="store_true")
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default="",
-        help="HTTP 模式：如 http://127.0.0.1:8001（打 /api/v1/retrieval/rag）",
-    )
+    parser.add_argument("--username", type=str, default="admin")
+    parser.add_argument("--password", type=str, default="")
     run_bench(parser.parse_args())
 
 
