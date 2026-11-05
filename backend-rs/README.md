@@ -128,6 +128,21 @@ docker compose up eks-server
 > 开启且工件就绪时 adaptive 门控在本数据集上均跳过精排（rule_only_small_pool /
 > rule_only_identifier），延迟与纯规则一致。复测命令见 `scripts/bench_retrieval.py`。
 
+### 文档批量入库提速（可选 int8 量化模型）
+
+BGE embedding 是入库链路的绝对瓶颈（解析/切块/写入仅毫秒级）；`BGE_BATCH_SIZE`
+16→64 实测无增益（ort 线程池已打满）。将 `EKS_BGE_MODEL_DIR` 指向 **int8 量化模型**
+（如 Xenova 导出的 `model_quantized.onnx`，102MB，重命名为 `onnx/model.onnx` 放置）
+可再提速约 2 倍：
+
+| 模型 | 7 份文档全量入库 | 检索 mean | recall@5 | MRR@10 |
+|---|---|---|---|---|
+| fp32（默认，407MB） | 24.5s | 0.11s | 0.878 | 0.7276 |
+| int8 量化（102MB） | **12.7s** | 0.18s | 0.8537 | 0.7683 |
+
+注意：查询与库向量必须来自同一编码器——**切换模型后需删除并重新上传全部文档**，
+不可混用；质量优先场景建议保持 fp32。
+
 ## 与 Python 基线的关系
 
 后端已从 Python 全量重写为 Rust 并移除 Python 实现。迁移期以 Python 行为为基线逐项对齐
