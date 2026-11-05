@@ -810,6 +810,102 @@ pub async fn build_long_term_memory_messages(
     route: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
 ) -> Vec<ChatMessage> {
+    build_long_term_memory_messages_inner(
+        pool,
+        user_id,
+        query,
+        conversation_id,
+        session_id,
+        top_k,
+        embedder,
+        route,
+        recent_history,
+        None,
+    )
+    .await
+}
+
+/// 对齐 Python `MemoryContext`：一次请求内复用画像读取与按 route 的最终消息，
+/// 消除 skill 多轮 + 最终组消息路径上的重复画像 SQL 与事件记忆检索。
+pub struct MemoryContext<'a> {
+    pool: &'a sqlx::SqlitePool,
+    user_id: &'a str,
+    query: &'a str,
+    conversation_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    embedder: Option<&'a Embedder>,
+    profile: std::sync::Mutex<Option<String>>,
+    routes:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<ChatMessage>>>>,
+}
+
+impl<'a> MemoryContext<'a> {
+    pub fn new(
+        pool: &'a sqlx::SqlitePool,
+        user_id: &'a str,
+        query: &'a str,
+        conversation_id: Option<&'a str>,
+        session_id: Option<&'a str>,
+        embedder: Option<&'a Embedder>,
+    ) -> Self {
+        MemoryContext {
+            pool,
+            user_id,
+            query,
+            conversation_id,
+            session_id,
+            embedder,
+            profile: std::sync::Mutex::new(None),
+            routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 等价 `build_long_term_memory_messages`，同 route 二次调用直接命中缓存。
+    pub async fn messages(
+        &self,
+        route: Option<&str>,
+        top_k: usize,
+        recent_history: &[crate::short_memory::MemoryMessage],
+    ) -> std::sync::Arc<Vec<ChatMessage>> {
+        let key = route.map(str::trim).unwrap_or("").to_string();
+        if let Some(cached) = self.routes.lock().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let messages = std::sync::Arc::new(
+            build_long_term_memory_messages_inner(
+                self.pool,
+                self.user_id,
+                self.query,
+                self.conversation_id,
+                self.session_id,
+                top_k,
+                self.embedder,
+                route,
+                recent_history,
+                Some(&self.profile),
+            )
+            .await,
+        );
+        self.routes
+            .lock()
+            .unwrap()
+            .insert(key, messages.clone());
+        messages
+    }
+}
+
+async fn build_long_term_memory_messages_inner(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+    embedder: Option<&Embedder>,
+    route: Option<&str>,
+    recent_history: &[crate::short_memory::MemoryMessage],
+    profile_cache: Option<&std::sync::Mutex<Option<String>>>,
+) -> Vec<ChatMessage> {
     if user_id.trim().is_empty() {
         return Vec::new();
     }
@@ -823,7 +919,21 @@ pub async fn build_long_term_memory_messages(
         top_k
     };
     let mut messages = Vec::new();
-    let profile = profile_prompt(pool, user_id).await;
+    let profile = match profile_cache {
+        Some(cache) => {
+            // 先把缓存值 clone 出来再 match，避免 MutexGuard 跨 await 持有（Send 约束）。
+            let cached = cache.lock().unwrap().clone();
+            match cached {
+                Some(value) => value,
+                None => {
+                    let fresh = profile_prompt(pool, user_id).await;
+                    *cache.lock().unwrap() = Some(fresh.clone());
+                    fresh
+                }
+            }
+        }
+        None => profile_prompt(pool, user_id).await,
+    };
     if !profile.is_empty() {
         messages.push(ChatMessage::new("system", profile));
     }
@@ -2897,6 +3007,21 @@ fn parse_json_object(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn memory_context_caches_messages_by_route() {
+        // 空 user_id 走短路路径不触库；同 route 二次调用必须返回同一份 Arc（缓存命中）。
+        let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let ctx = MemoryContext::new(&pool, "", "查一下差旅标准", None, None, None);
+        let history = vec![crate::short_memory::MemoryMessage {
+            role: "user".into(),
+            content: "差旅标准是什么".into(),
+        }];
+        let first = ctx.messages(Some("skill"), 0, &history).await;
+        let second = ctx.messages(Some("skill"), 0, &history).await;
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(first.is_empty());
+    }
 
     #[test]
     fn clamp_score_any_parses_strings_like_python() {

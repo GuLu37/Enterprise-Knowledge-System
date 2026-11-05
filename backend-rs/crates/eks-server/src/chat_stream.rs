@@ -201,6 +201,8 @@ struct SkillActionInput<'a> {
     llm: Option<Arc<LlmClient>>,
     /// 渐进披露的整会话兜底：Python 仅非流式路径启用，流式路径不兜底。
     conversation_fallback: bool,
+    /// 请求级记忆缓存：一次请求内 skill 多轮复用画像与按 route 的消息。
+    memory: Option<&'a crate::memory::MemoryContext<'a>>,
 }
 
 impl<'a> SkillActionInput<'a> {
@@ -309,18 +311,22 @@ async fn prepare_skill_action(
     }
     let fallback = crate::skills::format_skill_answer(&answer_name, &answer_result);
     let (messages, generate_messages) = if input.llm.is_some() {
-        let long_term = crate::memory::build_long_term_memory_messages(
-            input.pool,
-            input.user_id,
-            input.query,
-            nonempty(input.conversation_id),
-            nonempty(input.session_id),
-            0,
-            Some(input.embedder),
-            Some("skill"),
-            &history_messages,
-        )
-        .await;
+        let long_term = match input.memory {
+            // 请求级缓存：skill 循环多轮共享同一份 route=skill 消息与画像。
+            Some(ctx) => (*ctx.messages(Some("skill"), 0, &history_messages).await).clone(),
+            None => crate::memory::build_long_term_memory_messages(
+                input.pool,
+                input.user_id,
+                input.query,
+                nonempty(input.conversation_id),
+                nonempty(input.session_id),
+                0,
+                Some(input.embedder),
+                Some("skill"),
+                &history_messages,
+            )
+            .await,
+        };
         let history_messages = crate::short_memory::assemble(
             &history_messages,
             input.options,
@@ -1355,7 +1361,12 @@ pub async fn warmup_chat_runtime(state: &AppState) -> RuntimeWarmup {
             }
         }
     } else {
-        result.cross_encoder_error = Some("Cross-Encoder 未加载，检索将使用规则重排".into());
+        // 透出启动期加载失败的根因（如 onnx/tokenizer 文件缺失），对齐 Python warmup_cross_encoder 的 error 透传。
+        let detail = match &state.engine.cross_encoder_load_error {
+            Some(root) => format!("Cross-Encoder 未加载，检索将使用规则重排: {root}"),
+            None => "Cross-Encoder 未加载，检索将使用规则重排".to_string(),
+        };
+        result.cross_encoder_error = Some(detail);
     }
 
     result.finalize_status();
@@ -1516,6 +1527,15 @@ pub async fn generate_chat(
         require_configured_llm(&llm_client)?;
     }
     let mcp_manifests = state.config.mcp_remote_tool_manifests.clone();
+    // 请求级记忆缓存：对齐 Python MemoryContext，一次请求内复用画像与按 route 消息。
+    let memory_ctx = crate::memory::MemoryContext::new(
+        &state.pool,
+        &user.user_id,
+        &query,
+        nonempty(&conversation_id),
+        nonempty(&session_id),
+        Some(&state.engine.embedder),
+    );
 
     let intent = crate::intent::route_query_action(
         &query,
@@ -1541,6 +1561,7 @@ pub async fn generate_chat(
                 mcp_manifests: &mcp_manifests,
                 llm: Some(llm_client.clone()),
                 conversation_fallback: true,
+                memory: Some(&memory_ctx),
             },
             &intent,
         )
@@ -1633,18 +1654,10 @@ pub async fn generate_chat(
         })));
     }
     let history = memory_history(&request.history);
-    let long_term = crate::memory::build_long_term_memory_messages(
-        &state.pool,
-        &user.user_id,
-        &query,
-        nonempty(&conversation_id),
-        nonempty(&session_id),
-        0,
-        Some(&state.engine.embedder),
-        Some(&intent.route),
-        &history,
-    )
-    .await;
+    let long_term = (*memory_ctx
+        .messages(Some(&intent.route), 0, &history)
+        .await)
+    .clone();
     let history_messages = crate::short_memory::assemble(
         &history,
         &options,
@@ -1764,6 +1777,15 @@ pub async fn stream_chat(
         yield Ok(sse_json("intent", intent.to_json()));
         let mut working_history = history.clone();
         let mut last_skill_name = String::new();
+        // 请求级记忆缓存：skill 循环 ×N + 最终组消息共享画像与按 route 消息。
+        let memory_ctx = crate::memory::MemoryContext::new(
+            &pool,
+            &user_id,
+            &query,
+            nonempty(&conversation_id),
+            nonempty(&session_id),
+            Some(&engine.embedder),
+        );
 
         if intent.route == "skill" {
             let mut exhausted = false;
@@ -1796,6 +1818,7 @@ pub async fn stream_chat(
                         mcp_manifests: &mcp_manifests,
                         llm: Some(llm_client.clone()),
                         conversation_fallback: false,
+                        memory: Some(&memory_ctx),
                     },
                     &intent,
                 )
@@ -2110,18 +2133,10 @@ pub async fn stream_chat(
         }
 
         let memory_history = memory_history(&history);
-        let long_term = crate::memory::build_long_term_memory_messages(
-            &pool,
-            &user_id,
-            &query,
-            nonempty(&conversation_id),
-            nonempty(&session_id),
-            0,
-            Some(&engine.embedder),
-            Some(&intent.route),
-            &memory_history,
-        )
-        .await;
+        let long_term = (*memory_ctx
+            .messages(Some(&intent.route), 0, &memory_history)
+            .await)
+        .clone();
         let history_messages = match crate::short_memory::assemble(
             &memory_history,
             &options,
