@@ -128,20 +128,27 @@ docker compose up eks-server
 > 开启且工件就绪时 adaptive 门控在本数据集上均跳过精排（rule_only_small_pool /
 > rule_only_identifier），延迟与纯规则一致。复测命令见 `scripts/bench_retrieval.py`。
 
-### 文档批量入库提速（可选 int8 量化模型）
+### 文档批量入库提速（GPU / int8 量化两种方案）
 
-BGE embedding 是入库链路的绝对瓶颈（解析/切块/写入仅毫秒级）；`BGE_BATCH_SIZE`
-16→64 实测无增益（ort 线程池已打满）。将 `EKS_BGE_MODEL_DIR` 指向 **int8 量化模型**
-（如 Xenova 导出的 `model_quantized.onnx`，102MB，重命名为 `onnx/model.onnx` 放置）
-可再提速约 2 倍：
+BGE embedding 是入库链路的绝对瓶颈（解析/切块/写入仅毫秒级）。实测三种模式
+（7 份演示文档、i5-14400F + RTX 3050 6GB、41 查询基准）：
 
-| 模型 | 7 份文档全量入库 | 检索 mean | recall@5 | MRR@10 |
-|---|---|---|---|---|
-| fp32（默认，407MB） | 24.5s | 0.11s | 0.878 | 0.7276 |
-| int8 量化（102MB） | **12.7s** | 0.18s | 0.8537 | 0.7683 |
+| 模式 | 配置 | 全量入库 | 检索 mean | recall@5 | MRR@10 |
+|---|---|---|---|---|---|
+| fp32 CPU（默认） | `BGE_DEVICE=cpu` | 24.5s | 0.11s | 0.878 | 0.7276 |
+| int8 CPU | `EKS_BGE_MODEL_DIR`→量化模型 | 12.7s | 0.18s | 0.854 | 0.7683 |
+| **fp32 GPU (DirectML)** | `BGE_DEVICE=directml` | **9.6s** | 0.29s | **0.902** | **0.793** |
 
-注意：查询与库向量必须来自同一编码器——**切换模型后需删除并重新上传全部文档**，
-不可混用；质量优先场景建议保持 fp32。
+说明：
+- `BGE_BATCH_SIZE` 16→64 在 CPU 与 GPU 下均无额外增益（瓶颈已不在批大小）。
+- **GPU 走 DirectML**（Windows DX12，免 CUDA 工具链）：`ort` 启用 `directml`
+  feature，并将 [Microsoft.AI.DirectML](https://www.nuget.org/packages/Microsoft.AI.DirectML)
+  包内 `bin/x64-win/DirectML.dll` 放到 `eks-server.exe` 同目录；设置
+  `BGE_DEVICE=directml`（`CROSS_ENCODER_DEVICE` 同理）。初始化失败自动回退 CPU 并告警。
+- **int8 量化**：Xenova 导出的 `model_quantized.onnx`（102MB）重命名为
+  `onnx/model.onnx` 放入新模型目录，`EKS_BGE_MODEL_DIR` 指向即可。
+  ⚠️ int8 模型与 DirectML 不兼容（量化算子回退 CPU 反而更慢），GPU 场景请配 fp32。
+- ⚠️ 查询与库向量必须来自同一编码器——**切换模型/设备后需删除并重新上传全部文档**。
 
 ## 与 Python 基线的关系
 

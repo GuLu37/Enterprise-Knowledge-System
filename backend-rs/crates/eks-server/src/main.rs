@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokenizer_path: std::path::PathBuf::from(&config.cross_encoder_tokenizer),
                 max_length: config.cross_encoder_max_length,
                 batch_size: config.cross_encoder_batch_size,
+                device: config.cross_encoder_device.clone(),
             },
         ) {
             Ok(ce) => {

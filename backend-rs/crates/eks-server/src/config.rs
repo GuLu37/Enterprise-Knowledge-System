@@ -37,8 +37,10 @@ pub struct Config {
     pub cross_encoder_confidence_threshold: f64,
     pub cross_encoder_confidence_margin: f64,
     pub cross_encoder_trigger_mode: String,
-    /// 对齐 Python `CROSS_ENCODER_DEVICE` 的 HTTP 回显；ONNX 推理仍走 CPU，不迁 HF device。
+    /// 对齐 Python `CROSS_ENCODER_DEVICE` 的 HTTP 回显；directml/gpu 时尝试 GPU 推理，失败回退 CPU。
     pub cross_encoder_device: String,
+    /// BGE 推理设备：cpu（默认）/ directml|dml|gpu（DirectML，失败回退 CPU）。
+    pub bge_device: String,
     pub llm_provider: String,
     pub llm_temperature: f64,
     pub llm_timeout: u64,
@@ -631,6 +633,7 @@ impl Config {
             cross_encoder_confidence_margin: env_f64("CROSS_ENCODER_CONFIDENCE_MARGIN", 0.08).clamp(0.0, 1.0),
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
             cross_encoder_device: env_or("CROSS_ENCODER_DEVICE", "auto"),
+            bge_device: env_or("BGE_DEVICE", "cpu"),
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
             llm_timeout: env_i64("LLM_TIMEOUT", 60).max(1) as u64,
@@ -758,6 +761,7 @@ impl Config {
             cross_encoder_confidence_margin: 0.08,
             cross_encoder_trigger_mode: "adaptive".into(),
             cross_encoder_device: "auto".into(),
+            bge_device: "cpu".into(),
             llm_provider: "ollama".into(),
             llm_temperature: 0.7,
             llm_timeout: 60,

@@ -22,6 +22,8 @@ pub struct CrossEncoderConfig {
     pub tokenizer_path: std::path::PathBuf,
     pub max_length: usize,
     pub batch_size: usize,
+    /// 推理设备：cpu / directml|dml|gpu（失败回退 CPU）。
+    pub device: String,
 }
 
 impl CrossEncoder {
@@ -43,17 +45,9 @@ impl CrossEncoder {
             .ok_or("cross-encoder vocab 缺少 <pad>")? as i64;
 
         let environment = crate::embedder::ort_environment_shared()?;
-        let session = ort::session::Session::builder(environment)
-            .and_then(|b| {
-                b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(
-                        std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4),
-                    )?
-                    .commit_from_file(&config.onnx_path)
-            })
-            .map_err(|e| format!("Cross-Encoder session 初始化失败: {}", e))?;
+        let session =
+            crate::embedder::build_ort_session(environment, &config.device, &config.onnx_path)
+                .map_err(|e| format!("Cross-Encoder session 初始化失败: {e}"))?;
         Ok(CrossEncoder {
             session: Mutex::new(session),
             tokenizer,

@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 eks-kernels = { path = "../eks-kernels" }
-ort = { version = "2.0.0-rc.15" }
+ort = { version = "2.0.0-rc.15", features = ["directml"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 async-stream = "0.3"
 futures-util = "0.3"

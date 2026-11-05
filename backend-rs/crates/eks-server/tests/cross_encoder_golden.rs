@@ -48,6 +48,8 @@ fn cross_encoder_matches_torch_golden() {
         tokenizer_path: snapshot.join("tokenizer.json"),
         max_length: 512,
         batch_size: 8,
+        // 金分对拍固定 CPU，保证数值可复现。
+        device: "cpu".into(),
     };
     let encoder = CrossEncoder::load(&config).expect("cross-encoder 初始化失败");
     let actual = encoder

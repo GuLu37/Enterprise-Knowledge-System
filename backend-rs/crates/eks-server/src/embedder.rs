@@ -11,6 +11,52 @@ use tokenizers::Tokenizer;
 
 static ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
 
+/// 按设备偏好构建 ONNX session：
+/// - cpu（含空/auto）：纯 CPU（保持与金向量对拍可复现）
+/// - directml / dml / gpu / cuda：尝试 DirectML（Windows DX12 GPU，免 CUDA 工具链，
+///   需在 exe 旁放置 DirectML.dll），初始化失败自动回退 CPU 并告警。
+/// 供 embedder 与 cross_encoder 共用。
+pub fn build_ort_session(
+    environment: &ort::environment::Environment,
+    device: &str,
+    onnx_path: &std::path::Path,
+) -> Result<ort::session::Session, String> {
+    let normalized = device.trim().to_lowercase();
+    let wants_gpu = matches!(
+        normalized.as_str(),
+        "directml" | "dml" | "gpu" | "cuda"
+    );
+    if wants_gpu {
+        let attempt = ort::session::Session::builder(environment).and_then(|b| {
+            b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+                .with_execution_providers([ort::ep::DirectML::default().build()])?
+                .commit_from_file(onnx_path)
+        });
+        match attempt {
+            Ok(session) => {
+                tracing::info!("ONNX session 已启用 DirectML (GPU): {}", onnx_path.display());
+                return Ok(session);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "DirectML 初始化失败，回退 CPU（需在 exe 旁放置 DirectML.dll 且系统支持 DX12）: {err}"
+                );
+            }
+        }
+    }
+    ort::session::Session::builder(environment)
+        .and_then(|b| {
+            b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+                .with_intra_threads(
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4),
+                )?
+                .commit_from_file(onnx_path)
+        })
+        .map_err(|e| format!("ONNX session 初始化失败: {e}"))
+}
+
 pub fn ort_environment_shared() -> Result<&'static ort::environment::Environment, String> {
     if let Some(env) = ORT_ENV.get() {
         return Ok(env);
@@ -41,6 +87,8 @@ pub struct EmbedderConfig {
     pub max_length: usize,
     pub batch_size: usize,
     pub normalize_embeddings: bool,
+    /// 推理设备：cpu（默认）/ directml|dml|gpu（DirectML，失败回退 CPU）。
+    pub device: String,
 }
 
 impl EmbedderConfig {
@@ -51,6 +99,7 @@ impl EmbedderConfig {
             max_length: config.bge_max_length as usize,
             batch_size: config.bge_batch_size.max(1),
             normalize_embeddings: config.bge_normalize_embeddings,
+            device: config.bge_device.clone(),
         }
     }
 
@@ -82,17 +131,7 @@ impl Embedder {
             .ok_or("vocab 缺少 [PAD]")? as i64;
 
         let environment = ort_environment_shared()?;
-        let session = ort::session::Session::builder(environment)
-            .and_then(|b| {
-                b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(
-                        std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4),
-                    )?
-                    .commit_from_file(&onnx_path)
-            })
-            .map_err(|e| format!("ONNX session 初始化失败: {}", e))?;
+        let session = build_ort_session(environment, &config.device, &onnx_path)?;
         Ok(Embedder {
             session: std::sync::Mutex::new(session),
             tokenizer,
@@ -228,6 +267,7 @@ pub fn embedder_for(model_dir: &Path, instruction: &str, max_length: usize) -> R
         max_length,
         batch_size: 16,
         normalize_embeddings: true,
+        device: "cpu".into(),
     })
 }
 
