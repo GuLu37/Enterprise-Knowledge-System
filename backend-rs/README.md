@@ -115,6 +115,12 @@ docker compose up eks-server
 | 迁移前 Python 基线（历史数据） | 2.92s | 4.79s | 0.9024 | 0.8618 |
 | **Rust 后端** | **0.104s** | **0.120s** | **0.9512** | **0.9024** |
 
+> 指标对模型导出物与运行环境敏感：迁移期读数基于当时开发机的原始 ONNX 导出。
+> 2026-11 验收复测（hf-mirror Xenova fp32 ONNX、多查询候选池修复后）：mean 0.11s /
+> P95 0.14s / recall@5 0.878 / MRR@10 0.7276，与 Python 基线同量级；Cross-Encoder
+> 开启且工件就绪时 adaptive 门控在本数据集上均跳过精排（rule_only_small_pool /
+> rule_only_identifier），延迟与纯规则一致。复测命令见 `scripts/bench_retrieval.py`。
+
 ## 与 Python 基线的关系
 
 后端已从 Python 全量重写为 Rust 并移除 Python 实现。迁移期以 Python 行为为基线逐项对齐
