@@ -1,6 +1,8 @@
 # Enterprise Knowledge System — Rust 后端
 
-高性能企业知识库 RAG 系统，后端从 Python 全量重写为单一 Rust 二进制（`eks-server`）。
+高性能企业知识库 RAG 系统的**单体 Rust 后端**（单一二进制 `eks-server`）。
+项目最初以 Python 实现，后全量重写为 Rust 并移除 Python 代码；行为对齐记录见
+「全量Rust化」系列提交与源码内注释，`backend/` 目录现仅保留运行时资产。
 
 ## 架构
 
@@ -25,20 +27,22 @@
 ## 检索链路
 
 ```
-用户查询 → 意图路由（规则快判 skill/direct/rag，冲突或模糊时 LLM 消歧）
-用户查询 → 多查询启发式扩展（含编号保护/结构化别名）
+用户查询 → 意图路由 intent.rs（规则快判 skill/direct/rag，冲突或模糊时 LLM 消歧）
+用户查询 → 多查询启发式扩展 retrieval.rs（含编号保护/结构化别名）
   ├─ Dense: BGE ONNX 向量化 → milvus_lite COSINE 暴力扫描
   ├─ Sparse: CJK 2/3-gram 分词 → BM25Okapi 两段式（全语料选候选→切片重打分）
-  └─ 每变体 RRF 融合 (0.5/0.5) → 变体间融合 (原始 1.4 / 变体 0.75)
-→ 规则重排（关键词覆盖/焦点/特异度/门控 + adaptive CE 跳过）
+  └─ 每变体 RRF 融合 (0.5/0.5，产物 source=hybrid 携带 matched_sources/fusion_score)
+     → 变体间融合 (原始 1.4 / 变体 0.75)，候选池 candidate_k = max(8·top_k, top_k+20, 60)
+→ 规则重排 eks-kernels/rerank（关键词覆盖/焦点/特异度/门控 + adaptive CE 跳过 cascade.rs）
   ├─ 高置信/小候选池/编号查询 → 纯规则
   └─ 低置信 → Cross-Encoder 前K精排 → 0.65/0.35 权重混合
 → 结构化同 Sheet 聚合（xlsx 按行展开 + 表头还原）
-→ 父块上下文批量回填（SQLite IN 查询）
+→ 父块上下文批量回填（SQLite IN 查询，失败逐条回退）
 → 上下文组装（6.5K/30K 字符限制）
-→ 证据不足时统一 ReAct（全量本地工具，最多 3 轮；失败回退 query 改写）
+→ 证据不足时统一 ReAct react.rs（全量本地工具，最多 3 轮；失败回退 rag 专用循环）
+→ 长期记忆消息按请求缓存（memory.rs MemoryContext：画像 + 按 route 消息复用）
 → 短期记忆（默认最近 5 轮窗口；summary 模式对更早轮次递进摘要并缓存）
-→ SSE 流式推送 (start/intent/sources/token/done)
+→ SSE 流式推送 (start/intent/tool_call/tool_result/sources/message/token/done)
 → 回合写入 SQLite `memory_records`（事件记忆 + 触发词画像抽取）
 ```
 
@@ -96,13 +100,16 @@ docker compose up eks-server
 | DELETE | `/api/v1/documents/delete/{id}` | 删除文档（前端契约） |
 | DELETE | `/api/v1/documents/{id}` | 删除文档 |
 | GET | `/api/v1/skills` | 技能列表 |
+| GET | `/api/v1/skills/function-calling` | Function Calling 工具 schema |
+| GET | `/api/v1/skills/capabilities` | 统一能力目录（RAG + Skill + MCP） |
 | POST | `/api/v1/skills/execute` | 执行本地技能 |
+| GET | `/health` / `/docs` / `/openapi.json` | 健康检查 / 自绘 API 文档 |
 
 ## 支持的文档格式
 
 | 格式 | 解析方式 | 说明 |
 |---|---|---|
-| .txt / .md | 直接读取 | UTF-8 |
+| .txt / .md / .csv / .tsv / .html | 直接读取 | UTF-8，自动回退 BOM/GBK/GB18030 |
 | .docx | zip + XML | 提取 `<w:t>` 文本 |
 | .xlsx / .xls | calamine | 按 Sheet 提取，含 `[Sheet]` 标记 |
 | .pptx | zip + XML | 提取 `<a:t>` 文本 |
@@ -131,37 +138,57 @@ docker compose up eks-server
 
 ```
 backend-rs/
-├── Cargo.toml                 # workspace
+├── Cargo.toml                     # workspace（eks-kernels + eks-server）
+├── rust-toolchain.toml            # Rust 1.92.0
 ├── crates/
-│   ├── eks-kernels/           # 纯 Rust 检索内核（无 FFI）
+│   ├── eks-kernels/               # 纯 Rust 检索内核（零依赖，无 FFI）
 │   │   └── src/
-│   │       ├── text.rs        # CJK 分词 + 归一化
-│   │       ├── bm25.rs        # BM25Okapi（rank_bm25 逐位一致）
-│   │       ├── lexical.rs     # 词法覆盖打分
-│   │       ├── rerank.rs      # 规则重排 + 信号 + 门控
-│   │       └── fuse.rs        # RRF 融合
-│   └── eks-server/            # HTTP 服务
-│       └── src/
-│           ├── main.rs        # 入口
-│           ├── config.rs      # .env 配置
-│           ├── auth.rs        # JWT/PBKDF2/会话
-│           ├── db.rs          # SQLite 访问
-│           ├── milvus_lite.rs # milvus_lite 直读引擎
-│           ├── embedder.rs    # BGE ONNX 推理
-│           ├── cross_encoder.rs # CE ONNX 推理
-│           ├── retrieval.rs   # 查询扩展 + 稀疏索引
-│           ├── retrieval_engine.rs # 检索编排
-│           ├── cascade.rs     # adaptive CE 门控
-│           ├── llm.rs         # 多供应商 LLM 客户端
-│           ├── chat_stream.rs # SSE 聊天（含简化 ReAct）
-│           ├── conversations.rs # 对话管理
-│           ├── documents.rs   # 文档管理 + 技能列表
-│           ├── ingest.rs      # 文档入库（解析/切块/向量化/写入）
-│           └── routes.rs      # 路由注册
-├── scripts/
-│   └── bench_retrieval.py     # 纯 HTTP 检索基准（打 eks-server）
-└── tests/
-    └── fixtures/              # 金向量/tokenizer 对拍数据
+│   │       ├── text.rs            # CJK 2/3-gram 分词 + 文本归一化
+│   │       ├── bm25.rs            # BM25Okapi（与 rank_bm25 逐位一致）
+│   │       ├── lexical.rs         # 词法覆盖打分
+│   │       ├── rerank.rs          # 规则重排信号/打分/门控 + 关键词相关性过滤
+│   │       └── fuse.rs            # RRF 融合（来源标记 + 融合分）
+│   └── eks-server/                # HTTP 服务（单一二进制）
+│       ├── src/
+│       │   ├── main.rs            # 入口：启动横幅/模型加载/优雅关停
+│       │   ├── state.rs           # 共享应用状态（AppState/预热快照）
+│       │   ├── config.rs          # backend/.env 加载（含逐行容错）+ 路径解析
+│       │   ├── routes.rs          # 路由注册 + OpenAPI 文档端点
+│       │   ├── validate.rs        # 请求字段校验（422 语义对齐）
+│       │   ├── auth.rs            # PBKDF2/HS256 JWT/会话/令牌续期中间件/CORS
+│       │   ├── db.rs              # SQLite 访问层（schema/时间戳/用户表）
+│       │   ├── logging.rs         # tracing 控制台+滚动文件/panic 堆栈 hook
+│       │   ├── request_log.rs     # 请求开始/完成/异常日志中间件
+│       │   ├── openapi.rs         # 手绘 OpenAPI 3.1 + /docs 页面
+│       │   ├── llm.rs             # 多供应商 LLM 客户端（流式/工具调用/兜底链）
+│       │   ├── intent.rs          # 意图路由（规则快判 + LLM 动作选择）
+│       │   ├── skills.rs          # 本地 Skill：目录/参数归一化/SQLite 执行
+│       │   ├── remote_mcp.rs      # 远程 MCP manifest → Skill 注册适配
+│       │   ├── trace.rs           # 工具与技能调用轨迹日志
+│       │   ├── embedder.rs        # BGE ONNX 推理（HF tokenizer 逐位对齐）
+│       │   ├── cross_encoder.rs   # Cross-Encoder ONNX 精排推理
+│       │   ├── milvus_lite.rs     # milvus_lite 直读引擎（Parquet+Manifest，无 gRPC）
+│       │   ├── retrieval.rs       # 查询扩展/稀疏索引/上下文组装/引用去重
+│       │   ├── retrieval_engine.rs# 检索编排：多查询融合/重排/父块回填/结构化聚合
+│       │   ├── cascade.rs         # adaptive Cross-Encoder 门控
+│       │   ├── planner.rs         # 常规检索规划器（首轮策略/证据评估）
+│       │   ├── rag_cache.rs       # 检索结果内存缓存（TTL/LRU/失效）
+│       │   ├── react.rs           # ReAct 升级：统一编排与 rag 专用循环
+│       │   ├── chat_stream.rs     # 聊天端点：generate/SSE 流式/skill 执行
+│       │   ├── conversations.rs   # 对话 CRUD
+│       │   ├── memory.rs          # 长期记忆：事件/画像/层级召回/consolidate/MemoryContext
+│       │   ├── memory_chunk.rs    # 长期记忆切块（对话/语义双粒度）
+│       │   ├── short_memory.rs    # 短期记忆（窗口/递进摘要）
+│       │   ├── documents.rs       # 文档路由：列表/正文/上传/删除
+│       │   ├── ingest.rs          # 文档入库：解析→切块→向量化→milvus/SQLite 写入
+│       │   └── tests.rs           # 跨实现互通单测（PBKDF2/JWT 等）
+│       └── tests/
+│           ├── embed_golden.rs    # BGE 金向量对拍
+│           ├── cross_encoder_golden.rs # CE 金分对拍
+│           ├── tokenizer_ids.rs   # tokenizer id 对拍
+│           └── fixtures/          # 金向量/tokenizer 对拍数据
+└── scripts/
+    └── bench_retrieval.py         # 纯 HTTP 检索基准（登录→清缓存→/retrieval/rag）
 ```
 
 ## 测试
@@ -195,6 +222,9 @@ docker compose up eks-server
 
 ## 环境变量
 
+除下表 `EKS_*` 专属变量外，其余配置复用 `backend/.env` 的同名键（完整清单见
+[backend/.env.example](../backend/.env.example)）；`EKS_*` 与进程环境变量优先于 .env。
+
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | EKS_HOST | 127.0.0.1 | 监听地址 |
@@ -202,7 +232,8 @@ docker compose up eks-server
 | EKS_ENV_FILE | ../backend/.env | .env 路径 |
 | EKS_SQLITE_PATH | ../backend/app/data/rag_metadata.db | SQLite 路径 |
 | EKS_MILVUS_LITE_PATH | ../backend/app/data/milvus_lite.db | milvus_lite 路径 |
-| EKS_BGE_MODEL_DIR | ../backend/app/models/bge-base-zh-v1.5 | BGE 模型目录 |
-| EKS_CROSS_ENCODER_ONNX | （见 .env） | CE ONNX 路径 |
-| CROSS_ENCODER_ENABLED | true | 是否启用 CE |
+| EKS_BGE_MODEL_DIR | ../backend/app/models/bge-base-zh-v1.5 | BGE 模型目录（需含 onnx/model.onnx + tokenizer.json） |
+| EKS_CROSS_ENCODER_ONNX | 按 CROSS_ENCODER_MODEL_NAME/CACHE_DIR 推导 | CE ONNX 路径（缺省时按 HF snapshot 布局查找） |
+| EKS_CROSS_ENCODER_TOKENIZER | 同上 | CE tokenizer.json 路径 |
+| CROSS_ENCODER_ENABLED | true | 是否启用 CE（工件缺失时启动降级为纯规则，根因经 runtime-status 透出） |
 | CROSS_ENCODER_TRIGGER_MODE | adaptive | 精排触发模式 |

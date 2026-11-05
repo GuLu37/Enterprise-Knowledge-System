@@ -23,18 +23,18 @@ flowchart TD
     R --> E{证据是否充分}
     E -->|是| G[直接 complete<br/>零额外模型轮次]
     E -->|否| U2[统一 ReAct 编排<br/>绑定全量工具表 同轨迹多轮编排 上限 3 轮]
-    U2 -->|bind_tools 失败或开关关闭| X[回退 rag 专用循环<br/>只挂检索工具]
+    U2 -->|工具调用绑定失败或开关关闭| X[回退 rag 专用循环<br/>只挂检索工具]
 ```
 
 ### 路由与 ReAct 的职责边界
 
-1. `route_query_action` 是请求级动作路由入口。
+1. `intent.rs` 的 `route_query_action` 是请求级动作路由入口。
 2. 规则优先识别特殊 Skill 请求；其余请求先根据知识词、直答词、编号等信号判断，低置信或冲突场景再交给 LLM。
 3. LLM 动作选择使用统一工具目录和 Function Calling schema。`search_knowledge_base` 与本地 Skill 在同一工具注册表中，但 RAG 会被转换为独立的 `rag` 分支。
-4. RAG 分支先做一轮常规检索：规则路径选择第一次检索方式和 `top_k`，并通过统一工具入口执行一次检索。
+4. RAG 分支先做一轮常规检索：`planner.rs` 规则路径选择第一次检索方式和 `top_k`，并通过统一工具入口执行一次检索。
 5. 如果第一轮常规检索的证据不足，进入 ReAct 编排接手（默认统一编排循环，见第 6 条）。ReAct 可以观察结果后更换 query、`retrieval_method` 或 `top_k` 再检索。
-6. ReAct 升级路径分两档：统一 ReAct 编排循环（`_run_unified_react_loop`，默认开启）绑定**完整工具注册表**（RAG 检索 + 本地 Skill + 远程 MCP），最多运行 `UNIFIED_REACT_MAX_ITERATIONS` 轮（默认 3）；当开关关闭或供应商不支持工具绑定时，回退到只暴露 `search_knowledge_base` 的 rag 专用循环（`_run_rag_react_loop`，最多 `REACT_MAX_ITERATIONS` 轮，默认 3）。
-7. ReAct 同一轮中的多个工具调用会并行执行（检索与远程调用均为 IO 密集），并对相同工具 + 相同参数的调用去重；走过检索后会按规则评估证据充分性，充分即提前结束，避免过度检索拉长延迟。模型绑定工具失败或没有产出结果时，主链路使用已获得的结果收尾。
+6. ReAct 升级路径分两档（`react.rs`）：统一编排循环 `run_unified_react`（默认开启）绑定**完整工具注册表**（RAG 检索 + 本地 Skill + 远程 MCP），最多运行 `UNIFIED_REACT_MAX_ITERATIONS` 轮（默认 3）；当开关关闭或供应商不支持工具调用时，回退到只暴露 `search_knowledge_base` 的 rag 专用循环 `run_rag_react`（最多 `REACT_MAX_ITERATIONS` 轮，默认 3）。
+7. ReAct 同一轮中的多个工具调用会并行执行（检索与远程调用均为 IO 密集）；rag 循环按归一化 query 去重、统一编排按「工具名 + 键排序参数 JSON」去重。走过检索后会按规则评估证据充分性，充分即提前结束，避免过度检索拉长延迟。模型工具调用失败或没有产出结果时，主链路使用已获得的结果收尾。
 
 ### ReAct Agent 运行链路（简化）
 
@@ -42,9 +42,9 @@ flowchart TD
 
 1. **意图识别**：规则快判能直接短路的问题（约 37% 的路由判断零模型调用）不再进入 Agent；其余请求由模型在统一工具表（RAG 检索 + 记忆/热词/文件清单等本地 Skill + 已配置的远程 MCP）中选择直接回答、调用 Skill、澄清或检索。
 2. **普通 RAG 一轮收口**：已判定为 RAG 的请求先做一轮零模型的常规检索；规则证据足够就直接组装回答，不升级，也不付额外模型轮次。
-3. **升级统一 ReAct 编排**：证据不足时进入 `_run_unified_react_loop`。模型在同一条对话轨迹里跨工具编排——可以改写检索词、更换检索方式（dense/sparse/hybrid）、调整返回条数，也可以先查记忆、再补检索、再看文件清单，每轮都能看到自己上一步的工具结果（Observation）。
-4. **回合内工程约束**：同一轮多个互不依赖的工具调用并行执行；相同工具 + 相同参数自动去重；工具执行失败会把错误反馈给模型，由它换路或改参重试，而不是空手继续；走过检索后由规则判定证据充分即提前停止，全程最多 `UNIFIED_REACT_MAX_ITERATIONS`（默认 3）轮。
-5. **降级保底**：模型供应商不支持工具绑定（`bind_tools` 失败）或 `UNIFIED_REACT_ENABLED=false` 时，回退到只暴露检索工具的 rag 专用循环；仍无结果则用已有检索结果收尾，明确告知用户，不中断链路。
+3. **升级统一 ReAct 编排**：证据不足时进入统一编排循环。模型在同一条对话轨迹里跨工具编排——可以改写检索词、更换检索方式（dense/sparse/hybrid）、调整返回条数，也可以先查记忆、再补检索、再看文件清单，每轮都能看到自己上一步的工具结果（Observation）。
+4. **回合内工程约束**：同一轮多个互不依赖的工具调用并行执行；重复调用自动去重；工具执行失败会把错误反馈给模型，由它换路或改参重试，而不是空手继续；走过检索后由规则判定证据充分即提前停止，全程最多 `UNIFIED_REACT_MAX_ITERATIONS`（默认 3）轮。
+5. **降级保底**：模型供应商不支持工具调用（`invoke_with_tools` 失败）或 `UNIFIED_REACT_ENABLED=false` 时，回退到只暴露检索工具的 rag 专用循环；仍无结果则用已有检索结果收尾，明确告知用户，不中断链路。
 
 环境开关：`UNIFIED_REACT_ENABLED`（默认 `true`）、`UNIFIED_REACT_MAX_ITERATIONS`（默认 `3`）、`UNIFIED_REACT_PARALLEL_WORKERS`（默认 `4`）。
 
@@ -104,9 +104,9 @@ RAG 使用统一工具名 `search_knowledge_base`。工具描述和参数 schema
 
 ### 5. 可观测性与启动性能
 
-- Skill、RAG 工具以及异常都会输出结构化 tracing 日志。
-- 后端启动时在后台预热 LLM、Embedding 和可选 Cross-Encoder，并异步初始化 Milvus，不阻塞 HTTP 服务启动。
-- `/api/v1/chat/runtime-status` 可查看模型和向量运行时状态。
+- Skill、RAG 工具以及异常都会输出结构化 tracing 日志；5xx 响应与 panic（含堆栈）以 error 级写入日志文件，便于检索定位。
+- 后端启动时在后台预热 LLM、Embedding 和可选 Cross-Encoder，并预热稀疏 BM25 索引，不阻塞 HTTP 服务启动。
+- `/api/v1/chat/runtime-status` 可查看模型和向量运行时状态，Cross-Encoder 工件缺失时直接透出根因。
 - RAG 和 Skill 的执行结果通过 SSE 事件传给前端，便于展示工具调用状态和来源资料。
 
 ## 存储架构
@@ -152,6 +152,11 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 | Retrieval | `POST /api/v1/retrieval/search/hybrid` | Hybrid 检索 |
 | Retrieval | `POST /api/v1/retrieval/search/dense` | Dense 检索 |
 | Retrieval | `POST /api/v1/retrieval/search/sparse` | Sparse 检索 |
+| Retrieval | `POST /api/v1/retrieval/rag` | 完整 RAG 工作流（多查询 + 重排 + 上下文组装） |
+| Skills | `GET /api/v1/skills` | 内置 Skill 定义目录 |
+| Skills | `GET /api/v1/skills/function-calling` | Function Calling 工具 schema |
+| Skills | `GET /api/v1/skills/capabilities` | 统一能力目录（RAG + Skill + MCP） |
+| Skills | `POST /api/v1/skills/execute` | 执行指定 Skill |
 | Chat | `POST /api/v1/chat/generate` | 同步生成回答 |
 | Chat | `POST /api/v1/chat/stream` | SSE 流式回答 |
 | Chat | `GET /api/v1/chat/runtime-status` | 查看后台预热状态 |

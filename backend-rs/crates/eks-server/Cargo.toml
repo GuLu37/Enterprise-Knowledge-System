@@ -2,7 +2,7 @@
 name = "eks-server"
 version.workspace = true
 edition.workspace = true
-description = "Enterprise Knowledge System 后端（Rust 全量重写，分阶段绞杀 Python 版）"
+description = "Enterprise Knowledge System 后端（单体 Rust 二进制 eks-server：axum HTTP/SSE + ONNX 推理 + milvus_lite 直读）"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
