@@ -450,6 +450,27 @@ pub struct MemoryChunkRow {
 }
 
 /// 创建空的 milvus_lite collection 目录与 manifest。
+/// manifest.json 的读-改-写互斥锁：并发上传（append 数据文件）与并发删除（append delta）
+/// 同时改写 manifest 时会互相读到半写状态（EOF while parsing），批量入库/删除必现。
+/// 所有 manifest 写路径（append_memory_chunks / append_delta_pks / ingest append）经此串行化；
+/// 锁内只有毫秒级文件 IO，embedding 等重活都在锁外，吞吐不受影响。
+static MANIFEST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn manifest_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    MANIFEST_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// manifest 原子替换写入：先写临时文件再 rename，读侧永远只会看到
+/// 完整的旧版本或完整的新版本，杜绝并发读到半写 JSON。
+pub fn write_manifest_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content).map_err(|err| err.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 pub fn ensure_collection(root: &Path, collection: &str) -> Result<(), String> {
     let collection_dir = root.join("collections").join(collection);
     let manifest_path = collection_dir.join("manifest.json");
@@ -470,11 +491,10 @@ pub fn ensure_collection(root: &Path, collection: &str) -> Result<(), String> {
             }
         }
     });
-    std::fs::write(
-        manifest_path,
-        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
+    write_manifest_atomic(
+        &manifest_path,
+        &serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )?;
     Ok(())
 }
 
@@ -487,6 +507,7 @@ pub fn append_memory_chunks(
     if rows.is_empty() {
         return Ok(());
     }
+    let _guard = manifest_write_guard();
     let embedding_dimension = embedding_dimension.max(1);
     ensure_collection(root, collection)?;
     ensure_collection_dimension(root, collection, embedding_dimension)?;
@@ -615,11 +636,10 @@ pub fn append_memory_chunks(
     } else {
         manifest["partitions"]["_default"]["data_files"] = serde_json::json!([format!("data/{new_file}")]);
     }
-    std::fs::write(
+    write_manifest_atomic(
         &manifest_path,
-        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
+        &serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )?;
     Ok(())
 }
 
@@ -768,6 +788,7 @@ fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), St
     if pks.is_empty() {
         return Ok(());
     }
+    let _guard = manifest_write_guard();
     let collection_dir = root.join("collections").join(collection);
     let manifest_path = collection_dir.join("manifest.json");
     let manifest_str = std::fs::read_to_string(&manifest_path)
@@ -811,11 +832,10 @@ fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), St
     } else {
         manifest["partitions"]["_default"]["delta_files"] = serde_json::json!([relative]);
     }
-    std::fs::write(
+    write_manifest_atomic(
         &manifest_path,
-        serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
+        &serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
+    )?;
     Ok(())
 }
 
@@ -1097,6 +1117,61 @@ mod tests {
         assert!(validate_vector_dimension("doc_chunk", 512, 768)
             .unwrap_err()
             .contains("当前为 512, 配置为 768"));
+    }
+
+    #[test]
+    fn concurrent_appends_keep_manifest_parseable() {
+        // 回归：并发 append（数据文件）与并发 delta 删除同时读改写 manifest，
+        // 修复前会互相读到半写状态（EOF while parsing）。锁后 manifest 必须始终可解析。
+        let root = std::env::temp_dir().join(format!(
+            "eks-milvus-lock-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        ensure_collection(&root, "doc_chunk").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for k in 0..20usize {
+                    if t % 2 == 0 {
+                        let rows = vec![MemoryChunkRow {
+                            memory_id: format!("m{t}_{k}"),
+                            chunk_index: 0,
+                            source_name: "s".into(),
+                            chunk_text: "文本".into(),
+                            user_id: "u".into(),
+                            conversation_id: "c".into(),
+                            session_id: "s".into(),
+                            chunk_type: "dialogue".into(),
+                            topic: "".into(),
+                            turn_start: 0,
+                            turn_end: 0,
+                            created_at: "2026-01-01".into(),
+                            vector: vec![0.1f32; 4],
+                        }];
+                        append_memory_chunks(&root, "memory_chunks", &rows, 4).unwrap();
+                    } else {
+                        append_delta_pks(&root, "doc_chunk", &[k as i64]).unwrap();
+                    }
+                    // 任意时刻 manifest 必须完整可解析
+                    let text =
+                        std::fs::read_to_string(root.join("collections").join(if t % 2 == 0 {
+                            "memory_chunks"
+                        } else {
+                            "doc_chunk"
+                        }).join("manifest.json")).unwrap();
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

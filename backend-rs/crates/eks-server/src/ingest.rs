@@ -1331,6 +1331,8 @@ pub async fn append_to_milvus_lite(
     if child_rows.is_empty() || vectors.is_empty() {
         return Ok(());
     }
+    // manifest 读-改-写与并发删除/记忆写入互斥（锁内仅毫秒级文件 IO）。
+    let _guard = crate::milvus_lite::manifest_write_guard();
     let embedding_dimension = embedding_dimension.max(1);
     // 全新 milvus_lite.db 首次写入时集合尚不存在，先确保布局（对齐 append_memory_chunks）。
     crate::milvus_lite::ensure_collection(&store.root, collection)?;
@@ -1434,7 +1436,10 @@ pub async fn append_to_milvus_lite(
     }
     let manifest_out = serde_json::to_string_pretty(&manifest)
         .map_err(|e| e.to_string())?;
-    std::fs::write(&manifest_path, manifest_out).map_err(|e| e.to_string())?;
+    crate::milvus_lite::write_manifest_atomic(
+        &manifest_path,
+        &manifest_out,
+    )?;
 
     Ok(())
 }
