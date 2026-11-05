@@ -24,19 +24,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # ==================== Python 后端（备选/过渡） ====================
-  # 取消注释以同时运行 Python 后端（端口 8001）
-  # backend-python:
-  #   build:
-  #     context: ./backend
-  #   ports:
-  #     - "8001:8000"
-  #   volumes:
-  #     - ./backend/app/models:/app/app/models:ro
-  #     - ./backend/app/data:/app/app/data
-  #     - ./backend/.env:/app/.env:ro
-  #   restart: unless-stopped
-
   # ==================== 前端 ====================
   frontend:
     build:

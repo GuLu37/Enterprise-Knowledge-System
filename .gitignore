@@ -7,22 +7,11 @@
 .idea/
 .vscode/
 
-# ==================== Python 缓存（根目录级） ====================
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# ==================== Rust 构建产物 ====================
-backend/native/*/target/
-backend/native/*/dist/
-
 # ==================== 基准/评估产物 ====================
 # 汇总数据集保留入库（rrf_ablation_eval.json），其余明细/基线文件不入库
 docs/rrf_*.json
 !docs/rrf_ablation_eval.json
 docs/rrf_*.log
-backend/bench_*.txt
-backend/bench_results/
 
 # ==================== 本地临时文件 ====================
 *.tmp
