@@ -80,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(
                     "Cross-Encoder 内核不可用，检索将走纯规则路径: {exc}"
                 );
+                // 保留根因（工件路径等），经 /chat/runtime-status 透出供诊断。
+                engine.cross_encoder_load_error = Some(exc);
             }
         }
     }

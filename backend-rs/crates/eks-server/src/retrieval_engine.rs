@@ -296,6 +296,8 @@ pub struct RetrievalEngine {
     pub ce_threshold: f64,
     pub ce_margin: f64,
     pub ce_trigger_mode: String,
+    /// 启动期 Cross-Encoder 工件加载失败的原因（透出到 runtime-status 供诊断）。
+    pub cross_encoder_load_error: Option<String>,
     sparse: tokio::sync::RwLock<Option<Arc<SparseIndexSnapshot>>>,
     result_cache: tokio::sync::Mutex<crate::rag_cache::RagResultCache>,
 }
@@ -342,6 +344,7 @@ impl RetrievalEngine {
             ce_threshold: 0.60,
             ce_margin: 0.08,
             ce_trigger_mode: "adaptive".to_string(),
+            cross_encoder_load_error: None,
             sparse: tokio::sync::RwLock::new(None),
             result_cache: tokio::sync::Mutex::new(crate::rag_cache::RagResultCache::new(true, 3600)),
         }

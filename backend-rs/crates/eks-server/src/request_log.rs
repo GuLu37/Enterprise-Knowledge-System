@@ -38,6 +38,15 @@ pub fn format_request_exception(request_line: &str, duration_ms: f64) -> String 
     format!("请求异常: {request_line} duration={duration_ms:.2}ms")
 }
 
+/// Err 型 5xx 的请求异常文案：带状态码与时长，对齐 Python `logger.exception` 的定位作用。
+pub fn format_request_exception_status(
+    request_line: &str,
+    status: u16,
+    duration_ms: f64,
+) -> String {
+    format!("请求异常: {request_line} status={status} duration={duration_ms:.2}ms")
+}
+
 fn connect_addr(request: &Request) -> Option<SocketAddr> {
     request
         .extensions()
@@ -76,10 +85,17 @@ pub async fn log_requests(request: Request, next: Next) -> Response {
     match AssertUnwindSafe(next.run(request)).catch_unwind().await {
         Ok(response) => {
             let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-            tracing::debug!(
-                "{}",
-                format_request_complete(&line, response.status().as_u16(), duration_ms)
-            );
+            let status = response.status().as_u16();
+            if status >= 500 {
+                // 对齐 Python `logger.exception`：5xx 响应以 error 级记录请求异常，
+                // 与 panic 分支共用前缀，便于日志检索定位。
+                tracing::error!(
+                    "{}",
+                    format_request_exception_status(&line, status, duration_ms)
+                );
+            } else {
+                tracing::debug!("{}", format_request_complete(&line, status, duration_ms));
+            }
             response
         }
         Err(payload) => {
@@ -117,6 +133,10 @@ mod tests {
         assert_eq!(
             format_request_exception("POST /api/v1/chat/generate", 3.2),
             "请求异常: POST /api/v1/chat/generate duration=3.20ms"
+        );
+        assert_eq!(
+            format_request_exception_status("POST /api/v1/chat/generate", 500, 3.2),
+            "请求异常: POST /api/v1/chat/generate status=500 duration=3.20ms"
         );
         assert_eq!(client_host_from_addr(None), "-");
         assert_eq!(

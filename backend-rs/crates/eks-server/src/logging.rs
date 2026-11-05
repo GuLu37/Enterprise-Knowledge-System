@@ -171,6 +171,7 @@ impl<'a> MakeWriter<'a> for MutexWriter {
 
 /// 控制台 + 滚动文件。文件初始化失败时仅保留 stderr。
 pub fn init_tracing(log_dir: &str, log_level: &str) {
+    install_panic_hook();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(parse_log_level(log_level)));
     let stdout_layer = fmt::layer().with_writer(std::io::stderr).with_target(true);
@@ -194,6 +195,32 @@ pub fn init_tracing(log_dir: &str, log_level: &str) {
             tracing::warn!(path = %dir.display(), "日志目录不可用，仅输出到控制台: {err}");
         }
     }
+}
+
+/// panic 进 tracing（含堆栈）而非只落 stderr，对齐 Python `logger.exception` 的可追溯性。
+/// 原生默认 hook 的输出保留：控制台仍能看到 panic；此处补齐文件日志与 backtrace。
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(message) = info.payload().downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = info.payload().downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|loc| format!("{loc}"))
+            .unwrap_or_else(|| "unknown".into());
+        tracing::error!(
+            panic = %payload,
+            location = %location,
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "panic 已捕获"
+        );
+        previous(info);
+    }));
 }
 
 #[cfg(test)]
