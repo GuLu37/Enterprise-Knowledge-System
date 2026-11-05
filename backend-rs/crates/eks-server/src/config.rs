@@ -509,11 +509,83 @@ fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// 加载 .env。dotenvy 对含裸引号的数组值（如 `CORS_ORIGINS=["http://…"]`）会整体解析失败，
+/// 导致失败行之后的全部变量被静默丢弃（历史上曾让 JWT 密钥/管理员密码回落默认值）。
+/// 这里整体失败时回退为逐行加载：坏行 warn 指明行号并跳过，其余变量照常生效；
+/// 与 dotenvy 一致，不覆盖已存在的环境变量。
+fn load_env_file(path: &str) {
+    if dotenvy::from_filename(path).is_ok() {
+        return;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(path, "配置文件读取失败，使用环境变量与默认值: {err}");
+            return;
+        }
+    };
+    let mut loaded = 0usize;
+    let mut skipped = 0usize;
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            skipped += 1;
+            tracing::warn!(line = index + 1, "配置行缺少 = 分隔符，已跳过: {trimmed}");
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            skipped += 1;
+            tracing::warn!(line = index + 1, "配置键非法，已跳过: {trimmed}");
+            continue;
+        }
+        if env::var(key).is_ok() {
+            continue; // 已有环境变量优先，等价 dotenvy 不覆盖语义
+        }
+        let value = parse_env_value(raw_value.trim());
+        // 单行无法安全解析的（如跨行引号），跳过并计数。
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+            loaded += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    tracing::warn!(
+        path,
+        loaded,
+        skipped,
+        "配置文件存在 dotenvy 无法整体解析的行，已按行容错加载（跳过行请人工检查格式）"
+    );
+}
+
+/// 解析单个 .env 值：剥成对引号；未加引号时截掉 ` #` 行内注释。
+fn parse_env_value(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        return Some(raw[1..raw.len() - 1].to_string());
+    }
+    if bytes.first() == Some(&b'"') || bytes.first() == Some(&b'\'') {
+        return None; // 引号未闭合，交给调用方跳过
+    }
+    let value = match raw.find(" #") {
+        Some(position) => raw[..position].trim_end(),
+        None => raw,
+    };
+    Some(value.to_string())
+}
+
 impl Config {
     /// 从 .env 文件（默认 ../backend/.env，可用 EKS_ENV_FILE 覆盖）+ 环境变量加载。
     pub fn load() -> Self {
         let env_file = env_or("EKS_ENV_FILE", "../backend/.env");
-        let _ = dotenvy::from_filename(&env_file);
+        load_env_file(&env_file);
         let cross_encoder_model_name = load_cross_encoder_model_name();
         let (cross_encoder_onnx, cross_encoder_tokenizer) =
             load_cross_encoder_paths(&cross_encoder_model_name);
@@ -747,6 +819,38 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_file_with_bare_quote_arrays_falls_back_to_line_loading() {
+        // 复现历史缺陷：dotenvy 整体解析失败后，失败行之后的变量必须仍能生效。
+        let path = std::env::temp_dir().join(format!("eks-env-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(
+            &path,
+            "# 模板\n\
+             EKS_PROBE_HEAD=1\n\
+             CORS_ORIGINS=[\"http://localhost:5173\"]\n\
+             EKS_PROBE_TAIL=2\n",
+        )
+        .unwrap();
+        std::env::remove_var("EKS_PROBE_HEAD");
+        std::env::remove_var("EKS_PROBE_TAIL");
+        load_env_file(path.to_str().unwrap());
+        assert_eq!(std::env::var("EKS_PROBE_HEAD").unwrap(), "1");
+        assert_eq!(std::env::var("EKS_PROBE_TAIL").unwrap(), "2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_env_value_strips_quotes_and_inline_comment() {
+        assert_eq!(
+            parse_env_value(r#"'["a", "b"]'"#).as_deref(),
+            Some(r#"["a", "b"]"#)
+        );
+        assert_eq!(parse_env_value(r#""plain""#).as_deref(), Some("plain"));
+        assert_eq!(parse_env_value("a.png # 注释").as_deref(), Some("a.png"));
+        assert_eq!(parse_env_value("true").as_deref(), Some("true"));
+        assert_eq!(parse_env_value(r#""unterminated"#), None);
+    }
 
     #[test]
     fn parses_json_and_csv_cors_origins() {
