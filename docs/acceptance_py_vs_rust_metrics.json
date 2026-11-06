@@ -1,0 +1,1475 @@
+{
+ "metrics": {
+  "py": {
+   "tags": {
+    "conc_chat_c1": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 63.5,
+     "p90_ms": 81.3,
+     "p95_ms": 88.8,
+     "p99_ms": 92.6,
+     "mean_ms": 69.9,
+     "max_ms": 92.6
+    },
+    "conc_chat_c16": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 444.4,
+     "p90_ms": 470.2,
+     "p95_ms": 470.2,
+     "p99_ms": 473.2,
+     "mean_ms": 382.0,
+     "max_ms": 473.2
+    },
+    "conc_chat_c4": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 116.7,
+     "p90_ms": 135.3,
+     "p95_ms": 139.4,
+     "p99_ms": 153.8,
+     "mean_ms": 114.5,
+     "max_ms": 153.8
+    },
+    "conc_chat_c8": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 239.4,
+     "p90_ms": 267.1,
+     "p95_ms": 268.0,
+     "p99_ms": 294.1,
+     "mean_ms": 221.0,
+     "max_ms": 294.1
+    },
+    "conc_hybrid_c1": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 273.0,
+     "p90_ms": 295.0,
+     "p95_ms": 308.6,
+     "p99_ms": 322.9,
+     "mean_ms": 258.7,
+     "max_ms": 322.9
+    },
+    "conc_hybrid_c16": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 4108.7,
+     "p90_ms": 4219.3,
+     "p95_ms": 4654.9,
+     "p99_ms": 5413.3,
+     "mean_ms": 3687.3,
+     "max_ms": 5413.3
+    },
+    "conc_hybrid_c32": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 5840.5,
+     "p90_ms": 9501.3,
+     "p95_ms": 10380.8,
+     "p99_ms": 10386.5,
+     "mean_ms": 5754.4,
+     "max_ms": 10386.5
+    },
+    "conc_hybrid_c4": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 1043.8,
+     "p90_ms": 1200.5,
+     "p95_ms": 1221.0,
+     "p99_ms": 1222.0,
+     "mean_ms": 1060.9,
+     "max_ms": 1222.0
+    },
+    "conc_hybrid_c8": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 2082.9,
+     "p90_ms": 2143.3,
+     "p95_ms": 2144.9,
+     "p99_ms": 2571.0,
+     "mean_ms": 2044.5,
+     "max_ms": 2571.0
+    },
+    "seq_dense": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 91.6,
+     "p90_ms": 100.8,
+     "p95_ms": 112.1,
+     "p99_ms": 150.8,
+     "mean_ms": 94.4,
+     "max_ms": 150.8
+    },
+    "seq_hybrid": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 270.7,
+     "p90_ms": 298.1,
+     "p95_ms": 313.2,
+     "p99_ms": 325.5,
+     "mean_ms": 259.1,
+     "max_ms": 325.5
+    },
+    "seq_sparse": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 6.9,
+     "p90_ms": 8.0,
+     "p95_ms": 8.2,
+     "p99_ms": 11.9,
+     "mean_ms": 7.0,
+     "max_ms": 11.9
+    },
+    "skills_exec": {
+     "n": 60,
+     "ok": 60,
+     "p50_ms": 360.6,
+     "p90_ms": 694.2,
+     "p95_ms": 772.1,
+     "p99_ms": 888.1,
+     "mean_ms": 363.1,
+     "max_ms": 907.5
+    },
+    "stream_chitchat": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 151.2,
+     "p90_ms": 213.8,
+     "p95_ms": 233.2,
+     "p99_ms": 233.2,
+     "mean_ms": 160.7,
+     "max_ms": 233.2
+    },
+    "stream_knowledge": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 120.6,
+     "p90_ms": 163.6,
+     "p95_ms": 167.4,
+     "p99_ms": 167.4,
+     "mean_ms": 131.6,
+     "max_ms": 167.4
+    },
+    "stream_memory": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 956.5,
+     "p90_ms": 1027.2,
+     "p95_ms": 1036.6,
+     "p99_ms": 1036.6,
+     "mean_ms": 942.6,
+     "max_ms": 1036.6
+    }
+   },
+   "sweep_walls": {
+    "hybrid_c1": {
+     "n": 40,
+     "wall_s": 10.35,
+     "rps": 3.86
+    },
+    "hybrid_c4": {
+     "n": 40,
+     "wall_s": 10.61,
+     "rps": 3.77
+    },
+    "hybrid_c8": {
+     "n": 40,
+     "wall_s": 10.23,
+     "rps": 3.91
+    },
+    "hybrid_c16": {
+     "n": 40,
+     "wall_s": 10.27,
+     "rps": 3.89
+    },
+    "hybrid_c32": {
+     "n": 40,
+     "wall_s": 10.39,
+     "rps": 3.85
+    },
+    "chat_c1": {
+     "n": 20,
+     "wall_s": 1.4,
+     "rps": 14.28
+    },
+    "chat_c4": {
+     "n": 20,
+     "wall_s": 0.61,
+     "rps": 32.89
+    },
+    "chat_c8": {
+     "n": 20,
+     "wall_s": 0.59,
+     "rps": 33.67
+    },
+    "chat_c16": {
+     "n": 20,
+     "wall_s": 0.57,
+     "rps": 35.4
+    },
+    "skills_c8": {
+     "n": 60,
+     "wall_s": 3.01,
+     "rps": 19.91
+    },
+    "stream_c4": {
+     "n": 30,
+     "wall_s": 3.39,
+     "rps": 8.84
+    }
+   },
+   "retrieval": {
+    "calls": 323,
+    "failures": 0,
+    "failure_rate": 0.0,
+    "precision_among_success": 0.0,
+    "mrr10_among_success": 0.0,
+    "avg_results": 2.81
+   },
+   "chat_and_tools": {
+    "chat_calls": 80,
+    "chat_failures": 0,
+    "chat_failure_rate": 0.0,
+    "stream_calls": 30,
+    "stream_failures": 0,
+    "tool_calls_observed": 30,
+    "tool_results_observed": 30,
+    "tool_result_errors": 0,
+    "tools_failure_rate": 0.0,
+    "stream_answer_precision": 1.0
+   },
+   "skills": {
+    "calls": 60,
+    "failures": 0,
+    "failure_rate": 0.0
+   },
+   "overall": {
+    "total": 493,
+    "failures": 0,
+    "error_rate": 0.0
+   }
+  },
+  "rs": {
+   "tags": {
+    "conc_chat_c1": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 46.7,
+     "p90_ms": 61.6,
+     "p95_ms": 61.7,
+     "p99_ms": 62.0,
+     "mean_ms": 49.1,
+     "max_ms": 62.0
+    },
+    "conc_chat_c16": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 95.4,
+     "p90_ms": 383.6,
+     "p95_ms": 488.0,
+     "p99_ms": 596.5,
+     "mean_ms": 160.4,
+     "max_ms": 596.5
+    },
+    "conc_chat_c4": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 20.7,
+     "p90_ms": 54.7,
+     "p95_ms": 62.0,
+     "p99_ms": 158.6,
+     "mean_ms": 32.7,
+     "max_ms": 158.6
+    },
+    "conc_chat_c8": {
+     "n": 20,
+     "ok": 20,
+     "p50_ms": 22.2,
+     "p90_ms": 194.1,
+     "p95_ms": 214.8,
+     "p99_ms": 262.1,
+     "mean_ms": 64.6,
+     "max_ms": 262.1
+    },
+    "conc_hybrid_c1": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 206.3,
+     "p90_ms": 249.2,
+     "p95_ms": 267.2,
+     "p99_ms": 271.3,
+     "mean_ms": 204.8,
+     "max_ms": 271.3
+    },
+    "conc_hybrid_c16": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 2335.2,
+     "p90_ms": 2723.4,
+     "p95_ms": 2741.5,
+     "p99_ms": 2830.8,
+     "mean_ms": 2086.6,
+     "max_ms": 2830.8
+    },
+    "conc_hybrid_c32": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 3511.3,
+     "p90_ms": 4961.1,
+     "p95_ms": 5008.0,
+     "p99_ms": 5220.4,
+     "mean_ms": 3191.8,
+     "max_ms": 5220.4
+    },
+    "conc_hybrid_c4": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 615.4,
+     "p90_ms": 754.0,
+     "p95_ms": 802.1,
+     "p99_ms": 876.9,
+     "mean_ms": 602.7,
+     "max_ms": 876.9
+    },
+    "conc_hybrid_c8": {
+     "n": 40,
+     "ok": 40,
+     "p50_ms": 1235.0,
+     "p90_ms": 1535.9,
+     "p95_ms": 1556.9,
+     "p99_ms": 1622.3,
+     "mean_ms": 1198.1,
+     "max_ms": 1622.3
+    },
+    "seq_dense": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 76.7,
+     "p90_ms": 83.1,
+     "p95_ms": 90.2,
+     "p99_ms": 107.5,
+     "mean_ms": 77.2,
+     "max_ms": 107.5
+    },
+    "seq_hybrid": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 223.5,
+     "p90_ms": 265.6,
+     "p95_ms": 266.2,
+     "p99_ms": 311.8,
+     "mean_ms": 220.8,
+     "max_ms": 311.8
+    },
+    "seq_sparse": {
+     "n": 41,
+     "ok": 41,
+     "p50_ms": 11.6,
+     "p90_ms": 17.4,
+     "p95_ms": 18.2,
+     "p99_ms": 19.2,
+     "mean_ms": 12.1,
+     "max_ms": 19.2
+    },
+    "skills_exec": {
+     "n": 60,
+     "ok": 60,
+     "p50_ms": 14.0,
+     "p90_ms": 59.9,
+     "p95_ms": 190.6,
+     "p99_ms": 221.8,
+     "mean_ms": 35.9,
+     "max_ms": 296.7
+    },
+    "stream_chitchat": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 46.6,
+     "p90_ms": 74.1,
+     "p95_ms": 74.9,
+     "p99_ms": 74.9,
+     "mean_ms": 52.9,
+     "max_ms": 74.9
+    },
+    "stream_knowledge": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 38.0,
+     "p90_ms": 62.1,
+     "p95_ms": 75.4,
+     "p99_ms": 75.4,
+     "mean_ms": 44.1,
+     "max_ms": 75.4
+    },
+    "stream_memory": {
+     "n": 10,
+     "ok": 10,
+     "p50_ms": 2117.5,
+     "p90_ms": 2655.6,
+     "p95_ms": 2671.3,
+     "p99_ms": 2671.3,
+     "mean_ms": 2127.5,
+     "max_ms": 2671.3
+    }
+   },
+   "sweep_walls": {
+    "hybrid_c1": {
+     "n": 40,
+     "wall_s": 8.2,
+     "rps": 4.88
+    },
+    "hybrid_c4": {
+     "n": 40,
+     "wall_s": 6.1,
+     "rps": 6.55
+    },
+    "hybrid_c8": {
+     "n": 40,
+     "wall_s": 6.29,
+     "rps": 6.35
+    },
+    "hybrid_c16": {
+     "n": 40,
+     "wall_s": 6.07,
+     "rps": 6.59
+    },
+    "hybrid_c32": {
+     "n": 40,
+     "wall_s": 6.06,
+     "rps": 6.6
+    },
+    "chat_c1": {
+     "n": 20,
+     "wall_s": 0.99,
+     "rps": 20.3
+    },
+    "chat_c4": {
+     "n": 20,
+     "wall_s": 0.22,
+     "rps": 92.44
+    },
+    "chat_c8": {
+     "n": 20,
+     "wall_s": 0.26,
+     "rps": 76.12
+    },
+    "chat_c16": {
+     "n": 20,
+     "wall_s": 0.6,
+     "rps": 33.37
+    },
+    "skills_c8": {
+     "n": 60,
+     "wall_s": 0.33,
+     "rps": 179.29
+    },
+    "stream_c4": {
+     "n": 30,
+     "wall_s": 6.06,
+     "rps": 4.95
+    }
+   },
+   "retrieval": {
+    "calls": 323,
+    "failures": 0,
+    "failure_rate": 0.0,
+    "precision_among_success": 0.0,
+    "mrr10_among_success": 0.0,
+    "avg_results": 3.55
+   },
+   "chat_and_tools": {
+    "chat_calls": 80,
+    "chat_failures": 0,
+    "chat_failure_rate": 0.0,
+    "stream_calls": 30,
+    "stream_failures": 0,
+    "tool_calls_observed": 30,
+    "tool_results_observed": 30,
+    "tool_result_errors": 0,
+    "tools_failure_rate": 0.0,
+    "stream_answer_precision": 1.0
+   },
+   "skills": {
+    "calls": 60,
+    "failures": 0,
+    "failure_rate": 0.0
+   },
+   "overall": {
+    "total": 493,
+    "failures": 0,
+    "error_rate": 0.0
+   }
+  }
+ },
+ "contract_diff": {
+  "endpoints_only_in": {
+   "python": [],
+   "rust": [
+    "/api/v1/documents",
+    "/api/v1/documents/{document_id}",
+    "/api/v1/retrieval/cache-clear",
+    "/api/v1/retrieval/rag",
+    "/docs",
+    "/openapi.json",
+    "/redoc"
+   ]
+  },
+  "probes": [
+   {
+    "probe": "auth_me",
+    "py": {
+     "name": "auth_me",
+     "status": 200,
+     "keys": [
+      "created_at",
+      "is_active",
+      "last_login_at",
+      "role",
+      "updated_at",
+      "user_id",
+      "username"
+     ]
+    },
+    "rs": {
+     "name": "auth_me",
+     "status": 200,
+     "keys": [
+      "created_at",
+      "is_active",
+      "last_login_at",
+      "role",
+      "updated_at",
+      "user_id",
+      "username"
+     ]
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "auth_refresh_invalid",
+    "py": {
+     "name": "auth_refresh_invalid",
+     "status": 401
+    },
+    "rs": {
+     "name": "auth_refresh_invalid",
+     "status": 401
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "chat_gen_chitchat",
+    "py": {
+     "name": "chat_gen_chitchat",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "rs": {
+     "name": "chat_gen_chitchat",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "chat_gen_knowledge",
+    "py": {
+     "name": "chat_gen_knowledge",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "rs": {
+     "name": "chat_gen_knowledge",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "chat_gen_structured",
+    "py": {
+     "name": "chat_gen_structured",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "rs": {
+     "name": "chat_gen_structured",
+     "status": 200,
+     "keys": [
+      "model",
+      "query",
+      "response",
+      "retrieval_method",
+      "sources"
+     ],
+     "fact": {
+      "has_marker": true,
+      "has_sources": true
+     }
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "chat_stream_chitchat",
+    "py": {
+     "name": "chat_stream_chitchat",
+     "status": 200,
+     "ms": 110.1,
+     "sse": {
+      "events": [
+       "start",
+       "tool_call",
+       "tool_result",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "message": 7,
+       "start": 1,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "rs": {
+     "name": "chat_stream_chitchat",
+     "status": 200,
+     "ms": 43.0,
+     "sse": {
+      "events": [
+       "start",
+       "intent",
+       "tool_call",
+       "tool_result",
+       "sources",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "intent": 1,
+       "message": 7,
+       "sources": 1,
+       "start": 1,
+       "token": 7,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "verdict": "DIFF",
+    "first_diff_field": "sse"
+   },
+   {
+    "probe": "chat_stream_knowledge",
+    "py": {
+     "name": "chat_stream_knowledge",
+     "status": 200,
+     "ms": 121.1,
+     "sse": {
+      "events": [
+       "start",
+       "tool_call",
+       "tool_result",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "message": 7,
+       "start": 1,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "rs": {
+     "name": "chat_stream_knowledge",
+     "status": 200,
+     "ms": 32.3,
+     "sse": {
+      "events": [
+       "start",
+       "intent",
+       "tool_call",
+       "tool_result",
+       "sources",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "intent": 1,
+       "message": 7,
+       "sources": 1,
+       "start": 1,
+       "token": 7,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "verdict": "DIFF",
+    "first_diff_field": "sse"
+   },
+   {
+    "probe": "chat_stream_structured",
+    "py": {
+     "name": "chat_stream_structured",
+     "status": 200,
+     "ms": 87.7,
+     "sse": {
+      "events": [
+       "start",
+       "tool_call",
+       "tool_result",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "message",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "message": 7,
+       "start": 1,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "rs": {
+     "name": "chat_stream_structured",
+     "status": 200,
+     "ms": 25.0,
+     "sse": {
+      "events": [
+       "start",
+       "intent",
+       "tool_call",
+       "tool_result",
+       "sources",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "message",
+       "token",
+       "done"
+      ],
+      "event_counts": {
+       "done": 1,
+       "intent": 1,
+       "message": 7,
+       "sources": 1,
+       "start": 1,
+       "token": 7,
+       "tool_call": 1,
+       "tool_result": 1
+      },
+      "tool_calls": 1,
+      "tool_results": 1,
+      "tool_result_errors": 0,
+      "answer_has_marker": true
+     }
+    },
+    "verdict": "DIFF",
+    "first_diff_field": "sse"
+   },
+   {
+    "probe": "conv_delete",
+    "py": {
+     "name": "conv_delete",
+     "status": 200
+    },
+    "rs": {
+     "name": "conv_delete",
+     "status": 200
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "conv_list",
+    "py": {
+     "name": "conv_list",
+     "status": 200,
+     "fact": {
+      "count": 1
+     }
+    },
+    "rs": {
+     "name": "conv_list",
+     "status": 200,
+     "fact": {
+      "count": 1
+     }
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "conv_save",
+    "py": {
+     "name": "conv_save",
+     "status": 200
+    },
+    "rs": {
+     "name": "conv_save",
+     "status": 200
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "doc_content",
+    "py": {
+     "name": "doc_content",
+     "status": 200,
+     "keys": [
+      "content",
+      "content_type",
+      "document_id",
+      "file_type",
+      "original_filename",
+      "status",
+      "updated_at"
+     ]
+    },
+    "rs": {
+     "name": "doc_content",
+     "status": 200,
+     "keys": [
+      "content",
+      "content_type",
+      "document_id",
+      "file_type",
+      "original_filename",
+      "status",
+      "updated_at"
+     ]
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "doc_delete_missing",
+    "py": {
+     "name": "doc_delete_missing",
+     "status": 400
+    },
+    "rs": {
+     "name": "doc_delete_missing",
+     "status": 400
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "docs",
+    "py": {
+     "name": "docs",
+     "status": 200,
+     "keys": [
+      "_raw"
+     ]
+    },
+    "rs": {
+     "name": "docs",
+     "status": 200,
+     "keys": [
+      "_raw"
+     ]
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "health",
+    "py": {
+     "name": "health",
+     "status": 200,
+     "keys": [
+      "app",
+      "environment",
+      "status",
+      "version"
+     ]
+    },
+    "rs": {
+     "name": "health",
+     "status": 200,
+     "keys": [
+      "app",
+      "environment",
+      "status",
+      "version"
+     ]
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "openapi",
+    "py": {
+     "method": "GET",
+     "path": "/openapi.json",
+     "status": 200,
+     "name": "openapi"
+    },
+    "rs": {
+     "method": "GET",
+     "path": "/openapi.json",
+     "status": 200,
+     "name": "openapi"
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "retrieval_rag",
+    "py": {
+     "name": "retrieval_rag",
+     "status": 404,
+     "keys": [
+      "detail"
+     ]
+    },
+    "rs": {
+     "name": "retrieval_rag",
+     "status": 200,
+     "keys": [
+      "context",
+      "expanded_queries",
+      "message",
+      "query",
+      "results",
+      "retrieval_method"
+     ]
+    },
+    "verdict": "DIFF",
+    "first_diff_field": "status"
+   },
+   {
+    "probe": "root",
+    "py": {
+     "name": "root",
+     "status": 200,
+     "keys": [
+      "docs",
+      "name",
+      "version"
+     ]
+    },
+    "rs": {
+     "name": "root",
+     "status": 200,
+     "keys": [
+      "docs",
+      "name",
+      "version"
+     ]
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "search_dense",
+    "py": {
+     "name": "search_dense",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "dense",
+      "dense",
+      "dense",
+      "dense",
+      "dense"
+     ],
+     "n_results": 5
+    },
+    "rs": {
+     "name": "search_dense",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "dense",
+      "dense",
+      "dense",
+      "dense",
+      "dense"
+     ],
+     "n_results": 5
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "search_hybrid",
+    "py": {
+     "name": "search_hybrid",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "hybrid",
+      "hybrid",
+      "hybrid"
+     ],
+     "n_results": 3
+    },
+    "rs": {
+     "name": "search_hybrid",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "hybrid",
+      "hybrid",
+      "hybrid"
+     ],
+     "n_results": 3
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "search_sparse",
+    "py": {
+     "name": "search_sparse",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "sparse",
+      "sparse",
+      "sparse",
+      "sparse",
+      "sparse"
+     ],
+     "n_results": 5
+    },
+    "rs": {
+     "name": "search_sparse",
+     "status": 200,
+     "keys": [
+      "query",
+      "results",
+      "retrieval_method",
+      "top_k"
+     ],
+     "hit_sources": [
+      "sparse",
+      "sparse",
+      "sparse",
+      "sparse",
+      "sparse"
+     ],
+     "n_results": 5
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "skill_document_hot_word_statistics",
+    "py": {
+     "name": "skill_document_hot_word_statistics",
+     "status": 200,
+     "fact": "result_keys:filters,scope,summary,top_words"
+    },
+    "rs": {
+     "name": "skill_document_hot_word_statistics",
+     "status": 200,
+     "fact": "result_keys:filters,scope,summary,top_words"
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "skill_list_available_tools",
+    "py": {
+     "name": "skill_list_available_tools",
+     "status": 200,
+     "fact": "result_keys:summary,tools"
+    },
+    "rs": {
+     "name": "skill_list_available_tools",
+     "status": 200,
+     "fact": "result_keys:summary,tools"
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "skill_list_knowledge_base_files",
+    "py": {
+     "name": "skill_list_knowledge_base_files",
+     "status": 200,
+     "fact": "result_keys:documents,filters,summary"
+    },
+    "rs": {
+     "name": "skill_list_knowledge_base_files",
+     "status": 200,
+     "fact": "result_keys:documents,filters,summary"
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "skill_memory_query",
+    "py": {
+     "name": "skill_memory_query",
+     "status": 200,
+     "fact": "result_keys:filters,matched_memories,memory_scope,profile_memories,query,summary"
+    },
+    "rs": {
+     "name": "skill_memory_query",
+     "status": 200,
+     "fact": "result_keys:filters,matched_memories,memory_scope,profile_memories,query,summary"
+    },
+    "verdict": "MATCH"
+   },
+   {
+    "probe": "skill_nonexistent_skill_x",
+    "py": {
+     "name": "skill_nonexistent_skill_x",
+     "status": 404,
+     "fact": null
+    },
+    "rs": {
+     "name": "skill_nonexistent_skill_x",
+     "status": 404,
+     "fact": null
+    },
+    "verdict": "MATCH"
+   }
+  ],
+  "lists": {
+   "skill_names": {
+    "python": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original"
+    ],
+    "rust": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original"
+    ],
+    "equal": true
+   },
+   "tool_names": {
+    "python": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original",
+     "search_knowledge_base"
+    ],
+    "rust": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original",
+     "search_knowledge_base"
+    ],
+    "equal": true
+   },
+   "capability_names": {
+    "python": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original",
+     "search_knowledge_base"
+    ],
+    "rust": [
+     "delete_profile_memory",
+     "document_hot_word_statistics",
+     "list_available_tools",
+     "list_knowledge_base_files",
+     "memory_query",
+     "memory_retrieve_original",
+     "search_knowledge_base"
+    ],
+    "equal": true
+   },
+   "doc_statuses": {
+    "python": [
+     "ready"
+    ],
+    "rust": [
+     "ready"
+    ],
+    "equal": true
+   }
+  }
+ },
+ "seed": {
+  "py": {
+   "side": "py",
+   "phase": "seed",
+   "started_at": "2026-11-06 11:27:35",
+   "upload_errors": [],
+   "uploads": {
+    "01_差旅报销制度_V2.0.docx": 13.5,
+    "02_采购审批流程.docx": 12.1,
+    "03_项目Alpha上线手册.docx": 13.0,
+    "04_产品与账号常见问题.md": 11.1,
+    "05_费用标准表.xlsx": 9.9,
+    "06_企业内部信息总表.xlsx": 18.0,
+    "07_本月工资表.xlsx": 17.9
+   },
+   "doc_ids": {
+    "01_差旅报销制度_V2.0.docx": "9af76c7429a74215aca6693fb718d54b",
+    "02_采购审批流程.docx": "a8f4309fdae94fb9a2fa35e006ecb987",
+    "03_项目Alpha上线手册.docx": "92aeb211e2f84c08aacb430188067400",
+    "04_产品与账号常见问题.md": "5890660684fc45df9d9930a3400d4e06",
+    "05_费用标准表.xlsx": "70ea6b1ad9394572b99269354efd92de",
+    "06_企业内部信息总表.xlsx": "525a0b520a554a8fbf426ef8182c1eed",
+    "07_本月工资表.xlsx": "da1972814a864b389566aec8229545f0"
+   },
+   "per_doc_ready": {
+    "01_差旅报销制度_V2.0.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 4054.0
+    },
+    "02_采购审批流程.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2037.2
+    },
+    "03_项目Alpha上线手册.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2040.9
+    },
+    "04_产品与账号常见问题.md": {
+     "status": "ready",
+     "ready_ms_since_upload": 4067.4
+    },
+    "05_费用标准表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 4074.4
+    },
+    "06_企业内部信息总表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 52877.5
+    },
+    "07_本月工资表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 24497.4
+    }
+   },
+   "ingest_failures": [],
+   "ingest_total_seconds": 93.6,
+   "post_seed_probe": {
+    "status": 200,
+    "ms": 222.7,
+    "body": "{\"query\":\"出差结束后最晚多久要提交报销单？\",\"retrieval_method\":\"hybrid\",\"results\":[{\"content\":\"[章节] 4. 报销时限与例外\\n员工应在出差结束后 5 个工作日内提交报销单，并上传交通、住宿与其他费用凭证。超过 30 个自然日提交的，须由部门负责人说明原因。\\n\\n例外申请：因展会、重大客户接待或目的地房源紧张导致住宿超标的，应在报销单中填写“超标住宿说明”，并由事业部总监批准。\",\"metadata\":{\"child_id\":\"9af76c7429a74215aca6693fb718d54b:c000010\",\"document"
+   },
+   "finished_at": "2026-11-06 11:29:09"
+  },
+  "rs": {
+   "side": "rs",
+   "phase": "seed",
+   "started_at": "2026-11-06 11:20:57",
+   "upload_errors": [],
+   "uploads": {
+    "01_差旅报销制度_V2.0.docx": 7.7,
+    "02_采购审批流程.docx": 5.5,
+    "03_项目Alpha上线手册.docx": 6.8,
+    "04_产品与账号常见问题.md": 6.6,
+    "05_费用标准表.xlsx": 8.0,
+    "06_企业内部信息总表.xlsx": 5.3,
+    "07_本月工资表.xlsx": 5.3
+   },
+   "doc_ids": {
+    "01_差旅报销制度_V2.0.docx": "dd8fe8893b22473aa348463576f94802",
+    "02_采购审批流程.docx": "d9ba26d716394fdb8bf33d64b407a9d6",
+    "03_项目Alpha上线手册.docx": "5c7bac00c81c4795931ffeef7623208b",
+    "04_产品与账号常见问题.md": "b2b51045ea094d1891e369661b6373c8",
+    "05_费用标准表.xlsx": "21a0021923cb4a4a98724f5f091af9c8",
+    "06_企业内部信息总表.xlsx": "e6fcb69853b04ffeb1ebded397489234",
+    "07_本月工资表.xlsx": "24d7e9c0803a4c7fa2a105135eb14001"
+   },
+   "per_doc_ready": {
+    "01_差旅报销制度_V2.0.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2015.1
+    },
+    "02_采购审批流程.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2017.5
+    },
+    "03_项目Alpha上线手册.docx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2015.2
+    },
+    "04_产品与账号常见问题.md": {
+     "status": "ready",
+     "ready_ms_since_upload": 4039.9
+    },
+    "05_费用标准表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 2028.8
+    },
+    "06_企业内部信息总表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 14144.0
+    },
+    "07_本月工资表.xlsx": {
+     "status": "ready",
+     "ready_ms_since_upload": 6062.6
+    }
+   },
+   "ingest_failures": [],
+   "ingest_total_seconds": 32.3,
+   "post_seed_probe": {
+    "status": 200,
+    "ms": 81.1,
+    "body": "{\"query\":\"出差结束后最晚多久要提交报销单？\",\"results\":[{\"content\":\"[章节] 4. 报销时限与例外\\n员工应在出差结束后 5 个工作日内提交报销单，并上传交通、住宿与其他费用凭证。超过 30 个自然日提交的，须由部门负责人说明原因。\\n\\n例外申请：因展会、重大客户接待或目的地房源紧张导致住宿超标的，应在报销单中填写“超标住宿说明”，并由事业部总监批准。\",\"metadata\":{\"child_id\":\"dd8fe8893b22473aa348463576f94802:c000010\",\"chunk_index\":10,\"content_type\":\"appl"
+   },
+   "finished_at": "2026-11-06 11:21:30"
+  }
+ }
+}
