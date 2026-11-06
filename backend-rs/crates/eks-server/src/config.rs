@@ -270,6 +270,28 @@ pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
 
 /// 对齐 Python `VECTOR_STORE_TYPE`：只接受 milvus_lite/lite，拒绝远程 milvus gRPC。
 /// 空值默认 milvus_lite（Rust 不实现服务端 Milvus）。
+/// `EMBED_SESSION_COUNT` 解析：显式设置（≥1）优先；未设置时按设备自适应——
+/// GPU 类设备（auto/directml/dml/gpu/cuda）默认 4 会话提升多用户并发吞吐
+/// （fp32 BGE 每会话约 400MB 显存，4 会话对 6GB 卡仍安全）；CPU 默认 2，
+/// 避免多会话 × 全核 intra-op 线程互相争抢。
+fn resolve_embed_session_count(device: &str) -> usize {
+    if let Ok(value) = std::env::var("EMBED_SESSION_COUNT") {
+        if let Ok(parsed) = value.trim().parse::<i64>() {
+            if parsed >= 1 {
+                return parsed as usize;
+            }
+        }
+        tracing::warn!("EMBED_SESSION_COUNT 非法（{value}），回退设备自适应默认值");
+    }
+    let normalized = device.trim().to_lowercase();
+    let gpu_like = matches!(normalized.as_str(), "auto" | "directml" | "dml" | "gpu" | "cuda");
+    if gpu_like {
+        4
+    } else {
+        2
+    }
+}
+
 pub fn parse_vector_store_type(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_lowercase();
     let value = if normalized.is_empty() {
@@ -638,7 +660,7 @@ impl Config {
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
             cross_encoder_device: env_or("CROSS_ENCODER_DEVICE", "auto"),
             bge_device: env_or("BGE_DEVICE", "cpu"),
-            embed_session_count: env_i64("EMBED_SESSION_COUNT", 2).max(1) as usize,
+            embed_session_count: resolve_embed_session_count(&env_or("BGE_DEVICE", "cpu")),
             cross_encoder_session_count: env_i64("CROSS_ENCODER_SESSION_COUNT", 1).max(1) as usize,
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),

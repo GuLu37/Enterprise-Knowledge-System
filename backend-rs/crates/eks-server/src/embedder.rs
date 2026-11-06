@@ -12,8 +12,10 @@ use tokenizers::Tokenizer;
 static ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
 
 /// 按设备偏好构建 ONNX session：
-/// - cpu（含空/auto）：纯 CPU（保持与金向量对拍可复现）
-/// - directml / dml / gpu / cuda：尝试 DirectML（Windows DX12 GPU，免 CUDA 工具链，
+/// - cpu / 空：纯 CPU（保持与金向量对拍可复现）
+/// - auto：探测 GPU（DirectML）优先，失败回退 CPU——与 Python `BGE_DEVICE=auto`
+///   的 cuda-if-available 语义对齐；默认 .env 即走此路径
+/// - directml / dml / gpu / cuda：强制 DirectML（Windows DX12 GPU，免 CUDA 工具链，
 ///   需在 exe 旁放置 DirectML.dll），初始化失败自动回退 CPU 并告警。
 /// 供 embedder 与 cross_encoder 共用。
 pub fn build_ort_session(
@@ -24,7 +26,7 @@ pub fn build_ort_session(
     let normalized = device.trim().to_lowercase();
     let wants_gpu = matches!(
         normalized.as_str(),
-        "directml" | "dml" | "gpu" | "cuda"
+        "auto" | "directml" | "dml" | "gpu" | "cuda"
     );
     if wants_gpu {
         let attempt = ort::session::Session::builder(environment).and_then(|b| {
