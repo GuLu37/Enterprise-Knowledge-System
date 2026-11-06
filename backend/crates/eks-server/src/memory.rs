@@ -1626,6 +1626,61 @@ fn compact_content(content: &str) -> String {
     normalized.replace('\n', " ").chars().take(LONG_TERM_MEMORY_SNIPPET_LIMIT).collect()
 }
 
+/// 记忆文本 → 向量的进程级缓存。
+///
+/// `blend_cosine_scores` 与 ANN 召回此前对同一批记忆文本/查询反复整段重嵌入，
+/// 是记忆类请求延迟与并发排队的主要来源。记忆内容写入后不可变（更新只动
+/// access/importance 字段），同一文本的向量恒定，可安全复用；键为内容哈希，
+/// 命中时再做全文比对，哈希碰撞只会退化为未命中，不影响正确性。
+/// 方向前缀区分查询指令（embed_queries 会前置 query_instruction）。
+static MEMORY_VECTOR_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, (String, std::sync::Arc<Vec<f32>>)>>,
+> = std::sync::OnceLock::new();
+const MEMORY_VECTOR_CACHE_CAP: usize = 8192;
+
+fn memory_vector_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u64, (String, std::sync::Arc<Vec<f32>>)>> {
+    MEMORY_VECTOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn content_hash(kind: &str, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (kind, text).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_memory_vector(kind: &str, text: &str) -> Option<std::sync::Arc<Vec<f32>>> {
+    let cache = memory_vector_cache().lock().unwrap();
+    cache
+        .get(&content_hash(kind, text))
+        .filter(|(stored, _)| stored == text)
+        .map(|(_, vector)| vector.clone())
+}
+
+fn store_memory_vector(kind: &str, text: &str, vector: Vec<f32>) {
+    let mut cache = memory_vector_cache().lock().unwrap();
+    // 简单容量上限：超限整体清空（一次性冷启动代价，避免 LRU 复杂度）
+    if cache.len() >= MEMORY_VECTOR_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(
+        content_hash(kind, text),
+        (text.to_string(), std::sync::Arc::new(vector)),
+    );
+}
+
+/// 查询向量（带查询指令）缓存版：未命中时嵌入一次并写入缓存。
+fn embed_query_cached(embedder: &Embedder, query: &str) -> Option<Vec<f32>> {
+    if let Some(vector) = cached_memory_vector("q", query) {
+        return Some((*vector).clone());
+    }
+    let vectors = embedder.embed_queries(&[query.to_string()]).ok()?;
+    let vector = vectors.into_iter().next()?;
+    store_memory_vector("q", query, vector.clone());
+    Some(vector)
+}
+
 fn blend_cosine_scores(hits: &mut [EventMemoryHit], query: &str, embedder: &Embedder) {
     if hits.is_empty() {
         return;
@@ -1638,24 +1693,45 @@ fn blend_cosine_scores(hits: &mut [EventMemoryHit], query: &str, embedder: &Embe
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     order.truncate(COSINE_RERANK_LIMIT);
-    let query_vec = match embedder.embed_queries(&[query.to_string()]) {
-        Ok(vectors) if !vectors.is_empty() => vectors.into_iter().next().unwrap_or_default(),
-        Ok(_) => return,
-        Err(err) => {
-            tracing::warn!("长期记忆 query 向量化失败: {err}");
+    let query_vec = match embed_query_cached(embedder, query) {
+        Some(vector) if !vector.is_empty() => vector,
+        _ => {
+            tracing::warn!("长期记忆 query 向量化失败");
             return;
         }
     };
-    let texts: Vec<String> = order.iter().map(|&index| hits[index].content.clone()).collect();
-    let doc_vecs = match embedder.embed_documents(&texts) {
-        Ok(vectors) => vectors,
-        Err(err) => {
-            tracing::warn!("长期记忆文档向量化失败: {err}");
-            return;
+    // 先取缓存命中；未命中的文本一次性批量补嵌入（每条文本进程生命周期仅此一次）
+    let mut misses: Vec<(usize, usize)> = Vec::new(); // (order 内位置, 行号)
+    let mut doc_vecs: Vec<Option<std::sync::Arc<Vec<f32>>>> = Vec::with_capacity(order.len());
+    for (position, &index) in order.iter().enumerate() {
+        if let Some(vector) = cached_memory_vector("d", &hits[index].content) {
+            doc_vecs.push(Some(vector));
+        } else {
+            doc_vecs.push(None);
+            misses.push((position, index));
         }
-    };
+    }
+    if !misses.is_empty() {
+        let texts: Vec<String> = misses
+            .iter()
+            .map(|(_, index)| hits[*index].content.clone())
+            .collect();
+        match embedder.embed_documents(&texts) {
+            Ok(vectors) => {
+                for (offset, &(position, index)) in misses.iter().enumerate() {
+                    if let Some(vector) = vectors.get(offset) {
+                        store_memory_vector("d", &hits[index].content, vector.clone());
+                        doc_vecs[position] = Some(std::sync::Arc::new(vector.clone()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("长期记忆文档向量化失败: {err}");
+            }
+        }
+    }
     for (offset, index) in order.into_iter().enumerate() {
-        if let Some(vector) = doc_vecs.get(offset) {
+        if let Some(Some(vector)) = doc_vecs.get(offset) {
             hits[index].score += 0.25 * cosine(&query_vec, vector).max(0.0);
         }
     }
@@ -2762,11 +2838,7 @@ async fn search_event_memories_ann(
     ) {
         return AnnSearch::Failed(err);
     }
-    let vectors = match sink.embedder.embed_queries(&[query.to_string()]) {
-        Ok(vectors) => vectors,
-        Err(_) => return AnnSearch::Unavailable,
-    };
-    let Some(vector) = vectors.into_iter().next() else {
+    let Some(vector) = embed_query_cached(&sink.embedder, query) else {
         return AnnSearch::Unavailable;
     };
     if let Err(err) = crate::milvus_lite::validate_vector_dimension(

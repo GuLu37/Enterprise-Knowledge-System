@@ -324,9 +324,7 @@ impl MilvusLiteStore {
             .enumerate()
             .map(|(index, row)| (index, cosine(query, &row.vector)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        Ok(scored)
+        Ok(sort_top_k_desc(scored, top_k))
     }
 
     /// COSINE 检索并按行字段过滤（长期记忆 user/conversation/session）。
@@ -349,10 +347,25 @@ impl MilvusLiteStore {
             .filter(|(_, row)| predicate(row))
             .map(|(index, row)| (index, cosine(query, &row.vector)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        Ok(scored)
+        Ok(sort_top_k_desc(scored, top_k))
     }
+}
+
+/// 降序取 top_k：先 O(n) 部分选择再对前 k 排序，避免大库下的全量 O(n log n) 排序；
+/// 输出与「全量排序后 truncate」完全一致。
+fn sort_top_k_desc(mut scored: Vec<(usize, f64)>, top_k: usize) -> Vec<(usize, f64)> {
+    let by_score_desc = |a: &(usize, f64), b: &(usize, f64)| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    if top_k == 0 {
+        return Vec::new();
+    }
+    if scored.len() > top_k {
+        scored.select_nth_unstable_by(top_k - 1, by_score_desc);
+        scored.truncate(top_k);
+    }
+    scored.sort_by(by_score_desc);
+    scored
 }
 
 pub const DEFAULT_EMBEDDING_DIMENSION: usize = 768;
@@ -842,6 +855,24 @@ fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_top_k_desc_matches_full_sort() {
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) as f64) / (u32::MAX as f64)
+        };
+        for (len, top_k) in [(0, 3), (1, 3), (5, 3), (5, 5), (5, 0), (200, 7), (200, 200)] {
+            let scored: Vec<(usize, f64)> = (0..len).map(|i| (i, next())).collect();
+            let mut expected = scored.clone();
+            expected.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            expected.truncate(top_k);
+            assert_eq!(sort_top_k_desc(scored, top_k), expected, "len={len} top_k={top_k}");
+        }
+    }
 
     fn dev_db_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

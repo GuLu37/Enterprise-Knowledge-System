@@ -49,14 +49,26 @@ pub fn build_ort_session(
     ort::session::Session::builder(environment)
         .and_then(|b| {
             b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-                .with_intra_threads(
-                    std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(4),
-                )?
+                .with_intra_threads(resolve_intra_threads())?
                 .commit_from_file(onnx_path)
         })
         .map_err(|e| format!("ONNX session 初始化失败: {e}"))
+}
+
+/// CPU 会话 intra-op 线程数：默认全核；`EKS_INTRA_THREADS` 可显式覆盖
+/// （多 CPU 会话并发时，设为 核数/会话数 可避免线程超额订阅争抢）。
+fn resolve_intra_threads() -> usize {
+    if let Ok(value) = std::env::var("EKS_INTRA_THREADS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            if parsed >= 1 {
+                return parsed;
+            }
+        }
+        tracing::warn!("EKS_INTRA_THREADS 非法（{value}），回退全核默认值");
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 pub fn ort_environment_shared() -> Result<&'static ort::environment::Environment, String> {
@@ -142,11 +154,30 @@ impl Embedder {
 
         let environment = ort_environment_shared()?;
         let session_count = config.session_count.max(1);
+        // 会话构建相互独立，并行创建（GPU 会话每个约 0.5s，串行会拖长冷启动）
+        let mut results: Vec<Result<ort::session::Session, String>> = Vec::with_capacity(session_count);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..session_count)
+                .map(|index| {
+                    let device = config.device.clone();
+                    let onnx_path = onnx_path.clone();
+                    scope.spawn(move || {
+                        build_ort_session(environment, &device, &onnx_path)
+                            .map_err(|err| format!("session[{index}] {err}"))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("session 构建线程 panic".into())),
+                );
+            }
+        });
         let mut sessions = Vec::with_capacity(session_count);
-        for index in 0..session_count {
-            let session = build_ort_session(environment, &config.device, &onnx_path)
-                .map_err(|err| format!("session[{index}] {err}"))?;
-            sessions.push(std::sync::Mutex::new(session));
+        for result in results {
+            sessions.push(std::sync::Mutex::new(result?));
         }
         if session_count > 1 {
             tracing::info!(
@@ -198,12 +229,13 @@ impl Embedder {
     }
 
     fn embed_prepared_batch(&self, prepared: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        let mut encodings = Vec::with_capacity(prepared.len());
-        for text in prepared {
-            let encoding = self
-                .tokenizer
-                .encode(text.as_str(), true)
-                .map_err(|e| format!("分词失败: {}", e))?;
+        // encode_batch 并行分词（tokenizers 内建 rayon），大批量入库时显著快于逐条 encode
+        let encodings = self
+            .tokenizer
+            .encode_batch(prepared.to_vec(), true)
+            .map_err(|e| format!("分词失败: {}", e))?;
+        let mut id_rows: Vec<Vec<i64>> = Vec::with_capacity(encodings.len());
+        for encoding in &encodings {
             let mut ids: Vec<i64> = encoding
                 .get_ids()
                 .iter()
@@ -212,8 +244,9 @@ impl Embedder {
             if ids.len() > self.max_length {
                 ids.truncate(self.max_length);
             }
-            encodings.push(ids);
+            id_rows.push(ids);
         }
+        let encodings = id_rows;
         let seq_len = encodings.iter().map(|ids| ids.len()).max().unwrap_or(1).max(1);
         let batch = encodings.len();
 
