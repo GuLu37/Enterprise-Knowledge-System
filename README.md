@@ -52,7 +52,7 @@ flowchart TD
 
 ### 1. 统一 Skill / Tool 注册与执行
 
-`backend-rs/crates/eks-server/src/skills.rs` 统一维护能力定义、公开目录、Function Calling schema 和执行入口。所有模型选择的工具都经过统一执行入口，RAG 也不再有独立的旁路执行协议。
+`backend/crates/eks-server/src/skills.rs` 统一维护能力定义、公开目录、Function Calling schema 和执行入口。所有模型选择的工具都经过统一执行入口，RAG 也不再有独立的旁路执行协议。
 
 当前内置 Skill：
 
@@ -174,7 +174,7 @@ Parent 是切块和上下文回填概念，不会单独建立 Milvus Parent coll
 | 模块 | 技术 |
 | --- | --- |
 | 前端 | Vue 3、Vite、Lucide Vue |
-| 后端 | Rust、Axum、SQLite、Milvus Lite（`backend-rs`，单一后端服务 eks-server） |
+| 后端 | Rust、Axum、SQLite、Milvus Lite（`backend`，单一后端服务 eks-server） |
 | LLM 编排 | Rust 原生多供应商客户端、Function Calling、ReAct 检索循环 |
 | 检索 | Milvus Lite、BGE ONNX Embedding、BM25、RRF、规则重排、可选 Cross-Encoder（ONNX） |
 | 模型服务 | Ollama、OpenAI、DeepSeek、OpenRouter、Anthropic |
@@ -211,7 +211,7 @@ BGE_LOCAL_FILES_ONLY=true
 3. 启动 Rust 后端：
 
 ```powershell
-cd backend-rs
+cd backend
 $env:LIBRARY_PATH="/usr/lib/gcc/x86_64-linux-gnu/13"
 cargo +1.92.0 run -p eks-server
 ```
@@ -219,7 +219,7 @@ cargo +1.92.0 run -p eks-server
 Linux/macOS：
 
 ```bash
-cd backend-rs
+cd backend
 export LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13
 cargo +1.92.0 run -p eks-server
 ```
@@ -305,15 +305,17 @@ docker compose --profile mysql up -d --build
 
 ```text
 .
-├── backend-rs/           # Rust 后端（单一服务 eks-server）
+├── backend/              # Rust 后端（单一服务 eks-server）+ 运行时资产
+│   ├── Cargo.toml        # workspace（eks-kernels + eks-server）
+│   ├── rust-toolchain.toml
+│   ├── Dockerfile        # 服务镜像（compose 构建上下文）
 │   ├── crates/
 │   │   ├── eks-kernels/  # 分词、BM25、融合与重排内核
 │   │   └── eks-server/   # Axum API、检索、记忆、认证
-│   └── scripts/          # 纯 HTTP 检索基准（bench_retrieval.py）
-├── backend/              # 运行时资产目录（无后端代码）
+│   ├── scripts/          # 纯 HTTP 检索基准（bench_retrieval.py）
 │   ├── .env.example      # 环境变量模板（复制为 .env 使用）
-│   └── app/
-│       ├── skills/       # 技能详细规则文档（运行时由 Rust 读取）
+│   └── app/              # 运行时资产
+│       ├── skills/       # 技能详细规则文档（入库，运行时由 Rust 读取）
 │       ├── models/       # BGE / Cross-Encoder ONNX 模型（不入库）
 │       ├── data/         # SQLite 与 milvus_lite.db（不入库）
 │       └── logs/         # 运行日志（不入库）

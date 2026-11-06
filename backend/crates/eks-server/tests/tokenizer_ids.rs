@@ -23,7 +23,7 @@ fn tokenizer_ids_match_hf() {
     let golden: IdsGolden =
         serde_json::from_reader(std::fs::File::open(&fixture_path).unwrap()).unwrap();
     let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../backend/app/models/bge-base-zh-v1.5/tokenizer.json");
+        .join("../../app/models/bge-base-zh-v1.5/tokenizer.json");
     if !tokenizer_path.exists() {
         eprintln!("跳过: tokenizer.json 不存在");
         return;

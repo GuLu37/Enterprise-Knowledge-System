@@ -987,15 +987,15 @@ pub fn default_skills_dir() -> PathBuf {
     candidate_skills_dirs()
         .into_iter()
         .find(|path| path.is_dir())
-        .unwrap_or_else(|| PathBuf::from("../backend/app/skills"))
+        .unwrap_or_else(|| PathBuf::from("app/skills"))
 }
 
 fn candidate_skills_dirs() -> Vec<PathBuf> {
     vec![
+        // CWD=backend（标准运行方式）与 CWD=仓库根 两种情况
+        PathBuf::from("app/skills"),
         PathBuf::from("backend/app/skills"),
-        PathBuf::from("../backend/app/skills"),
-        PathBuf::from("../../backend/app/skills"),
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../backend/app/skills"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/skills"),
     ]
 }
 

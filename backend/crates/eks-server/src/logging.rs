@@ -229,8 +229,8 @@ mod tests {
 
     #[test]
     fn resolves_log_dir_relative_to_backend_app() {
-        assert_eq!(resolve_log_dir("logs"), PathBuf::from("../backend/app/logs"));
-        assert_eq!(resolve_log_dir(""), PathBuf::from("../backend/app/logs"));
+        assert_eq!(resolve_log_dir("logs"), PathBuf::from("app/logs"));
+        assert_eq!(resolve_log_dir(""), PathBuf::from("app/logs"));
         assert_eq!(
             resolve_log_dir("/var/log/eks"),
             PathBuf::from("/var/log/eks")

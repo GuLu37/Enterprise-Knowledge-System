@@ -19,4 +19,4 @@ docs/rrf_*.log
 .DS_Store
 
 # ==================== Rust 构建产物 ====================
-backend-rs/target/
+backend/target/

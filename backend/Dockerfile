@@ -3,10 +3,10 @@ FROM rust:1.92-slim AS builder
 
 WORKDIR /build
 
-# 先拷贝 Cargo 文件利用层缓存
-COPY backend-rs/Cargo.toml backend-rs/Cargo.lock ./
-COPY backend-rs/crates/eks-kernels/Cargo.toml crates/eks-kernels/
-COPY backend-rs/crates/eks-server/Cargo.toml crates/eks-server/
+# 先拷贝 Cargo 文件利用层缓存（构建上下文为 backend/）
+COPY Cargo.toml Cargo.lock ./
+COPY crates/eks-kernels/Cargo.toml crates/eks-kernels/
+COPY crates/eks-server/Cargo.toml crates/eks-server/
 
 # 桩文件让 cargo 能解析依赖
 RUN mkdir -p crates/eks-kernels/src crates/eks-server/src && \
@@ -17,7 +17,7 @@ RUN mkdir -p crates/eks-kernels/src crates/eks-server/src && \
 RUN cargo build --release 2>/dev/null || true
 
 # 拷贝源码并构建
-COPY backend-rs/crates/ crates/
+COPY crates/ crates/
 RUN touch crates/eks-kernels/src/lib.rs crates/eks-server/src/main.rs && \
     cargo build --release --bin eks-server
 

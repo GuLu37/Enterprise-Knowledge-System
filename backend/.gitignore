@@ -28,3 +28,6 @@ temp/
 uploads/
 .cache/
 *.cache
+
+# ==================== Rust 构建产物 ====================
+target/

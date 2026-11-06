@@ -25,7 +25,7 @@ fn cross_encoder_matches_torch_golden() {
 
     // 默认模型目录（HF snapshot）
     let model_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../backend/app/models/models--BAAI--bge-reranker-base/snapshots");
+        .join("../../app/models/models--BAAI--bge-reranker-base/snapshots");
     let snapshot = match std::fs::read_dir(&model_root) {
         Ok(entries) => entries
             .flatten()

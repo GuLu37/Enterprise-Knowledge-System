@@ -17,7 +17,7 @@ struct Golden {
 }
 
 fn model_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../backend/app/models/bge-base-zh-v1.5")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/models/bge-base-zh-v1.5")
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {

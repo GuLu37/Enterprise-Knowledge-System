@@ -845,7 +845,7 @@ mod tests {
 
     fn dev_db_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../backend/app/data/milvus_lite.db")
+            .join("../../app/data/milvus_lite.db")
     }
 
     #[tokio::test]

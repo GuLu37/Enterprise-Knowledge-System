@@ -265,7 +265,7 @@ pub fn sqlite_path_from_database_url(raw: &str) -> Option<String> {
     parsed
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| format!("../backend/app/data/{name}"))
+        .map(|name| format!("app/data/{name}"))
 }
 
 /// 对齐 Python `VECTOR_STORE_TYPE`：只接受 milvus_lite/lite，拒绝远程 milvus gRPC。
@@ -338,7 +338,7 @@ pub fn resolve_backend_model_path(raw: &str, default: &str) -> String {
         || value.contains("/models/")
         || value.ends_with(".onnx");
     let relative = value.strip_prefix("./").unwrap_or(value);
-    let candidate = PathBuf::from("../backend").join(relative);
+    let candidate = PathBuf::from(relative);
     if looks_like_path || candidate.exists() {
         // 统一输出正斜杠，与 Python/Linux 侧路径口径一致（Windows join 会产生反斜杠）。
         return candidate.to_string_lossy().replace('\\', "/");
@@ -359,7 +359,7 @@ pub fn resolve_app_path(raw: &str, default: &str) -> String {
     }
     let relative = value.strip_prefix("./").unwrap_or(value);
     // 统一输出正斜杠，与 Python/Linux 侧路径口径一致（Windows join 会产生反斜杠）。
-    PathBuf::from("../backend/app")
+    PathBuf::from("app")
         .join(relative)
         .to_string_lossy()
         .replace('\\', "/")
@@ -379,7 +379,7 @@ fn load_sqlite_path() -> String {
             return path;
         }
     }
-    "../backend/app/data/rag_metadata.db".into()
+    "app/data/rag_metadata.db".into()
 }
 
 fn load_bge_model_dir() -> String {
@@ -390,7 +390,7 @@ fn load_bge_model_dir() -> String {
     }
     resolve_backend_model_path(
         &env::var("BGE_MODEL_NAME").unwrap_or_default(),
-        "../backend/app/models/bge-base-zh-v1.5",
+        "app/models/bge-base-zh-v1.5",
     )
 }
 
@@ -610,9 +610,9 @@ fn parse_env_value(raw: &str) -> Option<String> {
 }
 
 impl Config {
-    /// 从 .env 文件（默认 ../backend/.env，可用 EKS_ENV_FILE 覆盖）+ 环境变量加载。
+    /// 从 .env 文件（默认 .env，可用 EKS_ENV_FILE 覆盖）+ 环境变量加载。
     pub fn load() -> Self {
-        let env_file = env_or("EKS_ENV_FILE", "../backend/.env");
+        let env_file = env_or("EKS_ENV_FILE", ".env");
         load_env_file(&env_file);
         let cross_encoder_model_name = load_cross_encoder_model_name();
         let (cross_encoder_onnx, cross_encoder_tokenizer) =
@@ -1013,7 +1013,7 @@ mod tests {
     fn parses_python_env_path_aliases() {
         assert_eq!(
             sqlite_path_from_database_url("sqlite:///./app/data/rag_metadata.db").as_deref(),
-            Some("../backend/app/data/rag_metadata.db")
+            Some("app/data/rag_metadata.db")
         );
         assert_eq!(
             sqlite_path_from_database_url("sqlite:////var/eks/rag_metadata.db").as_deref(),
@@ -1036,7 +1036,7 @@ mod tests {
         );
         assert_eq!(
             resolve_backend_model_path("./app/models/bge-base-zh-v1.5", "def"),
-            "../backend/app/models/bge-base-zh-v1.5"
+            "app/models/bge-base-zh-v1.5"
         );
         assert_eq!(
             resolve_backend_model_path("BAAI/bge-base-zh-v1.5", "def"),
@@ -1049,11 +1049,11 @@ mod tests {
         assert!(resolve_cross_encoder_artifacts("BAAI/bge-reranker-base").is_none());
         assert_eq!(
             resolve_app_path("./data/milvus_lite.db", "data/milvus_lite.db"),
-            "../backend/app/data/milvus_lite.db"
+            "app/data/milvus_lite.db"
         );
         assert_eq!(
             resolve_app_path("", "data/milvus_lite.db"),
-            "../backend/app/data/milvus_lite.db"
+            "app/data/milvus_lite.db"
         );
     }
 
@@ -1129,7 +1129,7 @@ mod tests {
         assert!(defaults.contains(&"tsv".to_string()));
         assert_eq!(
             resolve_app_path("logs", "logs"),
-            "../backend/app/logs"
+            "app/logs"
         );
     }
 
