@@ -2808,7 +2808,8 @@ async fn write_memory_vector(
         tracing::warn!("长期记忆向量写入失败: {err}");
         return;
     }
-    sink.store.invalidate(&sink.collection).await;
+    // 不硬失效快照：manifest mtime 变化会让下一次 collection() 走增量重载，
+    // 保留旧快照可避免每轮持久化后全量重读 memory_chunks 的所有 parquet。
 }
 
 enum AnnSearch {

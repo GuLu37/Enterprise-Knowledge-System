@@ -486,8 +486,10 @@ impl RetrievalEngine {
     }
 
     pub async fn invalidate(&self) {
-        self.store.invalidate(self.child_collection()).await;
-        *self.sparse.write().await = None;
+        // 不硬失效集合快照：mtime 变化会触发 collection() 增量重载（只读新增
+        // parquet 并与缓存行合并），保留旧快照作增量基座；删除路径已由
+        // delete_* 内部自行硬失效。稀疏索引与检索结果缓存仍需重建/清空。
+        self.sparse.write().await.take();
         self.result_cache.lock().await.clear();
         tracing::info!("{}", format_sparse_index_invalidated());
     }

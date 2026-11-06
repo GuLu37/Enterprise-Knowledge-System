@@ -61,6 +61,12 @@ pub struct Row {
 pub struct CollectionSnapshot {
     pub rows: Vec<Row>,
     pub loaded_at: SystemTime,
+    /// 快照已覆盖的数据/删除文件清单与已删 pk 集，供增量加载复用：
+    /// 追加只会在 data_files 末尾 push 新文件，满足「前缀一致 + delta 未变」
+    /// 时只需读取新增文件并与缓存行合并，避免每次追加后全量重读所有 parquet。
+    data_files: Vec<String>,
+    delta_files: Vec<String>,
+    deleted_pks: std::collections::HashSet<i64>,
 }
 
 #[derive(Deserialize)]
@@ -138,7 +144,8 @@ impl MilvusLiteStore {
         }
     }
 
-    /// 获取集合快照；manifest mtime 未变时命中缓存，变化时整体重载。
+    /// 获取集合快照；manifest mtime 未变时命中缓存，变化时优先增量加载
+    /// （只读新增数据文件并与缓存行合并），不满足增量条件才全量重读。
     pub async fn collection(&self, name: &str) -> std::io::Result<Arc<CollectionSnapshot>> {
         let collection_dir = self.root.join("collections").join(name);
         let mtime = read_manifest_mtime(&collection_dir)?;
@@ -150,13 +157,26 @@ impl MilvusLiteStore {
                 }
             }
         }
-        let snapshot = Arc::new(self.load_collection(&collection_dir)?);
+        let cached = {
+            let cache = self.cache.read().await;
+            cache.get(name).map(|(_, snapshot)| snapshot.clone())
+        };
+        let snapshot = match cached {
+            Some(previous) => match self.try_load_incremental(&collection_dir, &previous) {
+                Ok(Some(snapshot)) => Arc::new(snapshot),
+                // 条件不满足或增量读失败：回退全量（全量失败才真正报错）
+                Ok(None) | Err(_) => Arc::new(self.load_collection(&collection_dir)?),
+            },
+            None => Arc::new(self.load_collection(&collection_dir)?),
+        };
         let mut cache = self.cache.write().await;
         cache.insert(name.to_string(), (mtime, snapshot.clone()));
         Ok(snapshot)
     }
 
-    /// 强制失效（文档写入后由外部调用）。
+    /// 强制失效（删除路径使用：delta 变化后增量条件不成立，直接丢弃快照）。
+    /// 纯追加路径不要调用——mtime 变化足以触发 `collection()` 的增量重载，
+    /// 保留旧快照才能作为增量合并的基座。
     pub async fn invalidate(&self, name: &str) {
         self.cache.write().await.remove(name);
     }
@@ -262,43 +282,37 @@ impl MilvusLiteStore {
             collection_dir.join("manifest.json"),
         )?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let files = manifest_file_lists(collection_dir, &manifest)?;
 
         let mut rows: Vec<Row> = Vec::new();
         let mut deleted: HashSet<i64> = HashSet::new();
         let mut latest_by_pk: HashMap<i64, usize> = HashMap::new();
 
-        for partition in manifest.partitions.values() {
-            let partition_dir = collection_dir.join("partitions").join("_default");
-            for file in &partition.data_files {
-                for row in read_parquet_rows(&partition_dir.join(file))? {
-                    let seq = row
+        for file in &files.data {
+            for row in read_parquet_rows(&file)? {
+                let seq = row
+                    .fields
+                    .get("_seq")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                if let Some(&existing) = latest_by_pk.get(&row.pk) {
+                    let existing_seq = rows[existing]
                         .fields
                         .get("_seq")
                         .and_then(|v| v.as_int())
                         .unwrap_or(0);
-                    if let Some(&existing) = latest_by_pk.get(&row.pk) {
-                        let existing_seq = rows[existing]
-                            .fields
-                            .get("_seq")
-                            .and_then(|v| v.as_int())
-                            .unwrap_or(0);
-                        if seq > existing_seq {
-                            rows[existing] = row;
-                        }
-                    } else {
-                        latest_by_pk.insert(row.pk, rows.len());
-                        rows.push(row);
+                    if seq > existing_seq {
+                        rows[existing] = row;
                     }
+                } else {
+                    latest_by_pk.insert(row.pk, rows.len());
+                    rows.push(row);
                 }
             }
-            for file in &partition.delta_files {
-                let path = partition_dir.join(file);
-                if !path.exists() {
-                    continue;
-                }
-                for pk in read_delta_pks(&path)? {
-                    deleted.insert(pk);
-                }
+        }
+        for path in &files.delta {
+            for pk in read_delta_pks(path)? {
+                deleted.insert(pk);
             }
         }
 
@@ -307,7 +321,69 @@ impl MilvusLiteStore {
         Ok(CollectionSnapshot {
             rows,
             loaded_at: SystemTime::now(),
+            data_files: files.data_names,
+            delta_files: files.delta_names,
+            deleted_pks: deleted,
         })
+    }
+
+    /// 增量加载：满足「delta 未变 + data_files 为缓存清单的前缀扩展」时，只读取
+    /// 新增 parquet 并与缓存快照合并；条件不满足返回 None 回退全量。
+    /// 合并语义与全量加载一致（同 pk 取 _seq 更新者，已删 pk 过滤）。
+    fn try_load_incremental(
+        &self,
+        collection_dir: &Path,
+        cached: &CollectionSnapshot,
+    ) -> std::io::Result<Option<CollectionSnapshot>> {
+        let manifest: Manifest = serde_json::from_reader(std::fs::File::open(
+            collection_dir.join("manifest.json"),
+        )?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let files = manifest_file_lists(collection_dir, &manifest)?;
+
+        if files.delta_names != cached.delta_files
+            || files.data_names.len() < cached.data_files.len()
+            || files.data_names[..cached.data_files.len()] != cached.data_files[..]
+        {
+            return Ok(None);
+        }
+        let new_files = &files.data[cached.data_files.len()..];
+
+        let mut rows = cached.rows.clone();
+        let mut latest_by_pk: HashMap<i64, usize> =
+            rows.iter().enumerate().map(|(i, r)| (r.pk, i)).collect();
+        for file in new_files {
+            for row in read_parquet_rows(file)? {
+                let seq = row
+                    .fields
+                    .get("_seq")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                if let Some(&existing) = latest_by_pk.get(&row.pk) {
+                    let existing_seq = rows[existing]
+                        .fields
+                        .get("_seq")
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+                    if seq > existing_seq {
+                        rows[existing] = row;
+                    }
+                } else {
+                    latest_by_pk.insert(row.pk, rows.len());
+                    rows.push(row);
+                }
+            }
+        }
+        // delta 与缓存一致：旧行已在缓存加载时过滤，新增行按同一 deleted 集合过滤
+        let deleted = cached.deleted_pks.clone();
+        rows.retain(|row| !deleted.contains(&row.pk));
+        Ok(Some(CollectionSnapshot {
+            rows,
+            loaded_at: SystemTime::now(),
+            data_files: files.data_names,
+            delta_files: files.delta_names,
+            deleted_pks: deleted,
+        }))
     }
 
     /// FLAT + COSINE 暴力扫描，返回 (行下标, 余弦分) 降序 top_k。
@@ -463,6 +539,49 @@ pub struct MemoryChunkRow {
 }
 
 /// 创建空的 milvus_lite collection 目录与 manifest。
+/// manifest 声明的数据/删除文件清单（路径 + 文件名，按分区名排序保证确定性；
+/// 不存在的 delta 文件按原语义跳过路径但保留文件名，便于变更比较）。
+struct ManifestFileLists {
+    data: Vec<PathBuf>,
+    data_names: Vec<String>,
+    delta: Vec<PathBuf>,
+    delta_names: Vec<String>,
+}
+
+fn manifest_file_lists(
+    collection_dir: &Path,
+    manifest: &Manifest,
+) -> std::io::Result<ManifestFileLists> {
+    let partition_dir = collection_dir.join("partitions").join("_default");
+    let mut names: Vec<&String> = manifest.partitions.keys().collect();
+    names.sort();
+    let mut out = ManifestFileLists {
+        data: Vec::new(),
+        data_names: Vec::new(),
+        delta: Vec::new(),
+        delta_names: Vec::new(),
+    };
+    for name in names {
+        let Some(partition) = manifest.partitions.get(name) else {
+            continue;
+        };
+        for file in &partition.data_files {
+            out.data_names.push(file.clone());
+            out.data.push(partition_dir.join(file));
+        }
+        for file in &partition.delta_files {
+            let path = partition_dir.join(file);
+            if !path.exists() {
+                out.delta_names.push(file.clone());
+                continue;
+            }
+            out.delta_names.push(file.clone());
+            out.delta.push(path);
+        }
+    }
+    Ok(out)
+}
+
 /// manifest.json 的读-改-写互斥锁：并发上传（append 数据文件）与并发删除（append delta）
 /// 同时改写 manifest 时会互相读到半写状态（EOF while parsing），批量入库/删除必现。
 /// 所有 manifest 写路径（append_memory_chunks / append_delta_pks / ingest append）经此串行化；
@@ -1201,6 +1320,113 @@ mod tests {
         }
         for handle in handles {
             handle.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn chunk_row(memory_id: &str, text: &str, vector: Vec<f32>) -> MemoryChunkRow {
+        MemoryChunkRow {
+            memory_id: memory_id.into(),
+            chunk_index: 0,
+            source_name: "conversation".into(),
+            chunk_text: text.into(),
+            user_id: "u1".into(),
+            conversation_id: "c1".into(),
+            session_id: "s1".into(),
+            chunk_type: "dialogue".into(),
+            topic: String::new(),
+            turn_start: 0,
+            turn_end: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            vector,
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_snapshot_matches_full_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-incremental-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let dim = DEFAULT_EMBEDDING_DIMENSION;
+        let mk_vec = |seed: f32| vec![seed; dim];
+        // 三批追加：第一批 2 行，第二批 2 行，第三批 1 行
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[
+                chunk_row("u1:c1:0:a", "记忆甲", mk_vec(0.1)),
+                chunk_row("u1:c1:0:b", "记忆乙", mk_vec(0.2)),
+            ],
+            dim,
+        )
+        .unwrap();
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[
+                chunk_row("u1:c2:0:c", "记忆丙", mk_vec(0.3)),
+                chunk_row("u1:c2:0:d", "记忆丁", mk_vec(0.4)),
+            ],
+            dim,
+        )
+        .unwrap();
+        let store = MilvusLiteStore::open(root.clone());
+        // 基座快照（覆盖前两批），随后再追加第三批
+        let base = store.collection("memory_chunks").await.unwrap();
+        assert_eq!(base.rows.len(), 4);
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[chunk_row("u1:c3:0:e", "记忆戊", mk_vec(0.5))],
+            dim,
+        )
+        .unwrap();
+        // 增量路径（mtime 变化 + 前缀满足 → 只读第三个文件）
+        let incremental = store.collection("memory_chunks").await.unwrap();
+        // 黑盒证明确实走了增量：移走两个旧数据文件后再追加一批，若实现回退
+        // 全量会因旧文件缺失而报错，增量路径只读新增文件则照常成功。
+        let data_dir = root.join("collections/memory_chunks/partitions/_default/data");
+        let mut old_names: Vec<std::path::PathBuf> = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        old_names.sort();
+        assert_eq!(old_names.len(), 3);
+        let moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = old_names[..2]
+            .iter()
+            .map(|path| (path.clone(), path.with_extension("hidden")))
+            .collect();
+        for (src, dst) in &moved {
+            std::fs::rename(src, dst).unwrap();
+        }
+        append_memory_chunks(
+            &root,
+            "memory_chunks",
+            &[chunk_row("u1:c4:0:f", "记忆己", mk_vec(0.6))],
+            dim,
+        )
+        .unwrap();
+        let still_incremental = store.collection("memory_chunks").await.unwrap();
+        assert_eq!(still_incremental.rows.len(), 6);
+        for (src, dst) in &moved {
+            std::fs::rename(dst, src).unwrap();
+        }
+        // 全量路径（绕过缓存：新 store 实例）
+        let fresh = MilvusLiteStore::open(root.clone());
+        let full = fresh.collection("memory_chunks").await.unwrap();
+        assert_eq!(incremental.rows.len() + 1, full.rows.len());
+        for (a, b) in still_incremental.rows.iter().zip(full.rows.iter()) {
+            assert_eq!(a.pk, b.pk);
+            assert_eq!(a.vector, b.vector);
+            assert_eq!(
+                a.fields.get("memory_id").and_then(|v| v.as_str()),
+                b.fields.get("memory_id").and_then(|v| v.as_str())
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
