@@ -299,6 +299,8 @@ pub struct RetrievalEngine {
     /// 启动期 Cross-Encoder 工件加载失败的原因（透出到 runtime-status 供诊断）。
     pub cross_encoder_load_error: Option<String>,
     sparse: tokio::sync::RwLock<Option<Arc<SparseIndexSnapshot>>>,
+    /// 稀疏索引 single-flight 构建锁（并发首查只建一次）。
+    sparse_build: tokio::sync::RwLock<()>,
     result_cache: tokio::sync::Mutex<crate::rag_cache::RagResultCache>,
 }
 
@@ -346,6 +348,7 @@ impl RetrievalEngine {
             ce_trigger_mode: "adaptive".to_string(),
             cross_encoder_load_error: None,
             sparse: tokio::sync::RwLock::new(None),
+            sparse_build: tokio::sync::RwLock::new(()),
             result_cache: tokio::sync::Mutex::new(crate::rag_cache::RagResultCache::new(true, 3600)),
         }
     }
@@ -412,15 +415,25 @@ impl RetrievalEngine {
                 return snapshot.clone();
             }
         }
-        let started = std::time::Instant::now();
-        let built = Arc::new(SparseIndexSnapshot::build(rows));
-        tracing::info!(
-            "稀疏持久索引构建完成: rows={} kernel=rust elapsed={:.2}s",
-            rows.len(),
-            started.elapsed().as_secs_f64()
-        );
-        *self.sparse.write().await = Some(built.clone());
-        built
+        // single-flight：并发首查只允许一个任务构建，其余等待复用，避免重复秒级重建。
+        {
+            let mut builder = self.sparse_build.write().await;
+            {
+                let cached = self.sparse.read().await;
+                if let Some(snapshot) = cached.as_ref() {
+                    return snapshot.clone();
+                }
+            }
+            let started = std::time::Instant::now();
+            let built = Arc::new(SparseIndexSnapshot::build(rows));
+            tracing::info!(
+                "稀疏持久索引构建完成: rows={} kernel=rust elapsed={:.2}s",
+                rows.len(),
+                started.elapsed().as_secs_f64()
+            );
+            *self.sparse.write().await = Some(built.clone());
+            built
+        }
     }
 
     fn uses_cached_sparse(&self, row_count: usize) -> bool {
@@ -511,7 +524,14 @@ impl RetrievalEngine {
             Some(snapshot) => snapshot,
             None => return Ok(Vec::new()),
         };
-        let vectors = self.embedder.embed_queries(&[query.to_string()])?;
+        // 嵌入是 CPU/GPU 密集同步操作，放阻塞线程池避免占住 tokio worker。
+        let embedder = self.embedder.clone();
+        let query_text = query.to_string();
+        let vectors = tokio::task::spawn_blocking(move || {
+            embedder.embed_queries(&[query_text])
+        })
+        .await
+        .map_err(|err| err.to_string())??;
         let vector = vectors.first().ok_or_else(|| "查询向量为空".to_string())?;
         let hits = self
             .store
@@ -719,10 +739,17 @@ impl RetrievalEngine {
         };
 
         let query_vectors = if want_dense {
-            match self.embedder.embed_queries(&queries) {
-                Ok(vectors) => vectors,
-                Err(err) => {
+            // 批量嵌入放阻塞线程池，多用户并发时不占 tokio worker。
+            let embedder = self.embedder.clone();
+            let batch = queries.clone();
+            match tokio::task::spawn_blocking(move || embedder.embed_queries(&batch)).await {
+                Ok(Ok(vectors)) => vectors,
+                Ok(Err(err)) => {
                     tracing::warn!("批量密集检索失败，跳过该路结果: {err}");
+                    Vec::new()
+                }
+                Err(err) => {
+                    tracing::warn!("批量密集检索任务失败，跳过该路结果: {err}");
                     Vec::new()
                 }
             }

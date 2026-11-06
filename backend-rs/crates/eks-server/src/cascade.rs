@@ -172,6 +172,8 @@ impl crate::retrieval_engine::RetrievalEngine {
             .iter()
             .map(cross_encoder_text)
             .collect();
+        // 注：CE 触发频率低（adaptive 门控大多跳过），此处保持同步调用；
+        // 会话池已解除并发互斥，偶发阻塞可接受。
         let ce_scores = match ce.score(query, &ce_texts) {
             Ok(scores) if scores.len() == candidate_limit => scores,
             Ok(scores) => {

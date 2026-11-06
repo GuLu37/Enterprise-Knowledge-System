@@ -50,6 +50,7 @@ fn cross_encoder_matches_torch_golden() {
         batch_size: 8,
         // 金分对拍固定 CPU，保证数值可复现。
         device: "cpu".into(),
+        session_count: 1,
     };
     let encoder = CrossEncoder::load(&config).expect("cross-encoder 初始化失败");
     let actual = encoder

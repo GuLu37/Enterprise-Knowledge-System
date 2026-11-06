@@ -70,8 +70,13 @@ pub fn ort_environment_shared() -> Result<&'static ort::environment::Environment
     ORT_ENV.get().ok_or_else(|| "ORT 环境初始化失败".to_string())
 }
 
+/// ort 2.0-rc 的 Session 不支持并发推理（官方注明会崩溃/内存损坏），
+/// 多用户并发下单一 `Mutex<Session>` 会把所有嵌入请求串成队列（实测冷查询
+/// p95 膨胀近 3 倍）。这里改为 **会话池**：加载 N 个独立 session 轮询借用，
+/// 并发请求落在不同 session 上真正并行；并发超过 N 时按锁公平排队。
 pub struct Embedder {
-    session: std::sync::Mutex<ort::session::Session>,
+    sessions: Vec<std::sync::Mutex<ort::session::Session>>,
+    next: std::sync::atomic::AtomicUsize,
     tokenizer: Tokenizer,
     pad_id: i64,
     pub query_instruction: String,
@@ -89,6 +94,8 @@ pub struct EmbedderConfig {
     pub normalize_embeddings: bool,
     /// 推理设备：cpu（默认）/ directml|dml|gpu（DirectML，失败回退 CPU）。
     pub device: String,
+    /// 并发会话数（每会话独立加载一份模型权重；GPU 下注意显存占用）。
+    pub session_count: usize,
 }
 
 impl EmbedderConfig {
@@ -100,6 +107,7 @@ impl EmbedderConfig {
             batch_size: config.bge_batch_size.max(1),
             normalize_embeddings: config.bge_normalize_embeddings,
             device: config.bge_device.clone(),
+            session_count: config.embed_session_count,
         }
     }
 
@@ -131,9 +139,22 @@ impl Embedder {
             .ok_or("vocab 缺少 [PAD]")? as i64;
 
         let environment = ort_environment_shared()?;
-        let session = build_ort_session(environment, &config.device, &onnx_path)?;
+        let session_count = config.session_count.max(1);
+        let mut sessions = Vec::with_capacity(session_count);
+        for index in 0..session_count {
+            let session = build_ort_session(environment, &config.device, &onnx_path)
+                .map_err(|err| format!("session[{index}] {err}"))?;
+            sessions.push(std::sync::Mutex::new(session));
+        }
+        if session_count > 1 {
+            tracing::info!(
+                "Embedder 会话池就绪: sessions={session_count} device={}",
+                config.device
+            );
+        }
         Ok(Embedder {
-            session: std::sync::Mutex::new(session),
+            sessions,
+            next: std::sync::atomic::AtomicUsize::new(0),
             tokenizer,
             pad_id,
             query_instruction: config.query_instruction.clone(),
@@ -141,6 +162,13 @@ impl Embedder {
             batch_size: config.batch_size.max(1),
             normalize_embeddings: config.normalize_embeddings,
         })
+    }
+
+    /// 轮询借用一个会话：并发请求均匀落到池中各 session。
+    fn pick_session(&self) -> &std::sync::Mutex<ort::session::Session> {
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.sessions.len();
+        &self.sessions[index]
     }
 
     /// 批量向量化（分词 + 前向 + CLS 池化 + L2）。is_query 时前置查询指令。
@@ -206,7 +234,7 @@ impl Embedder {
         let token_type_ids: Vec<i64> = vec![0; batch * seq_len];
 
         let mut session = self
-            .session
+            .pick_session()
             .lock()
             .map_err(|_| "ONNX session 锁中毒".to_string())?;
         let outputs = session
@@ -268,6 +296,7 @@ pub fn embedder_for(model_dir: &Path, instruction: &str, max_length: usize) -> R
         batch_size: 16,
         normalize_embeddings: true,
         device: "cpu".into(),
+        session_count: 1,
     })
 }
 

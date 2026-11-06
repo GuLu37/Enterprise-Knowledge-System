@@ -20,7 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(15))
         .pragma("journal_mode", "WAL");
-    let pool = sqlx::SqlitePool::connect_with(db_options).await?;
+    let pool = sqlx::pool::PoolOptions::new()
+        .max_connections(16)
+        .connect_with(db_options)
+        .await?;
     eks_server::db::ensure_auth_schema(&pool).await?;
     eks_server::db::ensure_document_schema(&pool).await?;
     eks_server::db::ensure_conversation_schema(&pool).await?;
@@ -63,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_length: config.cross_encoder_max_length,
                 batch_size: config.cross_encoder_batch_size,
                 device: config.cross_encoder_device.clone(),
+                session_count: config.cross_encoder_session_count,
             },
         ) {
             Ok(ce) => {

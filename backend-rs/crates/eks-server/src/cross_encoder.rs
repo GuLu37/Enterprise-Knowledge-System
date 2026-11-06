@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer;
 
+/// 同 Embedder：ort Session 不支持并发推理，用会话池支撑多用户并行精排。
 pub struct CrossEncoder {
-    session: Mutex<ort::session::Session>,
+    sessions: Vec<Mutex<ort::session::Session>>,
+    next: std::sync::atomic::AtomicUsize,
     tokenizer: Tokenizer,
     pad_id: i64,
     max_length: usize,
@@ -24,6 +26,8 @@ pub struct CrossEncoderConfig {
     pub batch_size: usize,
     /// 推理设备：cpu / directml|dml|gpu（失败回退 CPU）。
     pub device: String,
+    /// 并发会话数（CE 模型较大，默认 1；多用户精排并发时调 2-4，注意内存/显存）。
+    pub session_count: usize,
 }
 
 impl CrossEncoder {
@@ -45,16 +49,38 @@ impl CrossEncoder {
             .ok_or("cross-encoder vocab 缺少 <pad>")? as i64;
 
         let environment = crate::embedder::ort_environment_shared()?;
-        let session =
-            crate::embedder::build_ort_session(environment, &config.device, &config.onnx_path)
-                .map_err(|e| format!("Cross-Encoder session 初始化失败: {e}"))?;
+        let session_count = config.session_count.max(1);
+        let mut sessions = Vec::with_capacity(session_count);
+        for index in 0..session_count {
+            let session = crate::embedder::build_ort_session(
+                environment,
+                &config.device,
+                &config.onnx_path,
+            )
+            .map_err(|e| format!("Cross-Encoder session[{index}] 初始化失败: {e}"))?;
+            sessions.push(Mutex::new(session));
+        }
+        if session_count > 1 {
+            tracing::info!(
+                "Cross-Encoder 会话池就绪: sessions={session_count} device={}",
+                config.device
+            );
+        }
         Ok(CrossEncoder {
-            session: Mutex::new(session),
+            sessions,
+            next: std::sync::atomic::AtomicUsize::new(0),
             tokenizer,
             pad_id,
             max_length: config.max_length.max(16),
             batch_size: config.batch_size.max(1),
         })
+    }
+
+    /// 轮询借用一个会话。
+    fn pick_session(&self) -> &Mutex<ort::session::Session> {
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.sessions.len();
+        &self.sessions[index]
     }
 
     /// 批量 query-text 打分（sigmoid 单 logit），结果顺序与 texts 一致。
@@ -104,7 +130,7 @@ impl CrossEncoder {
                 }
             }
             let mut session = self
-                .session
+                .pick_session()
                 .lock()
                 .map_err(|_| "session 锁中毒".to_string())?;
             let outputs = session

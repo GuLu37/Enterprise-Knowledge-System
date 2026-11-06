@@ -257,5 +257,20 @@ docker compose up eks-server
 | EKS_BGE_MODEL_DIR | ../backend/app/models/bge-base-zh-v1.5 | BGE 模型目录（需含 onnx/model.onnx + tokenizer.json） |
 | EKS_CROSS_ENCODER_ONNX | 按 CROSS_ENCODER_MODEL_NAME/CACHE_DIR 推导 | CE ONNX 路径（缺省时按 HF snapshot 布局查找） |
 | EKS_CROSS_ENCODER_TOKENIZER | 同上 | CE tokenizer.json 路径 |
+| EMBED_SESSION_COUNT | 2 | BGE 并发会话数（多用户并发检索/入库并行度；GPU 建议 4-6，每会话一份权重注意显存） |
+| CROSS_ENCODER_SESSION_COUNT | 1 | CE 并发会话数（模型较大，多用户精排并发时调 2-4） |
 | CROSS_ENCODER_ENABLED | true | 是否启用 CE（工件缺失时启动降级为纯规则，根因经 runtime-status 透出） |
 | CROSS_ENCODER_TRIGGER_MODE | adaptive | 精排触发模式 |
+
+## 多用户并发
+
+单进程内的并发能力由以下机制保证（8 并发用户压测，RTX 3050 + fp32/DirectML）：
+
+- **ONNX 会话池**：ort 的 Session 不支持并发推理，`EMBED_SESSION_COUNT` 个独立会话轮询借用，
+  消除全局互斥。冷查询（缓存未命中）p50 767→108ms、p95 1007→162ms、吞吐 9.5→62.7 req/s。
+- **热路径非阻塞**：检索引擎的查询向量化移入 `spawn_blocking`，不再占住 tokio worker。
+- **SQLite 池**：连接池上限 16（WAL 多读单写），多用户读写不串队。
+- **稀疏索引 single-flight**：并发首查只构建一次 BM25 索引，其余请求等待复用。
+- **milvus_lite manifest 写互斥 + 原子替换**：并发上传/删除不损坏索引文件（见性能与可靠性提交）。
+- 热查询（缓存命中）p50 ~30ms 与会话数无关；SSE 流式首事件 ~50-120ms；
+  并发上传 4 文档全部入库 ~3s；流式完整时长由 LLM 供应商网络主导。

@@ -41,6 +41,10 @@ pub struct Config {
     pub cross_encoder_device: String,
     /// BGE 推理设备：cpu（默认）/ directml|dml|gpu（DirectML，失败回退 CPU）。
     pub bge_device: String,
+    /// BGE 并发会话数（多用户并发检索/入库的并行度；每会话一份模型权重）。
+    pub embed_session_count: usize,
+    /// Cross-Encoder 并发会话数（模型较大，默认 1）。
+    pub cross_encoder_session_count: usize,
     pub llm_provider: String,
     pub llm_temperature: f64,
     pub llm_timeout: u64,
@@ -634,6 +638,8 @@ impl Config {
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
             cross_encoder_device: env_or("CROSS_ENCODER_DEVICE", "auto"),
             bge_device: env_or("BGE_DEVICE", "cpu"),
+            embed_session_count: env_i64("EMBED_SESSION_COUNT", 2).max(1) as usize,
+            cross_encoder_session_count: env_i64("CROSS_ENCODER_SESSION_COUNT", 1).max(1) as usize,
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
             llm_timeout: env_i64("LLM_TIMEOUT", 60).max(1) as u64,
@@ -762,6 +768,8 @@ impl Config {
             cross_encoder_trigger_mode: "adaptive".into(),
             cross_encoder_device: "auto".into(),
             bge_device: "cpu".into(),
+            embed_session_count: 1,
+            cross_encoder_session_count: 1,
             llm_provider: "ollama".into(),
             llm_temperature: 0.7,
             llm_timeout: 60,
