@@ -1005,7 +1005,11 @@ pub async fn search_event_memories(
     .await
     {
         AnnSearch::Hits(hits) => return Ok(hits),
-        AnnSearch::Failed(err) => return Err(err),
+        AnnSearch::Failed(err) => {
+            let wrapped = format_memory_search_fail(&err);
+            tracing::error!("{wrapped}");
+            return Err(wrapped);
+        }
         AnnSearch::Unavailable => {}
     }
 
@@ -1098,7 +1102,7 @@ pub async fn search_event_memories(
     });
     let limit = top_k.max(1);
     scored.truncate(limit);
-    mark_accessed(pool, user_id, &scored).await;
+    mark_accessed_async(pool, user_id, &scored).await;
     Ok(scored)
 }
 
@@ -1353,7 +1357,7 @@ async fn mark_ids_accessed(pool: &sqlx::SqlitePool, user_id: &str, memory_ids: &
             importance_score: 0.0,
         })
         .collect();
-    mark_accessed(pool, user_id, &hits).await;
+    mark_accessed_async(pool, user_id, &hits).await;
 }
 
 pub async fn retrieve_original_conversation(
@@ -1756,12 +1760,46 @@ fn cosine(left: &[f32], right: &[f32]) -> f64 {
     }
 }
 
-async fn mark_accessed(pool: &sqlx::SqlitePool, user_id: &str, hits: &[EventMemoryHit]) {
+fn format_memory_search_fail(error: &str) -> String {
+    format!("长期记忆检索失败: {error}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn format_access_stat_async_fail(error: &str) -> String {
+    format!("异步更新长期记忆访问统计失败: {error}")
+}
+
+fn format_access_stat_submit_fail(error: &str) -> String {
+    format!("提交长期记忆访问统计任务失败: {error}")
+}
+
+async fn mark_accessed_async(pool: &sqlx::SqlitePool, user_id: &str, hits: &[EventMemoryHit]) {
     if hits.is_empty() {
         return;
     }
+    let ids: Vec<String> = hits.iter().map(|hit| hit.memory_id.clone()).collect();
+    #[cfg(test)]
+    {
+        mark_accessed_ids(pool, user_id, &ids).await;
+    }
+    #[cfg(not(test))]
+    {
+        let pool = pool.clone();
+        let user_id = user_id.to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    mark_accessed_ids(&pool, &user_id, &ids).await;
+                });
+            }
+            Err(err) => tracing::warn!("{}", format_access_stat_submit_fail(&err.to_string())),
+        }
+    }
+}
+
+async fn mark_accessed_ids(pool: &sqlx::SqlitePool, user_id: &str, ids: &[String]) {
     let now = crate::db::fmt_dt(&crate::db::now_naive());
-    for hit in hits {
+    for memory_id in ids {
         if let Err(err) = sqlx::query(
             "UPDATE memory_records SET access_count = access_count + 1, last_accessed_at = ?, updated_at = ? \
              WHERE user_id = ? AND memory_id = ? AND status = 'active'",
@@ -1769,7 +1807,7 @@ async fn mark_accessed(pool: &sqlx::SqlitePool, user_id: &str, hits: &[EventMemo
         .bind(&now)
         .bind(&now)
         .bind(user_id)
-        .bind(&hit.memory_id)
+        .bind(memory_id)
         .execute(pool)
         .await
         {
@@ -2967,7 +3005,7 @@ async fn search_event_memories_ann(
             })
     });
     scored.truncate(top_k.max(1));
-    mark_accessed(pool, user_id, &scored).await;
+    mark_accessed_async(pool, user_id, &scored).await;
     AnnSearch::Hits(scored)
 }
 
@@ -3476,6 +3514,18 @@ mod tests {
         assert_eq!(
             format_memory_maintenance_complete(2, 1, 3),
             "长期记忆维护完成: rescored=2 expired=1 purged=3"
+        );
+        assert_eq!(
+            format_memory_search_fail("timeout"),
+            "长期记忆检索失败: timeout"
+        );
+        assert_eq!(
+            format_access_stat_async_fail("db locked"),
+            "异步更新长期记忆访问统计失败: db locked"
+        );
+        assert_eq!(
+            format_access_stat_submit_fail("runtime shutdown"),
+            "提交长期记忆访问统计任务失败: runtime shutdown"
         );
     }
 
