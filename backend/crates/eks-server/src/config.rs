@@ -629,7 +629,7 @@ impl Config {
             environment: env_or("ENVIRONMENT", "开发版"),
             debug: env_bool("DEBUG", true),
             api_prefix: env_or("API_PREFIX", "/api/v1"),
-            host: env_first(&["EKS_HOST", "SERVER_HOST"], "127.0.0.1"),
+            host: env_first(&["EKS_HOST", "SERVER_HOST"], "0.0.0.0"),
             port: env_i64_first(&["EKS_PORT", "SERVER_PORT"], 8000) as u16,
             sqlite_path: load_sqlite_path(),
             jwt_secret_key: env_or("JWT_SECRET_KEY", "change-me-in-production"),
@@ -665,7 +665,7 @@ impl Config {
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
             llm_timeout: env_i64("LLM_TIMEOUT", 60).max(1) as u64,
-            llm_max_tokens: env_i64("LLM_MAX_TOKENS", 4096).max(1) as u32,
+            llm_max_tokens: env_i64("LLM_MAX_TOKENS", 2000).max(1) as u32,
             llm_max_fallback_attempts: env_i64("LLM_MAX_FALLBACK_ATTEMPTS", 2).max(1) as usize,
             deepseek_api_key: env_or("DEEPSEEK_API_KEY", ""),
             deepseek_base_url: env_or("DEEPSEEK_BASE_URL", ""),
@@ -1131,6 +1131,8 @@ mod tests {
             resolve_app_path("logs", "logs"),
             "app/logs"
         );
+        assert_eq!(env_first(&["EKS_MISSING_HOST", "SERVER_HOST_MISSING"], "0.0.0.0"), "0.0.0.0");
+        assert_eq!(env_i64("LLM_MAX_TOKENS_MISSING", 2000), 2000);
     }
 
     #[test]
