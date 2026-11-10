@@ -3,7 +3,6 @@
 use eks_server::config::Config;
 use eks_server::routes;
 use eks_server::state::{AppState, RuntimeWarmup};
-use sqlx::sqlite::SqliteConnectOptions;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -13,13 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eks_server::logging::init_tracing(&config.log_dir, &config.log_level);
     let addr = format!("{}:{}", config.host, config.port);
 
-    // 与 Python 共用同一 SQLite 文件（WAL 模式，读写共存）
-    let db_options = SqliteConnectOptions::new()
-        .filename(&config.sqlite_path)
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .busy_timeout(std::time::Duration::from_secs(15))
-        .pragma("journal_mode", "WAL");
+    // 与 Python 共用同一 SQLite 文件（WAL + synchronous=NORMAL）
+    let db_options = eks_server::db::sqlite_connect_options(&config.sqlite_path);
     let pool = sqlx::pool::PoolOptions::new()
         .max_connections(16)
         .connect_with(db_options)

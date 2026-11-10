@@ -119,6 +119,22 @@ pub async fn ensure_auth_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// 对齐 Python `init_metadata_db`：WAL + `synchronous=NORMAL` + `busy_timeout=15000`。
+pub fn apply_sqlite_pragmas(
+    options: sqlx::sqlite::SqliteConnectOptions,
+) -> sqlx::sqlite::SqliteConnectOptions {
+    options
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(15))
+        .pragma("journal_mode", "WAL")
+        .pragma("synchronous", "NORMAL")
+}
+
+pub fn sqlite_connect_options(filename: impl AsRef<std::path::Path>) -> sqlx::sqlite::SqliteConnectOptions {
+    apply_sqlite_pragmas(sqlx::sqlite::SqliteConnectOptions::new().filename(filename))
+}
+
 /// 对齐 Python `init_metadata_db` 收尾 debug。
 pub fn format_sqlite_schema_ready() -> &'static str {
     "✓ SQLite 元数据与认证表初始化完成"
@@ -475,6 +491,22 @@ pub async fn revoke_session(pool: &sqlx::SqlitePool, session_id: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sqlite_uses_wal_and_normal_synchronous() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let pool = sqlx::SqlitePool::connect_with(apply_sqlite_pragmas(
+            SqliteConnectOptions::from_str("sqlite::memory:").expect("memory sqlite"),
+        ))
+        .await
+        .expect("connect");
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .expect("pragma");
+        assert_eq!(sync, 1, "NORMAL == 1");
+    }
 
     #[test]
     fn sqlite_schema_ready_log_matches_python() {
