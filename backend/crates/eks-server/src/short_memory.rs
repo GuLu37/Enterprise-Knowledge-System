@@ -252,6 +252,10 @@ fn set_cached(key: CacheKey, summary: String) {
     }
 }
 
+fn format_summary_submit_fail(error: &str) -> String {
+    format!("后台短期摘要任务提交失败: {error}")
+}
+
 fn schedule_summary(
     history: Vec<MemoryMessage>,
     options: ShortMemoryOptions,
@@ -260,6 +264,7 @@ fn schedule_summary(
 ) {
     {
         let Ok(mut pending) = inflight().lock() else {
+            tracing::warn!("{}", format_summary_submit_fail("inflight lock poisoned"));
             return;
         };
         if pending.contains(&key) || get_cached(&key).is_some() {
@@ -267,16 +272,26 @@ fn schedule_summary(
         }
         pending.insert(key.clone());
     }
-    tokio::spawn(async move {
-        let result = build_summary_text(&history, options.window_n, options.summary_m, &llm).await;
-        match result {
-            Ok(summary) => set_cached(key.clone(), summary),
-            Err(err) => tracing::warn!("后台短期摘要生成失败: {err}"),
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let result = build_summary_text(&history, options.window_n, options.summary_m, &llm).await;
+                match result {
+                    Ok(summary) => set_cached(key.clone(), summary),
+                    Err(err) => tracing::warn!("后台短期摘要生成失败: {err}"),
+                }
+                if let Ok(mut pending) = inflight().lock() {
+                    pending.remove(&key);
+                }
+            });
         }
-        if let Ok(mut pending) = inflight().lock() {
-            pending.remove(&key);
+        Err(err) => {
+            if let Ok(mut pending) = inflight().lock() {
+                pending.remove(&key);
+            }
+            tracing::warn!("{}", format_summary_submit_fail(&err.to_string()));
         }
-    });
+    }
 }
 
 async fn build_summary_text(
@@ -348,6 +363,14 @@ mod tests {
             role: role.into(),
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn summary_submit_fail_log_matches_python() {
+        assert_eq!(
+            format_summary_submit_fail("executor shutdown"),
+            "后台短期摘要任务提交失败: executor shutdown"
+        );
     }
 
     #[test]
