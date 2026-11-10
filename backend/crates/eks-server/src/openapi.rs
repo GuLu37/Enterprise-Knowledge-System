@@ -594,26 +594,26 @@ pub fn spec(config: &Config) -> Value {
         "components": components(),
         "paths": {
             "/": { "get": op("根路由", "root", None) },
-            "/health": { "get": op("健康检查", "health", None) },
+            "/health": { "get": op("健康检查接口，供反向代理、监控和外部探活使用。", "health", None) },
             "/docs": { "get": op("Swagger 风格文档页", "swagger_ui_html", None) },
             "/redoc": { "get": op("ReDoc 风格文档页", "redoc_html", None) },
             "/openapi.json": { "get": op("OpenAPI Schema", "openapi", None) },
-            (format!("{prefix}/auth/login")): { "post": with_json_io(op("登录", "login", Some("Auth")), Some("LoginRequest"), Some("TokenResponse")) },
-            (format!("{prefix}/auth/register")): { "post": with_json_io(op("注册", "register", Some("Auth")), Some("RegisterRequest"), Some("TokenResponse")) },
-            (format!("{prefix}/auth/refresh")): { "post": with_json_io(op("刷新令牌", "refresh_token", Some("Auth")), Some("RefreshTokenRequest"), Some("TokenResponse")) },
-            (format!("{prefix}/auth/password")): { "post": with_json_io(secured("修改密码", "change_password", "Auth"), Some("PasswordChangeRequest"), Some("TokenResponse")) },
-            (format!("{prefix}/auth/me")): { "get": with_json_io(secured("当前用户", "me", "Auth"), None, Some("UserResponse")) },
-            (format!("{prefix}/retrieval/search/hybrid")): { "post": with_json_io(secured("混合检索", "hybrid_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
-            (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("稠密检索", "dense_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
-            (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索", "sparse_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/auth/login")): { "post": with_json_io(op("用户名密码登录，返回 JWT。", "login", Some("Auth")), Some("LoginRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/register")): { "post": with_json_io(op("创建新账号并直接登录。", "register", Some("Auth")), Some("RegisterRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/refresh")): { "post": with_json_io(op("刷新登录令牌，并让旧令牌失效。", "refresh_token", Some("Auth")), Some("RefreshTokenRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/password")): { "post": with_json_io(secured("修改当前用户密码，并自动旋转登录态。", "change_password", "Auth"), Some("PasswordChangeRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/me")): { "get": with_json_io(secured("返回当前登录用户。", "me", "Auth"), None, Some("UserResponse")) },
+            (format!("{prefix}/retrieval/search/hybrid")): { "post": with_json_io(secured("混合检索文档", "hybrid_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("密集向量检索 (语义相似度)", "dense_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索 (BM25 关键词)", "sparse_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
             (format!("{prefix}/retrieval/rag")): { "post": with_json_io(secured("RAG 检索生成", "retrieval_rag", "Retrieval"), Some("ChatRequest"), Some("ChatResponse")) },
             (format!("{prefix}/retrieval/cache-clear")): { "post": secured("清空检索缓存", "retrieval_cache_clear", "Retrieval") },
-            (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("对话设置", "get_chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
-            (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("运行时状态", "get_chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
-            (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热", "warmup_chat_runtime", "Chat"), None, Some("ChatWarmupResponse")) },
-            (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成回复", "generate_response", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
+            (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("返回前端需要遵守的聊天配置。", "get_chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
+            (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("返回聊天模型和向量模型的后台初始化状态。", "get_chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
+            (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热聊天相关的 LLM 和 embedding 运行时。", "warmup_chat_runtime", "Chat"), None, Some("ChatWarmupResponse")) },
+            (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成一次先做意图路由、再按需调用 RAG 工具的回答。", "generate_response", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
             (format!("{prefix}/chat/consolidate")): { "post": with_query_params(
-                secured("巩固记忆", "consolidate_conversation", "Chat"),
+                secured("会话结束兜底：对整段历史执行三层递进摘要合并。", "consolidate_conversation", "Chat"),
                 json!([{
                     "name": "conversation_id",
                     "in": "query",
@@ -621,37 +621,37 @@ pub fn spec(config: &Config) -> Value {
                     "schema": { "type": "string", "title": "Conversation Id" }
                 }])
             ) },
-            (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式对话", "stream_response", "Chat"), Some("ChatRequest"), None) },
+            (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式生成回答，并转发 RAG 工具调用及来源事件。", "stream_response", "Chat"), Some("ChatRequest"), None) },
             (format!("{prefix}/chat/conversations")): {
-                "get": with_json_io(secured("会话列表", "list_conversations", "Chat"), None, Some("ConversationListResponse")),
-                "delete": with_json_io(secured("清空会话", "clear_conversations", "Chat"), None, Some("ConversationClearResponse"))
+                "get": with_json_io(secured("返回当前用户在服务端保存的对话列表。", "list_conversations", "Chat"), None, Some("ConversationListResponse")),
+                "delete": with_json_io(secured("清空当前用户的全部对话记录和关联长期记忆。", "clear_conversations", "Chat"), None, Some("ConversationClearResponse"))
             },
             (format!("{prefix}/chat/conversations/{{conversation_id}}")): {
-                "put": with_json_io(secured("更新会话", "upsert_conversation", "Chat"), Some("ConversationUpsertRequest"), Some("ConversationRecordResponse")),
-                "delete": with_json_io(secured("删除会话", "delete_conversation", "Chat"), None, Some("ConversationDeleteResponse"))
+                "put": with_json_io(secured("保存某个用户的单个对话记录。", "upsert_conversation", "Chat"), Some("ConversationUpsertRequest"), Some("ConversationRecordResponse")),
+                "delete": with_json_io(secured("删除一个 conversation_id 关联的长期记忆。", "delete_conversation", "Chat"), None, Some("ConversationDeleteResponse"))
             },
             (format!("{prefix}/documents")): { "get": with_query_params(
-                with_json_io(secured("文档列表", "list_documents", "Documents"), None, Some("DocumentListResponse")),
+                with_json_io(secured("列出所有文档", "list_documents", "Documents"), None, Some("DocumentListResponse")),
                 json!([
                     { "name": "skip", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0, "title": "Skip" } },
                     { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10, "title": "Limit" } }
                 ])
             ) },
             (format!("{prefix}/documents/list")): { "get": with_query_params(
-                with_json_io(secured("文档列表（兼容）", "list_documents_compat", "Documents"), None, Some("DocumentListResponse")),
+                with_json_io(secured("列出所有文档", "list_documents_compat", "Documents"), None, Some("DocumentListResponse")),
                 json!([
                     { "name": "skip", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0, "title": "Skip" } },
                     { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10, "title": "Limit" } }
                 ])
             ) },
             (format!("{prefix}/documents/upload")): { "post": with_multipart_upload(with_json_io(secured("上传文档", "upload_document", "Documents"), None, Some("DocumentResponse"))) },
-            (format!("{prefix}/documents/content/{{document_id}}")): { "get": with_json_io(secured("文档内容", "get_document_content", "Documents"), None, Some("DocumentContentResponse")) },
+            (format!("{prefix}/documents/content/{{document_id}}")): { "get": with_json_io(secured("获取文档正文预览内容。", "get_document_content", "Documents"), None, Some("DocumentContentResponse")) },
             (format!("{prefix}/documents/delete/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document_compat", "Documents"), None, Some("DocumentDeleteResponse")) },
             (format!("{prefix}/documents/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document", "Documents"), None, Some("DocumentDeleteResponse")) },
-            (format!("{prefix}/skills")): { "get": with_array_response(secured("技能列表", "get_skills", "Skills"), "SkillDefinitionResponse") },
-            (format!("{prefix}/skills/function-calling")): { "get": secured("Function Calling 技能", "get_function_calling_tools", "Skills") },
-            (format!("{prefix}/skills/capabilities")): { "get": secured("技能能力", "get_capabilities", "Skills") },
-            (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行技能", "execute_skill_route", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
+            (format!("{prefix}/skills")): { "get": with_array_response(secured("返回当前可用的技能目录。", "get_skills", "Skills"), "SkillDefinitionResponse") },
+            (format!("{prefix}/skills/function-calling")): { "get": secured("返回标准 Function Calling 工具定义。", "get_function_calling_tools", "Skills") },
+            (format!("{prefix}/skills/capabilities")): { "get": secured("返回统一能力目录，Function Calling 工具列表是 Skill 的发现入口。", "get_capabilities", "Skills") },
+            (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行一个标准化 Skill。", "execute_skill_route", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
         }
     });
     apply_fastapi_operation_ids(&mut spec);
@@ -771,6 +771,26 @@ mod tests {
             spec["components"]["schemas"]["SkillExecuteRequest"]["properties"]["arguments"]
                 ["additionalProperties"],
             true
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/login"]["post"]["summary"],
+            "用户名密码登录，返回 JWT。"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/retrieval/search/dense"]["post"]["summary"],
+            "密集向量检索 (语义相似度)"
+        );
+        assert_eq!(
+            spec["paths"]["/health"]["get"]["summary"],
+            "健康检查接口，供反向代理、监控和外部探活使用。"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/stream"]["post"]["summary"],
+            "流式生成回答，并转发 RAG 工具调用及来源事件。"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/skills/execute"]["post"]["summary"],
+            "执行一个标准化 Skill。"
         );
         assert_eq!(
             spec["paths"]["/api/v1/auth/login"]["post"]["operationId"],
