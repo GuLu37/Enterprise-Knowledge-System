@@ -108,6 +108,14 @@ mod tests {
             err.detail_json()["detail"][0]["msg"],
             "Field required"
         );
+        assert_eq!(
+            err.detail_json()["detail"][0]["input"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            err.detail_json()["detail"][0]["url"],
+            "https://errors.pydantic.dev/2.12/v/missing"
+        );
     }
 
     #[test]

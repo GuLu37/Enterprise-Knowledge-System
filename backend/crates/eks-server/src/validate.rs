@@ -7,13 +7,14 @@ pub fn string_min_length(value: &str, min: usize) -> Result<(), AuthError> {
 
 pub fn string_min_length_at(value: &str, min: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) < min {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!(
                 "String should have at least {min} character{}",
                 if min == 1 { "" } else { "s" }
             ),
             "string_too_short",
+            serde_json::json!(value),
         ))
     } else {
         Ok(())
@@ -26,10 +27,11 @@ pub fn string_max_length(value: &str, max: usize) -> Result<(), AuthError> {
 
 pub fn string_max_length_at(value: &str, max: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) > max {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!("String should have at most {max} characters"),
             "string_too_long",
+            serde_json::json!(value),
         ))
     } else {
         Ok(())
@@ -51,16 +53,18 @@ pub fn ge_le_int(value: i64, ge: i64, le: i64) -> Result<(), AuthError> {
 
 pub fn ge_le_int_at(value: i64, ge: i64, le: i64, loc: &[&str]) -> Result<(), AuthError> {
     if value < ge {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!("Input should be greater than or equal to {ge}"),
             "greater_than_equal",
+            serde_json::json!(value),
         ))
     } else if value > le {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!("Input should be less than or equal to {le}"),
             "less_than_equal",
+            serde_json::json!(value),
         ))
     } else {
         Ok(())
@@ -73,22 +77,24 @@ pub fn ge_le_float(value: f64, ge: f64, le: f64) -> Result<(), AuthError> {
 
 pub fn ge_le_float_at(value: f64, ge: f64, le: f64, loc: &[&str]) -> Result<(), AuthError> {
     if !value.is_finite() || value < ge {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!(
                 "Input should be greater than or equal to {}",
                 format_pydantic_number(ge)
             ),
             "greater_than_equal",
+            serde_json::json!(value),
         ))
     } else if value > le {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &format!(
                 "Input should be less than or equal to {}",
                 format_pydantic_number(le)
             ),
             "less_than_equal",
+            serde_json::json!(value),
         ))
     } else {
         Ok(())
@@ -103,10 +109,11 @@ pub fn literal_at(value: &str, allowed: &[&str], loc: &[&str]) -> Result<(), Aut
     if allowed.iter().any(|item| *item == value) {
         Ok(())
     } else {
-        Err(AuthError::unprocessable_at(
+        Err(AuthError::unprocessable_at_input(
             loc,
             &literal_message(allowed),
             "literal_error",
+            serde_json::json!(value),
         ))
     }
 }
@@ -177,10 +184,11 @@ pub fn optional_datetime_field_at(value: Option<&str>, loc: &[&str]) -> Result<(
     match value {
         None => Ok(()),
         Some(text) if crate::db::parse_client_datetime(text).is_some() => Ok(()),
-        Some(_) => Err(AuthError::unprocessable_at(
+        Some(text) => Err(AuthError::unprocessable_at_input(
             loc,
             "Input should be a valid datetime",
             "datetime_from_date_parsing",
+            serde_json::json!(text),
         )),
     }
 }
@@ -262,6 +270,11 @@ mod tests {
         let empty_user = login_fields("", "secret").unwrap_err();
         assert_eq!(empty_user.loc, vec!["body".to_string(), "username".to_string()]);
         assert_eq!(empty_user.error_type, "string_too_short");
+        assert_eq!(empty_user.input, serde_json::json!(""));
+        assert_eq!(
+            empty_user.detail_json()["detail"][0]["url"],
+            "https://errors.pydantic.dev/2.12/v/string_too_short"
+        );
         assert_eq!(
             detail(register_fields("user", "12345", "12345").unwrap_err()),
             (

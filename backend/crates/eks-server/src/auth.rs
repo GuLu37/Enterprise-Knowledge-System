@@ -281,14 +281,22 @@ fn loc_json_item(item: &str) -> serde_json::Value {
     serde_json::json!(item)
 }
 
+/// 对齐 Python `pydantic==2.12.5` 校验错误里的文档链接。
+const PYDANTIC_ERROR_URL_PREFIX: &str = "https://errors.pydantic.dev/2.12/v/";
+
+fn pydantic_error_url(error_type: &str) -> String {
+    format!("{PYDANTIC_ERROR_URL_PREFIX}{error_type}")
+}
+
 /// 与 FastAPI HTTPException(status, detail) 同构的错误。
-/// 422 另带 Pydantic `loc`/`type`，序列化为 `detail: [{loc, msg, type}]`。
+/// 422 序列化为 `detail: [{loc, msg, type, input, url}]`，对齐 Pydantic v2。
 #[derive(Debug, Clone)]
 pub struct AuthError {
     pub status: axum::http::StatusCode,
     pub detail: String,
     pub loc: Vec<String>,
     pub error_type: String,
+    pub input: serde_json::Value,
 }
 
 impl AuthError {
@@ -298,6 +306,7 @@ impl AuthError {
             detail: detail.into(),
             loc: Vec::new(),
             error_type: String::new(),
+            input: serde_json::Value::Null,
         }
     }
 
@@ -318,11 +327,21 @@ impl AuthError {
     }
 
     pub fn unprocessable_at(loc: &[&str], detail: &str, error_type: &str) -> Self {
+        Self::unprocessable_at_input(loc, detail, error_type, serde_json::Value::Null)
+    }
+
+    pub fn unprocessable_at_input(
+        loc: &[&str],
+        detail: &str,
+        error_type: &str,
+        input: serde_json::Value,
+    ) -> Self {
         AuthError {
             status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             detail: detail.to_string(),
             loc: loc.iter().map(|item| (*item).to_string()).collect(),
             error_type: error_type.to_string(),
+            input,
         }
     }
 
@@ -342,7 +361,9 @@ impl AuthError {
                 "detail": [{
                     "loc": loc,
                     "msg": self.detail,
-                    "type": error_type
+                    "type": error_type,
+                    "input": self.input,
+                    "url": pydantic_error_url(error_type)
                 }]
             })
         } else {
