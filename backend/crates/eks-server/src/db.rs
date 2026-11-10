@@ -124,6 +124,16 @@ pub fn format_sqlite_schema_ready() -> &'static str {
     "✓ SQLite 元数据与认证表初始化完成"
 }
 
+/// 对齐 Python `init_metadata_db` 的 schema / bootstrap 失败。
+pub fn format_sqlite_init_fail(err: &str) -> String {
+    format!("初始化用户表或 bootstrap 管理员失败: {err}")
+}
+
+/// 对齐 Python `SQLite document_chunks 已补齐历史 Parent ID: %s`。
+pub fn format_parent_id_backfill(migrated: u64) -> String {
+    format!("SQLite document_chunks 已补齐历史 Parent ID: {migrated}")
+}
+
 /// 对齐 Python `init_metadata_db` 中的 documents / document_chunks 表。
 pub async fn ensure_document_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -225,10 +235,7 @@ async fn migrate_document_parent_id(pool: &sqlx::SqlitePool) -> Result<(), sqlx:
     .execute(pool)
     .await?;
     if result.rows_affected() > 0 {
-        tracing::info!(
-            migrated = result.rows_affected(),
-            "SQLite document_chunks 已补齐历史 Parent ID"
-        );
+        tracing::info!("{}", format_parent_id_backfill(result.rows_affected()));
     }
     Ok(())
 }
@@ -474,6 +481,14 @@ mod tests {
         assert_eq!(
             format_sqlite_schema_ready(),
             "✓ SQLite 元数据与认证表初始化完成"
+        );
+        assert_eq!(
+            format_sqlite_init_fail("locked"),
+            "初始化用户表或 bootstrap 管理员失败: locked"
+        );
+        assert_eq!(
+            format_parent_id_backfill(3),
+            "SQLite document_chunks 已补齐历史 Parent ID: 3"
         );
     }
 

@@ -24,7 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_connections(16)
         .connect_with(db_options)
         .await?;
-    eks_server::db::ensure_auth_schema(&pool).await?;
+    if let Err(err) = eks_server::db::ensure_auth_schema(&pool).await {
+        tracing::error!("{}", eks_server::db::format_sqlite_init_fail(&err.to_string()));
+        return Err(err.into());
+    }
     eks_server::db::ensure_document_schema(&pool).await?;
     eks_server::db::ensure_conversation_schema(&pool).await?;
     match eks_server::auth::seed_bootstrap_admin(
@@ -45,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(eks_server::auth::BootstrapAdminOutcome::Skipped) => {
             tracing::info!("未配置 bootstrap 管理员，跳过账号初始化");
         }
-        Err(err) => tracing::error!("初始化 bootstrap 管理员失败: {err}"),
+        Err(err) => tracing::error!("{}", eks_server::db::format_sqlite_init_fail(&err.to_string())),
     }
     eks_server::memory::ensure_schema(&pool).await?;
     tracing::debug!("{}", eks_server::db::format_sqlite_schema_ready());
