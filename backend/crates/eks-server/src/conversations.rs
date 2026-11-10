@@ -24,11 +24,15 @@ pub struct ConversationRecord {
     pub messages: Value,
 }
 
+fn default_message_list() -> Value {
+    json!([])
+}
+
 #[derive(Deserialize)]
 pub struct ConversationUpsertRequest {
     #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_message_list")]
     pub messages: Value,
     #[serde(default)]
     pub created_at: Option<String>,
@@ -59,6 +63,20 @@ fn message_role(item: &Value) -> String {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(flag)) => flag.to_string(),
         _ => String::new(),
+    }
+}
+
+/// 对齐 Pydantic `messages: List[Dict] = Field(default_factory=list)`：缺省 `[]`，`null`/非列表 422。
+fn require_message_list(messages: &Value) -> Result<(), AuthError> {
+    if messages.is_array() {
+        Ok(())
+    } else {
+        Err(AuthError::unprocessable_at_input(
+            &["body", "messages"],
+            "Input should be a valid list",
+            "list_type",
+            messages.clone(),
+        ))
     }
 }
 
@@ -156,6 +174,7 @@ pub async fn upsert_conversation(
     crate::validate::session_id_field(request.session_id.as_deref())?;
     crate::validate::optional_datetime_field_at(request.created_at.as_deref(), &["body", "created_at"])?;
     crate::validate::optional_datetime_field_at(request.updated_at.as_deref(), &["body", "updated_at"])?;
+    require_message_list(&request.messages)?;
     let cid = conversation_id.trim().to_string();
     if user.user_id.is_empty() || cid.is_empty() {
         return Err(AuthError::bad_request(empty_conversation_identity_error()));
@@ -408,6 +427,14 @@ mod tests {
             ])
         );
         assert_eq!(normalize_messages(&json!("not-list")), "[]");
+        let omitted: ConversationUpsertRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.messages, json!([]));
+        let explicit_null: ConversationUpsertRequest =
+            serde_json::from_str(r#"{"messages":null}"#).unwrap();
+        let err = require_message_list(&explicit_null.messages).unwrap_err();
+        assert_eq!(err.error_type, "list_type");
+        assert_eq!(err.detail, "Input should be a valid list");
+        assert_eq!(err.input, json!(null));
         assert_eq!(empty_conversation_identity_error(), "user_id 和 conversation_id 不能为空");
         assert!(!json_is_truthy(&json!(null)));
         assert!(!json_is_truthy(&json!(0)));
