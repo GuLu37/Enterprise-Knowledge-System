@@ -68,11 +68,442 @@ const REDOC_HTML: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
-fn op(summary: &str, operation_id: &str) -> Value {
-    json!({
+fn op(summary: &str, operation_id: &str, tag: Option<&str>) -> Value {
+    op_full(summary, operation_id, tag, "200", false)
+}
+
+fn secured(summary: &str, operation_id: &str, tag: &str) -> Value {
+    op_full(summary, operation_id, Some(tag), "200", true)
+}
+
+fn accepted(summary: &str, operation_id: &str, tag: &str) -> Value {
+    op_full(summary, operation_id, Some(tag), "202", true)
+}
+
+fn op_full(
+    summary: &str,
+    operation_id: &str,
+    tag: Option<&str>,
+    success: &str,
+    bearer: bool,
+) -> Value {
+    let mut value = json!({
         "summary": summary,
         "operationId": operation_id,
-        "responses": { "200": { "description": "成功" } }
+        "responses": { success: { "description": "成功" } }
+    });
+    if let Some(tag) = tag {
+        value["tags"] = json!([tag]);
+    }
+    if bearer {
+        value["security"] = json!([{ "HTTPBearer": [] }]);
+    }
+    value
+}
+
+fn ref_schema(name: &str) -> Value {
+    json!({ "$ref": format!("#/components/schemas/{name}") })
+}
+
+fn with_json_io(mut op: Value, request: Option<&str>, response: Option<&str>) -> Value {
+    if let Some(name) = request {
+        op["requestBody"] = json!({
+            "required": true,
+            "content": {
+                "application/json": { "schema": ref_schema(name) }
+            }
+        });
+        op["responses"]["422"] = json!({
+            "description": "Validation Error",
+            "content": {
+                "application/json": { "schema": ref_schema("HTTPValidationError") }
+            }
+        });
+    }
+    if let Some(name) = response {
+        let code = if op["responses"].get("202").is_some() {
+            "202"
+        } else {
+            "200"
+        };
+        op["responses"][code]["content"] = json!({
+            "application/json": { "schema": ref_schema(name) }
+        });
+    }
+    op
+}
+
+fn components() -> Value {
+    json!({
+        "securitySchemes": {
+            "HTTPBearer": {
+                "type": "http",
+                "scheme": "bearer"
+            }
+        },
+        "schemas": {
+            "HTTPValidationError": {
+                "title": "HTTPValidationError",
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "title": "Detail",
+                        "type": "array",
+                        "items": ref_schema("ValidationError")
+                    }
+                }
+            },
+            "ValidationError": {
+                "title": "ValidationError",
+                "required": ["loc", "msg", "type"],
+                "type": "object",
+                "properties": {
+                    "loc": {
+                        "title": "Location",
+                        "type": "array",
+                        "items": {
+                            "anyOf": [{ "type": "string" }, { "type": "integer" }]
+                        }
+                    },
+                    "msg": { "title": "Message", "type": "string" },
+                    "type": { "title": "Error Type", "type": "string" }
+                }
+            },
+            "UserResponse": {
+                "title": "UserResponse",
+                "type": "object",
+                "required": ["user_id", "username", "role"],
+                "properties": {
+                    "user_id": { "type": "string", "title": "User Id" },
+                    "username": { "type": "string", "title": "Username" },
+                    "role": { "type": "string", "title": "Role" },
+                    "is_active": { "type": "boolean", "title": "Is Active", "default": true },
+                    "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "last_login_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+                }
+            },
+            "TokenResponse": {
+                "title": "TokenResponse",
+                "type": "object",
+                "required": ["access_token", "refresh_token", "user"],
+                "properties": {
+                    "access_token": { "type": "string", "title": "Access Token" },
+                    "refresh_token": { "type": "string", "title": "Refresh Token" },
+                    "token_type": { "type": "string", "title": "Token Type", "default": "bearer", "enum": ["bearer"] },
+                    "access_expires_in": { "type": "integer", "title": "Access Expires In", "default": 0 },
+                    "refresh_expires_in": { "type": "integer", "title": "Refresh Expires In", "default": 0 },
+                    "user": ref_schema("UserResponse")
+                }
+            },
+            "LoginRequest": {
+                "title": "LoginRequest",
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                    "username": { "type": "string", "title": "Username", "minLength": 1, "maxLength": 128 },
+                    "password": { "type": "string", "title": "Password", "minLength": 1, "maxLength": 128 }
+                }
+            },
+            "RegisterRequest": {
+                "title": "RegisterRequest",
+                "type": "object",
+                "required": ["username", "password", "confirm_password"],
+                "properties": {
+                    "username": { "type": "string", "title": "Username", "minLength": 1, "maxLength": 128 },
+                    "password": { "type": "string", "title": "Password", "minLength": 6, "maxLength": 128 },
+                    "confirm_password": { "type": "string", "title": "Confirm Password", "minLength": 6, "maxLength": 128 }
+                }
+            },
+            "RefreshTokenRequest": {
+                "title": "RefreshTokenRequest",
+                "type": "object",
+                "required": ["refresh_token"],
+                "properties": {
+                    "refresh_token": { "type": "string", "title": "Refresh Token", "minLength": 1 }
+                }
+            },
+            "PasswordChangeRequest": {
+                "title": "PasswordChangeRequest",
+                "type": "object",
+                "required": ["current_password", "new_password"],
+                "properties": {
+                    "current_password": { "type": "string", "title": "Current Password", "minLength": 1, "maxLength": 128 },
+                    "new_password": { "type": "string", "title": "New Password", "minLength": 6, "maxLength": 128 }
+                }
+            },
+            "SkillExecuteRequest": {
+                "title": "SkillExecuteRequest",
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "title": "Name", "minLength": 1 },
+                    "arguments": { "type": "object", "title": "Arguments" },
+                    "context": ref_schema("SkillExecutionContextRequest")
+                }
+            },
+            "SkillExecutionContextRequest": {
+                "title": "SkillExecutionContextRequest",
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "session_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "query": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "trace_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "metadata": { "type": "object", "title": "Metadata" }
+                }
+            },
+            "SkillExecuteResponse": {
+                "title": "SkillExecuteResponse",
+                "type": "object",
+                "required": ["skill", "category", "kind", "executed_at"],
+                "properties": {
+                    "skill": { "type": "string" },
+                    "category": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "arguments": { "type": "object" },
+                    "context": { "type": "object" },
+                    "result": { "type": "object" },
+                    "executed_at": { "type": "string" }
+                }
+            },
+            "SkillDefinitionResponse": {
+                "title": "SkillDefinitionResponse",
+                "type": "object",
+                "required": ["name", "description", "category", "kind"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "category": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "metadata": { "type": "object" },
+                    "function_calling": { "type": "object" }
+                }
+            },
+            "DocumentResponse": {
+                "title": "DocumentResponse",
+                "type": "object",
+                "required": ["document_id", "original_filename", "stored_filename", "file_path", "file_type", "file_size", "status", "chunk_count"],
+                "properties": {
+                    "document_id": { "type": "string" },
+                    "original_filename": { "type": "string" },
+                    "stored_filename": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "content_type": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "file_type": { "type": "string" },
+                    "file_size": { "type": "integer" },
+                    "status": { "type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"] },
+                    "chunk_count": { "type": "integer", "default": 0 },
+                    "error_message": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+                }
+            },
+            "DocumentListResponse": {
+                "title": "DocumentListResponse",
+                "type": "object",
+                "required": ["documents", "total", "skip", "limit"],
+                "properties": {
+                    "documents": { "type": "array", "items": ref_schema("DocumentResponse") },
+                    "total": { "type": "integer" },
+                    "skip": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }
+            },
+            "DocumentContentResponse": {
+                "title": "DocumentContentResponse",
+                "type": "object",
+                "required": ["document_id", "original_filename", "file_type", "status", "content"],
+                "properties": {
+                    "document_id": { "type": "string" },
+                    "original_filename": { "type": "string" },
+                    "file_type": { "type": "string" },
+                    "status": { "type": "string" },
+                    "content": { "type": "string" },
+                    "content_type": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+                }
+            },
+            "DocumentDeleteResponse": {
+                "title": "DocumentDeleteResponse",
+                "type": "object",
+                "required": ["document_id", "original_filename", "stored_filename", "file_path", "file_type", "file_size", "status", "chunk_count"],
+                "properties": {
+                    "document_id": { "type": "string" },
+                    "original_filename": { "type": "string" },
+                    "stored_filename": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "content_type": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "file_type": { "type": "string" },
+                    "file_size": { "type": "integer" },
+                    "status": { "type": "string", "enum": ["processing", "ready", "failed", "deleting", "deleted"] },
+                    "chunk_count": { "type": "integer", "default": 0 },
+                    "error_message": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "milvus_deleted": { "type": "boolean", "default": false },
+                    "file_deleted": { "type": "boolean", "default": false }
+                }
+            },
+            "RetrievalRequest": {
+                "title": "RetrievalRequest",
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "top_k": { "type": "integer", "default": 5, "minimum": 1, "maximum": 50 }
+                }
+            },
+            "RetrievalResultResponse": {
+                "title": "RetrievalResultResponse",
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                    "content": { "type": "string" },
+                    "metadata": { "type": "object" },
+                    "score": { "type": "number", "default": 0.0 },
+                    "source": { "type": "string", "default": "" }
+                }
+            },
+            "RetrievalResponse": {
+                "title": "RetrievalResponse",
+                "type": "object",
+                "required": ["query", "retrieval_method", "results", "top_k"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "retrieval_method": { "type": "string", "enum": ["hybrid", "dense", "sparse"] },
+                    "results": { "type": "array", "items": ref_schema("RetrievalResultResponse") },
+                    "top_k": { "type": "integer" }
+                }
+            },
+            "ChatMessage": {
+                "title": "ChatMessage",
+                "type": "object",
+                "required": ["role", "content"],
+                "properties": {
+                    "role": { "type": "string", "enum": ["system", "user", "assistant"] },
+                    "content": { "type": "string", "minLength": 1 }
+                }
+            },
+            "ChatRequest": {
+                "title": "ChatRequest",
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "history": { "anyOf": [{ "type": "array", "items": ref_schema("ChatMessage") }, { "type": "null" }] },
+                    "conversation_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "session_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "top_k": { "type": "integer", "default": 5, "minimum": 1, "maximum": 50 },
+                    "use_retrieval": { "type": "boolean", "default": true },
+                    "retrieval_method": { "type": "string", "default": "hybrid", "enum": ["hybrid", "dense", "sparse"] },
+                    "short_memory_strategy": { "type": "string", "default": "window", "enum": ["window", "summary"] },
+                    "short_memory_n": { "type": "integer", "default": 5, "minimum": 1 },
+                    "short_memory_m": { "type": "integer", "default": 10, "minimum": 1 },
+                    "temperature": { "anyOf": [{ "type": "number", "minimum": 0, "maximum": 2 }, { "type": "null" }] },
+                    "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "model": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                }
+            },
+            "ChatResponse": {
+                "title": "ChatResponse",
+                "type": "object",
+                "required": ["query", "response", "model"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "response": { "type": "string" },
+                    "sources": { "type": "array", "items": ref_schema("RetrievalResultResponse") },
+                    "model": { "type": "string" },
+                    "retrieval_method": { "anyOf": [{ "type": "string", "enum": ["hybrid", "dense", "sparse"] }, { "type": "null" }] }
+                }
+            },
+            "ChatSettingsResponse": {
+                "title": "ChatSettingsResponse",
+                "type": "object",
+                "required": ["max_conversations"],
+                "properties": { "max_conversations": { "type": "integer" } }
+            },
+            "ChatRuntimeStatusResponse": {
+                "title": "ChatRuntimeStatusResponse",
+                "type": "object",
+                "properties": {
+                    "ready": { "type": "boolean", "default": false },
+                    "status": { "type": "string", "default": "initializing" },
+                    "llm_warmed": { "type": "boolean", "default": false },
+                    "embedding_warmed": { "type": "boolean", "default": false },
+                    "cross_encoder_enabled": { "type": "boolean", "default": false },
+                    "cross_encoder_warmed": { "type": "boolean", "default": false },
+                    "cross_encoder_model": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "cross_encoder_device": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "cross_encoder_error": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                }
+            },
+            "ChatWarmupResponse": {
+                "title": "ChatWarmupResponse",
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "default": "initializing" },
+                    "llm_warmed": { "type": "boolean", "default": false },
+                    "embedding_warmed": { "type": "boolean", "default": false },
+                    "cross_encoder_enabled": { "type": "boolean", "default": false },
+                    "cross_encoder_warmed": { "type": "boolean", "default": false },
+                    "cross_encoder_model": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "cross_encoder_device": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "cross_encoder_error": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                }
+            },
+            "ConversationRecordResponse": {
+                "title": "ConversationRecordResponse",
+                "type": "object",
+                "required": ["conversation_id"],
+                "properties": {
+                    "conversation_id": { "type": "string" },
+                    "session_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "messages": { "type": "array", "items": { "type": "object" } }
+                }
+            },
+            "ConversationListResponse": {
+                "title": "ConversationListResponse",
+                "type": "object",
+                "properties": {
+                    "conversations": { "type": "array", "items": ref_schema("ConversationRecordResponse") }
+                }
+            },
+            "ConversationUpsertRequest": {
+                "title": "ConversationUpsertRequest",
+                "type": "object",
+                "properties": {
+                    "session_id": { "anyOf": [{ "type": "string", "maxLength": 64 }, { "type": "null" }] },
+                    "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+                    "messages": { "type": "array", "items": { "type": "object" } }
+                }
+            },
+            "ConversationDeleteResponse": {
+                "title": "ConversationDeleteResponse",
+                "type": "object",
+                "required": ["conversation_id"],
+                "properties": {
+                    "conversation_id": { "type": "string" },
+                    "memory_deleted": { "type": "boolean", "default": false }
+                }
+            },
+            "ConversationClearResponse": {
+                "title": "ConversationClearResponse",
+                "type": "object",
+                "properties": {
+                    "deleted_count": { "type": "integer", "default": 0 },
+                    "memory_deleted_count": { "type": "integer", "default": 0 }
+                }
+            }
+        }
     })
 }
 
@@ -85,46 +516,54 @@ pub fn spec(config: &Config) -> Value {
             "version": config.app_version,
             "description": "基于 LangChain 的 RAG 三重检索系统",
         },
+        "tags": [
+            { "name": "Auth" },
+            { "name": "Documents" },
+            { "name": "Retrieval" },
+            { "name": "Chat" },
+            { "name": "Skills" },
+        ],
+        "components": components(),
         "paths": {
-            "/": { "get": op("根路由", "root") },
-            "/health": { "get": op("健康检查", "health") },
-            "/docs": { "get": op("Swagger 风格文档页", "docs") },
-            "/redoc": { "get": op("ReDoc 风格文档页", "redoc") },
-            "/openapi.json": { "get": op("OpenAPI Schema", "openapi_json") },
-            (format!("{prefix}/auth/login")): { "post": op("登录", "login") },
-            (format!("{prefix}/auth/register")): { "post": op("注册", "register") },
-            (format!("{prefix}/auth/refresh")): { "post": op("刷新令牌", "refresh") },
-            (format!("{prefix}/auth/password")): { "post": op("修改密码", "change_password") },
-            (format!("{prefix}/auth/me")): { "get": op("当前用户", "me") },
-            (format!("{prefix}/retrieval/search/hybrid")): { "post": op("混合检索", "retrieval_hybrid") },
-            (format!("{prefix}/retrieval/search/dense")): { "post": op("稠密检索", "retrieval_dense") },
-            (format!("{prefix}/retrieval/search/sparse")): { "post": op("稀疏检索", "retrieval_sparse") },
-            (format!("{prefix}/retrieval/rag")): { "post": op("RAG 检索生成", "retrieval_rag") },
-            (format!("{prefix}/retrieval/cache-clear")): { "post": op("清空检索缓存", "retrieval_cache_clear") },
-            (format!("{prefix}/chat/settings")): { "get": op("对话设置", "chat_settings") },
-            (format!("{prefix}/chat/runtime-status")): { "get": op("运行时状态", "chat_runtime_status") },
-            (format!("{prefix}/chat/warmup")): { "post": op("预热", "chat_warmup") },
-            (format!("{prefix}/chat/generate")): { "post": op("生成回复", "generate_chat") },
-            (format!("{prefix}/chat/consolidate")): { "post": op("巩固记忆", "consolidate_chat") },
-            (format!("{prefix}/chat/stream")): { "post": op("流式对话", "stream_chat") },
+            "/": { "get": op("根路由", "root", None) },
+            "/health": { "get": op("健康检查", "health", None) },
+            "/docs": { "get": op("Swagger 风格文档页", "docs", None) },
+            "/redoc": { "get": op("ReDoc 风格文档页", "redoc", None) },
+            "/openapi.json": { "get": op("OpenAPI Schema", "openapi_json", None) },
+            (format!("{prefix}/auth/login")): { "post": with_json_io(op("登录", "login", Some("Auth")), Some("LoginRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/register")): { "post": with_json_io(op("注册", "register", Some("Auth")), Some("RegisterRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/refresh")): { "post": with_json_io(op("刷新令牌", "refresh", Some("Auth")), Some("RefreshTokenRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/password")): { "post": with_json_io(secured("修改密码", "change_password", "Auth"), Some("PasswordChangeRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/me")): { "get": with_json_io(secured("当前用户", "me", "Auth"), None, Some("UserResponse")) },
+            (format!("{prefix}/retrieval/search/hybrid")): { "post": with_json_io(secured("混合检索", "retrieval_hybrid", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("稠密检索", "retrieval_dense", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索", "retrieval_sparse", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/rag")): { "post": with_json_io(secured("RAG 检索生成", "retrieval_rag", "Retrieval"), Some("ChatRequest"), Some("ChatResponse")) },
+            (format!("{prefix}/retrieval/cache-clear")): { "post": secured("清空检索缓存", "retrieval_cache_clear", "Retrieval") },
+            (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("对话设置", "chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
+            (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("运行时状态", "chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
+            (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热", "chat_warmup", "Chat"), None, Some("ChatWarmupResponse")) },
+            (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成回复", "generate_chat", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
+            (format!("{prefix}/chat/consolidate")): { "post": secured("巩固记忆", "consolidate_chat", "Chat") },
+            (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式对话", "stream_chat", "Chat"), Some("ChatRequest"), None) },
             (format!("{prefix}/chat/conversations")): {
-                "get": op("会话列表", "list_conversations"),
-                "delete": op("清空会话", "clear_conversations")
+                "get": with_json_io(secured("会话列表", "list_conversations", "Chat"), None, Some("ConversationListResponse")),
+                "delete": with_json_io(secured("清空会话", "clear_conversations", "Chat"), None, Some("ConversationClearResponse"))
             },
             (format!("{prefix}/chat/conversations/{{conversation_id}}")): {
-                "put": op("更新会话", "upsert_conversation"),
-                "delete": op("删除会话", "delete_conversation")
+                "put": with_json_io(secured("更新会话", "upsert_conversation", "Chat"), Some("ConversationUpsertRequest"), Some("ConversationRecordResponse")),
+                "delete": with_json_io(secured("删除会话", "delete_conversation", "Chat"), None, Some("ConversationDeleteResponse"))
             },
-            (format!("{prefix}/documents")): { "get": op("文档列表", "list_documents") },
-            (format!("{prefix}/documents/list")): { "get": op("文档列表（兼容）", "list_documents_compat") },
-            (format!("{prefix}/documents/upload")): { "post": op("上传文档", "upload_document") },
-            (format!("{prefix}/documents/content/{{document_id}}")): { "get": op("文档内容", "get_document_content") },
-            (format!("{prefix}/documents/delete/{{document_id}}")): { "delete": op("删除文档", "delete_document_compat") },
-            (format!("{prefix}/documents/{{document_id}}")): { "delete": op("删除文档", "delete_document") },
-            (format!("{prefix}/skills")): { "get": op("技能列表", "list_skills") },
-            (format!("{prefix}/skills/function-calling")): { "get": op("Function Calling 技能", "list_skill_function_calling") },
-            (format!("{prefix}/skills/capabilities")): { "get": op("技能能力", "skill_capabilities") },
-            (format!("{prefix}/skills/execute")): { "post": op("执行技能", "execute_skill") },
+            (format!("{prefix}/documents")): { "get": with_json_io(secured("文档列表", "list_documents", "Documents"), None, Some("DocumentListResponse")) },
+            (format!("{prefix}/documents/list")): { "get": with_json_io(secured("文档列表（兼容）", "list_documents_compat", "Documents"), None, Some("DocumentListResponse")) },
+            (format!("{prefix}/documents/upload")): { "post": with_json_io(secured("上传文档", "upload_document", "Documents"), None, Some("DocumentResponse")) },
+            (format!("{prefix}/documents/content/{{document_id}}")): { "get": with_json_io(secured("文档内容", "get_document_content", "Documents"), None, Some("DocumentContentResponse")) },
+            (format!("{prefix}/documents/delete/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document_compat", "Documents"), None, Some("DocumentDeleteResponse")) },
+            (format!("{prefix}/documents/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document", "Documents"), None, Some("DocumentDeleteResponse")) },
+            (format!("{prefix}/skills")): { "get": secured("技能列表", "list_skills", "Skills") },
+            (format!("{prefix}/skills/function-calling")): { "get": secured("Function Calling 技能", "list_skill_function_calling", "Skills") },
+            (format!("{prefix}/skills/capabilities")): { "get": secured("技能能力", "skill_capabilities", "Skills") },
+            (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行技能", "execute_skill", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
         }
     })
 }
@@ -158,6 +597,68 @@ mod tests {
         assert!(spec["paths"]["/api/v1/auth/login"]["post"].is_object());
         assert!(spec["paths"]["/api/v1/documents/upload"]["post"].is_object());
         assert!(spec["paths"]["/api/v1/chat/stream"]["post"].is_object());
+        assert_eq!(
+            spec["tags"],
+            serde_json::json!([
+                { "name": "Auth" },
+                { "name": "Documents" },
+                { "name": "Retrieval" },
+                { "name": "Chat" },
+                { "name": "Skills" },
+            ])
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/login"]["post"]["tags"],
+            serde_json::json!(["Auth"])
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/documents/upload"]["post"]["tags"],
+            serde_json::json!(["Documents"])
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/retrieval/rag"]["post"]["tags"],
+            serde_json::json!(["Retrieval"])
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/stream"]["post"]["tags"],
+            serde_json::json!(["Chat"])
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/skills"]["get"]["tags"],
+            serde_json::json!(["Skills"])
+        );
+        assert!(spec["paths"]["/health"]["get"].get("tags").is_none());
+        assert_eq!(
+            spec["components"]["securitySchemes"]["HTTPBearer"],
+            serde_json::json!({ "type": "http", "scheme": "bearer" })
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/me"]["get"]["security"],
+            serde_json::json!([{ "HTTPBearer": [] }])
+        );
+        assert!(spec["paths"]["/api/v1/auth/login"]["post"]
+            .get("security")
+            .is_none());
+        assert_eq!(
+            spec["paths"]["/api/v1/documents/{document_id}"]["delete"]["responses"]["202"]
+                ["description"],
+            "成功"
+        );
+        assert!(spec["components"]["schemas"]["HTTPValidationError"].is_object());
+        assert!(spec["components"]["schemas"]["TokenResponse"].is_object());
+        assert!(spec["components"]["schemas"]["SkillExecuteRequest"].is_object());
+        assert!(spec["components"]["schemas"]["DocumentResponse"].is_object());
+        assert!(spec["components"]["schemas"]["ChatRequest"].is_object());
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/login"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/LoginRequest"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/generate"]["post"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ChatResponse"
+        );
     }
 
     #[test]

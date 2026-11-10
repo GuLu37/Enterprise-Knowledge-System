@@ -1,4 +1,5 @@
 //! eks-server 库层：供二进制入口与集成测试共用。
+#![recursion_limit = "256"]
 pub mod auth;
 pub mod chat_stream;
 pub mod cascade;
