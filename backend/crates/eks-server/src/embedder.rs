@@ -36,7 +36,10 @@ pub fn build_ort_session(
         });
         match attempt {
             Ok(session) => {
-                tracing::info!("ONNX session 已启用 DirectML (GPU): {}", onnx_path.display());
+                tracing::info!(
+                    "ONNX session 已启用 DirectML (GPU): {}",
+                    onnx_path.display()
+                );
                 return Ok(session);
             }
             Err(err) => {
@@ -81,7 +84,9 @@ pub fn ort_environment_shared() -> Result<&'static ort::environment::Environment
         .build()
         .map_err(|e| e.to_string())?;
     let _ = ORT_ENV.set(env);
-    ORT_ENV.get().ok_or_else(|| "ORT 环境初始化失败".to_string())
+    ORT_ENV
+        .get()
+        .ok_or_else(|| "ORT 环境初始化失败".to_string())
 }
 
 /// ort 2.0-rc 的 Session 不支持并发推理（官方注明会崩溃/内存损坏），
@@ -136,26 +141,41 @@ impl EmbedderConfig {
 
 pub type SharedEmbedder = Arc<Embedder>;
 
+pub fn format_init_rust_bge(onnx_path: &Path) -> String {
+    format!(
+        "初始化 Rust BGE Embedding (ONNX fp32): {}",
+        onnx_path.display()
+    )
+}
+
+pub fn format_rust_bge_ready(vocab: usize) -> String {
+    format!("✓ Rust BGE Embedding 就绪 (vocab={vocab})")
+}
+
+pub fn format_embedding_init_complete(model: &str) -> String {
+    format!("✓ Embedding 初始化完成 (kernel=rust, model: {model})")
+}
+
 impl Embedder {
     pub fn load(config: &EmbedderConfig) -> Result<Self, String> {
         let onnx_path = config.onnx_path();
         if !onnx_path.exists() {
             return Err(format!("ONNX 模型不存在: {}", onnx_path.display()));
         }
+        tracing::info!("{}", format_init_rust_bge(&onnx_path));
         let mut tokenizer = Tokenizer::from_file(config.tokenizer_path())
             .map_err(|e| format!("tokenizer.json 加载失败: {}", e))?;
         tokenizer
             .with_padding(None)
             .with_truncation(None)
             .map_err(|e| format!("tokenizer 配置失败: {}", e))?;
-        let pad_id = tokenizer
-            .token_to_id("[PAD]")
-            .ok_or("vocab 缺少 [PAD]")? as i64;
+        let pad_id = tokenizer.token_to_id("[PAD]").ok_or("vocab 缺少 [PAD]")? as i64;
 
         let environment = ort_environment_shared()?;
         let session_count = config.session_count.max(1);
         // 会话构建相互独立，并行创建（GPU 会话每个约 0.5s，串行会拖长冷启动）
-        let mut results: Vec<Result<ort::session::Session, String>> = Vec::with_capacity(session_count);
+        let mut results: Vec<Result<ort::session::Session, String>> =
+            Vec::with_capacity(session_count);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..session_count)
                 .map(|index| {
@@ -185,6 +205,7 @@ impl Embedder {
                 config.device
             );
         }
+        tracing::info!("{}", format_rust_bge_ready(tokenizer.get_vocab_size(true)));
         Ok(Embedder {
             sessions,
             next: std::sync::atomic::AtomicUsize::new(0),
@@ -236,18 +257,19 @@ impl Embedder {
             .map_err(|e| format!("分词失败: {}", e))?;
         let mut id_rows: Vec<Vec<i64>> = Vec::with_capacity(encodings.len());
         for encoding in &encodings {
-            let mut ids: Vec<i64> = encoding
-                .get_ids()
-                .iter()
-                .map(|id| *id as i64)
-                .collect();
+            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
             if ids.len() > self.max_length {
                 ids.truncate(self.max_length);
             }
             id_rows.push(ids);
         }
         let encodings = id_rows;
-        let seq_len = encodings.iter().map(|ids| ids.len()).max().unwrap_or(1).max(1);
+        let seq_len = encodings
+            .iter()
+            .map(|ids| ids.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let batch = encodings.len();
 
         let mut input_ids: Vec<i64> = Vec::with_capacity(batch * seq_len);
@@ -318,12 +340,22 @@ pub fn shared_embedder(config: &crate::config::Config) -> Result<SharedEmbedder,
     }
     let embedder_config = EmbedderConfig::from_env(config);
     let result = Embedder::load(&embedder_config).map(Arc::new);
+    if result.is_ok() {
+        tracing::info!(
+            "{}",
+            format_embedding_init_complete(&embedder_config.model_dir.display().to_string())
+        );
+    }
     let _ = EMBEDDER.set(result.clone());
     result
 }
 
 /// 供测试直接构造。
-pub fn embedder_for(model_dir: &Path, instruction: &str, max_length: usize) -> Result<Embedder, String> {
+pub fn embedder_for(
+    model_dir: &Path,
+    instruction: &str,
+    max_length: usize,
+) -> Result<Embedder, String> {
     Embedder::load(&EmbedderConfig {
         model_dir: model_dir.to_path_buf(),
         query_instruction: instruction.to_string(),
@@ -351,6 +383,22 @@ fn maybe_l2_normalize(vector: Vec<f32>, enabled: bool) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_init_logs_match_python() {
+        assert_eq!(
+            format_init_rust_bge(Path::new("app/models/bge-base-zh-v1.5/onnx/model.onnx")),
+            "初始化 Rust BGE Embedding (ONNX fp32): app/models/bge-base-zh-v1.5/onnx/model.onnx"
+        );
+        assert_eq!(
+            format_rust_bge_ready(21128),
+            "✓ Rust BGE Embedding 就绪 (vocab=21128)"
+        );
+        assert_eq!(
+            format_embedding_init_complete("app/models/bge-base-zh-v1.5"),
+            "✓ Embedding 初始化完成 (kernel=rust, model: app/models/bge-base-zh-v1.5)"
+        );
+    }
 
     #[test]
     fn from_env_reads_bge_batch_size() {
