@@ -1,6 +1,8 @@
 //! 对齐 FastAPI：JSON / Query 反序列化失败返回 422 `detail: [{loc, msg, type}]`。
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{FromRequest, FromRequestParts, Json, Query, Request};
+use axum::body::Bytes;
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{FromRequest, FromRequestParts, Query, Request};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::request::Parts;
 use serde::de::{Deserialize, DeserializeOwned, Deserializer};
 
@@ -19,6 +21,22 @@ pub struct ApiJson<T>(pub T);
 
 pub struct ApiQuery<T>(pub T);
 
+fn json_content_type(req: &Request) -> Option<String> {
+    req.headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+}
+
+fn is_json_media_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+}
+
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
     T: DeserializeOwned,
@@ -27,9 +45,35 @@ where
     type Rejection = AuthError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(value)) => Ok(ApiJson(value)),
-            Err(rejection) => Err(map_json_rejection(rejection)),
+        let content_type = json_content_type(&req).unwrap_or_default();
+        // FastAPI 对缺省 Content-Type 仍按 JSON 解析；非 JSON 媒体类型走 model_attributes_type。
+        if !content_type.is_empty() && !is_json_media_type(&content_type) {
+            return Err(AuthError::unprocessable_at(
+                &["body"],
+                "Input should be a valid dictionary or object to extract fields from",
+                "model_attributes_type",
+            ));
+        }
+        let bytes = match Bytes::from_request(req, state).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(AuthError::unprocessable_at(
+                    &["body"],
+                    "JSON decode error",
+                    "json_invalid",
+                ));
+            }
+        };
+        match serde_json::from_slice::<T>(&bytes) {
+            Ok(value) => Ok(ApiJson(value)),
+            Err(err) if err.is_syntax() || err.is_eof() => {
+                Err(AuthError::unprocessable_at(
+                    &["body"],
+                    "JSON decode error",
+                    "json_invalid",
+                ))
+            }
+            Err(err) => Err(map_data_error(&err.to_string())),
         }
     }
 }
@@ -49,25 +93,73 @@ where
     }
 }
 
-pub fn map_json_rejection(rejection: JsonRejection) -> AuthError {
-    match rejection {
-        JsonRejection::JsonDataError(inner) => map_data_error(&inner.body_text()),
-        JsonRejection::JsonSyntaxError(_) => {
-            AuthError::unprocessable_at(&["body"], "JSON decode error", "json_invalid")
-        }
-        JsonRejection::MissingJsonContentType(_) => {
-            AuthError::unprocessable_at(&["body"], "Field required", "missing")
-        }
-        other => AuthError::unprocessable_at(&["body"], &other.body_text(), "value_error"),
+pub fn map_query_rejection(rejection: QueryRejection) -> AuthError {
+    map_query_error_text(&rejection.body_text())
+}
+
+fn map_query_error_text(text: &str) -> AuthError {
+    if let Some(field) = missing_field_name(text) {
+        return AuthError::unprocessable_at(&["query", &field], "Field required", "missing");
+    }
+    if let Some((field, raw)) = query_int_parse_failure(text) {
+        return AuthError::unprocessable_at_input(
+            &["query", &field],
+            "Input should be a valid integer, unable to parse string as an integer",
+            "int_parsing",
+            serde_json::json!(raw),
+        );
+    }
+    AuthError::unprocessable_at(&["query"], "Input should be a valid value", "value_error")
+}
+
+fn query_int_parse_failure(text: &str) -> Option<(String, String)> {
+    let looks_int = text.contains("invalid digit")
+        || text.contains("expected i64")
+        || text.contains("expected u64")
+        || text.contains("expected i32")
+        || text.contains("expected u32")
+        || text.contains("expected isize")
+        || text.contains("expected usize");
+    if !looks_int {
+        return None;
+    }
+    let field = quoted_ident(text)
+        .or_else(|| path_field(text))
+        .unwrap_or_else(|| "limit".to_string());
+    let raw = quoted_value(text).unwrap_or_default();
+    Some((field, raw))
+}
+
+fn quoted_ident(text: &str) -> Option<String> {
+    const MARKER: &str = "missing field `";
+    if text.contains(MARKER) {
+        return None;
+    }
+    let start = text.find('`')?;
+    let rest = &text[start + 1..];
+    let end = rest.find('`')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
-pub fn map_query_rejection(rejection: QueryRejection) -> AuthError {
-    let text = rejection.body_text();
-    if let Some(field) = missing_field_name(&text) {
-        return AuthError::unprocessable_at(&["query", &field], "Field required", "missing");
+fn path_field(text: &str) -> Option<String> {
+    for token in ["limit", "skip", "conversation_id"] {
+        if text.contains(token) {
+            return Some(token.to_string());
+        }
     }
-    AuthError::unprocessable_at(&["query"], "Input should be a valid value", "value_error")
+    None
+}
+
+fn quoted_value(text: &str) -> Option<String> {
+    let start = text.find('"')?;
+    let rest = &text[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 fn map_data_error(text: &str) -> AuthError {
@@ -93,6 +185,7 @@ fn missing_field_name(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
     use axum::http::StatusCode;
 
     #[test]
@@ -120,9 +213,23 @@ mod tests {
 
     #[test]
     fn missing_query_field_uses_query_loc() {
-        let err = map_query_rejection_text("missing field `conversation_id`");
+        let err = map_query_error_text("missing field `conversation_id`");
         assert_eq!(err.loc, vec!["query".to_string(), "conversation_id".to_string()]);
         assert_eq!(err.detail, "Field required");
+    }
+
+    #[test]
+    fn query_int_parsing_matches_pydantic() {
+        let err = map_query_error_text(
+            r#"Failed to deserialize query string: invalid type: string "abc", expected i64"#,
+        );
+        assert_eq!(err.error_type, "int_parsing");
+        assert_eq!(err.loc, vec!["query".to_string(), "limit".to_string()]);
+        assert_eq!(
+            err.detail,
+            "Input should be a valid integer, unable to parse string as an integer"
+        );
+        assert_eq!(err.input, serde_json::json!("abc"));
     }
 
     #[test]
@@ -140,11 +247,64 @@ mod tests {
         assert_eq!(items.history, vec!["user"]);
     }
 
-    fn map_query_rejection_text(text: &str) -> AuthError {
-        if let Some(field) = missing_field_name(text) {
-            AuthError::unprocessable_at(&["query", &field], "Field required", "missing")
-        } else {
-            AuthError::unprocessable_at(&["query"], "Input should be a valid value", "value_error")
+    #[tokio::test]
+    async fn missing_content_type_still_parses_json() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            query: String,
         }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .body(axum::body::Body::from(r#"{"query":"差旅"}"#))
+            .unwrap();
+        let parsed = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("expected JSON without Content-Type to parse"),
+        };
+        assert_eq!(parsed.0.query, "差旅");
+    }
+
+    #[tokio::test]
+    async fn wrong_content_type_is_model_attributes_type() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            query: String,
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(axum::body::Body::from(r#"{"query":"差旅"}"#))
+            .unwrap();
+        let err = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(_) => panic!("expected model_attributes_type"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "model_attributes_type");
+        assert_eq!(
+            err.detail,
+            "Input should be a valid dictionary or object to extract fields from"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_limit_abc_is_int_parsing() {
+        #[derive(serde::Deserialize)]
+        struct LimitQuery {
+            limit: i64,
+        }
+        let request = Request::builder()
+            .uri("http://example.com/list?limit=abc")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+        let err = match ApiQuery::<LimitQuery>::from_request_parts(&mut parts, &()).await {
+            Ok(_) => panic!("expected int_parsing for limit=abc"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "int_parsing");
+        assert_eq!(err.loc, vec!["query".to_string(), "limit".to_string()]);
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
