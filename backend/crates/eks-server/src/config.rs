@@ -39,7 +39,7 @@ pub struct Config {
     pub cross_encoder_trigger_mode: String,
     /// 对齐 Python `CROSS_ENCODER_DEVICE` 的 HTTP 回显；directml/gpu 时尝试 GPU 推理，失败回退 CPU。
     pub cross_encoder_device: String,
-    /// BGE 推理设备：cpu（默认）/ directml|dml|gpu（DirectML，失败回退 CPU）。
+    /// BGE 推理设备：对齐 Python `BGE_DEVICE` 缺省 `auto`（探测 GPU，失败回退 CPU）。
     pub bge_device: String,
     /// BGE 并发会话数（多用户并发检索/入库的并行度；每会话一份模型权重）。
     pub embed_session_count: usize,
@@ -659,8 +659,8 @@ impl Config {
             cross_encoder_confidence_margin: env_f64("CROSS_ENCODER_CONFIDENCE_MARGIN", 0.08).clamp(0.0, 1.0),
             cross_encoder_trigger_mode: env_or("CROSS_ENCODER_TRIGGER_MODE", "adaptive"),
             cross_encoder_device: env_or("CROSS_ENCODER_DEVICE", "auto"),
-            bge_device: env_or("BGE_DEVICE", "cpu"),
-            embed_session_count: resolve_embed_session_count(&env_or("BGE_DEVICE", "cpu")),
+            bge_device: env_or("BGE_DEVICE", "auto"),
+            embed_session_count: resolve_embed_session_count(&env_or("BGE_DEVICE", "auto")),
             cross_encoder_session_count: env_i64("CROSS_ENCODER_SESSION_COUNT", 1).max(1) as usize,
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_temperature: env_f64("LLM_TEMPERATURE", 0.7),
