@@ -85,6 +85,16 @@ pub async fn docs() -> impl IntoResponse {
     )
 }
 
+pub async fn redoc() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8",
+        )],
+        crate::openapi::redoc_html(),
+    )
+}
+
 pub async fn openapi_json(State(state): State<AppState>) -> impl IntoResponse {
     Json(crate::openapi::spec(&state.config))
 }
@@ -297,7 +307,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/", get(root))
         .route("/health", get(health))
         .route("/docs", get(docs))
-        .route("/redoc", get(docs))
+        .route("/redoc", get(redoc))
         .route("/openapi.json", get(openapi_json))
         .route(
             &format!("{prefix}/auth/login"),

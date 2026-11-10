@@ -50,6 +50,24 @@ const DOCS_HTML: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
+/// 对齐 FastAPI 默认 `/redoc`：加载 ReDoc 并指向 `/openapi.json`。
+const REDOC_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<title>ReDoc</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+<style>body { margin: 0; padding: 0; }</style>
+</head>
+<body>
+<noscript>ReDoc requires Javascript to function. Please enable it to browse the documentation.</noscript>
+<redoc spec-url="/openapi.json"></redoc>
+<script src="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"></script>
+</body>
+</html>
+"#;
+
 fn op(summary: &str, operation_id: &str) -> Value {
     json!({
         "summary": summary,
@@ -115,6 +133,10 @@ pub fn docs_html() -> &'static str {
     DOCS_HTML
 }
 
+pub fn redoc_html() -> &'static str {
+    REDOC_HTML
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +165,10 @@ mod tests {
         assert!(docs_html().contains("<!DOCTYPE html>"));
         assert!(docs_html().contains("/openapi.json"));
         assert!(docs_html().contains("info.description"));
+        assert!(redoc_html().contains("<redoc spec-url=\"/openapi.json\">"));
+        assert!(redoc_html().contains("redoc.standalone.js"));
+        assert!(spec(&crate::config::Config::jwt_test())["paths"]
+            .get("/redoc")
+            .is_some());
     }
 }
