@@ -149,6 +149,15 @@ pub fn format_milvus_init_error(error: &str) -> String {
     format!("Milvus 后台初始化出错: {error}")
 }
 
+/// 对齐 Python `initialize_collections` 捕获异常后继续启动。
+pub fn format_milvus_init_failed_continue(error: &str) -> String {
+    format!(
+        "Milvus 初始化失败，后端将继续启动，相关检索/入库功能在 Milvus 恢复前不可用: {error}"
+    )
+}
+
+pub const MILVUS_INIT_FAIL_DETAIL: &str = "Milvus 初始化失败详情";
+
 /// 对齐 Python `_child_collection_expected_fields`（Lite parquet 另有 `_seq`，校验用子集）。
 pub const CHILD_COLLECTION_FIELDS: &[&str] = &[
     "pk",
@@ -253,24 +262,29 @@ impl MilvusLiteStore {
         }
     }
 
-    /// 对齐 Python `_initialize_milvus_in_background`：lite 打开后报告就绪状态。
-    pub fn log_startup_ready(&self) {
-        if self.root.as_os_str().is_empty() {
+    /// 对齐 Python `_initialize_milvus_in_background`：按 `initialize_collections` 结果报告就绪。
+    pub fn log_startup_ready(&self, ready: bool) {
+        if ready {
+            tracing::info!("{}", format_milvus_ready());
+        } else {
             tracing::warn!("{}", format_milvus_not_ready());
-            return;
         }
-        tracing::info!("{}", format_milvus_ready());
     }
 
     /// 对齐 Python `initialize_collections`：启动时确保 Child / 长期记忆 collection 存在并预热。
-    pub fn initialize_collections(&self, child: &str, memory: &str) {
+    /// 失败时打 Python 同款告警并返回 `false`，不阻断进程启动。
+    pub fn initialize_collections(&self, child: &str, memory: &str) -> bool {
         if self.root.as_os_str().is_empty() {
-            return;
+            return false;
         }
-        ensure_named_collection(&self.root, child, CollectionKind::Child);
-        ensure_named_collection(&self.root, memory, CollectionKind::Memory);
-        warmup_named_collection(&self.root, child);
-        warmup_named_collection(&self.root, memory);
+        match try_initialize_collections(&self.root, child, memory) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("{}", format_milvus_init_failed_continue(&err));
+                tracing::debug!("{MILVUS_INIT_FAIL_DETAIL}");
+                false
+            }
+        }
     }
 
     /// 获取集合快照；manifest mtime 未变时命中缓存，变化时优先增量加载
@@ -808,18 +822,25 @@ fn warmup_named_collection(root: &Path, collection: &str) {
     tracing::info!("{}", format_warmup_already_loaded(collection));
 }
 
-fn ensure_named_collection(root: &Path, collection: &str, kind: CollectionKind) {
+fn try_initialize_collections(root: &Path, child: &str, memory: &str) -> Result<(), String> {
+    ensure_named_collection(root, child, CollectionKind::Child)?;
+    ensure_named_collection(root, memory, CollectionKind::Memory)?;
+    warmup_named_collection(root, child);
+    warmup_named_collection(root, memory);
+    Ok(())
+}
+
+fn ensure_named_collection(root: &Path, collection: &str, kind: CollectionKind) -> Result<(), String> {
     match ensure_collection(root, collection) {
-        Ok(true) => tracing::info!("{}", match kind {
-            CollectionKind::Child => format_child_collection_created(collection),
-            CollectionKind::Memory => format_memory_collection_created(collection),
-        }),
-        Ok(false) => {
-            if let Err(err) = ensure_collection_schema(root, collection, kind) {
-                tracing::warn!("{}", format_milvus_init_error(&err));
-            }
+        Ok(true) => {
+            tracing::info!("{}", match kind {
+                CollectionKind::Child => format_child_collection_created(collection),
+                CollectionKind::Memory => format_memory_collection_created(collection),
+            });
+            Ok(())
         }
-        Err(err) => tracing::warn!("{}", format_milvus_init_error(&err)),
+        Ok(false) => ensure_collection_schema(root, collection, kind),
+        Err(err) => Err(err),
     }
 }
 
@@ -1204,6 +1225,11 @@ mod tests {
             format_milvus_init_error("timeout"),
             "Milvus 后台初始化出错: timeout"
         );
+        assert_eq!(
+            format_milvus_init_failed_continue("schema mismatch"),
+            "Milvus 初始化失败，后端将继续启动，相关检索/入库功能在 Milvus 恢复前不可用: schema mismatch"
+        );
+        assert_eq!(MILVUS_INIT_FAIL_DETAIL, "Milvus 初始化失败详情");
     }
 
     #[test]
