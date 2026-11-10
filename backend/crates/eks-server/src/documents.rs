@@ -95,9 +95,8 @@ fn normalized_allowed_types(types: &[String]) -> HashSet<String> {
 
 fn reject_unsupported_file_type(file_type: &str, allowed: &[String]) -> Option<String> {
     let file_type = file_type.trim().trim_start_matches('.').to_lowercase();
-    if !normalized_allowed_types(allowed).contains(&file_type)
-        || !crate::ingest::is_extractable_type(&file_type)
-    {
+    // 对齐 Python：上传闸门只看 ALLOWED_FILE_TYPES。`.doc`/`.ppt` 默认可上传，抽取失败另计。
+    if !normalized_allowed_types(allowed).contains(&file_type) {
         Some(format!("不支持的文件类型: {file_type}"))
     } else {
         None
@@ -1289,14 +1288,8 @@ mod tests {
         assert!(reject_unsupported_file_type("PDF", &allowed).is_none());
         assert!(reject_unsupported_file_type("md", &allowed).is_none());
         let defaults = crate::config::parse_allowed_file_types("");
-        assert_eq!(
-            reject_unsupported_file_type("doc", &defaults).as_deref(),
-            Some("不支持的文件类型: doc")
-        );
-        assert_eq!(
-            reject_unsupported_file_type("ppt", &defaults).as_deref(),
-            Some("不支持的文件类型: ppt")
-        );
+        assert!(reject_unsupported_file_type("doc", &defaults).is_none());
+        assert!(reject_unsupported_file_type("ppt", &defaults).is_none());
         assert!(reject_unsupported_file_type("pptx", &defaults).is_none());
         assert!(reject_unsupported_file_type("html", &defaults).is_none());
         assert!(reject_unsupported_file_type("csv", &defaults).is_none());
