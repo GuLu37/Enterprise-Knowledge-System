@@ -234,6 +234,10 @@ fn format_document_ingest_fail(document_id: &str, err: &str) -> String {
     format!("文档入库失败 (document_id={document_id}): {err}")
 }
 
+fn missing_upload_file() -> AuthError {
+    AuthError::unprocessable_at(&["body", "file"], "Field required", "missing")
+}
+
 fn document_sql_error(action: &str, err: sqlx::Error) -> AuthError {
     // 对齐 Python 路由：500 detail 回传真实错误信息（仅日志再叠加动作前缀）。
     let detail = err.to_string();
@@ -863,9 +867,9 @@ pub async fn upload_document(
             break;
         }
     }
-    // 对齐 FastAPI `file: UploadFile = File(...)`：缺字段是 422 而非 400。
+    // 对齐 FastAPI `file: UploadFile = File(...)`：缺字段是 422 loc=["body","file"]。
     if !saw_file_field {
-        return Err(AuthError::unprocessable("Field required"));
+        return Err(missing_upload_file());
     }
 
     let filename = sanitize_original_filename(&filename);
@@ -1007,6 +1011,11 @@ mod tests {
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
         let other = document_content_exception("文档切块失败，未生成有效内容");
         assert_eq!(other.status, StatusCode::BAD_REQUEST);
+        let missing_file = missing_upload_file();
+        assert_eq!(missing_file.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(missing_file.detail, "Field required");
+        assert_eq!(missing_file.loc, vec!["body".to_string(), "file".to_string()]);
+        assert_eq!(missing_file.error_type, "missing");
     }
 
     #[test]
