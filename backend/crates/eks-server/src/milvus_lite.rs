@@ -220,6 +220,31 @@ pub fn format_schema_mismatch(kind: CollectionKind, collection: &str, missing: &
     }
 }
 
+/// 对齐 Python `warmup_collections`：集合不存在。
+pub fn format_warmup_skip_missing(name: &str) -> String {
+    format!("启动预热跳过不存在的 collection: {name}")
+}
+
+/// 对齐 Python `warmup_collections`：Lite 打开后即已在进程内可读。
+pub fn format_warmup_already_loaded(name: &str) -> String {
+    format!("collection 已加载完成，跳过预热: {name}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_warmup_start(name: &str) -> String {
+    format!("开始预热 collection: {name}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_warmup_complete(name: &str) -> String {
+    format!("✓ collection 预热完成: {name}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_warmup_fail(name: &str, err: &str) -> String {
+    format!("Milvus collection 预热失败，已跳过 (collection={name}, error={err})")
+}
+
 impl MilvusLiteStore {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         MilvusLiteStore {
@@ -237,13 +262,15 @@ impl MilvusLiteStore {
         tracing::info!("{}", format_milvus_ready());
     }
 
-    /// 对齐 Python `initialize_collections`：启动时确保 Child / 长期记忆 collection 存在。
+    /// 对齐 Python `initialize_collections`：启动时确保 Child / 长期记忆 collection 存在并预热。
     pub fn initialize_collections(&self, child: &str, memory: &str) {
         if self.root.as_os_str().is_empty() {
             return;
         }
         ensure_named_collection(&self.root, child, CollectionKind::Child);
         ensure_named_collection(&self.root, memory, CollectionKind::Memory);
+        warmup_named_collection(&self.root, child);
+        warmup_named_collection(&self.root, memory);
     }
 
     /// 获取集合快照；manifest mtime 未变时命中缓存，变化时优先增量加载
@@ -765,6 +792,20 @@ pub fn ensure_collection(root: &Path, collection: &str) -> Result<bool, String> 
         &serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
     )?;
     Ok(true)
+}
+
+fn warmup_named_collection(root: &Path, collection: &str) {
+    if !root
+        .join("collections")
+        .join(collection)
+        .join("manifest.json")
+        .is_file()
+    {
+        tracing::warn!("{}", format_warmup_skip_missing(collection));
+        return;
+    }
+    // Lite 无独立 load_collection：manifest 存在即进程内可读，对齐「已加载完成，跳过预热」。
+    tracing::info!("{}", format_warmup_already_loaded(collection));
 }
 
 fn ensure_named_collection(root: &Path, collection: &str, kind: CollectionKind) {
@@ -1477,6 +1518,26 @@ mod tests {
             format_schema_mismatch(CollectionKind::Memory, "memory_chunks", &["user_id"]),
             "Milvus collection schema 不匹配: memory_chunks 缺少字段 ['user_id']，请执行迁移或清理后重新初始化"
         );
+        assert_eq!(
+            format_warmup_skip_missing("doc_chunk"),
+            "启动预热跳过不存在的 collection: doc_chunk"
+        );
+        assert_eq!(
+            format_warmup_already_loaded("memory_chunks"),
+            "collection 已加载完成，跳过预热: memory_chunks"
+        );
+        assert_eq!(
+            format_warmup_start("doc_chunk"),
+            "开始预热 collection: doc_chunk"
+        );
+        assert_eq!(
+            format_warmup_complete("doc_chunk"),
+            "✓ collection 预热完成: doc_chunk"
+        );
+        assert_eq!(
+            format_warmup_fail("doc_chunk", "timeout"),
+            "Milvus collection 预热失败，已跳过 (collection=doc_chunk, error=timeout)"
+        );
     }
 
     #[test]
@@ -1489,6 +1550,13 @@ mod tests {
         assert!(ensure_collection(&root, "doc_chunk").unwrap());
         assert!(!ensure_collection(&root, "doc_chunk").unwrap());
         assert!(ensure_collection_schema(&root, "doc_chunk", CollectionKind::Child).is_ok());
+        let store = MilvusLiteStore::open(&root);
+        store.initialize_collections("doc_chunk", "memory_chunks");
+        assert!(root
+            .join("collections")
+            .join("memory_chunks")
+            .join("manifest.json")
+            .is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 
