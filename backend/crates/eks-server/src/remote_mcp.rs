@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::skills::SkillDefinition;
 
@@ -61,7 +61,13 @@ fn normalize_string_list(value: Option<&Value>) -> Vec<String> {
 }
 
 fn coerce_parameters(manifest: &Value) -> Value {
-    for key in ["parameters", "schema", "input_schema", "inputSchema", "arguments_schema"] {
+    for key in [
+        "parameters",
+        "schema",
+        "input_schema",
+        "inputSchema",
+        "arguments_schema",
+    ] {
         if let Some(candidate) = manifest.get(key) {
             if candidate.is_object() {
                 return candidate.clone();
@@ -121,8 +127,10 @@ pub fn build_remote_mcp_skill_definition(manifest: &Value) -> Result<SkillDefini
     };
     let category = first_non_empty(manifest, &["category"]).unwrap_or_else(|| "mcp".into());
     let provider = first_non_empty(manifest, &["provider", "server_name", "server"]);
-    let server_name = first_non_empty(manifest, &["server_name", "server", "provider"]).unwrap_or_default();
-    let tool_name = first_non_empty(manifest, &["tool_name", "remote_tool_name", "name"]).unwrap_or_else(|| name.clone());
+    let server_name =
+        first_non_empty(manifest, &["server_name", "server", "provider"]).unwrap_or_default();
+    let tool_name = first_non_empty(manifest, &["tool_name", "remote_tool_name", "name"])
+        .unwrap_or_else(|| name.clone());
     let mut metadata = match manifest.get("metadata") {
         Some(Value::Object(object)) => Value::Object(object.clone()),
         _ => json!({}),
@@ -134,7 +142,12 @@ pub fn build_remote_mcp_skill_definition(manifest: &Value) -> Result<SkillDefini
                 .filter(|(key, _)| {
                     !matches!(
                         key.as_str(),
-                        "executor" | "parameters" | "schema" | "input_schema" | "inputSchema" | "arguments_schema"
+                        "executor"
+                            | "parameters"
+                            | "schema"
+                            | "input_schema"
+                            | "inputSchema"
+                            | "arguments_schema"
                     )
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -161,6 +174,18 @@ pub fn build_remote_mcp_skill_definition(manifest: &Value) -> Result<SkillDefini
     })
 }
 
+/// 对齐 Python `register_skill` 对远程 MCP 的校验失败告警。
+pub fn format_register_remote_skill_fail(name: &str, reason: &str) -> String {
+    format!("注册远程 MCP skill 失败: {name} reason={reason}")
+}
+
+fn accept_remote_skill(definition: &SkillDefinition) -> Result<(), String> {
+    if definition.name.trim().is_empty() {
+        return Err("skill name 不能为空".into());
+    }
+    Ok(())
+}
+
 /// 把配置中的 manifest 转成可注册 Skill；跳过未启用或缺少名称的条目。
 pub fn skills_from_manifests(manifests: &[Value]) -> Vec<SkillDefinition> {
     let mut registered = Vec::new();
@@ -172,7 +197,13 @@ pub fn skills_from_manifests(manifests: &[Value]) -> Vec<SkillDefinition> {
             continue;
         }
         match build_remote_mcp_skill_definition(manifest) {
-            Ok(definition) => registered.push(definition),
+            Ok(definition) => match accept_remote_skill(&definition) {
+                Ok(()) => registered.push(definition),
+                Err(exc) => tracing::warn!(
+                    "{}",
+                    format_register_remote_skill_fail(&definition.name, &exc)
+                ),
+            },
             Err(err) => tracing::warn!("跳过无效的远程 MCP manifest: {err} ({manifest})"),
         }
     }
@@ -219,10 +250,15 @@ mod tests {
         assert_eq!(definition.category, "mcp");
         assert_eq!(definition.provider.as_deref(), Some("crm"));
         assert_eq!(definition.tags, vec!["CRM", "客户"]);
-        assert!(definition.description.starts_with("[未接入执行器·当前不可用]"));
+        assert!(definition
+            .description
+            .starts_with("[未接入执行器·当前不可用]"));
         assert_eq!(definition.metadata["executor_ready"], false);
         assert_eq!(definition.metadata["tool_name"], "lookup_account");
-        assert_eq!(definition.parameters["properties"]["account_id"]["type"], "string");
+        assert_eq!(
+            definition.parameters["properties"]["account_id"]["type"],
+            "string"
+        );
         assert!(!definition.executor_ready());
         assert!(execution_error_message(&definition).contains("crm/lookup_account"));
     }
@@ -233,8 +269,23 @@ mod tests {
         assert!(definition.executor_ready());
         assert_eq!(definition.description, "创建工单");
         assert_eq!(definition.provider.as_deref(), Some("itsm"));
-        assert_eq!(definition.parameters["properties"]["title"]["type"], "string");
+        assert_eq!(
+            definition.parameters["properties"]["title"]["type"],
+            "string"
+        );
         assert!(execution_error_message(&definition).contains("itsm/ticket_create"));
+    }
+
+    #[test]
+    fn register_fail_log_matches_python() {
+        assert_eq!(
+            format_register_remote_skill_fail("crm_lookup", "skill name 不能为空"),
+            "注册远程 MCP skill 失败: crm_lookup reason=skill name 不能为空"
+        );
+        assert!(accept_remote_skill(
+            &build_remote_mcp_skill_definition(&sample_unready()).unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
