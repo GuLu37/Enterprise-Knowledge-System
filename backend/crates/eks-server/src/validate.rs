@@ -7,7 +7,7 @@ pub fn string_min_length(value: &str, min: usize) -> Result<(), AuthError> {
 
 pub fn string_min_length_at(value: &str, min: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) < min {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!(
                 "String should have at least {min} character{}",
@@ -15,6 +15,7 @@ pub fn string_min_length_at(value: &str, min: usize, loc: &[&str]) -> Result<(),
             ),
             "string_too_short",
             serde_json::json!(value),
+            serde_json::json!({ "min_length": min }),
         ))
     } else {
         Ok(())
@@ -27,11 +28,12 @@ pub fn string_max_length(value: &str, max: usize) -> Result<(), AuthError> {
 
 pub fn string_max_length_at(value: &str, max: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) > max {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!("String should have at most {max} characters"),
             "string_too_long",
             serde_json::json!(value),
+            serde_json::json!({ "max_length": max }),
         ))
     } else {
         Ok(())
@@ -53,18 +55,20 @@ pub fn ge_le_int(value: i64, ge: i64, le: i64) -> Result<(), AuthError> {
 
 pub fn ge_le_int_at(value: i64, ge: i64, le: i64, loc: &[&str]) -> Result<(), AuthError> {
     if value < ge {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!("Input should be greater than or equal to {ge}"),
             "greater_than_equal",
             serde_json::json!(value),
+            serde_json::json!({ "ge": ge }),
         ))
     } else if value > le {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!("Input should be less than or equal to {le}"),
             "less_than_equal",
             serde_json::json!(value),
+            serde_json::json!({ "le": le }),
         ))
     } else {
         Ok(())
@@ -77,7 +81,7 @@ pub fn ge_le_float(value: f64, ge: f64, le: f64) -> Result<(), AuthError> {
 
 pub fn ge_le_float_at(value: f64, ge: f64, le: f64, loc: &[&str]) -> Result<(), AuthError> {
     if !value.is_finite() || value < ge {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!(
                 "Input should be greater than or equal to {}",
@@ -85,9 +89,10 @@ pub fn ge_le_float_at(value: f64, ge: f64, le: f64, loc: &[&str]) -> Result<(), 
             ),
             "greater_than_equal",
             serde_json::json!(value),
+            serde_json::json!({ "ge": ge }),
         ))
     } else if value > le {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &format!(
                 "Input should be less than or equal to {}",
@@ -95,6 +100,7 @@ pub fn ge_le_float_at(value: f64, ge: f64, le: f64, loc: &[&str]) -> Result<(), 
             ),
             "less_than_equal",
             serde_json::json!(value),
+            serde_json::json!({ "le": le }),
         ))
     } else {
         Ok(())
@@ -109,11 +115,12 @@ pub fn literal_at(value: &str, allowed: &[&str], loc: &[&str]) -> Result<(), Aut
     if allowed.iter().any(|item| *item == value) {
         Ok(())
     } else {
-        Err(AuthError::unprocessable_at_input(
+        Err(AuthError::unprocessable_at_ctx(
             loc,
             &literal_message(allowed),
             "literal_error",
             serde_json::json!(value),
+            serde_json::json!({ "expected": literal_expected(allowed) }),
         ))
     }
 }
@@ -130,17 +137,24 @@ fn format_pydantic_number(value: f64) -> String {
     }
 }
 
-fn literal_message(allowed: &[&str]) -> String {
+fn literal_expected(allowed: &[&str]) -> String {
     match allowed {
-        [] => "Input should be a valid literal".into(),
-        [only] => format!("Input should be '{only}'"),
-        [first, second] => format!("Input should be '{first}' or '{second}'"),
+        [] => "a valid literal".into(),
+        [only] => format!("'{only}'"),
+        [first, second] => format!("'{first}' or '{second}'"),
         _ => {
             let head = &allowed[..allowed.len() - 1];
             let last = allowed[allowed.len() - 1];
             let quoted: Vec<String> = head.iter().map(|item| format!("'{item}'")).collect();
-            format!("Input should be {} or '{last}'", quoted.join(", "))
+            format!("{} or '{last}'", quoted.join(", "))
         }
+    }
+}
+
+fn literal_message(allowed: &[&str]) -> String {
+    match allowed {
+        [] => "Input should be a valid literal".into(),
+        _ => format!("Input should be {}", literal_expected(allowed)),
     }
 }
 
@@ -271,6 +285,10 @@ mod tests {
         assert_eq!(empty_user.loc, vec!["body".to_string(), "username".to_string()]);
         assert_eq!(empty_user.error_type, "string_too_short");
         assert_eq!(empty_user.input, serde_json::json!(""));
+        assert_eq!(
+            empty_user.detail_json()["detail"][0]["ctx"],
+            serde_json::json!({ "min_length": 1 })
+        );
         assert_eq!(
             empty_user.detail_json()["detail"][0]["url"],
             "https://errors.pydantic.dev/2.12/v/string_too_short"

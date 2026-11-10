@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::Request,
-    http::{HeaderName, HeaderValue},
+    http::{HeaderName, HeaderValue, Method},
     middleware::Next,
     response::Response,
 };
@@ -73,7 +73,7 @@ where
 }
 
 pub fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
-    use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+    use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
     let allow_origin = if origins.iter().any(|item| item.trim() == "*") {
         AllowOrigin::mirror_request()
@@ -91,7 +91,16 @@ pub fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
     CorsLayer::new()
         .allow_origin(allow_origin)
         .allow_credentials(true)
-        .allow_methods(AllowMethods::mirror_request())
+        // 对齐 Starlette CORSMiddleware(allow_methods=["*"])：带 credentials 时展开为方法列表。
+        .allow_methods([
+            Method::DELETE,
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PATCH,
+            Method::POST,
+            Method::PUT,
+        ])
         .allow_headers(AllowHeaders::mirror_request())
         .expose_headers([ACCESS_TOKEN_HEADER])
 }
@@ -297,6 +306,7 @@ pub struct AuthError {
     pub loc: Vec<String>,
     pub error_type: String,
     pub input: serde_json::Value,
+    pub ctx: serde_json::Value,
 }
 
 impl AuthError {
@@ -307,6 +317,7 @@ impl AuthError {
             loc: Vec::new(),
             error_type: String::new(),
             input: serde_json::Value::Null,
+            ctx: serde_json::Value::Null,
         }
     }
 
@@ -336,12 +347,23 @@ impl AuthError {
         error_type: &str,
         input: serde_json::Value,
     ) -> Self {
+        Self::unprocessable_at_ctx(loc, detail, error_type, input, serde_json::Value::Null)
+    }
+
+    pub fn unprocessable_at_ctx(
+        loc: &[&str],
+        detail: &str,
+        error_type: &str,
+        input: serde_json::Value,
+        ctx: serde_json::Value,
+    ) -> Self {
         AuthError {
             status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             detail: detail.to_string(),
             loc: loc.iter().map(|item| (*item).to_string()).collect(),
             error_type: error_type.to_string(),
             input,
+            ctx,
         }
     }
 
@@ -357,15 +379,17 @@ impl AuthError {
             } else {
                 self.error_type.as_str()
             };
-            serde_json::json!({
-                "detail": [{
-                    "loc": loc,
-                    "msg": self.detail,
-                    "type": error_type,
-                    "input": self.input,
-                    "url": pydantic_error_url(error_type)
-                }]
-            })
+            let mut error = serde_json::json!({
+                "loc": loc,
+                "msg": self.detail,
+                "type": error_type,
+                "input": self.input,
+                "url": pydantic_error_url(error_type)
+            });
+            if !self.ctx.is_null() {
+                error["ctx"] = self.ctx.clone();
+            }
+            serde_json::json!({ "detail": [error] })
         } else {
             serde_json::json!({ "detail": self.detail })
         }
@@ -463,6 +487,18 @@ mod http_layer_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("http://localhost:5173")
         );
+        let allow_methods = preflight
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        for method in ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"] {
+            assert!(
+                allow_methods.contains(method),
+                "missing {method} in {allow_methods}"
+            );
+        }
 
         let response = app
             .oneshot(
