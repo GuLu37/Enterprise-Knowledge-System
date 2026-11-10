@@ -526,14 +526,26 @@ impl RetrievalEngine {
             Some(snapshot) => snapshot,
             None => return Ok(Vec::new()),
         };
+        tracing::debug!("{}", format_dense_debug(query, top_k));
         // 嵌入是 CPU/GPU 密集同步操作，放阻塞线程池避免占住 tokio worker。
         let embedder = self.embedder.clone();
         let query_text = query.to_string();
-        let vectors = tokio::task::spawn_blocking(move || {
+        let vectors = match tokio::task::spawn_blocking(move || {
             embedder.embed_queries(&[query_text])
         })
         .await
-        .map_err(|err| err.to_string())??;
+        {
+            Ok(Ok(vectors)) => vectors,
+            Ok(Err(err)) => {
+                tracing::error!("{}", format_batch_dense_fail(&err));
+                return Err(err);
+            }
+            Err(err) => {
+                let detail = err.to_string();
+                tracing::error!("{}", format_batch_dense_fail(&detail));
+                return Err(detail);
+            }
+        };
         let vector = vectors.first().ok_or_else(|| "查询向量为空".to_string())?;
         let hits = self
             .store
@@ -551,9 +563,13 @@ impl RetrievalEngine {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<RetrievalItem>, String> {
-        let snapshot = match self.collection_snapshot("稀疏").await? {
-            Some(snapshot) => snapshot,
-            None => return Ok(Vec::new()),
+        let snapshot = match self.collection_snapshot("稀疏").await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(Vec::new()),
+            Err(err) => {
+                tracing::error!("稀疏检索失败: {err}");
+                return Err(err);
+            }
         };
         let hits = self
             .sparse_hits(&snapshot.rows, query, sparse_candidate_limit(top_k))
@@ -747,12 +763,23 @@ impl RetrievalEngine {
             match tokio::task::spawn_blocking(move || embedder.embed_queries(&batch)).await {
                 Ok(Ok(vectors)) => vectors,
                 Ok(Err(err)) => {
-                    tracing::warn!("批量密集检索失败，跳过该路结果: {err}");
-                    Vec::new()
+                    if want_sparse {
+                        tracing::warn!("批量密集检索失败，跳过该路结果: {err}");
+                        Vec::new()
+                    } else {
+                        tracing::error!("{}", format_batch_dense_fail(&err));
+                        return Err(err);
+                    }
                 }
                 Err(err) => {
-                    tracing::warn!("批量密集检索任务失败，跳过该路结果: {err}");
-                    Vec::new()
+                    let detail = err.to_string();
+                    if want_sparse {
+                        tracing::warn!("批量密集检索任务失败，跳过该路结果: {detail}");
+                        Vec::new()
+                    } else {
+                        tracing::error!("{}", format_batch_dense_fail(&detail));
+                        return Err(detail);
+                    }
                 }
             }
         } else {
@@ -1457,6 +1484,14 @@ fn format_sparse_index_invalidated() -> &'static str {
     "稀疏持久索引已失效，将在下次检索时重建"
 }
 
+fn format_batch_dense_fail(err: &str) -> String {
+    format!("批量密集检索失败: {err}")
+}
+
+fn format_dense_debug(query: &str, top_k: usize) -> String {
+    format!("密集检索: {query} (top_k: {top_k})")
+}
+
 /// 对齐 Python `warm_build_sparse_index` 外层异常。
 pub fn format_sparse_index_warm_exception(err: &str) -> String {
     format!("稀疏持久索引预热异常: {err}")
@@ -1792,6 +1827,14 @@ mod tests {
         assert_eq!(
             format_sparse_index_warm_fail("timeout"),
             "稀疏持久索引预热失败，检索将回退 LIKE 路径: timeout"
+        );
+        assert_eq!(
+            format_batch_dense_fail("embed timeout"),
+            "批量密集检索失败: embed timeout"
+        );
+        assert_eq!(
+            format_dense_debug("差旅报销", 5),
+            "密集检索: 差旅报销 (top_k: 5)"
         );
     }
 
