@@ -197,6 +197,14 @@ pub fn init_tracing(log_dir: &str, log_level: &str) {
     }
 }
 
+pub fn format_uncaught_exception() -> &'static str {
+    "未捕获异常"
+}
+
+pub fn format_thread_uncaught_exception(name: &str) -> String {
+    format!("线程未捕获异常: {name}")
+}
+
 /// panic 进 tracing（含堆栈）而非只落 stderr，对齐 Python `logger.exception` 的可追溯性。
 /// 原生默认 hook 的输出保留：控制台仍能看到 panic；此处补齐文件日志与 backtrace。
 fn install_panic_hook() {
@@ -213,11 +221,21 @@ fn install_panic_hook() {
             .location()
             .map(|loc| format!("{loc}"))
             .unwrap_or_else(|| "unknown".into());
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .to_string();
+        let message = if thread_name == "main" {
+            format_uncaught_exception().to_string()
+        } else {
+            format_thread_uncaught_exception(&thread_name)
+        };
         tracing::error!(
             panic = %payload,
             location = %location,
             backtrace = %std::backtrace::Backtrace::force_capture(),
-            "panic 已捕获"
+            "{}",
+            message
         );
         previous(info);
     }));
@@ -244,6 +262,11 @@ mod tests {
         assert_eq!(parse_log_level("WARNING"), "warn");
         assert_eq!(parse_log_level("CRITICAL"), "error");
         assert_eq!(parse_log_level(""), "info");
+        assert_eq!(format_uncaught_exception(), "未捕获异常");
+        assert_eq!(
+            format_thread_uncaught_exception("memory-persist"),
+            "线程未捕获异常: memory-persist"
+        );
     }
 
     #[test]
