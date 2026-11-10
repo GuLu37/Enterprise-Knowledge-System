@@ -422,13 +422,16 @@ pub fn router(state: AppState) -> axum::Router {
         .fallback(json_not_found)
         .method_not_allowed_fallback(json_method_not_allowed)
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn(redirect_trailing_slashes))
+        .layer(axum::middleware::from_fn_with_state(
+            prefix.clone(),
+            redirect_trailing_slashes,
+        ))
         .layer(axum::middleware::from_fn(crate::auth::access_token_renewal_middleware))
         .layer(crate::auth::cors_layer(&state.config.cors_origins))
         .layer(axum::middleware::from_fn(crate::request_log::log_requests))
 }
 
-/// 对齐 Starlette `redirect_slashes=True`：尾斜杠 307 到去斜杠路径，保留 query。
+/// 对齐 Starlette `redirect_slashes=True`：仅当去掉尾斜杠后的路径能匹配已注册路由时 307。
 fn slash_redirect_location(uri: &Uri) -> Option<String> {
     let path = uri.path();
     if path.len() <= 1 || !path.ends_with('/') {
@@ -442,9 +445,80 @@ fn slash_redirect_location(uri: &Uri) -> Option<String> {
     })
 }
 
-async fn redirect_trailing_slashes(req: Request, next: Next) -> Response {
-    if let Some(location) = slash_redirect_location(req.uri()) {
-        return (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]).into_response();
+fn trimmed_path(uri: &Uri) -> Option<&str> {
+    let path = uri.path();
+    if path.len() <= 1 || !path.ends_with('/') {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    Some(if trimmed.is_empty() { "/" } else { trimmed })
+}
+
+/// 与 `router()` 注册表对齐；auth `{*rest}` 404 兜底不计入，避免未知 `/auth/x/` 多一次 307。
+fn registered_path(prefix: &str, path: &str) -> bool {
+    if matches!(path, "/" | "/health" | "/docs" | "/redoc" | "/openapi.json") {
+        return true;
+    }
+    let prefix = prefix.trim_end_matches('/');
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    if !rest.starts_with('/') {
+        return false;
+    }
+    const EXACT: &[&str] = &[
+        "/auth/login",
+        "/auth/register",
+        "/auth/refresh",
+        "/auth/password",
+        "/auth/me",
+        "/retrieval/search/hybrid",
+        "/retrieval/search/dense",
+        "/retrieval/search/sparse",
+        "/retrieval/rag",
+        "/retrieval/cache-clear",
+        "/chat/settings",
+        "/chat/runtime-status",
+        "/chat/warmup",
+        "/chat/generate",
+        "/chat/consolidate",
+        "/chat/stream",
+        "/chat/conversations",
+        "/documents",
+        "/documents/list",
+        "/documents/upload",
+        "/skills",
+        "/skills/function-calling",
+        "/skills/capabilities",
+        "/skills/execute",
+    ];
+    if EXACT.contains(&rest) {
+        return true;
+    }
+    one_segment_after(rest, "/chat/conversations/")
+        || one_segment_after(rest, "/documents/content/")
+        || one_segment_after(rest, "/documents/delete/")
+        || one_segment_after(rest, "/documents/")
+}
+
+fn one_segment_after(path: &str, stem: &str) -> bool {
+    let Some(tail) = path.strip_prefix(stem) else {
+        return false;
+    };
+    !tail.is_empty() && !tail.contains('/')
+}
+
+async fn redirect_trailing_slashes(
+    State(prefix): State<String>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(trimmed) = trimmed_path(req.uri()) {
+        if registered_path(&prefix, trimmed) {
+            if let Some(location) = slash_redirect_location(req.uri()) {
+                return (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]).into_response();
+            }
+        }
     }
     next.run(req).await
 }
@@ -878,6 +952,11 @@ mod docs_tests {
             slash_redirect_location(&"/api/v1/chat/settings/".parse().unwrap()).as_deref(),
             Some("/api/v1/chat/settings")
         );
+        assert!(registered_path("/api/v1", "/health"));
+        assert!(registered_path("/api/v1", "/api/v1/chat/settings"));
+        assert!(registered_path("/api/v1", "/api/v1/chat/conversations/c1"));
+        assert!(!registered_path("/api/v1", "/missing"));
+        assert!(!registered_path("/api/v1", "/api/v1/auth/nope"));
     }
 
     #[tokio::test]
@@ -885,7 +964,10 @@ mod docs_tests {
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
             .fallback(json_not_found)
-            .layer(axum::middleware::from_fn(redirect_trailing_slashes));
+            .layer(axum::middleware::from_fn_with_state(
+                "/api/v1".to_string(),
+                redirect_trailing_slashes,
+            ));
         let redirected = app
             .clone()
             .oneshot(
@@ -924,6 +1006,7 @@ mod docs_tests {
         );
 
         let missing = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/missing")
@@ -933,6 +1016,17 @@ mod docs_tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let missing_slash = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_slash.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
