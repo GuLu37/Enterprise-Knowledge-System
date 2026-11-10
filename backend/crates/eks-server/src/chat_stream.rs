@@ -916,6 +916,35 @@ fn sse_json(event: &str, data: serde_json::Value) -> Event {
     Event::default().event(event).data(data.to_string())
 }
 
+/// 对齐 Python `_sse_event("start", …)`：缺省 `conversation_id` / `session_id` 输出 JSON `null`，不回落成空字符串。
+fn stream_start_payload(
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    user_id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    use_retrieval: bool,
+    retrieval_method: &str,
+    short_memory_strategy: &str,
+    short_memory_n: usize,
+    short_memory_m: usize,
+) -> serde_json::Value {
+    json!({
+        "query": query,
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "user_id": user_id,
+        "provider": provider,
+        "model": model,
+        "use_retrieval": use_retrieval,
+        "retrieval_method": retrieval_method,
+        "short_memory_strategy": short_memory_strategy,
+        "short_memory_n": short_memory_n,
+        "short_memory_m": short_memory_m,
+    })
+}
+
 /// 对齐 Python `/chat/stream`：Cache-Control / Connection / X-Accel-Buffering。
 fn apply_sse_anti_buffer_headers(response: &mut Response) {
     let headers = response.headers_mut();
@@ -1283,7 +1312,8 @@ fn status_for_runtime(warmup: &RuntimeWarmup) -> String {
 }
 
 fn runtime_status_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
-    let mut payload = json!({
+    // 对齐 FastAPI `ChatRuntimeStatusResponse`：Optional 字段无值时仍输出 JSON `null`。
+    json!({
         "ready": warmup.is_ready(),
         "status": status_for_runtime(warmup),
         "llm_warmed": warmup.llm_warmed,
@@ -1292,17 +1322,14 @@ fn runtime_status_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
         "cross_encoder_warmed": warmup.cross_encoder_warmed,
         "cross_encoder_model": warmup.cross_encoder_model,
         "cross_encoder_device": warmup.cross_encoder_device,
+        "cross_encoder_error": warmup.cross_encoder_error,
         "provider": warmup.provider,
-    });
-    // 对齐 Python：cross_encoder_error 仅在出错时输出。
-    if let Some(error) = &warmup.cross_encoder_error {
-        payload["cross_encoder_error"] = json!(error);
-    }
-    payload
+    })
 }
 
 fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
-    let mut payload = json!({
+    // 对齐 FastAPI `ChatWarmupResponse`：Optional 字段无值时仍输出 JSON `null`。
+    json!({
         "status": warmup.status,
         "llm_warmed": warmup.llm_warmed,
         "embedding_warmed": warmup.embedding_warmed,
@@ -1310,13 +1337,9 @@ fn warmup_response_payload(warmup: &RuntimeWarmup) -> serde_json::Value {
         "cross_encoder_warmed": warmup.cross_encoder_warmed,
         "cross_encoder_model": warmup.cross_encoder_model,
         "cross_encoder_device": warmup.cross_encoder_device,
+        "cross_encoder_error": warmup.cross_encoder_error,
         "provider": warmup.provider,
-    });
-    // 对齐 Python：cross_encoder_error 仅在出错时输出。
-    if let Some(error) = &warmup.cross_encoder_error {
-        payload["cross_encoder_error"] = json!(error);
-    }
-    payload
+    })
 }
 
 /// 对齐 Python `warmup_chat_runtime`：构造 LLM、跑一次 embedding、探测 Cross-Encoder。
@@ -1716,8 +1739,10 @@ pub async fn stream_chat(
     let engine = state.engine.clone();
     let pool = state.pool.clone();
     let user_id = user.user_id.clone();
-    let conversation_id = request.conversation_id.clone().unwrap_or_default();
-    let session_id = request.session_id.clone().unwrap_or_default();
+    let start_conversation_id = request.conversation_id.clone();
+    let start_session_id = request.session_id.clone();
+    let conversation_id = start_conversation_id.clone().unwrap_or_default();
+    let session_id = start_session_id.clone().unwrap_or_default();
     let history = request.history.clone();
     let options = memory_options(&request);
     let window_n = request.short_memory_n;
@@ -1737,19 +1762,22 @@ pub async fn stream_chat(
     let event_expiry_days = config.memory_event_expiry_days;
 
     let stream = async_stream::stream! {
-        yield Ok::<Event, Infallible>(sse_json("start", json!({
-            "query": query,
-            "conversation_id": conversation_id,
-            "session_id": session_id,
-            "user_id": user_id,
-            "provider": request_provider,
-            "model": request_model,
-            "use_retrieval": requested_retrieval,
-            "retrieval_method": request_retrieval_method,
-            "short_memory_strategy": options.strategy,
-            "short_memory_n": options.window_n,
-            "short_memory_m": options.summary_m,
-        })));
+        yield Ok::<Event, Infallible>(sse_json(
+            "start",
+            stream_start_payload(
+                &query,
+                start_conversation_id.as_deref(),
+                start_session_id.as_deref(),
+                &user_id,
+                request_provider.as_deref(),
+                request_model.as_deref(),
+                requested_retrieval,
+                &request_retrieval_method,
+                &options.strategy,
+                options.window_n,
+                options.summary_m,
+            ),
+        ));
 
         if let Some(detail) = &prepare_error {
             yield Ok(sse_json("error", json!({"message": detail})));
@@ -2832,6 +2860,54 @@ mod tests {
     }
 
     #[test]
+    fn stream_start_serializes_omitted_ids_as_json_null() {
+        let payload = stream_start_payload(
+            "报销怎么走",
+            None,
+            None,
+            "u1",
+            None,
+            None,
+            true,
+            "hybrid",
+            "window",
+            5,
+            10,
+        );
+        assert_eq!(payload["conversation_id"], json!(null));
+        assert_eq!(payload["session_id"], json!(null));
+        assert_eq!(payload["provider"], json!(null));
+        assert_eq!(payload["model"], json!(null));
+        assert_eq!(payload["query"], "报销怎么走");
+        assert_eq!(payload["retrieval_method"], "hybrid");
+    }
+
+    #[test]
+    fn stream_start_echoes_provided_ids() {
+        let payload = stream_start_payload(
+            "q",
+            Some("c1"),
+            Some("s1"),
+            "u1",
+            Some("openai"),
+            Some("gpt-4o-mini"),
+            false,
+            "dense",
+            "summary",
+            3,
+            8,
+        );
+        assert_eq!(payload["conversation_id"], "c1");
+        assert_eq!(payload["session_id"], "s1");
+        assert_eq!(payload["provider"], "openai");
+        assert_eq!(payload["model"], "gpt-4o-mini");
+        assert_eq!(payload["use_retrieval"], false);
+        assert_eq!(payload["short_memory_strategy"], "summary");
+        assert_eq!(payload["short_memory_n"], 3);
+        assert_eq!(payload["short_memory_m"], 8);
+    }
+
+    #[test]
     fn empty_consolidate_returns_zero_like_python() {
         assert_eq!(
             empty_consolidate_payload(""),
@@ -2938,6 +3014,14 @@ mod tests {
         assert_eq!(warmup.cross_encoder_device.as_deref(), Some("auto"));
         assert_eq!(runtime_status_payload(&warmup)["cross_encoder_device"], "auto");
         assert_eq!(
+            runtime_status_payload(&warmup)["cross_encoder_error"],
+            json!(null)
+        );
+        assert_eq!(
+            warmup_response_payload(&warmup)["cross_encoder_error"],
+            json!(null)
+        );
+        assert_eq!(
             format_warmup_complete(true, true, false, None, 12.345),
             "聊天运行时后台预热完成: llm=True embedding=True cross_encoder=False provider=None duration=12.35ms"
         );
@@ -2991,6 +3075,17 @@ mod tests {
         assert_eq!(payload["llm_warmed"], true);
         assert_eq!(payload["embedding_warmed"], true);
         assert_eq!(payload["provider"], "openai");
+        assert_eq!(payload["cross_encoder_error"], json!(null));
+
+        warmup.cross_encoder_error = Some("Cross-Encoder 预热未返回分数".into());
+        assert_eq!(
+            runtime_status_payload(&warmup)["cross_encoder_error"],
+            "Cross-Encoder 预热未返回分数"
+        );
+        assert_eq!(
+            warmup_response_payload(&warmup)["cross_encoder_error"],
+            "Cross-Encoder 预热未返回分数"
+        );
     }
 
     #[tokio::test]
