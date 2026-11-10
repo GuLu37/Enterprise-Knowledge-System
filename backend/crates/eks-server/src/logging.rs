@@ -421,6 +421,20 @@ pub fn format_thread_uncaught_exception(name: &str) -> String {
     format!("线程未捕获异常: {name}")
 }
 
+pub fn format_asyncio_uncaught_exception() -> &'static str {
+    "asyncio 未捕获异常"
+}
+
+fn panic_log_message(thread_name: &str) -> String {
+    if thread_name == "main" {
+        format_uncaught_exception().to_string()
+    } else if thread_name.starts_with("tokio-runtime-worker") {
+        format_asyncio_uncaught_exception().to_string()
+    } else {
+        format_thread_uncaught_exception(thread_name)
+    }
+}
+
 /// panic 进 tracing（含堆栈）而非只落 stderr，对齐 Python `logger.exception` 的可追溯性。
 /// 原生默认 hook 的输出保留：控制台仍能看到 panic；此处补齐文件日志与 backtrace。
 fn install_panic_hook() {
@@ -441,11 +455,7 @@ fn install_panic_hook() {
             .name()
             .unwrap_or("unknown")
             .to_string();
-        let message = if thread_name == "main" {
-            format_uncaught_exception().to_string()
-        } else {
-            format_thread_uncaught_exception(&thread_name)
-        };
+        let message = panic_log_message(&thread_name);
         tracing::error!(
             panic = %payload,
             location = %location,
@@ -483,6 +493,12 @@ mod tests {
             format_thread_uncaught_exception("memory-persist"),
             "线程未捕获异常: memory-persist"
         );
+        assert_eq!(format_asyncio_uncaught_exception(), "asyncio 未捕获异常");
+        assert_eq!(
+            panic_log_message("tokio-runtime-worker"),
+            "asyncio 未捕获异常"
+        );
+        assert_eq!(panic_log_message("main"), "未捕获异常");
         assert_eq!(
             format_python_log_prefix(
                 "2026-11-10 16:58:01",
