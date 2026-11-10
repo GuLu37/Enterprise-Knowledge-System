@@ -35,9 +35,9 @@ pub struct ChatStreamRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default = "default_top_k")]
+    #[serde(default = "default_top_k", deserialize_with = "crate::extract::coerce_usize")]
     pub top_k: usize,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "crate::extract::coerce_bool")]
     pub use_retrieval: bool,
     #[serde(default)]
     pub retrieval_method: Option<String>,
@@ -45,13 +45,13 @@ pub struct ChatStreamRequest {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::coerce_opt_f64")]
     pub temperature: Option<f64>,
     #[serde(default = "default_short_memory_strategy")]
     pub short_memory_strategy: String,
-    #[serde(default = "default_short_memory_n")]
+    #[serde(default = "default_short_memory_n", deserialize_with = "crate::extract::coerce_usize")]
     pub short_memory_n: usize,
-    #[serde(default = "default_short_memory_m")]
+    #[serde(default = "default_short_memory_m", deserialize_with = "crate::extract::coerce_usize")]
     pub short_memory_m: usize,
 }
 
@@ -2325,6 +2325,13 @@ mod tests {
         let omitted: ChatStreamRequest =
             serde_json::from_str(r#"{"query":"差旅报销"}"#).expect("omitted history");
         assert!(omitted.history.is_empty());
+        let coerced: ChatStreamRequest = serde_json::from_str(
+            r#"{"query":"差旅","top_k":"5","use_retrieval":"yes","temperature":"0.7"}"#,
+        )
+        .expect("pydantic coercion");
+        assert_eq!(coerced.top_k, 5);
+        assert!(coerced.use_retrieval);
+        assert_eq!(coerced.temperature, Some(0.7));
     }
 
     #[test]

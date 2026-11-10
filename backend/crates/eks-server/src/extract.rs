@@ -4,7 +4,8 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::request::Parts;
-use serde::de::{Deserialize, DeserializeOwned, Deserializer};
+use serde::de::{Deserialize, DeserializeOwned, Deserializer, Error as DeError};
+use serde_json::Value;
 
 use crate::auth::AuthError;
 
@@ -15,6 +16,95 @@ where
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// 对齐 Pydantic 宽松整数：`"5"` / `5` / `5.0`。
+pub fn coerce_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    value_as_usize(Value::deserialize(deserializer)?).ok_or_else(|| DeError::custom("invalid integer"))
+}
+
+/// 对齐 Pydantic `Optional[int]`：缺省/null → None，字符串数字也可。
+pub fn coerce_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value_as_usize(value)
+            .map(Some)
+            .ok_or_else(|| DeError::custom("invalid integer")),
+    }
+}
+
+/// 对齐 Pydantic bool：`"yes"`/`"true"`/`1` 等。
+pub fn coerce_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    value_as_bool(Value::deserialize(deserializer)?).ok_or_else(|| DeError::custom("invalid boolean"))
+}
+
+/// 对齐 Pydantic `Optional[float]`。
+pub fn coerce_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value_as_f64(value)
+            .map(Some)
+            .ok_or_else(|| DeError::custom("invalid number")),
+    }
+}
+
+fn value_as_usize(value: Value) -> Option<usize> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .map(|value| value as usize)
+            .or_else(|| {
+                let float = number.as_f64()?;
+                if float >= 0.0 && float.fract() == 0.0 {
+                    Some(float as usize)
+                } else {
+                    None
+                }
+            }),
+        Value::String(raw) => raw.trim().parse().ok(),
+        Value::Bool(true) => Some(1),
+        Value::Bool(false) => Some(0),
+        _ => None,
+    }
+}
+
+fn value_as_bool(value: Value) -> Option<bool> {
+    match value {
+        Value::Bool(flag) => Some(flag),
+        Value::Number(number) => match number.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        },
+        Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "t" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "f" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn value_as_f64(value: Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.trim().parse().ok(),
+        Value::Bool(true) => Some(1.0),
+        Value::Bool(false) => Some(0.0),
+        _ => None,
+    }
 }
 
 pub struct ApiJson<T>(pub T);
@@ -245,6 +335,33 @@ mod tests {
         assert!(explicit_null.history.is_empty());
         let items: Payload = serde_json::from_str(r#"{"history":["user"]}"#).unwrap();
         assert_eq!(items.history, vec!["user"]);
+    }
+
+    #[test]
+    fn pydantic_coercion_accepts_string_numbers_and_yes() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            #[serde(deserialize_with = "coerce_usize")]
+            top_k: usize,
+            #[serde(deserialize_with = "coerce_bool")]
+            use_retrieval: bool,
+            #[serde(deserialize_with = "coerce_opt_f64")]
+            temperature: Option<f64>,
+            #[serde(default, deserialize_with = "coerce_opt_usize")]
+            extra: Option<usize>,
+        }
+        let parsed: Payload = serde_json::from_str(
+            r#"{"top_k":"5","use_retrieval":"yes","temperature":"0.7","extra":null}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.top_k, 5);
+        assert!(parsed.use_retrieval);
+        assert_eq!(parsed.temperature, Some(0.7));
+        assert_eq!(parsed.extra, None);
+        let omitted: Payload =
+            serde_json::from_str(r#"{"top_k":5,"use_retrieval":true,"temperature":null}"#).unwrap();
+        assert_eq!(omitted.temperature, None);
+        assert_eq!(omitted.extra, None);
     }
 
     #[tokio::test]

@@ -537,7 +537,7 @@ pub async fn json_method_not_allowed() -> impl IntoResponse {
 #[derive(Deserialize)]
 pub struct RetrievalRequest {
     pub query: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::coerce_opt_usize")]
     pub top_k: Option<usize>,
 }
 
