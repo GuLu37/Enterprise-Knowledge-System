@@ -3,52 +3,35 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
-const DOCS_HTML: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
+/// 对齐 FastAPI `get_swagger_ui_html`：`/docs` 加载 swagger-ui-dist 并指向 `/openapi.json`。
+const DOCS_HTML: &str = r##"<!DOCTYPE html>
+<html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>API Docs</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-    h1 { margin-bottom: 0.25rem; }
-    .muted { color: #666; }
-    section { border-top: 1px solid #ddd; padding: 0.75rem 0; }
-    code { font-size: 0.95em; }
-    .method { display: inline-block; min-width: 4.5rem; font-weight: 700; }
-  </style>
+<link type="text/css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+<link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+<title>Swagger UI</title>
 </head>
 <body>
-  <h1 id="title">API Docs</h1>
-  <p class="muted" id="subtitle">正在加载 OpenAPI…</p>
-  <div id="paths"></div>
-  <script>
-    fetch("/openapi.json").then(function (response) { return response.json(); }).then(function (spec) {
-      var info = spec.info || {};
-      document.title = (info.title || "API") + " " + (info.version || "");
-      document.getElementById("title").textContent = info.title || "API Docs";
-      var description = info.description ? info.description + " · " : "";
-      document.getElementById("subtitle").textContent = description + "version " + (info.version || "") + " · OpenAPI " + (spec.openapi || "");
-      var root = document.getElementById("paths");
-      var paths = spec.paths || {};
-      Object.keys(paths).sort().forEach(function (path) {
-        var methods = paths[path] || {};
-        Object.keys(methods).forEach(function (method) {
-          var op = methods[method] || {};
-          var section = document.createElement("section");
-          section.innerHTML = "<div><span class='method'>" + method.toUpperCase() +
-            "</span> <code>" + path + "</code></div><p>" + (op.summary || op.operationId || "") + "</p>";
-          root.appendChild(section);
-        });
-      });
-    }).catch(function (err) {
-      document.getElementById("subtitle").textContent = "无法加载 /openapi.json: " + err;
-    });
-  </script>
+<div id="swagger-ui">
+</div>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+    const ui = SwaggerUIBundle({
+        url: '/openapi.json',
+    "dom_id": "#swagger-ui",
+    "layout": "BaseLayout",
+    "deepLinking": true,
+    "showExtensions": true,
+    "showCommonExtensions": true,
+    presets: [
+        SwaggerUIBundle.presets.apis,
+        SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+    })
+</script>
 </body>
 </html>
-"#;
+"##;
 
 /// 对齐 FastAPI 默认 `/redoc`：加载 ReDoc 并指向 `/openapi.json`。
 const REDOC_HTML: &str = r#"<!DOCTYPE html>
@@ -78,6 +61,47 @@ fn secured(summary: &str, operation_id: &str, tag: &str) -> Value {
 
 fn accepted(summary: &str, operation_id: &str, tag: &str) -> Value {
     op_full(summary, operation_id, Some(tag), "202", true)
+}
+
+/// 对齐 FastAPI `generate_unique_id_function`：`{name}{path}` 非单词字符变 `_` 再加 `_{method}`。
+fn fastapi_operation_id(name: &str, path: &str, method: &str) -> String {
+    let raw = format!("{name}{path}");
+    let mut id: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    id.push('_');
+    id.push_str(&method.to_ascii_lowercase());
+    id
+}
+
+fn apply_fastapi_operation_ids(spec: &mut Value) {
+    let Some(paths) = spec.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let entries: Vec<String> = paths.keys().cloned().collect();
+    for path in entries {
+        let Some(item) = paths.get_mut(&path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let methods: Vec<String> = item.keys().cloned().collect();
+        for method in methods {
+            let Some(op) = item.get_mut(&method).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(name) = op.get("operationId").and_then(Value::as_str) else {
+                continue;
+            };
+            let generated = fastapi_operation_id(name, &path, &method);
+            op.insert("operationId".into(), json!(generated));
+        }
+    }
 }
 
 fn op_full(
@@ -553,7 +577,7 @@ fn components() -> Value {
 
 pub fn spec(config: &Config) -> Value {
     let prefix = config.api_prefix.trim_end_matches('/');
-    json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": {
             "title": config.app_name,
@@ -571,25 +595,25 @@ pub fn spec(config: &Config) -> Value {
         "paths": {
             "/": { "get": op("根路由", "root", None) },
             "/health": { "get": op("健康检查", "health", None) },
-            "/docs": { "get": op("Swagger 风格文档页", "docs", None) },
-            "/redoc": { "get": op("ReDoc 风格文档页", "redoc", None) },
-            "/openapi.json": { "get": op("OpenAPI Schema", "openapi_json", None) },
+            "/docs": { "get": op("Swagger 风格文档页", "swagger_ui_html", None) },
+            "/redoc": { "get": op("ReDoc 风格文档页", "redoc_html", None) },
+            "/openapi.json": { "get": op("OpenAPI Schema", "openapi", None) },
             (format!("{prefix}/auth/login")): { "post": with_json_io(op("登录", "login", Some("Auth")), Some("LoginRequest"), Some("TokenResponse")) },
             (format!("{prefix}/auth/register")): { "post": with_json_io(op("注册", "register", Some("Auth")), Some("RegisterRequest"), Some("TokenResponse")) },
-            (format!("{prefix}/auth/refresh")): { "post": with_json_io(op("刷新令牌", "refresh", Some("Auth")), Some("RefreshTokenRequest"), Some("TokenResponse")) },
+            (format!("{prefix}/auth/refresh")): { "post": with_json_io(op("刷新令牌", "refresh_token", Some("Auth")), Some("RefreshTokenRequest"), Some("TokenResponse")) },
             (format!("{prefix}/auth/password")): { "post": with_json_io(secured("修改密码", "change_password", "Auth"), Some("PasswordChangeRequest"), Some("TokenResponse")) },
             (format!("{prefix}/auth/me")): { "get": with_json_io(secured("当前用户", "me", "Auth"), None, Some("UserResponse")) },
-            (format!("{prefix}/retrieval/search/hybrid")): { "post": with_json_io(secured("混合检索", "retrieval_hybrid", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
-            (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("稠密检索", "retrieval_dense", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
-            (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索", "retrieval_sparse", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/hybrid")): { "post": with_json_io(secured("混合检索", "hybrid_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("稠密检索", "dense_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
+            (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索", "sparse_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
             (format!("{prefix}/retrieval/rag")): { "post": with_json_io(secured("RAG 检索生成", "retrieval_rag", "Retrieval"), Some("ChatRequest"), Some("ChatResponse")) },
             (format!("{prefix}/retrieval/cache-clear")): { "post": secured("清空检索缓存", "retrieval_cache_clear", "Retrieval") },
-            (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("对话设置", "chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
-            (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("运行时状态", "chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
-            (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热", "chat_warmup", "Chat"), None, Some("ChatWarmupResponse")) },
-            (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成回复", "generate_chat", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
+            (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("对话设置", "get_chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
+            (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("运行时状态", "get_chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
+            (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热", "warmup_chat_runtime", "Chat"), None, Some("ChatWarmupResponse")) },
+            (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成回复", "generate_response", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
             (format!("{prefix}/chat/consolidate")): { "post": with_query_params(
-                secured("巩固记忆", "consolidate_chat", "Chat"),
+                secured("巩固记忆", "consolidate_conversation", "Chat"),
                 json!([{
                     "name": "conversation_id",
                     "in": "query",
@@ -597,7 +621,7 @@ pub fn spec(config: &Config) -> Value {
                     "schema": { "type": "string", "title": "Conversation Id" }
                 }])
             ) },
-            (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式对话", "stream_chat", "Chat"), Some("ChatRequest"), None) },
+            (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式对话", "stream_response", "Chat"), Some("ChatRequest"), None) },
             (format!("{prefix}/chat/conversations")): {
                 "get": with_json_io(secured("会话列表", "list_conversations", "Chat"), None, Some("ConversationListResponse")),
                 "delete": with_json_io(secured("清空会话", "clear_conversations", "Chat"), None, Some("ConversationClearResponse"))
@@ -624,12 +648,14 @@ pub fn spec(config: &Config) -> Value {
             (format!("{prefix}/documents/content/{{document_id}}")): { "get": with_json_io(secured("文档内容", "get_document_content", "Documents"), None, Some("DocumentContentResponse")) },
             (format!("{prefix}/documents/delete/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document_compat", "Documents"), None, Some("DocumentDeleteResponse")) },
             (format!("{prefix}/documents/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document", "Documents"), None, Some("DocumentDeleteResponse")) },
-            (format!("{prefix}/skills")): { "get": with_array_response(secured("技能列表", "list_skills", "Skills"), "SkillDefinitionResponse") },
-            (format!("{prefix}/skills/function-calling")): { "get": secured("Function Calling 技能", "list_skill_function_calling", "Skills") },
-            (format!("{prefix}/skills/capabilities")): { "get": secured("技能能力", "skill_capabilities", "Skills") },
-            (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行技能", "execute_skill", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
+            (format!("{prefix}/skills")): { "get": with_array_response(secured("技能列表", "get_skills", "Skills"), "SkillDefinitionResponse") },
+            (format!("{prefix}/skills/function-calling")): { "get": secured("Function Calling 技能", "get_function_calling_tools", "Skills") },
+            (format!("{prefix}/skills/capabilities")): { "get": secured("技能能力", "get_capabilities", "Skills") },
+            (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行技能", "execute_skill_route", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
         }
-    })
+    });
+    apply_fastapi_operation_ids(&mut spec);
+    spec
 }
 
 pub fn docs_html() -> &'static str {
@@ -746,13 +772,30 @@ mod tests {
                 ["additionalProperties"],
             true
         );
+        assert_eq!(
+            spec["paths"]["/api/v1/auth/login"]["post"]["operationId"],
+            "login_api_v1_auth_login_post"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/generate"]["post"]["operationId"],
+            "generate_response_api_v1_chat_generate_post"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/conversations/{conversation_id}"]["delete"]["operationId"],
+            "delete_conversation_api_v1_chat_conversations__conversation_id__delete"
+        );
+        assert_eq!(
+            fastapi_operation_id("login", "/api/v1/auth/login", "post"),
+            "login_api_v1_auth_login_post"
+        );
     }
 
     #[test]
     fn docs_page_loads_openapi_json() {
         assert!(docs_html().contains("<!DOCTYPE html>"));
         assert!(docs_html().contains("/openapi.json"));
-        assert!(docs_html().contains("info.description"));
+        assert!(docs_html().contains("swagger-ui-bundle.js"));
+        assert!(docs_html().contains("SwaggerUIBundle"));
         assert!(redoc_html().contains("<redoc spec-url=\"/openapi.json\">"));
         assert!(redoc_html().contains("redoc.standalone.js"));
         assert!(spec(&crate::config::Config::jwt_test())["paths"]
