@@ -108,7 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "稀疏持久索引预热完成: rows={rows} elapsed={:.2}s",
                     started.elapsed().as_secs_f64()
                 ),
-                Err(err) => tracing::warn!("稀疏持久索引预热失败，检索将回退 LIKE 路径: {err}"),
+                Err(err) => tracing::warn!(
+                    "{}",
+                    eks_server::retrieval_engine::format_sparse_index_warm_exception(&err)
+                ),
             }
         });
     }

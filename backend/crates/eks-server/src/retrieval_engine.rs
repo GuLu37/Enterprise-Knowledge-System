@@ -1457,6 +1457,17 @@ fn format_sparse_index_invalidated() -> &'static str {
     "稀疏持久索引已失效，将在下次检索时重建"
 }
 
+/// 对齐 Python `warm_build_sparse_index` 外层异常。
+pub fn format_sparse_index_warm_exception(err: &str) -> String {
+    format!("稀疏持久索引预热异常: {err}")
+}
+
+/// 对齐 Python `CachedSparseIndex.warm_build` 内层失败。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_sparse_index_warm_fail(err: &str) -> String {
+    format!("稀疏持久索引预热失败，检索将回退 LIKE 路径: {err}")
+}
+
 fn format_parent_batch_fail(err: &str) -> String {
     format!("SQLite Parent 上下文批量读取失败，逐条回退: {err}")
 }
@@ -1773,6 +1784,14 @@ mod tests {
         assert_eq!(
             format_sparse_index_invalidated(),
             "稀疏持久索引已失效，将在下次检索时重建"
+        );
+        assert_eq!(
+            format_sparse_index_warm_exception("collection missing"),
+            "稀疏持久索引预热异常: collection missing"
+        );
+        assert_eq!(
+            format_sparse_index_warm_fail("timeout"),
+            "稀疏持久索引预热失败，检索将回退 LIKE 路径: timeout"
         );
     }
 
