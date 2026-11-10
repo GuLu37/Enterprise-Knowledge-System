@@ -5,6 +5,7 @@
 //! 失败冷却 60s + 超时预算分摊 + 单次最多尝试 LLM_MAX_FALLBACK_ATTEMPTS 家。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,63 @@ const FALLBACK_ORDER: &[&str] = &["deepseek", "openrouter", "openai", "anthropic
 
 /// 对齐 Python `FallbackLLM.prime` / `LLMException` 无可用 provider 文案。
 pub const LLM_NO_PROVIDER_MESSAGE: &str = "没有可用的 LLM 提供商，请检查配置: 无可用 provider";
+
+/// `init_llm()` 只打一次「兜底初始化完成」；启动 prime 与后台预热共用。
+static LLM_FALLBACK_INIT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// 对齐 Python `_create_llm` 的供应商展示名。
+pub fn provider_display_name(name: &str) -> &str {
+    match name {
+        "ollama" => "Ollama",
+        "openai" => "OpenAI",
+        "deepseek" => "DeepSeek",
+        "openrouter" => "OpenRouter",
+        "anthropic" => "Anthropic",
+        other => other,
+    }
+}
+
+pub fn format_try_init_provider(provider: &str) -> String {
+    format!("尝试初始化 LLM provider: {provider}")
+}
+
+pub fn format_init_named_llm(provider: &str, model: &str) -> String {
+    format!("初始化 {} LLM: {model}", provider_display_name(provider))
+}
+
+pub fn format_named_llm_init_fail(provider: &str, error: &str) -> String {
+    format!(
+        "{} LLM 初始化失败: {error}",
+        provider_display_name(provider)
+    )
+}
+
+pub fn format_provider_init_fallback(provider: &str, error: &str) -> String {
+    format!("LLM provider 初始化失败，继续兜底: {provider} -> {error}")
+}
+
+/// 对齐 Python `init_llm`：`provider or 'default-order'`。
+pub fn format_llm_fallback_init_complete(preferred: &str, active: &str) -> String {
+    let preferred = if preferred.trim().is_empty() {
+        "default-order"
+    } else {
+        preferred
+    };
+    format!("✓ LLM 兜底初始化完成 (preferred: {preferred}, active: {active})")
+}
+
+fn log_instantiate_provider(name: &str, model: &str) {
+    tracing::info!("{}", format_try_init_provider(name));
+    tracing::info!("{}", format_init_named_llm(name, model));
+}
+
+/// 对齐 Python `init_llm` 成功后的一次性横幅。
+pub fn log_llm_fallback_init_complete(preferred: &str, active: &str) {
+    if LLM_FALLBACK_INIT_LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::info!("{}", format_llm_fallback_init_complete(preferred, active));
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -304,13 +362,42 @@ impl LlmClient {
 
     /// 对齐 Python `FallbackLLM.prime`：预先挑选当前可用 provider 并粘滞到进程级实例。
     pub async fn prime(&self) -> Result<String, String> {
+        if let Some(active) = self.active_provider.lock().await.clone() {
+            return Ok(active);
+        }
         let providers = self.candidate_providers().await;
         if providers.is_empty() {
             return Err(LLM_NO_PROVIDER_MESSAGE.into());
         }
-        let name = providers[0].name.clone();
-        self.remember_success(&name).await;
-        Ok(name)
+        let mut errors: Vec<String> = Vec::new();
+        for provider in &providers {
+            log_instantiate_provider(&provider.name, &provider.model);
+            if provider.model.trim().is_empty() {
+                let err = "model 不能为空";
+                tracing::error!("{}", format_named_llm_init_fail(&provider.name, err));
+                tracing::warn!("{}", format_provider_init_fallback(&provider.name, err));
+                errors.push(format!("{}: {err}", provider.name));
+                continue;
+            }
+            self.remember_success(&provider.name).await;
+            return Ok(provider.name.clone());
+        }
+        Err(format!(
+            "没有可用的 LLM 提供商，请检查配置: {}",
+            if errors.is_empty() {
+                "无可用 provider".to_string()
+            } else {
+                errors.join(" | ")
+            }
+        ))
+    }
+
+    async fn maybe_log_instantiate(&self, provider: &ProviderConfig) {
+        let active = self.active_provider.lock().await;
+        if active.as_deref() != Some(provider.name.as_str()) {
+            drop(active);
+            log_instantiate_provider(&provider.name, &provider.model);
+        }
     }
 
     /// 按兜底顺序返回当前可用 provider（过滤冷却中的）。
@@ -407,6 +494,7 @@ impl LlmClient {
 
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
+            self.maybe_log_instantiate(provider).await;
             match self.invoke_provider(provider, messages, None, per_timeout).await {
                 Ok(result) => {
                     self.remember_success(&provider.name).await;
@@ -438,6 +526,7 @@ impl LlmClient {
         let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
+            self.maybe_log_instantiate(provider).await;
             match self
                 .invoke_provider(provider, messages, Some(tools), per_timeout)
                 .await
@@ -568,6 +657,7 @@ impl LlmClient {
         let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
         let mut errors: Vec<String> = Vec::new();
         for provider in &providers {
+            self.maybe_log_instantiate(provider).await;
             match self.open_stream_response(provider, messages, per_timeout).await {
                 Ok(response) => {
                     self.remember_success(&provider.name).await;
@@ -1633,6 +1723,50 @@ mod tests {
         );
         fail_handle.abort();
         ok_handle.abort();
+    }
+
+    #[test]
+    fn llm_init_logs_match_python() {
+        assert_eq!(
+            format_try_init_provider("openai"),
+            "尝试初始化 LLM provider: openai"
+        );
+        assert_eq!(
+            format_init_named_llm("ollama", "qwen2.5"),
+            "初始化 Ollama LLM: qwen2.5"
+        );
+        assert_eq!(
+            format_init_named_llm("openai", "gpt-4o-mini"),
+            "初始化 OpenAI LLM: gpt-4o-mini"
+        );
+        assert_eq!(
+            format_init_named_llm("deepseek", "deepseek-chat"),
+            "初始化 DeepSeek LLM: deepseek-chat"
+        );
+        assert_eq!(
+            format_init_named_llm("openrouter", "or-model"),
+            "初始化 OpenRouter LLM: or-model"
+        );
+        assert_eq!(
+            format_init_named_llm("anthropic", "claude"),
+            "初始化 Anthropic LLM: claude"
+        );
+        assert_eq!(
+            format_named_llm_init_fail("openai", "timeout"),
+            "OpenAI LLM 初始化失败: timeout"
+        );
+        assert_eq!(
+            format_provider_init_fallback("openai", "boom"),
+            "LLM provider 初始化失败，继续兜底: openai -> boom"
+        );
+        assert_eq!(
+            format_llm_fallback_init_complete("", "ollama"),
+            "✓ LLM 兜底初始化完成 (preferred: default-order, active: ollama)"
+        );
+        assert_eq!(
+            format_llm_fallback_init_complete("default-order", "openai"),
+            "✓ LLM 兜底初始化完成 (preferred: default-order, active: openai)"
+        );
     }
 
     #[tokio::test]

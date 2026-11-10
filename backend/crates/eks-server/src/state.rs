@@ -55,6 +55,7 @@ impl RuntimeWarmup {
     /// 对齐 `STARTUP_INIT_LLM` / `get_default_llm().prime()`：预热进程级默认 LLM。
     pub async fn apply_startup_llm(&mut self, llm: &crate::llm::LlmClient) -> Result<(), String> {
         let provider = llm.prime().await?;
+        crate::llm::log_llm_fallback_init_complete("default-order", &provider);
         self.llm_warmed = true;
         self.provider = Some(provider);
         Ok(())
