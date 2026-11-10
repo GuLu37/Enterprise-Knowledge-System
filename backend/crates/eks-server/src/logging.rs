@@ -326,6 +326,19 @@ pub fn format_python_log_prefix(
     format!("{timestamp} | {level:<8} | {name}:{function}:{line} - ")
 }
 
+fn color_level(level: &str) -> String {
+    let padded = format!("{level:<8}");
+    let code = match level {
+        "ERROR" => "31",
+        "WARN" => "33",
+        "INFO" => "32",
+        "DEBUG" => "36",
+        "TRACE" => "35",
+        _ => "0",
+    };
+    format!("\x1b[{code}m{padded}\x1b[0m")
+}
+
 struct PythonLogFormat;
 
 impl<S, N> FormatEvent<S, N> for PythonLogFormat
@@ -345,17 +358,22 @@ where
             .module_path()
             .and_then(|path| path.rsplit("::").next())
             .unwrap_or("unknown");
-        write!(
-            writer,
-            "{}",
-            format_python_log_prefix(
-                &timestamp,
-                meta.level().as_str(),
+        let level = meta.level().as_str();
+        let line = meta.line().unwrap_or(0);
+        if writer.has_ansi_escapes() {
+            write!(
+                writer,
+                "\x1b[32m{timestamp}\x1b[0m | {} | \x1b[36m{}\x1b[0m:\x1b[36m{function}\x1b[0m:\x1b[36m{line}\x1b[0m - ",
+                color_level(level),
                 meta.target(),
-                function,
-                meta.line().unwrap_or(0),
-            )
-        )?;
+            )?;
+        } else {
+            write!(
+                writer,
+                "{}",
+                format_python_log_prefix(&timestamp, level, meta.target(), function, line)
+            )?;
+        }
         ctx.format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
@@ -369,6 +387,7 @@ pub fn init_tracing(log_dir: &str, log_level: &str) {
         .unwrap_or_else(|_| EnvFilter::new(parse_log_level(log_level)));
     let stdout_layer = fmt::layer()
         .event_format(PythonLogFormat)
+        .with_ansi(true)
         .with_writer(console_writer())
         .with_filter(console_filter);
     let dir = resolve_log_dir(log_dir);
