@@ -1,8 +1,9 @@
 //! API 路由：/api/v1/auth/*（与 Python FastAPI 契约一致）+ /health。
 use axum::{
     Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION, header::LOCATION},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -411,9 +412,31 @@ pub fn router(state: AppState) -> axum::Router {
         .fallback(json_not_found)
         .method_not_allowed_fallback(json_method_not_allowed)
         .with_state(state.clone())
+        .layer(axum::middleware::from_fn(redirect_trailing_slashes))
         .layer(axum::middleware::from_fn(crate::auth::access_token_renewal_middleware))
         .layer(crate::auth::cors_layer(&state.config.cors_origins))
         .layer(axum::middleware::from_fn(crate::request_log::log_requests))
+}
+
+/// 对齐 Starlette `redirect_slashes=True`：尾斜杠 307 到去斜杠路径，保留 query。
+fn slash_redirect_location(uri: &Uri) -> Option<String> {
+    let path = uri.path();
+    if path.len() <= 1 || !path.ends_with('/') {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+    Some(match uri.query() {
+        Some(query) => format!("{trimmed}?{query}"),
+        None => trimmed.to_string(),
+    })
+}
+
+async fn redirect_trailing_slashes(req: Request, next: Next) -> Response {
+    if let Some(location) = slash_redirect_location(req.uri()) {
+        return (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]).into_response();
+    }
+    next.run(req).await
 }
 
 pub async fn json_not_found() -> impl IntoResponse {
@@ -827,6 +850,79 @@ mod docs_tests {
         let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["detail"], "Not Found");
+    }
+
+    #[test]
+    fn slash_redirect_location_matches_starlette() {
+        assert_eq!(
+            slash_redirect_location(&"/health/".parse().unwrap()).as_deref(),
+            Some("/health")
+        );
+        assert_eq!(
+            slash_redirect_location(&"/health/?q=1".parse().unwrap()).as_deref(),
+            Some("/health?q=1")
+        );
+        assert!(slash_redirect_location(&"/health".parse().unwrap()).is_none());
+        assert!(slash_redirect_location(&"/".parse().unwrap()).is_none());
+        assert_eq!(
+            slash_redirect_location(&"/api/v1/chat/settings/".parse().unwrap()).as_deref(),
+            Some("/api/v1/chat/settings")
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_returns_307_like_starlette() {
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .fallback(json_not_found)
+            .layer(axum::middleware::from_fn(redirect_trailing_slashes));
+        let redirected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirected
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/health")
+        );
+
+        let with_query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/?x=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            with_query
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/health?x=1")
+        );
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
