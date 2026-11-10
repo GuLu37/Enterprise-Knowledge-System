@@ -54,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder = eks_server::embedder::shared_embedder(&config)
         .map_err(|e| format!("Embedding 内核初始化失败: {e}"))?;
     let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
+    store.initialize_collections(
+        &config.milvus_child_collection,
+        &config.milvus_memory_collection,
+    );
     store.log_startup_ready();
     let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
         store.clone(), embedder, pool.clone(),

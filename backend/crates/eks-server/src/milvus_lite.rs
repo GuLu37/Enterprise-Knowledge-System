@@ -149,6 +149,77 @@ pub fn format_milvus_init_error(error: &str) -> String {
     format!("Milvus 后台初始化出错: {error}")
 }
 
+/// 对齐 Python `_child_collection_expected_fields`（Lite parquet 另有 `_seq`，校验用子集）。
+pub const CHILD_COLLECTION_FIELDS: &[&str] = &[
+    "pk",
+    "text",
+    "vector",
+    "document_id",
+    "child_id",
+    "parent_id",
+    "parent_index",
+    "chunk_index",
+    "source_name",
+    "chunk_text",
+    "child_text",
+    "file_type",
+    "content_type",
+];
+
+/// 对齐 Python `_ensure_memory_collection` 的 expected_fields。
+pub const MEMORY_COLLECTION_FIELDS: &[&str] = &[
+    "pk",
+    "text",
+    "vector",
+    "memory_id",
+    "chunk_index",
+    "source_name",
+    "chunk_text",
+    "user_id",
+    "conversation_id",
+    "session_id",
+    "chunk_type",
+    "topic",
+    "turn_start",
+    "turn_end",
+    "created_at",
+];
+
+#[derive(Debug, Clone, Copy)]
+pub enum CollectionKind {
+    Child,
+    Memory,
+}
+
+fn format_python_str_list(items: &[&str]) -> String {
+    let inner = items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
+}
+
+pub fn format_child_collection_created(name: &str) -> String {
+    format!("✓ Milvus Child collection 创建完成 ({name})")
+}
+
+pub fn format_memory_collection_created(name: &str) -> String {
+    format!("✓ Milvus 长期记忆 collection 创建完成 ({name})")
+}
+
+pub fn format_schema_mismatch(kind: CollectionKind, collection: &str, missing: &[&str]) -> String {
+    let fields = format_python_str_list(missing);
+    match kind {
+        CollectionKind::Child => format!(
+            "Milvus Child collection schema 不匹配: {collection} 缺少字段 {fields}，请执行迁移或清理后重新初始化"
+        ),
+        CollectionKind::Memory => format!(
+            "Milvus collection schema 不匹配: {collection} 缺少字段 {fields}，请执行迁移或清理后重新初始化"
+        ),
+    }
+}
+
 impl MilvusLiteStore {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         MilvusLiteStore {
@@ -164,6 +235,15 @@ impl MilvusLiteStore {
             return;
         }
         tracing::info!("{}", format_milvus_ready());
+    }
+
+    /// 对齐 Python `initialize_collections`：启动时确保 Child / 长期记忆 collection 存在。
+    pub fn initialize_collections(&self, child: &str, memory: &str) {
+        if self.root.as_os_str().is_empty() {
+            return;
+        }
+        ensure_named_collection(&self.root, child, CollectionKind::Child);
+        ensure_named_collection(&self.root, memory, CollectionKind::Memory);
     }
 
     /// 获取集合快照；manifest mtime 未变时命中缓存，变化时优先增量加载
@@ -484,6 +564,41 @@ pub fn validate_vector_dimension(
     Ok(())
 }
 
+/// 读取已有 parquet 字段名；空集合返回 None。
+pub fn collection_stored_field_names(root: &Path, collection: &str) -> Option<HashSet<String>> {
+    let collection_dir = root.join("collections").join(collection);
+    let manifest_str = std::fs::read_to_string(collection_dir.join("manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
+    let files = manifest
+        .pointer("/partitions/_default/data_files")?
+        .as_array()?;
+    let partition_dir = collection_dir.join("partitions").join("_default");
+    for file in files {
+        let rel = file.as_str()?;
+        let path = partition_dir.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        if let Some(names) = parquet_field_names(&path) {
+            return Some(names);
+        }
+    }
+    None
+}
+
+fn parquet_field_names(path: &Path) -> Option<HashSet<String>> {
+    let file = std::fs::File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    Some(
+        builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect(),
+    )
+}
+
 /// 读取已有 parquet 的 FixedSizeList 维度；空集合返回 None。
 pub fn collection_stored_vector_dimension(root: &Path, collection: &str) -> Option<usize> {
     let collection_dir = root.join("collections").join(collection);
@@ -625,11 +740,11 @@ pub fn write_manifest_atomic(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure_collection(root: &Path, collection: &str) -> Result<(), String> {
+pub fn ensure_collection(root: &Path, collection: &str) -> Result<bool, String> {
     let collection_dir = root.join("collections").join(collection);
     let manifest_path = collection_dir.join("manifest.json");
     if manifest_path.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     std::fs::create_dir_all(collection_dir.join("partitions").join("_default").join("data"))
         .map_err(|err| err.to_string())?;
@@ -649,7 +764,46 @@ pub fn ensure_collection(root: &Path, collection: &str) -> Result<(), String> {
         &manifest_path,
         &serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?,
     )?;
-    Ok(())
+    Ok(true)
+}
+
+fn ensure_named_collection(root: &Path, collection: &str, kind: CollectionKind) {
+    match ensure_collection(root, collection) {
+        Ok(true) => tracing::info!("{}", match kind {
+            CollectionKind::Child => format_child_collection_created(collection),
+            CollectionKind::Memory => format_memory_collection_created(collection),
+        }),
+        Ok(false) => {
+            if let Err(err) = ensure_collection_schema(root, collection, kind) {
+                tracing::warn!("{}", format_milvus_init_error(&err));
+            }
+        }
+        Err(err) => tracing::warn!("{}", format_milvus_init_error(&err)),
+    }
+}
+
+pub fn ensure_collection_schema(
+    root: &Path,
+    collection: &str,
+    kind: CollectionKind,
+) -> Result<(), String> {
+    let expected = match kind {
+        CollectionKind::Child => CHILD_COLLECTION_FIELDS,
+        CollectionKind::Memory => MEMORY_COLLECTION_FIELDS,
+    };
+    let Some(existing) = collection_stored_field_names(root, collection) else {
+        return Ok(());
+    };
+    let mut missing: Vec<&str> = expected
+        .iter()
+        .copied()
+        .filter(|name| !existing.contains(*name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    Err(format_schema_mismatch(kind, collection, &missing))
 }
 
 pub fn append_memory_chunks(
@@ -664,6 +818,7 @@ pub fn append_memory_chunks(
     let _guard = manifest_write_guard();
     let embedding_dimension = embedding_dimension.max(1);
     ensure_collection(root, collection)?;
+    ensure_collection_schema(root, collection, CollectionKind::Memory)?;
     ensure_collection_dimension(root, collection, embedding_dimension)?;
     let collection_dir = root.join("collections").join(collection);
     let manifest_path = collection_dir.join("manifest.json");
@@ -1302,6 +1457,88 @@ mod tests {
         assert!(validate_vector_dimension("doc_chunk", 512, 768)
             .unwrap_err()
             .contains("当前为 512, 配置为 768"));
+    }
+
+    #[test]
+    fn collection_create_and_schema_logs_match_python() {
+        assert_eq!(
+            format_child_collection_created("doc_chunk"),
+            "✓ Milvus Child collection 创建完成 (doc_chunk)"
+        );
+        assert_eq!(
+            format_memory_collection_created("memory_chunks"),
+            "✓ Milvus 长期记忆 collection 创建完成 (memory_chunks)"
+        );
+        assert_eq!(
+            format_schema_mismatch(CollectionKind::Child, "doc_chunk", &["child_id", "parent_id"]),
+            "Milvus Child collection schema 不匹配: doc_chunk 缺少字段 ['child_id', 'parent_id']，请执行迁移或清理后重新初始化"
+        );
+        assert_eq!(
+            format_schema_mismatch(CollectionKind::Memory, "memory_chunks", &["user_id"]),
+            "Milvus collection schema 不匹配: memory_chunks 缺少字段 ['user_id']，请执行迁移或清理后重新初始化"
+        );
+    }
+
+    #[test]
+    fn ensure_collection_creates_once_and_skips_empty_schema_check() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-milvus-ensure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(ensure_collection(&root, "doc_chunk").unwrap());
+        assert!(!ensure_collection(&root, "doc_chunk").unwrap());
+        assert!(ensure_collection_schema(&root, "doc_chunk", CollectionKind::Child).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_collection_schema_rejects_missing_child_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-milvus-schema-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        ensure_collection(&root, "doc_chunk").unwrap();
+        let collection_dir = root.join("collections").join("doc_chunk");
+        let data_dir = collection_dir.join("partitions").join("_default").join("data");
+        let schema = Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data_path = data_dir.join("data_000001_000001.parquet");
+        let file = std::fs::File::create(&data_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let manifest = serde_json::json!({
+            "version": 1,
+            "current_seq": 1,
+            "partitions": {
+                "_default": {
+                    "data_files": ["data/data_000001_000001.parquet"],
+                    "delta_files": []
+                }
+            }
+        });
+        std::fs::write(
+            collection_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = ensure_collection_schema(&root, "doc_chunk", CollectionKind::Child).unwrap_err();
+        assert!(err.contains("Milvus Child collection schema 不匹配: doc_chunk"));
+        assert!(err.contains("child_id"));
+        assert!(err.contains("请执行迁移或清理后重新初始化"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

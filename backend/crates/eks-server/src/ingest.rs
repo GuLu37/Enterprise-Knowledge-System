@@ -1336,6 +1336,11 @@ pub async fn append_to_milvus_lite(
     let embedding_dimension = embedding_dimension.max(1);
     // 全新 milvus_lite.db 首次写入时集合尚不存在，先确保布局（对齐 append_memory_chunks）。
     crate::milvus_lite::ensure_collection(&store.root, collection)?;
+    crate::milvus_lite::ensure_collection_schema(
+        &store.root,
+        collection,
+        crate::milvus_lite::CollectionKind::Child,
+    )?;
     crate::milvus_lite::ensure_collection_dimension(&store.root, collection, embedding_dimension)?;
     for vector in vectors {
         crate::milvus_lite::validate_vector_dimension(collection, vector.len(), embedding_dimension)?;
