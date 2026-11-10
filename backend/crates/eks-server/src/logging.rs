@@ -12,6 +12,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub const LOG_ROTATION_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -363,27 +364,28 @@ where
 /// 控制台 + 滚动文件。文件初始化失败时仅保留 stderr。
 pub fn init_tracing(log_dir: &str, log_level: &str) {
     install_panic_hook();
-    let filter = EnvFilter::try_from_default_env()
+    // 控制台跟 LOG_LEVEL；文件对齐 loguru `level=0`，本 crate 全量写入。
+    let console_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(parse_log_level(log_level)));
     let stdout_layer = fmt::layer()
         .event_format(PythonLogFormat)
-        .with_writer(console_writer());
+        .with_writer(console_writer())
+        .with_filter(console_filter);
     let dir = resolve_log_dir(log_dir);
     match RotatingFile::open(dir.clone()) {
         Ok(file) => {
             let file_layer = fmt::layer()
                 .event_format(PythonLogFormat)
                 .with_ansi(false)
-                .with_writer(MutexWriter(Mutex::new(file)));
+                .with_writer(MutexWriter(Mutex::new(file)))
+                .with_filter(EnvFilter::new("eks_server=trace,eks_kernels=trace"));
             tracing_subscriber::registry()
-                .with(filter)
                 .with(stdout_layer)
                 .with(file_layer)
                 .init();
         }
         Err(err) => {
             tracing_subscriber::registry()
-                .with(filter)
                 .with(stdout_layer)
                 .init();
             tracing::warn!(path = %dir.display(), "日志目录不可用，仅输出到控制台: {err}");
