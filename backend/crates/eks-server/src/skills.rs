@@ -1880,7 +1880,7 @@ async fn delete_profile_memory(pool: &sqlx::SqlitePool, user_id: &str, arguments
         return Ok(json!({
             "deleted_count": 0,
             "matched": [],
-            "summary": "未提供任何删除条件，请指定 memory_key 或 keywords。",
+            "summary": "未提供删除条件，请指定 memory_keys 或 keywords。",
         }));
     }
     let normalized_keys: Vec<String> = keys.iter().map(|key| key.trim().to_lowercase()).filter(|key| !key.is_empty()).collect();
@@ -2751,6 +2751,12 @@ mod tests {
         .unwrap();
         assert_eq!(invalid_scope["memory_scope"], "all");
         assert_eq!(invalid_scope.pointer("/summary/profile_count").and_then(|value| value.as_u64()), Some(1));
+        let empty = delete_profile_memory(&pool, "u1", &json!({})).await.unwrap();
+        assert_eq!(
+            empty["summary"],
+            "未提供删除条件，请指定 memory_keys 或 keywords。"
+        );
+        assert_eq!(empty["deleted_count"], 0);
         let deleted = delete_profile_memory(&pool, "u1", &json!({"keywords":["张三"]})).await.unwrap();
         assert_eq!(deleted.get("deleted_count").and_then(|value| value.as_u64()), Some(1));
     }
