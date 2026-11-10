@@ -316,6 +316,7 @@ pub struct ChatCompletion {
 pub struct StreamChunk {
     pub delta: String,
     pub provider: String,
+    pub error: Option<String>,
 }
 
 impl LlmClient {
@@ -645,7 +646,7 @@ impl LlmClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
-    /// 流式调用（SSE，带兜底链）。HTTP/连接失败时切换下一供应商，对齐 Python `FallbackLLM.stream`。
+    /// 流式调用（SSE，带兜底链）。打开或读流失败时切换下一供应商，对齐 Python `FallbackLLM.stream`。
     pub async fn stream(
         self: &Arc<Self>,
         messages: &[ChatMessage],
@@ -656,12 +657,18 @@ impl LlmClient {
         }
         let per_timeout = attempt_timeout(self.config.timeout_secs, providers.len());
         let mut errors: Vec<String> = Vec::new();
-        for provider in &providers {
-            self.maybe_log_instantiate(provider).await;
-            match self.open_stream_response(provider, messages, per_timeout).await {
+        let mut opened = None;
+        let mut remaining = Vec::new();
+        for provider in providers {
+            if opened.is_some() {
+                remaining.push(provider);
+                continue;
+            }
+            self.maybe_log_instantiate(&provider).await;
+            match self.open_stream_response(&provider, messages, per_timeout).await {
                 Ok(response) => {
                     self.remember_success(&provider.name).await;
-                    return Ok(spawn_stream_reader(response, provider));
+                    opened = Some((provider, response));
                 }
                 Err(exc) => {
                     tracing::warn!(
@@ -673,13 +680,23 @@ impl LlmClient {
                 }
             }
         }
-        Err(format!(
-            "所有 LLM 提供商均不可用: {}",
-            if errors.is_empty() {
-                "无可用 provider".to_string()
-            } else {
-                errors.join(" | ")
-            }
+        let Some((first_provider, first_response)) = opened else {
+            return Err(format!(
+                "所有 LLM 提供商均不可用: {}",
+                if errors.is_empty() {
+                    "无可用 provider".to_string()
+                } else {
+                    errors.join(" | ")
+                }
+            ));
+        };
+        Ok(spawn_stream_coordinator(
+            self.clone(),
+            messages.to_vec(),
+            per_timeout,
+            first_provider,
+            first_response,
+            remaining,
         ))
     }
 
@@ -768,60 +785,116 @@ pub fn resolve_llm_client(
     }
 }
 
-fn spawn_stream_reader(
-    response: reqwest::Response,
-    provider: &ProviderConfig,
+fn spawn_stream_coordinator(
+    client: Arc<LlmClient>,
+    messages: Vec<ChatMessage>,
+    per_timeout: u64,
+    first_provider: ProviderConfig,
+    first_response: reqwest::Response,
+    remaining: Vec<ProviderConfig>,
 ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let provider_name = provider.name.clone();
-    let is_ollama = provider.is_ollama;
-    let is_anthropic = provider.is_anthropic;
-
     tokio::spawn(async move {
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("SSE chunk 读取失败: {e}");
-                    break;
-                }
-            };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].to_string();
-                buffer.drain(..pos + 1);
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let delta = if is_ollama {
-                    stream_delta_from_ollama(line)
-                } else if is_anthropic {
-                    stream_delta_from_anthropic(line)
-                } else {
-                    stream_delta_from_openai(line)
-                };
-                if let Some(delta) = delta {
-                    if tx
-                        .send(StreamChunk {
-                            delta,
-                            provider: provider_name.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
+        let mut current_provider = first_provider;
+        let mut current_response = first_response;
+        let mut rest = remaining.into_iter();
+        loop {
+            match drain_stream(current_response, &current_provider, &tx).await {
+                Ok(()) => return,
+                Err(exc) => {
+                    tracing::warn!(
+                        "LLM 流式调用失败，切换到下一个 provider: {} -> {exc}",
+                        current_provider.name
+                    );
+                    client.record_failure(&current_provider.name).await;
+                    let mut next = None;
+                    for provider in rest.by_ref() {
+                        client.maybe_log_instantiate(&provider).await;
+                        match client
+                            .open_stream_response(&provider, &messages, per_timeout)
+                            .await
+                        {
+                            Ok(response) => {
+                                client.remember_success(&provider.name).await;
+                                next = Some((provider, response));
+                                break;
+                            }
+                            Err(open_exc) => {
+                                tracing::warn!(
+                                    "LLM 流式调用失败，切换到下一个 provider: {} -> {open_exc}",
+                                    provider.name
+                                );
+                                client.record_failure(&provider.name).await;
+                            }
+                        }
+                    }
+                    match next {
+                        Some((provider, response)) => {
+                            current_provider = provider;
+                            current_response = response;
+                        }
+                        None => {
+                            let _ = tx
+                                .send(StreamChunk {
+                                    delta: String::new(),
+                                    provider: current_provider.name.clone(),
+                                    error: Some(exc),
+                                })
+                                .await;
+                            return;
+                        }
                     }
                 }
             }
         }
     });
-
     rx
+}
+
+async fn drain_stream(
+    response: reqwest::Response,
+    provider: &ProviderConfig,
+    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return Err(format!("SSE chunk 读取失败: {e}")),
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].to_string();
+            buffer.drain(..pos + 1);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let delta = if provider.is_ollama {
+                stream_delta_from_ollama(line)
+            } else if provider.is_anthropic {
+                stream_delta_from_anthropic(line)
+            } else {
+                stream_delta_from_openai(line)
+            };
+            if let Some(delta) = delta {
+                if tx
+                    .send(StreamChunk {
+                        delta,
+                        provider: provider.name.clone(),
+                        error: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn json_line(line: &str) -> Option<&str> {
@@ -1616,6 +1689,69 @@ mod tests {
             "per-attempt timeout is 1s (2/2), old *4 budget would wait 4s, elapsed={elapsed:?}"
         );
         hang_handle.abort();
+        ok_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_mid_read_error_falls_back_to_next_provider() {
+        use axum::body::{Body, Bytes};
+
+        const SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\ndata: [DONE]\n\n";
+        let broken = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\n",
+                    ));
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    yield Err(std::io::Error::other("reset"));
+                };
+                axum::response::Response::builder()
+                    .status(200)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let broken_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_addr = broken_listener.local_addr().unwrap();
+        let broken_handle = tokio::spawn(async move {
+            axum::serve(broken_listener, broken).await.unwrap();
+        });
+        let (ok_url, ok_handle) =
+            serve_chat_completions(axum::http::StatusCode::OK, SSE, "text/event-stream").await;
+        let client = std::sync::Arc::new(LlmClient::new(LlmConfig {
+            preferred_provider: "openai".into(),
+            temperature: 0.2,
+            timeout_secs: 8,
+            max_tokens: 64,
+            max_fallback_attempts: 4,
+            providers: vec![
+                named_provider("openai", &format!("http://{broken_addr}")),
+                named_provider("deepseek", &ok_url),
+            ],
+        }));
+        let mut rx = client
+            .stream(&[ChatMessage::new("user", "hi")])
+            .await
+            .expect("mid-stream reset should fall back");
+        let mut deltas = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            if chunk.error.is_some() {
+                continue;
+            }
+            deltas.push((chunk.provider, chunk.delta));
+        }
+        assert_eq!(
+            deltas,
+            vec![
+                ("openai".into(), "part".into()),
+                ("deepseek".into(), "fallback".into())
+            ]
+        );
+        broken_handle.abort();
         ok_handle.abort();
     }
 

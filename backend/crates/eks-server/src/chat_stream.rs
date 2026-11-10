@@ -1257,10 +1257,10 @@ async fn collect_rag(
 }
 
 fn llm_unavailable() -> crate::auth::AuthError {
-    crate::auth::AuthError {
-        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        detail: crate::llm::LLM_NO_PROVIDER_MESSAGE.into(),
-    }
+    crate::auth::AuthError::http(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        crate::llm::LLM_NO_PROVIDER_MESSAGE,
+    )
 }
 
 /// 对齐 Python `run_chat` / `stream_chat`：无可用 provider 时在意图路由前失败。
@@ -1451,7 +1451,7 @@ pub struct ConsolidateQuery {
 pub async fn consolidate_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<ConsolidateQuery>,
+    crate::extract::ApiQuery(query): crate::extract::ApiQuery<ConsolidateQuery>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     // 对齐 Python 路由求值顺序：先构造默认 LLM（无 provider 时 500），再由服务层
@@ -1471,10 +1471,10 @@ pub async fn consolidate_chat(
         state.config.memory_event_expiry_days,
     )
     .await
-    .map_err(|detail| crate::auth::AuthError {
-        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    .map_err(|detail| crate::auth::AuthError::http(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         detail,
-    })?;
+    ))?;
     Ok(axum::Json(json!({
         "conversation_id": conversation_id,
         "consolidated": consolidated,
@@ -1502,7 +1502,7 @@ pub async fn chat_warmup(
 pub async fn generate_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::Json(request): axum::Json<ChatStreamRequest>,
+    crate::extract::ApiJson(request): crate::extract::ApiJson<ChatStreamRequest>,
 ) -> Result<axum::Json<serde_json::Value>, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     validate_chat_schema(&request)?;
@@ -1630,10 +1630,10 @@ pub async fn generate_chat(
         state.config.as_ref(),
     )
     .await
-    .map_err(|detail| crate::auth::AuthError {
-        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    .map_err(|detail| crate::auth::AuthError::http(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         detail,
-    })?;
+    ))?;
     if let Some(answer) = turn.direct {
         spawn_persist_turn(
             state.pool.clone(),
@@ -1700,7 +1700,7 @@ pub async fn generate_chat(
 pub async fn stream_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::Json(request): axum::Json<ChatStreamRequest>,
+    crate::extract::ApiJson(request): crate::extract::ApiJson<ChatStreamRequest>,
 ) -> Result<Response, crate::auth::AuthError> {
     let user = crate::routes::require_current_user(&state, &headers).await?;
     validate_chat_schema(&request)?;
@@ -1848,6 +1848,13 @@ pub async fn stream_chat(
                                     Ok(mut rx) => {
                                         let mut full_response = String::new();
                                         while let Some(chunk) = rx.recv().await {
+                                            if let Some(exc) = chunk.error {
+                                                tracing::warn!("LLM 流式生成失败，使用静态繁忙兜底: {exc}");
+                                                yield Ok(sse_json("message", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                                                yield Ok(sse_json("token", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                                                full_response.push_str(LLM_UNAVAILABLE_MESSAGE);
+                                                break;
+                                            }
                                             full_response.push_str(&chunk.delta);
                                             yield Ok(sse_json("message", json!({"content": chunk.delta})));
                                             yield Ok(sse_json("token", json!({"content": chunk.delta})));
@@ -2165,6 +2172,13 @@ pub async fn stream_chat(
         match llm_client.stream(&messages).await {
             Ok(mut rx) => {
                 while let Some(chunk) = rx.recv().await {
+                    if let Some(exc) = chunk.error {
+                        tracing::warn!("LLM 流式生成失败，使用静态繁忙兜底: {exc}");
+                        yield Ok(sse_json("message", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                        yield Ok(sse_json("token", json!({"content": LLM_UNAVAILABLE_MESSAGE})));
+                        full_response.push_str(LLM_UNAVAILABLE_MESSAGE);
+                        break;
+                    }
                     full_response.push_str(&chunk.delta);
                     yield Ok(sse_json("message", json!({"content": chunk.delta})));
                     yield Ok(sse_json("token", json!({"content": chunk.delta})));

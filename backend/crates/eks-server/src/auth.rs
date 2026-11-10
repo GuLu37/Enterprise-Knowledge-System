@@ -272,58 +272,85 @@ pub fn decode_token(token: &str, expected_type: &str, secret: &str) -> Result<To
 }
 
 /// 与 FastAPI HTTPException(status, detail) 同构的错误。
+/// 422 另带 Pydantic `loc`/`type`，序列化为 `detail: [{loc, msg, type}]`。
 #[derive(Debug)]
 pub struct AuthError {
     pub status: axum::http::StatusCode,
     pub detail: String,
+    pub loc: Vec<String>,
+    pub error_type: String,
 }
 
 impl AuthError {
-    pub fn bad_request(detail: &str) -> Self {
+    pub fn http(status: axum::http::StatusCode, detail: impl Into<String>) -> Self {
         AuthError {
-            status: axum::http::StatusCode::BAD_REQUEST,
-            detail: detail.to_string(),
+            status,
+            detail: detail.into(),
+            loc: Vec::new(),
+            error_type: String::new(),
         }
+    }
+
+    pub fn bad_request(detail: &str) -> Self {
+        Self::http(axum::http::StatusCode::BAD_REQUEST, detail)
     }
 
     pub fn unauthorized(detail: &str) -> Self {
-        AuthError {
-            status: axum::http::StatusCode::UNAUTHORIZED,
-            detail: detail.to_string(),
-        }
+        Self::http(axum::http::StatusCode::UNAUTHORIZED, detail)
     }
 
     pub fn conflict(detail: &str) -> Self {
-        AuthError {
-            status: axum::http::StatusCode::CONFLICT,
-            detail: detail.to_string(),
-        }
+        Self::http(axum::http::StatusCode::CONFLICT, detail)
     }
 
     pub fn unprocessable(detail: &str) -> Self {
+        Self::unprocessable_at(&["body"], detail, "value_error")
+    }
+
+    pub fn unprocessable_at(loc: &[&str], detail: &str, error_type: &str) -> Self {
         AuthError {
             status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             detail: detail.to_string(),
+            loc: loc.iter().map(|item| (*item).to_string()).collect(),
+            error_type: error_type.to_string(),
+        }
+    }
+
+    pub fn detail_json(&self) -> serde_json::Value {
+        if self.status == axum::http::StatusCode::UNPROCESSABLE_ENTITY {
+            let loc: Vec<serde_json::Value> = if self.loc.is_empty() {
+                vec![serde_json::json!("body")]
+            } else {
+                self.loc.iter().map(|item| serde_json::json!(item)).collect()
+            };
+            let error_type = if self.error_type.is_empty() {
+                "value_error"
+            } else {
+                self.error_type.as_str()
+            };
+            serde_json::json!({
+                "detail": [{
+                    "loc": loc,
+                    "msg": self.detail,
+                    "type": error_type
+                }]
+            })
+        } else {
+            serde_json::json!({ "detail": self.detail })
         }
     }
 }
 
 impl From<String> for AuthError {
     fn from(detail: String) -> Self {
-        AuthError {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            detail,
-        }
+        Self::http(axum::http::StatusCode::INTERNAL_SERVER_ERROR, detail)
     }
 }
 
 impl From<sqlx::Error> for AuthError {
     fn from(err: sqlx::Error) -> Self {
         tracing::error!("数据库错误: {err}");
-        AuthError {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            detail: "服务器内部错误".to_string(),
-        }
+        Self::http(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误")
     }
 }
 

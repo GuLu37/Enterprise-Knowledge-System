@@ -2,66 +2,112 @@
 use crate::auth::AuthError;
 
 pub fn string_min_length(value: &str, min: usize) -> Result<(), AuthError> {
+    string_min_length_at(value, min, &["body"])
+}
+
+pub fn string_min_length_at(value: &str, min: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) < min {
-        Err(AuthError::unprocessable(&format!(
-            "String should have at least {min} character{}",
-            if min == 1 { "" } else { "s" }
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!(
+                "String should have at least {min} character{}",
+                if min == 1 { "" } else { "s" }
+            ),
+            "string_too_short",
+        ))
     } else {
         Ok(())
     }
 }
 
 pub fn string_max_length(value: &str, max: usize) -> Result<(), AuthError> {
+    string_max_length_at(value, max, &["body"])
+}
+
+pub fn string_max_length_at(value: &str, max: usize, loc: &[&str]) -> Result<(), AuthError> {
     if char_len(value) > max {
-        Err(AuthError::unprocessable(&format!(
-            "String should have at most {max} characters"
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!("String should have at most {max} characters"),
+            "string_too_long",
+        ))
     } else {
         Ok(())
     }
 }
 
 pub fn bounded_string(value: &str, min: usize, max: usize) -> Result<(), AuthError> {
-    string_min_length(value, min)?;
-    string_max_length(value, max)
+    bounded_string_at(value, min, max, &["body"])
+}
+
+pub fn bounded_string_at(value: &str, min: usize, max: usize, loc: &[&str]) -> Result<(), AuthError> {
+    string_min_length_at(value, min, loc)?;
+    string_max_length_at(value, max, loc)
 }
 
 pub fn ge_le_int(value: i64, ge: i64, le: i64) -> Result<(), AuthError> {
+    ge_le_int_at(value, ge, le, &["body"])
+}
+
+pub fn ge_le_int_at(value: i64, ge: i64, le: i64, loc: &[&str]) -> Result<(), AuthError> {
     if value < ge {
-        Err(AuthError::unprocessable(&format!(
-            "Input should be greater than or equal to {ge}"
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!("Input should be greater than or equal to {ge}"),
+            "greater_than_equal",
+        ))
     } else if value > le {
-        Err(AuthError::unprocessable(&format!(
-            "Input should be less than or equal to {le}"
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!("Input should be less than or equal to {le}"),
+            "less_than_equal",
+        ))
     } else {
         Ok(())
     }
 }
 
 pub fn ge_le_float(value: f64, ge: f64, le: f64) -> Result<(), AuthError> {
+    ge_le_float_at(value, ge, le, &["body"])
+}
+
+pub fn ge_le_float_at(value: f64, ge: f64, le: f64, loc: &[&str]) -> Result<(), AuthError> {
     if !value.is_finite() || value < ge {
-        Err(AuthError::unprocessable(&format!(
-            "Input should be greater than or equal to {}",
-            format_pydantic_number(ge)
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!(
+                "Input should be greater than or equal to {}",
+                format_pydantic_number(ge)
+            ),
+            "greater_than_equal",
+        ))
     } else if value > le {
-        Err(AuthError::unprocessable(&format!(
-            "Input should be less than or equal to {}",
-            format_pydantic_number(le)
-        )))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &format!(
+                "Input should be less than or equal to {}",
+                format_pydantic_number(le)
+            ),
+            "less_than_equal",
+        ))
     } else {
         Ok(())
     }
 }
 
 pub fn literal(value: &str, allowed: &[&str]) -> Result<(), AuthError> {
+    literal_at(value, allowed, &["body"])
+}
+
+pub fn literal_at(value: &str, allowed: &[&str], loc: &[&str]) -> Result<(), AuthError> {
     if allowed.iter().any(|item| *item == value) {
         Ok(())
     } else {
-        Err(AuthError::unprocessable(&literal_message(allowed)))
+        Err(AuthError::unprocessable_at(
+            loc,
+            &literal_message(allowed),
+            "literal_error",
+        ))
     }
 }
 
@@ -92,61 +138,69 @@ fn literal_message(allowed: &[&str]) -> String {
 }
 
 pub fn login_fields(username: &str, password: &str) -> Result<(), AuthError> {
-    bounded_string(username, 1, 128)?;
-    bounded_string(password, 1, 128)
+    bounded_string_at(username, 1, 128, &["body", "username"])?;
+    bounded_string_at(password, 1, 128, &["body", "password"])
 }
 
 pub fn register_fields(username: &str, password: &str, confirm_password: &str) -> Result<(), AuthError> {
-    bounded_string(username, 1, 128)?;
-    bounded_string(password, 6, 128)?;
-    bounded_string(confirm_password, 6, 128)
+    bounded_string_at(username, 1, 128, &["body", "username"])?;
+    bounded_string_at(password, 6, 128, &["body", "password"])?;
+    bounded_string_at(confirm_password, 6, 128, &["body", "confirm_password"])
 }
 
 pub fn password_change_fields(current_password: &str, new_password: &str) -> Result<(), AuthError> {
-    bounded_string(current_password, 1, 128)?;
-    bounded_string(new_password, 6, 128)
+    bounded_string_at(current_password, 1, 128, &["body", "current_password"])?;
+    bounded_string_at(new_password, 6, 128, &["body", "new_password"])
 }
 
 pub fn refresh_token_field(refresh_token: &str) -> Result<(), AuthError> {
-    string_min_length(refresh_token, 1)
+    string_min_length_at(refresh_token, 1, &["body", "refresh_token"])
 }
 
 pub fn skill_name_field(name: &str) -> Result<(), AuthError> {
-    string_min_length(name, 1)
+    string_min_length_at(name, 1, &["body", "name"])
 }
 
 pub fn session_id_field(session_id: Option<&str>) -> Result<(), AuthError> {
     if let Some(value) = session_id {
-        string_max_length(value, 64)?;
+        string_max_length_at(value, 64, &["body", "session_id"])?;
     }
     Ok(())
 }
 
 /// 对齐 Pydantic `Optional[datetime]`：缺省/null 通过，非法字符串 422。
 pub fn optional_datetime_field(value: Option<&str>) -> Result<(), AuthError> {
+    optional_datetime_field_at(value, &["body"])
+}
+
+pub fn optional_datetime_field_at(value: Option<&str>, loc: &[&str]) -> Result<(), AuthError> {
     match value {
         None => Ok(()),
         Some(text) if crate::db::parse_client_datetime(text).is_some() => Ok(()),
-        Some(_) => Err(AuthError::unprocessable("Input should be a valid datetime")),
+        Some(_) => Err(AuthError::unprocessable_at(
+            loc,
+            "Input should be a valid datetime",
+            "datetime_from_date_parsing",
+        )),
     }
 }
 
 /// 对齐 `RetrievalRequest.top_k`：缺省 5，越界 422，不夹取。
 pub fn retrieval_top_k(top_k: Option<usize>) -> Result<usize, AuthError> {
     let value = top_k.unwrap_or(5);
-    ge_le_int(value as i64, 1, 50)?;
+    ge_le_int_at(value as i64, 1, 50, &["body", "top_k"])?;
     Ok(value)
 }
 
 pub fn document_list_skip(skip: i64) -> Result<i64, AuthError> {
-    ge_le_int(skip, 0, i64::MAX)?;
+    ge_le_int_at(skip, 0, i64::MAX, &["query", "skip"])?;
     Ok(skip)
 }
 
 /// 对齐 `/documents/list`：`limit` 缺省 10，范围 1–100。
 pub fn document_list_limit(limit: Option<i64>) -> Result<i64, AuthError> {
     let value = limit.unwrap_or(10);
-    ge_le_int(value, 1, 100)?;
+    ge_le_int_at(value, 1, 100, &["query", "limit"])?;
     Ok(value)
 }
 
@@ -162,20 +216,20 @@ pub struct ChatSchema {
 }
 
 pub fn chat_request_fields(schema: &ChatSchema) -> Result<(), AuthError> {
-    string_min_length(&schema.query, 1)?;
-    ge_le_int(schema.top_k as i64, 1, 50)?;
+    string_min_length_at(&schema.query, 1, &["body", "query"])?;
+    ge_le_int_at(schema.top_k as i64, 1, 50, &["body", "top_k"])?;
     if let Some(temperature) = schema.temperature {
-        ge_le_float(temperature, 0.0, 2.0)?;
+        ge_le_float_at(temperature, 0.0, 2.0, &["body", "temperature"])?;
     }
-    ge_le_int(schema.short_memory_n as i64, 1, i64::MAX)?;
-    ge_le_int(schema.short_memory_m as i64, 1, i64::MAX)?;
-    literal(&schema.short_memory_strategy, &["window", "summary"])?;
+    ge_le_int_at(schema.short_memory_n as i64, 1, i64::MAX, &["body", "short_memory_n"])?;
+    ge_le_int_at(schema.short_memory_m as i64, 1, i64::MAX, &["body", "short_memory_m"])?;
+    literal_at(&schema.short_memory_strategy, &["window", "summary"], &["body", "short_memory_strategy"])?;
     if let Some(method) = &schema.retrieval_method {
-        literal(method, &["hybrid", "dense", "sparse"])?;
+        literal_at(method, &["hybrid", "dense", "sparse"], &["body", "retrieval_method"])?;
     }
     for (role, content) in &schema.history {
-        literal(role, &["system", "user", "assistant"])?;
-        string_min_length(content, 1)?;
+        literal_at(role, &["system", "user", "assistant"], &["body", "history", "role"])?;
+        string_min_length_at(content, 1, &["body", "history", "content"])?;
     }
     Ok(())
 }
@@ -192,13 +246,17 @@ mod tests {
     #[test]
     fn password_and_username_follow_pydantic_lengths() {
         assert!(login_fields("admin", "1").is_ok());
+        let empty_user = login_fields("", "secret").unwrap_err();
         assert_eq!(
-            detail(login_fields("", "secret").unwrap_err()),
+            detail(empty_user),
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "String should have at least 1 character".into()
             )
         );
+        let empty_user = login_fields("", "secret").unwrap_err();
+        assert_eq!(empty_user.loc, vec!["body".to_string(), "username".to_string()]);
+        assert_eq!(empty_user.error_type, "string_too_short");
         assert_eq!(
             detail(register_fields("user", "12345", "12345").unwrap_err()),
             (

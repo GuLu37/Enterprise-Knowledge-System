@@ -14,13 +14,14 @@ use crate::auth::{
     hash_token, new_uuid_hex, token_bundle_json, verify_password,
 };
 use crate::db::{self, now_naive, fmt_dt};
+use crate::extract::ApiJson;
 use crate::state::AppState;
 
-/// 与 FastAPI HTTPException 的 {"detail": ...} 响应体一致。
+/// 与 FastAPI HTTPException / RequestValidationError 的 {"detail": ...} 响应体一致。
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let body = Json(json!({ "detail": self.detail }));
-        (self.status, body).into_response()
+        let status = self.status;
+        (status, Json(self.detail_json())).into_response()
     }
 }
 
@@ -172,7 +173,7 @@ async fn issue_token_bundle(
 
 pub async fn login(
     State(state): State<AppState>,
-    Json(request): Json<LoginRequest>,
+    ApiJson(request): ApiJson<LoginRequest>,
 ) -> Result<Json<Value>, AuthError> {
     crate::validate::login_fields(&request.username, &request.password)?;
     let username = request.username.trim().to_lowercase();
@@ -195,7 +196,7 @@ pub async fn login(
 
 pub async fn register(
     State(state): State<AppState>,
-    Json(request): Json<RegisterRequest>,
+    ApiJson(request): ApiJson<RegisterRequest>,
 ) -> Result<Json<Value>, AuthError> {
     crate::validate::register_fields(
         &request.username,
@@ -229,7 +230,7 @@ pub async fn register(
 
 pub async fn refresh(
     State(state): State<AppState>,
-    Json(request): Json<RefreshTokenRequest>,
+    ApiJson(request): ApiJson<RefreshTokenRequest>,
 ) -> Result<Json<Value>, AuthError> {
     crate::validate::refresh_token_field(&request.refresh_token)?;
     let claims = decode_token(&request.refresh_token, "refresh", &state.config.jwt_secret_key)?;
@@ -257,7 +258,7 @@ pub async fn refresh(
 pub async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PasswordChangeRequest>,
+    ApiJson(request): ApiJson<PasswordChangeRequest>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     crate::validate::password_change_fields(&request.current_password, &request.new_password)?;
@@ -407,10 +408,23 @@ pub fn router(state: AppState) -> axum::Router {
             &format!("{prefix}/skills/execute"),
             post(execute_skill),
         )
+        .fallback(json_not_found)
+        .method_not_allowed_fallback(json_method_not_allowed)
         .with_state(state.clone())
         .layer(axum::middleware::from_fn(crate::auth::access_token_renewal_middleware))
         .layer(crate::auth::cors_layer(&state.config.cors_origins))
         .layer(axum::middleware::from_fn(crate::request_log::log_requests))
+}
+
+pub async fn json_not_found() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(json!({ "detail": "Not Found" })))
+}
+
+pub async fn json_method_not_allowed() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(json!({ "detail": "Method Not Allowed" })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -421,7 +435,7 @@ pub struct RetrievalRequest {
 }
 
 fn reject_empty_query(query: &str) -> Result<(), AuthError> {
-    crate::validate::string_min_length(query, 1)
+    crate::validate::string_min_length_at(query, 1, &["body", "query"])
 }
 
 /// 对齐 Python `_build_response(request.query, …)`：HTTP 回显原始查询串。
@@ -436,7 +450,7 @@ fn retrieval_search_query(query: &str) -> &str {
 pub async fn retrieval_dense(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RetrievalRequest>,
+    ApiJson(request): ApiJson<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     retrieval_simple(state, headers, request, "dense").await
 }
@@ -444,7 +458,7 @@ pub async fn retrieval_dense(
 pub async fn retrieval_sparse(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RetrievalRequest>,
+    ApiJson(request): ApiJson<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     retrieval_simple(state, headers, request, "sparse").await
 }
@@ -476,7 +490,22 @@ async fn retrieval_simple(
     })))
 }
 
-#[derive(Deserialize, Default)]
+fn default_json_object() -> Value {
+    json!({})
+}
+
+fn deserialize_json_object<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(Value::Null) => default_json_object(),
+        Some(other) => other,
+    })
+}
+
+#[derive(Deserialize)]
 pub struct SkillExecuteContext {
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -486,14 +515,26 @@ pub struct SkillExecuteContext {
     pub query: Option<String>,
     #[serde(default)]
     pub trace_id: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_json_object", deserialize_with = "deserialize_json_object")]
     pub metadata: Value,
+}
+
+impl Default for SkillExecuteContext {
+    fn default() -> Self {
+        Self {
+            conversation_id: None,
+            session_id: None,
+            query: None,
+            trace_id: None,
+            metadata: default_json_object(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 pub struct SkillExecuteBody {
     pub name: String,
-    #[serde(default)]
+    #[serde(default = "default_json_object", deserialize_with = "deserialize_json_object")]
     pub arguments: Value,
     #[serde(default)]
     pub context: SkillExecuteContext,
@@ -532,7 +573,7 @@ pub async fn skill_capabilities(
 pub async fn execute_skill(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<SkillExecuteBody>,
+    ApiJson(request): ApiJson<SkillExecuteBody>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     crate::validate::skill_name_field(&request.name)?;
@@ -541,10 +582,10 @@ pub async fn execute_skill(
     // 未知技能 404；remote_mcp 不在此提前返回，统一走 execute_named_from，
     // 对齐 Python execute_skill 的三段 trace 日志（调用开始/调用异常）。
     if crate::skills::get_skill_definition_from(name, manifests).is_none() {
-        return Err(AuthError {
-            status: StatusCode::NOT_FOUND,
-            detail: crate::skills::skill_not_found_http_detail(name),
-        });
+        return Err(AuthError::http(
+            StatusCode::NOT_FOUND,
+            crate::skills::skill_not_found_http_detail(name),
+        ));
     }
     let context = crate::skills::SkillExecutionContext {
         user_id: &user.user_id,
@@ -566,10 +607,7 @@ pub async fn execute_skill(
         Some(state.engine.embedder.as_ref()),
     )
     .await
-    .map_err(|detail| AuthError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail,
-    })?;
+    .map_err(|detail| AuthError::http(StatusCode::INTERNAL_SERVER_ERROR, detail))?;
     let payload = crate::skills::wrap_skill_execution(
         name,
         &request.arguments,
@@ -578,15 +616,12 @@ pub async fn execute_skill(
     )
     .map_err(|detail| {
         if detail.starts_with("未找到技能:") {
-            AuthError {
-                status: StatusCode::NOT_FOUND,
-                detail: crate::skills::skill_not_found_http_detail(name),
-            }
+            AuthError::http(
+                StatusCode::NOT_FOUND,
+                crate::skills::skill_not_found_http_detail(name),
+            )
         } else {
-            AuthError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                detail,
-            }
+            AuthError::http(StatusCode::INTERNAL_SERVER_ERROR, detail)
         }
     })?;
     Ok(Json(crate::skills::skill_execute_http_payload(payload)))
@@ -595,7 +630,7 @@ pub async fn execute_skill(
 pub async fn retrieval_hybrid(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RetrievalRequest>,
+    ApiJson(request): ApiJson<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
@@ -627,7 +662,7 @@ pub async fn retrieval_hybrid(
 pub async fn retrieval_rag(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RetrievalRequest>,
+    ApiJson(request): ApiJson<RetrievalRequest>,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
@@ -671,10 +706,7 @@ fn retrieval_internal_error(method: &str, detail: String) -> AuthError {
 }
 
 fn internal_error(detail: String) -> AuthError {
-    AuthError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail,
-    }
+    AuthError::http(StatusCode::INTERNAL_SERVER_ERROR, detail)
 }
 
 #[cfg(test)]
@@ -704,10 +736,26 @@ mod health_tests {
         let err = reject_empty_query("").unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.detail, "String should have at least 1 character");
+        assert_eq!(err.loc, vec!["body".to_string(), "query".to_string()]);
+        assert_eq!(err.error_type, "string_too_short");
+        assert_eq!(
+            err.detail_json()["detail"][0]["msg"],
+            "String should have at least 1 character"
+        );
         assert!(reject_empty_query("   ").is_ok());
         assert!(reject_empty_query("差旅").is_ok());
         assert_eq!(echo_request_query("  差旅报销  "), "  差旅报销  ");
         assert_eq!(retrieval_search_query("  差旅报销  "), "差旅报销");
+    }
+
+    #[test]
+    fn skill_execute_omitted_arguments_default_to_object() {
+        let body: SkillExecuteBody = serde_json::from_str(r#"{"name":"memory_query"}"#).unwrap();
+        assert_eq!(body.arguments, json!({}));
+        assert_eq!(body.context.metadata, json!({}));
+        let explicit_null: SkillExecuteBody =
+            serde_json::from_str(r#"{"name":"memory_query","arguments":null}"#).unwrap();
+        assert_eq!(explicit_null.arguments, json!({}));
     }
 
     #[test]
@@ -779,6 +827,21 @@ mod docs_tests {
         let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["detail"], "Not Found");
+    }
+
+    #[tokio::test]
+    async fn global_fallback_returns_fastapi_json() {
+        let not_found = json_not_found().await.into_response();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(not_found.into_body(), 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["detail"], "Not Found");
+
+        let method = json_method_not_allowed().await.into_response();
+        assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = axum::body::to_bytes(method.into_body(), 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["detail"], "Method Not Allowed");
     }
 }
 

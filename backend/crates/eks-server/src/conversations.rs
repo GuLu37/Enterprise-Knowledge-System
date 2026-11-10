@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthError;
 use crate::db;
+use crate::extract::ApiJson;
 use crate::routes::require_current_user;
 use crate::state::AppState;
 
@@ -149,12 +150,12 @@ pub async fn upsert_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(conversation_id): Path<String>,
-    Json(request): Json<ConversationUpsertRequest>,
+    ApiJson(request): ApiJson<ConversationUpsertRequest>,
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     crate::validate::session_id_field(request.session_id.as_deref())?;
-    crate::validate::optional_datetime_field(request.created_at.as_deref())?;
-    crate::validate::optional_datetime_field(request.updated_at.as_deref())?;
+    crate::validate::optional_datetime_field_at(request.created_at.as_deref(), &["body", "created_at"])?;
+    crate::validate::optional_datetime_field_at(request.updated_at.as_deref(), &["body", "updated_at"])?;
     let cid = conversation_id.trim().to_string();
     if user.user_id.is_empty() || cid.is_empty() {
         return Err(AuthError::bad_request(empty_conversation_identity_error()));

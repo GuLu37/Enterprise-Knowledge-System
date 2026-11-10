@@ -5,7 +5,7 @@ use std::path::Path as FsPath;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthError;
 use crate::db;
+use crate::extract::ApiQuery;
 use crate::routes::require_current_user;
 use crate::state::AppState;
 
@@ -170,7 +171,7 @@ async fn list_documents_page(
 pub async fn list_documents(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<DocumentListQuery>,
+    ApiQuery(query): ApiQuery<DocumentListQuery>,
 ) -> Result<Json<Value>, AuthError> {
     list_documents_page(&state, &headers, query.skip, query.limit.unwrap_or(1000)).await
 }
@@ -179,7 +180,7 @@ pub async fn list_documents(
 pub async fn list_documents_compat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<DocumentListQuery>,
+    ApiQuery(query): ApiQuery<DocumentListQuery>,
 ) -> Result<Json<Value>, AuthError> {
     let skip = crate::validate::document_list_skip(query.skip)?;
     let limit = crate::validate::document_list_limit(query.limit)?;
@@ -237,10 +238,7 @@ fn document_sql_error(action: &str, err: sqlx::Error) -> AuthError {
     // 对齐 Python 路由：500 detail 回传真实错误信息（仅日志再叠加动作前缀）。
     let detail = err.to_string();
     tracing::error!("{}", format_document_route_error(action, &detail));
-    AuthError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail,
-    }
+    AuthError::http(StatusCode::INTERNAL_SERVER_ERROR, detail)
 }
 
 async fn load_document(
@@ -505,14 +503,14 @@ pub async fn get_document_content(
 
 /// 对齐 Python `/documents/content`：detail 含「不存在」时 404，其余 400。
 fn document_content_exception(detail: &str) -> AuthError {
-    AuthError {
-        status: if detail.contains("不存在") {
+    AuthError::http(
+        if detail.contains("不存在") {
             StatusCode::NOT_FOUND
         } else {
             StatusCode::BAD_REQUEST
         },
-        detail: detail.to_string(),
-    }
+        detail,
+    )
 }
 
 fn document_delete_requested(status: Option<&str>) -> bool {

@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod documents;
 pub mod embedder;
+pub mod extract;
 pub mod ingest;
 pub mod intent;
 pub mod llm;
