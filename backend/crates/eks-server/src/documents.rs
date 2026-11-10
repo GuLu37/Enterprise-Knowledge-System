@@ -228,6 +228,11 @@ fn format_document_route_error(action: &str, err: &str) -> String {
     format!("{action}: {err}")
 }
 
+/// 对齐 Python `ingest_document` 的入库异常日志。
+fn format_document_ingest_fail(document_id: &str, err: &str) -> String {
+    format!("文档入库失败 (document_id={document_id}): {err}")
+}
+
 fn document_sql_error(action: &str, err: sqlx::Error) -> AuthError {
     // 对齐 Python 路由：500 detail 回传真实错误信息（仅日志再叠加动作前缀）。
     let detail = err.to_string();
@@ -919,6 +924,7 @@ pub async fn upload_document(
     {
         Ok(row) => row,
         Err(err) => {
+            tracing::error!("{}", format_document_ingest_fail(&document_id, &err.detail));
             let _ = std::fs::remove_file(&file_path);
             return Err(err);
         }
@@ -1061,6 +1067,10 @@ mod tests {
         assert_eq!(
             format_document_route_error("文档删除失败", "busy"),
             "文档删除失败: busy"
+        );
+        assert_eq!(
+            format_document_ingest_fail("doc-1", "database is locked"),
+            "文档入库失败 (document_id=doc-1): database is locked"
         );
     }
 
