@@ -271,9 +271,19 @@ pub fn decode_token(token: &str, expected_type: &str, secret: &str) -> Result<To
     Ok(claims)
 }
 
+/// 对齐 Pydantic v2 `loc`：列表下标输出 JSON 数字，字段名仍是字符串。
+fn loc_json_item(item: &str) -> serde_json::Value {
+    if !item.is_empty() && item.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(index) = item.parse::<i64>() {
+            return serde_json::json!(index);
+        }
+    }
+    serde_json::json!(item)
+}
+
 /// 与 FastAPI HTTPException(status, detail) 同构的错误。
 /// 422 另带 Pydantic `loc`/`type`，序列化为 `detail: [{loc, msg, type}]`。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AuthError {
     pub status: axum::http::StatusCode,
     pub detail: String,
@@ -321,7 +331,7 @@ impl AuthError {
             let loc: Vec<serde_json::Value> = if self.loc.is_empty() {
                 vec![serde_json::json!("body")]
             } else {
-                self.loc.iter().map(|item| serde_json::json!(item)).collect()
+                self.loc.iter().map(|item| loc_json_item(item)).collect()
             };
             let error_type = if self.error_type.is_empty() {
                 "value_error"

@@ -2,9 +2,18 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Json, Query, Request};
 use axum::http::request::Parts;
-use serde::de::DeserializeOwned;
+use serde::de::{Deserialize, DeserializeOwned, Deserializer};
 
 use crate::auth::AuthError;
+
+/// 对齐 Pydantic `Optional[List[...]] = None`：JSON `null` 与缺省字段都回落成 `Default`。
+pub fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 pub struct ApiJson<T>(pub T);
 
@@ -106,6 +115,21 @@ mod tests {
         let err = map_query_rejection_text("missing field `conversation_id`");
         assert_eq!(err.loc, vec!["query".to_string(), "conversation_id".to_string()]);
         assert_eq!(err.detail, "Field required");
+    }
+
+    #[test]
+    fn null_optional_list_deserializes_as_empty() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            #[serde(default, deserialize_with = "null_as_default")]
+            history: Vec<String>,
+        }
+        let omitted: Payload = serde_json::from_str("{}").unwrap();
+        assert!(omitted.history.is_empty());
+        let explicit_null: Payload = serde_json::from_str(r#"{"history":null}"#).unwrap();
+        assert!(explicit_null.history.is_empty());
+        let items: Payload = serde_json::from_str(r#"{"history":["user"]}"#).unwrap();
+        assert_eq!(items.history, vec!["user"]);
     }
 
     fn map_query_rejection_text(text: &str) -> AuthError {

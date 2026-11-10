@@ -227,9 +227,14 @@ pub fn chat_request_fields(schema: &ChatSchema) -> Result<(), AuthError> {
     if let Some(method) = &schema.retrieval_method {
         literal_at(method, &["hybrid", "dense", "sparse"], &["body", "retrieval_method"])?;
     }
-    for (role, content) in &schema.history {
-        literal_at(role, &["system", "user", "assistant"], &["body", "history", "role"])?;
-        string_min_length_at(content, 1, &["body", "history", "content"])?;
+    for (index, (role, content)) in schema.history.iter().enumerate() {
+        let index = index.to_string();
+        literal_at(
+            role,
+            &["system", "user", "assistant"],
+            &["body", "history", &index, "role"],
+        )?;
+        string_min_length_at(content, 1, &["body", "history", &index, "content"])?;
     }
     Ok(())
 }
@@ -337,17 +342,38 @@ mod tests {
         );
         schema.temperature = Some(2.0);
         schema.history = vec![("tool".into(), "结果".into())];
+        let bad_role = chat_request_fields(&schema).unwrap_err();
         assert_eq!(
-            detail(chat_request_fields(&schema).unwrap_err()),
+            detail(bad_role.clone()),
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Input should be 'system', 'user' or 'assistant'".into()
             )
         );
-        schema.history = vec![("user".into(), "".into())];
         assert_eq!(
-            detail(chat_request_fields(&schema).unwrap_err()).1,
-            "String should have at least 1 character"
+            bad_role.loc,
+            vec![
+                "body".to_string(),
+                "history".to_string(),
+                "0".to_string(),
+                "role".to_string()
+            ]
+        );
+        assert_eq!(
+            bad_role.detail_json()["detail"][0]["loc"],
+            serde_json::json!(["body", "history", 0, "role"])
+        );
+        schema.history = vec![("user".into(), "".into())];
+        let empty_content = chat_request_fields(&schema).unwrap_err();
+        assert_eq!(empty_content.detail, "String should have at least 1 character");
+        assert_eq!(
+            empty_content.loc,
+            vec![
+                "body".to_string(),
+                "history".to_string(),
+                "0".to_string(),
+                "content".to_string()
+            ]
         );
         schema.history.clear();
         schema.query = "".into();

@@ -29,7 +29,7 @@ use crate::state::{AppState, RuntimeWarmup};
 #[derive(Deserialize)]
 pub struct ChatStreamRequest {
     pub query: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::null_as_default")]
     pub history: Vec<HistoryMessage>,
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -2316,6 +2316,18 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_treats_null_history_as_empty() {
+        let request: ChatStreamRequest = serde_json::from_str(
+            r#"{"query":"差旅报销","history":null}"#,
+        )
+        .expect("Optional history null");
+        assert!(request.history.is_empty());
+        let omitted: ChatStreamRequest =
+            serde_json::from_str(r#"{"query":"差旅报销"}"#).expect("omitted history");
+        assert!(omitted.history.is_empty());
+    }
+
+    #[test]
     fn chat_schema_rejects_pydantic_constraints() {
         let mut request = ChatStreamRequest {
             query: "差旅报销标准".into(),
@@ -2340,9 +2352,14 @@ mod tests {
         );
         request.temperature = Some(0.2);
         request.history = history(&[("tool", "结果")]);
+        let bad_role = validate_chat_schema(&request).unwrap_err();
         assert_eq!(
-            validate_chat_schema(&request).unwrap_err().detail,
+            bad_role.detail,
             "Input should be 'system', 'user' or 'assistant'"
+        );
+        assert_eq!(
+            bad_role.detail_json()["detail"][0]["loc"],
+            serde_json::json!(["body", "history", 0, "role"])
         );
         request.history.clear();
         request.query = "".into();
