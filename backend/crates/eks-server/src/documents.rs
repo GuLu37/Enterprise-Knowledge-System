@@ -297,11 +297,31 @@ async fn mark_document_deleting(
     Ok(updated)
 }
 
-fn remove_document_files(upload_dir: &FsPath, row: &DocumentRow) -> bool {
-    let removed_stored = std::fs::remove_file(upload_dir.join(&row.stored_filename)).is_ok();
-    let removed_dir = std::fs::remove_dir_all(upload_dir.join(&row.document_id)).is_ok();
-    let removed_path = !row.file_path.is_empty() && std::fs::remove_file(&row.file_path).is_ok();
-    removed_stored || removed_dir || removed_path
+fn remove_one_file(path: &FsPath) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn remove_one_dir(path: &FsPath) -> Result<bool, String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// 对齐 Python `file_path.unlink(missing_ok=True)`：找不到文件视为成功，其它 IO 错误中止删除。
+fn remove_document_files(upload_dir: &FsPath, row: &DocumentRow) -> Result<bool, String> {
+    let mut deleted = false;
+    deleted |= remove_one_file(&upload_dir.join(&row.stored_filename))?;
+    deleted |= remove_one_dir(&upload_dir.join(&row.document_id))?;
+    if !row.file_path.is_empty() {
+        deleted |= remove_one_file(FsPath::new(&row.file_path))?;
+    }
+    Ok(deleted)
 }
 
 async fn restore_document_after_delete_failure(
@@ -363,7 +383,16 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
         "3/4",
         &format!("开始删除本地文件: {}", row.file_path),
     );
-    let file_deleted = remove_document_files(&upload_dir, &row);
+    let file_deleted = match remove_document_files(&upload_dir, &row) {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            tracing::error!(
+                "{}",
+                format_delete_fail(document_id, "3/4", "本地文件删除失败", &err)
+            );
+            return Err(err);
+        }
+    };
     log_delete_step(
         document_id,
         "3/4",
@@ -1055,6 +1084,10 @@ mod tests {
             format_delete_fail("doc-1", "4/4", "SQLite 文档记录删除失败", "locked"),
             "[文档删除][4/4] SQLite 文档记录删除失败 (document_id=doc-1): locked"
         );
+        assert_eq!(
+            format_delete_fail("doc-1", "3/4", "本地文件删除失败", "permission denied"),
+            "[文档删除][3/4] 本地文件删除失败 (document_id=doc-1): permission denied"
+        );
     }
 
     #[test]
@@ -1187,9 +1220,30 @@ mod tests {
         let mut row = sample_row("deleting");
         row.stored_filename = "doc-1.md".into();
         row.file_path = extra.display().to_string();
-        assert!(remove_document_files(&upload_dir, &row));
+        assert!(remove_document_files(&upload_dir, &row).unwrap());
         assert!(!stored.exists());
         assert!(!extra.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_document_files_fails_when_path_is_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "eks-doc-delete-dir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let upload_dir = root.join("uploads");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let dir_path = root.join("not-a-file");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let mut row = sample_row("deleting");
+        row.stored_filename = "missing.md".into();
+        row.file_path = dir_path.display().to_string();
+        let err = remove_document_files(&upload_dir, &row).unwrap_err();
+        assert!(!err.is_empty(), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
