@@ -224,6 +224,15 @@ fn deletion_rejected(status: &str) -> Option<String> {
     }
 }
 
+/// 对齐 Python 后台 `delete_document`：`deleted` 与非 `deleting` 的错误文案不同于 HTTP 闸门。
+fn reject_background_delete(status: &str) -> Option<String> {
+    match status.trim() {
+        "deleting" => None,
+        "deleted" => Some("文档已经删除".to_string()),
+        other => Some(format!("文档当前状态为 {other}，无法执行后台删除")),
+    }
+}
+
 fn format_document_route_error(action: &str, err: &str) -> String {
     format!("{action}: {err}")
 }
@@ -349,11 +358,16 @@ async fn finalize_document_deletion(state: &AppState, document_id: &str) -> Resu
     let row = load_document(&state.pool, document_id)
         .await
         .map_err(|err| err.to_string())?;
-    // 对齐 Python：记录缺失或已删除时按删除失败处理（走失败日志与状态恢复路径）。
+    // 对齐 Python `delete_document(..., already_marked=True)`：HTTP 已标 deleting，
+    // 后台遇 deleted / 非 deleting 分别打「已经删除」与「无法执行后台删除」。
     let row = match row {
-        Some(row) if row.status != "deleted" => row,
-        Some(_) => return Err("文档当前状态为 deleted，无法重复删除".to_string()),
         None => return Err("文档不存在".to_string()),
+        Some(row) => {
+            if let Some(detail) = reject_background_delete(&row.status) {
+                return Err(detail);
+            }
+            row
+        }
     };
 
     log_delete_step(document_id, "1/4", "开始执行后台删除");
@@ -1059,6 +1073,19 @@ mod tests {
         assert!(deletion_rejected("ready").is_none());
         assert!(deletion_rejected("processing").is_none());
         assert!(deletion_rejected("failed").is_none());
+        assert_eq!(
+            reject_background_delete("deleted").as_deref(),
+            Some("文档已经删除")
+        );
+        assert_eq!(
+            reject_background_delete("ready").as_deref(),
+            Some("文档当前状态为 ready，无法执行后台删除")
+        );
+        assert_eq!(
+            reject_background_delete("failed").as_deref(),
+            Some("文档当前状态为 failed，无法执行后台删除")
+        );
+        assert!(reject_background_delete("deleting").is_none());
     }
 
     #[test]
