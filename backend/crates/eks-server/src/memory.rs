@@ -1850,6 +1850,10 @@ fn format_empty_memory_chunks() -> &'static str {
     "没有可写入的长期记忆块。"
 }
 
+fn format_memory_write_fail(err: &str) -> String {
+    format!("长期记忆写入失败: {err}")
+}
+
 fn format_profile_extract_fail(err: &str) -> String {
     format!("个性化记忆抽取失败，已跳过: {err}")
 }
@@ -2731,6 +2735,23 @@ async fn insert_event_memory_with_confidence(
         )
     });
     let stored_key = event_logical_key(user_id, &conv_key, chunk_type, &memory_id, chunk_index);
+    write_memory_vector(
+        &memory_id,
+        chunk_index,
+        content,
+        user_id,
+        &conv_key,
+        session_id,
+        chunk_type,
+        turn_start.unwrap_or(0),
+        turn_end.unwrap_or(turn_start.unwrap_or(0)),
+        &crate::db::utc_isoformat(now.and_utc()),
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!("{}", format_memory_write_fail(&err));
+        sqlx::Error::Protocol(format_memory_write_fail(&err).into())
+    })?;
     let current: Option<(String, i64)> = sqlx::query_as(
         "SELECT memory_id, version FROM memory_records \
          WHERE user_id = ? AND memory_type = 'event' AND memory_key = ? AND status = 'active' \
@@ -2753,19 +2774,6 @@ async fn insert_event_memory_with_confidence(
         version = old_version + 1;
         supersedes_memory_id = Some(old_id);
     }
-    write_memory_vector(
-        &memory_id,
-        chunk_index,
-        content,
-        user_id,
-        &conv_key,
-        session_id,
-        chunk_type,
-        turn_start.unwrap_or(0),
-        turn_end.unwrap_or(turn_start.unwrap_or(0)),
-        &crate::db::utc_isoformat(now.and_utc()),
-    )
-    .await;
     sqlx::query(
         "INSERT INTO memory_records (
             memory_id, user_id, memory_type, memory_key, content, conversation_id, session_id,
@@ -2808,19 +2816,16 @@ async fn write_memory_vector(
     turn_start: i64,
     turn_end: i64,
     created_at: &str,
-) {
+) -> Result<(), String> {
     let Some(sink) = memory_vector_sink() else {
-        return;
+        return Ok(());
     };
     let vectors = match sink.embedder.embed_documents(&[content.to_string()]) {
         Ok(vectors) => vectors,
-        Err(err) => {
-            tracing::warn!("长期记忆向量化失败，仅写入 SQLite: {err}");
-            return;
-        }
+        Err(err) => return Err(err),
     };
     let Some(vector) = vectors.into_iter().next() else {
-        return;
+        return Err("查询向量为空".into());
     };
     let row = crate::milvus_lite::MemoryChunkRow {
         memory_id: memory_id.to_string(),
@@ -2837,17 +2842,15 @@ async fn write_memory_vector(
         created_at: created_at.to_string(),
         vector,
     };
-    if let Err(err) = crate::milvus_lite::append_memory_chunks(
+    crate::milvus_lite::append_memory_chunks(
         &sink.store.root,
         &sink.collection,
         &[row],
         sink.embedding_dimension,
-    ) {
-        tracing::warn!("长期记忆向量写入失败: {err}");
-        return;
-    }
+    )?;
     // 不硬失效快照：manifest mtime 变化会让下一次 collection() 走增量重载，
     // 保留旧快照可避免每轮持久化后全量重读 memory_chunks 的所有 parquet。
+    Ok(())
 }
 
 enum AnnSearch {
@@ -3491,6 +3494,10 @@ mod tests {
             "个性化记忆更新完成 (user_id=u1, updated=2)"
         );
         assert_eq!(format_empty_memory_chunks(), "没有可写入的长期记忆块。");
+        assert_eq!(
+            format_memory_write_fail("embed timeout"),
+            "长期记忆写入失败: embed timeout"
+        );
         assert_eq!(
             format_profile_extract_fail("llm timeout"),
             "个性化记忆抽取失败，已跳过: llm timeout"
