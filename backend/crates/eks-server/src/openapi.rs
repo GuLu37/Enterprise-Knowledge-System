@@ -28,7 +28,8 @@ const DOCS_HTML: &str = r#"<!DOCTYPE html>
       var info = spec.info || {};
       document.title = (info.title || "API") + " " + (info.version || "");
       document.getElementById("title").textContent = info.title || "API Docs";
-      document.getElementById("subtitle").textContent = "version " + (info.version || "") + " · OpenAPI " + (spec.openapi || "");
+      var description = info.description ? info.description + " · " : "";
+      document.getElementById("subtitle").textContent = description + "version " + (info.version || "") + " · OpenAPI " + (spec.openapi || "");
       var root = document.getElementById("paths");
       var paths = spec.paths || {};
       Object.keys(paths).sort().forEach(function (path) {
@@ -64,6 +65,7 @@ pub fn spec(config: &Config) -> Value {
         "info": {
             "title": config.app_name,
             "version": config.app_version,
+            "description": "基于 LangChain 的 RAG 三重检索系统",
         },
         "paths": {
             "/": { "get": op("根路由", "root") },
@@ -124,6 +126,10 @@ mod tests {
         assert_eq!(spec["openapi"], "3.1.0");
         assert_eq!(spec["info"]["title"], "Enterprise Knowledge System");
         assert_eq!(spec["info"]["version"], "1.0.0");
+        assert_eq!(
+            spec["info"]["description"],
+            "基于 LangChain 的 RAG 三重检索系统"
+        );
         assert!(spec["paths"].get("/health").is_some());
         assert!(spec["paths"].get("/docs").is_some());
         assert!(spec["paths"].get("/openapi.json").is_some());
@@ -136,5 +142,6 @@ mod tests {
     fn docs_page_loads_openapi_json() {
         assert!(docs_html().contains("<!DOCTYPE html>"));
         assert!(docs_html().contains("/openapi.json"));
+        assert!(docs_html().contains("info.description"));
     }
 }
