@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Local, NaiveDate};
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub const LOG_ROTATION_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -311,18 +314,65 @@ fn console_writer() -> BoxMakeWriter {
     }
 }
 
+/// 对齐 Python loguru：`{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}`
+pub fn format_python_log_prefix(
+    timestamp: &str,
+    level: &str,
+    name: &str,
+    function: &str,
+    line: u32,
+) -> String {
+    format!("{timestamp} | {level:<8} | {name}:{function}:{line} - ")
+}
+
+struct PythonLogFormat;
+
+impl<S, N> FormatEvent<S, N> for PythonLogFormat
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = event.metadata();
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let function = meta
+            .module_path()
+            .and_then(|path| path.rsplit("::").next())
+            .unwrap_or("unknown");
+        write!(
+            writer,
+            "{}",
+            format_python_log_prefix(
+                &timestamp,
+                meta.level().as_str(),
+                meta.target(),
+                function,
+                meta.line().unwrap_or(0),
+            )
+        )?;
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
 /// 控制台 + 滚动文件。文件初始化失败时仅保留 stderr。
 pub fn init_tracing(log_dir: &str, log_level: &str) {
     install_panic_hook();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(parse_log_level(log_level)));
     let stdout_layer = fmt::layer()
-        .with_writer(console_writer())
-        .with_target(true);
+        .event_format(PythonLogFormat)
+        .with_writer(console_writer());
     let dir = resolve_log_dir(log_dir);
     match RotatingFile::open(dir.clone()) {
         Ok(file) => {
             let file_layer = fmt::layer()
+                .event_format(PythonLogFormat)
                 .with_ansi(false)
                 .with_writer(MutexWriter(Mutex::new(file)));
             tracing_subscriber::registry()
@@ -411,6 +461,16 @@ mod tests {
         assert_eq!(
             format_thread_uncaught_exception("memory-persist"),
             "线程未捕获异常: memory-persist"
+        );
+        assert_eq!(
+            format_python_log_prefix(
+                "2026-11-10 16:58:01",
+                "INFO",
+                "app.services.chat_service",
+                "stream_chat_events",
+                3896,
+            ),
+            "2026-11-10 16:58:01 | INFO     | app.services.chat_service:stream_chat_events:3896 - "
         );
     }
 
