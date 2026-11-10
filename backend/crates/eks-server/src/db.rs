@@ -119,6 +119,11 @@ pub async fn ensure_auth_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// 对齐 Python `init_metadata_db` 收尾 debug。
+pub fn format_sqlite_schema_ready() -> &'static str {
+    "✓ SQLite 元数据与认证表初始化完成"
+}
+
 /// 对齐 Python `init_metadata_db` 中的 documents / document_chunks 表。
 pub async fn ensure_document_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -463,6 +468,14 @@ pub async fn revoke_session(pool: &sqlx::SqlitePool, session_id: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_schema_ready_log_matches_python() {
+        assert_eq!(
+            format_sqlite_schema_ready(),
+            "✓ SQLite 元数据与认证表初始化完成"
+        );
+    }
 
     #[test]
     fn parse_client_datetime_accepts_frontend_iso_z_like_python() {

@@ -48,11 +48,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => tracing::error!("初始化 bootstrap 管理员失败: {err}"),
     }
     eks_server::memory::ensure_schema(&pool).await?;
+    tracing::debug!("{}", eks_server::db::format_sqlite_schema_ready());
 
     // 检索引擎（Milvus Lite 直读 + ONNX embedder + SQLite 父块）
     let embedder = eks_server::embedder::shared_embedder(&config)
         .map_err(|e| format!("Embedding 内核初始化失败: {e}"))?;
     let store = eks_server::milvus_lite::MilvusLiteStore::open(&config.milvus_lite_path);
+    store.log_startup_ready();
     let mut engine = eks_server::retrieval_engine::RetrievalEngine::new(
         store.clone(), embedder, pool.clone(),
     )

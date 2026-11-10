@@ -136,12 +136,34 @@ fn vector_from(array: &ArrayRef, index: usize) -> Vec<f32> {
     Vec::new()
 }
 
+pub fn format_milvus_ready() -> &'static str {
+    "✓ Milvus 后台初始化完成"
+}
+
+pub fn format_milvus_not_ready() -> &'static str {
+    "Milvus 后台初始化未完成，检索与入库将在服务恢复后可用"
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_milvus_init_error(error: &str) -> String {
+    format!("Milvus 后台初始化出错: {error}")
+}
+
 impl MilvusLiteStore {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         MilvusLiteStore {
             root: root.into(),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// 对齐 Python `_initialize_milvus_in_background`：lite 打开后报告就绪状态。
+    pub fn log_startup_ready(&self) {
+        if self.root.as_os_str().is_empty() {
+            tracing::warn!("{}", format_milvus_not_ready());
+            return;
+        }
+        tracing::info!("{}", format_milvus_ready());
     }
 
     /// 获取集合快照；manifest mtime 未变时命中缓存，变化时优先增量加载
@@ -974,6 +996,19 @@ fn append_delta_pks(root: &Path, collection: &str, pks: &[i64]) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn milvus_startup_logs_match_python() {
+        assert_eq!(format_milvus_ready(), "✓ Milvus 后台初始化完成");
+        assert_eq!(
+            format_milvus_not_ready(),
+            "Milvus 后台初始化未完成，检索与入库将在服务恢复后可用"
+        );
+        assert_eq!(
+            format_milvus_init_error("timeout"),
+            "Milvus 后台初始化出错: timeout"
+        );
+    }
 
     #[test]
     fn sort_top_k_desc_matches_full_sort() {
