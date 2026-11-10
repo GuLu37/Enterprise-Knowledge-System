@@ -105,6 +105,47 @@ fn ref_schema(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{name}") })
 }
 
+fn validation_response() -> Value {
+    json!({
+        "description": "Validation Error",
+        "content": {
+            "application/json": { "schema": ref_schema("HTTPValidationError") }
+        }
+    })
+}
+
+fn with_query_params(mut op: Value, params: Value) -> Value {
+    op["parameters"] = params;
+    op["responses"]["422"] = validation_response();
+    op
+}
+
+fn with_multipart_upload(mut op: Value) -> Value {
+    op["requestBody"] = json!({
+        "required": true,
+        "content": {
+            "multipart/form-data": {
+                "schema": ref_schema("Body_upload_document_api_v1_documents_upload_post")
+            }
+        }
+    });
+    op["responses"]["422"] = validation_response();
+    op
+}
+
+fn with_array_response(mut op: Value, item: &str) -> Value {
+    op["responses"]["200"]["content"] = json!({
+        "application/json": {
+            "schema": {
+                "type": "array",
+                "items": ref_schema(item),
+                "title": "Response Get Skills Api V1 Skills Get"
+            }
+        }
+    });
+    op
+}
+
 fn with_json_io(mut op: Value, request: Option<&str>, response: Option<&str>) -> Value {
     if let Some(name) = request {
         op["requestBody"] = json!({
@@ -113,12 +154,7 @@ fn with_json_io(mut op: Value, request: Option<&str>, response: Option<&str>) ->
                 "application/json": { "schema": ref_schema(name) }
             }
         });
-        op["responses"]["422"] = json!({
-            "description": "Validation Error",
-            "content": {
-                "application/json": { "schema": ref_schema("HTTPValidationError") }
-            }
-        });
+        op["responses"]["422"] = validation_response();
     }
     if let Some(name) = response {
         let code = if op["responses"].get("202").is_some() {
@@ -238,7 +274,7 @@ fn components() -> Value {
                 "required": ["name"],
                 "properties": {
                     "name": { "type": "string", "title": "Name", "minLength": 1 },
-                    "arguments": { "type": "object", "title": "Arguments" },
+                    "arguments": { "type": "object", "title": "Arguments", "additionalProperties": true },
                     "context": ref_schema("SkillExecutionContextRequest")
                 }
             },
@@ -250,7 +286,7 @@ fn components() -> Value {
                     "session_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
                     "query": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
                     "trace_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-                    "metadata": { "type": "object", "title": "Metadata" }
+                    "metadata": { "type": "object", "title": "Metadata", "additionalProperties": true }
                 }
             },
             "SkillExecuteResponse": {
@@ -262,9 +298,9 @@ fn components() -> Value {
                     "category": { "type": "string" },
                     "kind": { "type": "string" },
                     "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-                    "arguments": { "type": "object" },
-                    "context": { "type": "object" },
-                    "result": { "type": "object" },
+                    "arguments": { "type": "object", "additionalProperties": true },
+                    "context": { "type": "object", "additionalProperties": true },
+                    "result": { "type": "object", "additionalProperties": true },
                     "executed_at": { "type": "string" }
                 }
             },
@@ -279,8 +315,8 @@ fn components() -> Value {
                     "kind": { "type": "string" },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "provider": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-                    "metadata": { "type": "object" },
-                    "function_calling": { "type": "object" }
+                    "metadata": { "type": "object", "additionalProperties": true },
+                    "function_calling": { "type": "object", "additionalProperties": true }
                 }
             },
             "DocumentResponse": {
@@ -348,6 +384,14 @@ fn components() -> Value {
                     "file_deleted": { "type": "boolean", "default": false }
                 }
             },
+            "Body_upload_document_api_v1_documents_upload_post": {
+                "title": "Body_upload_document_api_v1_documents_upload_post",
+                "required": ["file"],
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "format": "binary", "title": "File" }
+                }
+            },
             "RetrievalRequest": {
                 "title": "RetrievalRequest",
                 "type": "object",
@@ -363,7 +407,7 @@ fn components() -> Value {
                 "required": ["content"],
                 "properties": {
                     "content": { "type": "string" },
-                    "metadata": { "type": "object" },
+                    "metadata": { "type": "object", "additionalProperties": true },
                     "score": { "type": "number", "default": 0.0 },
                     "source": { "type": "string", "default": "" }
                 }
@@ -466,7 +510,7 @@ fn components() -> Value {
                     "session_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
                     "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
                     "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
-                    "messages": { "type": "array", "items": { "type": "object" } }
+                    "messages": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
                 }
             },
             "ConversationListResponse": {
@@ -483,7 +527,7 @@ fn components() -> Value {
                     "session_id": { "anyOf": [{ "type": "string", "maxLength": 64 }, { "type": "null" }] },
                     "created_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
                     "updated_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
-                    "messages": { "type": "array", "items": { "type": "object" } }
+                    "messages": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
                 }
             },
             "ConversationDeleteResponse": {
@@ -544,7 +588,15 @@ pub fn spec(config: &Config) -> Value {
             (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("运行时状态", "chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
             (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热", "chat_warmup", "Chat"), None, Some("ChatWarmupResponse")) },
             (format!("{prefix}/chat/generate")): { "post": with_json_io(secured("生成回复", "generate_chat", "Chat"), Some("ChatRequest"), Some("ChatResponse")) },
-            (format!("{prefix}/chat/consolidate")): { "post": secured("巩固记忆", "consolidate_chat", "Chat") },
+            (format!("{prefix}/chat/consolidate")): { "post": with_query_params(
+                secured("巩固记忆", "consolidate_chat", "Chat"),
+                json!([{
+                    "name": "conversation_id",
+                    "in": "query",
+                    "required": true,
+                    "schema": { "type": "string", "title": "Conversation Id" }
+                }])
+            ) },
             (format!("{prefix}/chat/stream")): { "post": with_json_io(secured("流式对话", "stream_chat", "Chat"), Some("ChatRequest"), None) },
             (format!("{prefix}/chat/conversations")): {
                 "get": with_json_io(secured("会话列表", "list_conversations", "Chat"), None, Some("ConversationListResponse")),
@@ -554,13 +606,25 @@ pub fn spec(config: &Config) -> Value {
                 "put": with_json_io(secured("更新会话", "upsert_conversation", "Chat"), Some("ConversationUpsertRequest"), Some("ConversationRecordResponse")),
                 "delete": with_json_io(secured("删除会话", "delete_conversation", "Chat"), None, Some("ConversationDeleteResponse"))
             },
-            (format!("{prefix}/documents")): { "get": with_json_io(secured("文档列表", "list_documents", "Documents"), None, Some("DocumentListResponse")) },
-            (format!("{prefix}/documents/list")): { "get": with_json_io(secured("文档列表（兼容）", "list_documents_compat", "Documents"), None, Some("DocumentListResponse")) },
-            (format!("{prefix}/documents/upload")): { "post": with_json_io(secured("上传文档", "upload_document", "Documents"), None, Some("DocumentResponse")) },
+            (format!("{prefix}/documents")): { "get": with_query_params(
+                with_json_io(secured("文档列表", "list_documents", "Documents"), None, Some("DocumentListResponse")),
+                json!([
+                    { "name": "skip", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0, "title": "Skip" } },
+                    { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10, "title": "Limit" } }
+                ])
+            ) },
+            (format!("{prefix}/documents/list")): { "get": with_query_params(
+                with_json_io(secured("文档列表（兼容）", "list_documents_compat", "Documents"), None, Some("DocumentListResponse")),
+                json!([
+                    { "name": "skip", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0, "title": "Skip" } },
+                    { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10, "title": "Limit" } }
+                ])
+            ) },
+            (format!("{prefix}/documents/upload")): { "post": with_multipart_upload(with_json_io(secured("上传文档", "upload_document", "Documents"), None, Some("DocumentResponse"))) },
             (format!("{prefix}/documents/content/{{document_id}}")): { "get": with_json_io(secured("文档内容", "get_document_content", "Documents"), None, Some("DocumentContentResponse")) },
             (format!("{prefix}/documents/delete/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document_compat", "Documents"), None, Some("DocumentDeleteResponse")) },
             (format!("{prefix}/documents/{{document_id}}")): { "delete": with_json_io(accepted("删除文档", "delete_document", "Documents"), None, Some("DocumentDeleteResponse")) },
-            (format!("{prefix}/skills")): { "get": secured("技能列表", "list_skills", "Skills") },
+            (format!("{prefix}/skills")): { "get": with_array_response(secured("技能列表", "list_skills", "Skills"), "SkillDefinitionResponse") },
             (format!("{prefix}/skills/function-calling")): { "get": secured("Function Calling 技能", "list_skill_function_calling", "Skills") },
             (format!("{prefix}/skills/capabilities")): { "get": secured("技能能力", "skill_capabilities", "Skills") },
             (format!("{prefix}/skills/execute")): { "post": with_json_io(secured("执行技能", "execute_skill", "Skills"), Some("SkillExecuteRequest"), Some("SkillExecuteResponse")) },
@@ -658,6 +722,29 @@ mod tests {
             spec["paths"]["/api/v1/chat/generate"]["post"]["responses"]["200"]["content"]
                 ["application/json"]["schema"]["$ref"],
             "#/components/schemas/ChatResponse"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/documents/upload"]["post"]["requestBody"]["content"]
+                ["multipart/form-data"]["schema"]["$ref"],
+            "#/components/schemas/Body_upload_document_api_v1_documents_upload_post"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/documents/list"]["get"]["parameters"][1]["name"],
+            "limit"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/chat/consolidate"]["post"]["parameters"][0]["name"],
+            "conversation_id"
+        );
+        assert_eq!(
+            spec["paths"]["/api/v1/skills"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["items"]["$ref"],
+            "#/components/schemas/SkillDefinitionResponse"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["SkillExecuteRequest"]["properties"]["arguments"]
+                ["additionalProperties"],
+            true
         );
     }
 
