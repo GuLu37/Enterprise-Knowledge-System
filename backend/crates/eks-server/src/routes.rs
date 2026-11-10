@@ -605,14 +605,40 @@ fn deserialize_json_object<'de, D>(deserializer: D) -> Result<Value, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    Ok(match value {
-        None | Some(Value::Null) => default_json_object(),
-        Some(other) => other,
+    // 字段缺省走 `default = "{}"`；本函数只处理显式出现的值（含 JSON `null`）。
+    Value::deserialize(deserializer)
+}
+
+fn json_opt_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|item| item.to_string())
+}
+
+fn skill_execute_context(body: &SkillExecuteBody) -> Result<SkillExecuteContext, AuthError> {
+    crate::validate::require_dict(&body.arguments, &["body", "arguments"])?;
+    crate::validate::require_model(
+        &body.context,
+        &["body", "context"],
+        "SkillExecutionContextRequest",
+    )?;
+    let metadata = body
+        .context
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(default_json_object);
+    crate::validate::require_dict(&metadata, &["body", "context", "metadata"])?;
+    Ok(SkillExecuteContext {
+        conversation_id: json_opt_string(&body.context, "conversation_id"),
+        session_id: json_opt_string(&body.context, "session_id"),
+        query: json_opt_string(&body.context, "query"),
+        trace_id: json_opt_string(&body.context, "trace_id"),
+        metadata,
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SkillExecuteContext {
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -622,7 +648,6 @@ pub struct SkillExecuteContext {
     pub query: Option<String>,
     #[serde(default)]
     pub trace_id: Option<String>,
-    #[serde(default = "default_json_object", deserialize_with = "deserialize_json_object")]
     pub metadata: Value,
 }
 
@@ -643,8 +668,8 @@ pub struct SkillExecuteBody {
     pub name: String,
     #[serde(default = "default_json_object", deserialize_with = "deserialize_json_object")]
     pub arguments: Value,
-    #[serde(default)]
-    pub context: SkillExecuteContext,
+    #[serde(default = "default_json_object", deserialize_with = "deserialize_json_object")]
+    pub context: Value,
 }
 
 pub async fn list_skills(
@@ -684,6 +709,13 @@ pub async fn execute_skill(
 ) -> Result<Json<Value>, AuthError> {
     let user = require_current_user(&state, &headers).await?;
     crate::validate::skill_name_field(&request.name)?;
+    let SkillExecuteContext {
+        conversation_id,
+        session_id,
+        query,
+        trace_id,
+        metadata,
+    } = skill_execute_context(&request)?;
     let name = request.name.trim();
     let manifests = &state.config.mcp_remote_tool_manifests;
     // 未知技能 404；remote_mcp 不在此提前返回，统一走 execute_named_from，
@@ -696,13 +728,13 @@ pub async fn execute_skill(
     }
     let context = crate::skills::SkillExecutionContext {
         user_id: &user.user_id,
-        conversation_id: request.context.conversation_id.as_deref(),
-        session_id: request.context.session_id.as_deref(),
-        query: request.context.query.as_deref(),
+        conversation_id: conversation_id.as_deref(),
+        session_id: session_id.as_deref(),
+        query: query.as_deref(),
         provider: None,
         model: None,
-        trace_id: request.context.trace_id.as_deref(),
-        metadata: request.context.metadata,
+        trace_id: trace_id.as_deref(),
+        metadata,
     };
     let result = crate::skills::execute_named_from(
         &state.pool,
@@ -858,11 +890,41 @@ mod health_tests {
     #[test]
     fn skill_execute_omitted_arguments_default_to_object() {
         let body: SkillExecuteBody = serde_json::from_str(r#"{"name":"memory_query"}"#).unwrap();
+        let context = skill_execute_context(&body).unwrap();
         assert_eq!(body.arguments, json!({}));
-        assert_eq!(body.context.metadata, json!({}));
+        assert_eq!(context.metadata, json!({}));
         let explicit_null: SkillExecuteBody =
             serde_json::from_str(r#"{"name":"memory_query","arguments":null}"#).unwrap();
-        assert_eq!(explicit_null.arguments, json!({}));
+        let err = skill_execute_context(&explicit_null).unwrap_err();
+        assert_eq!(err.error_type, "dict_type");
+        assert_eq!(err.loc, vec!["body".to_string(), "arguments".to_string()]);
+        assert_eq!(err.detail, "Input should be a valid dictionary");
+        assert_eq!(err.input, json!(null));
+        let array_args: SkillExecuteBody =
+            serde_json::from_str(r#"{"name":"memory_query","arguments":[]}"#).unwrap();
+        assert_eq!(
+            skill_execute_context(&array_args).unwrap_err().error_type,
+            "dict_type"
+        );
+        let null_context: SkillExecuteBody =
+            serde_json::from_str(r#"{"name":"memory_query","context":null}"#).unwrap();
+        let context_err = skill_execute_context(&null_context).unwrap_err();
+        assert_eq!(context_err.error_type, "model_type");
+        assert_eq!(context_err.loc, vec!["body".to_string(), "context".to_string()]);
+        let null_metadata: SkillExecuteBody = serde_json::from_str(
+            r#"{"name":"memory_query","context":{"metadata":null}}"#,
+        )
+        .unwrap();
+        let metadata_err = skill_execute_context(&null_metadata).unwrap_err();
+        assert_eq!(metadata_err.error_type, "dict_type");
+        assert_eq!(
+            metadata_err.loc,
+            vec![
+                "body".to_string(),
+                "context".to_string(),
+                "metadata".to_string()
+            ]
+        );
     }
 
     #[test]

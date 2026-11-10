@@ -182,6 +182,39 @@ pub fn skill_name_field(name: &str) -> Result<(), AuthError> {
     string_min_length_at(name, 1, &["body", "name"])
 }
 
+/// 对齐 Pydantic `Dict[...] = Field(default_factory=dict)`：缺省 `{}`，`null`/非对象 422 `dict_type`。
+pub fn require_dict(value: &serde_json::Value, loc: &[&str]) -> Result<(), AuthError> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid dictionary",
+            "dict_type",
+            value.clone(),
+        ))
+    }
+}
+
+/// 对齐嵌套 Pydantic 模型：`null`/非对象 422 `model_type`。
+pub fn require_model(
+    value: &serde_json::Value,
+    loc: &[&str],
+    class_name: &str,
+) -> Result<(), AuthError> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(AuthError::unprocessable_at_ctx(
+            loc,
+            &format!("Input should be a valid dictionary or instance of {class_name}"),
+            "model_type",
+            value.clone(),
+            serde_json::json!({ "class_name": class_name }),
+        ))
+    }
+}
+
 pub fn session_id_field(session_id: Option<&str>) -> Result<(), AuthError> {
     if let Some(value) = session_id {
         string_max_length_at(value, 64, &["body", "session_id"])?;
@@ -462,6 +495,20 @@ mod tests {
         assert_eq!(
             detail(optional_datetime_field(Some("bad")).unwrap_err()).1,
             "Input should be a valid datetime"
+        );
+        let dict_err = require_dict(&serde_json::Value::Null, &["body", "arguments"]).unwrap_err();
+        assert_eq!(dict_err.error_type, "dict_type");
+        assert_eq!(dict_err.detail, "Input should be a valid dictionary");
+        let model_err = require_model(
+            &serde_json::json!([]),
+            &["body", "context"],
+            "SkillExecutionContextRequest",
+        )
+        .unwrap_err();
+        assert_eq!(model_err.error_type, "model_type");
+        assert_eq!(
+            model_err.detail_json()["detail"][0]["ctx"]["class_name"],
+            "SkillExecutionContextRequest"
         );
     }
 }
