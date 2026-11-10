@@ -154,16 +154,10 @@ where
                 ));
             }
         };
-        match serde_json::from_slice::<T>(&bytes) {
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        match serde_path_to_error::deserialize(&mut deserializer) {
             Ok(value) => Ok(ApiJson(value)),
-            Err(err) if err.is_syntax() || err.is_eof() => {
-                Err(AuthError::unprocessable_at(
-                    &["body"],
-                    "JSON decode error",
-                    "json_invalid",
-                ))
-            }
-            Err(err) => Err(map_data_error(&err.to_string())),
+            Err(err) => Err(map_path_error(&err)),
         }
     }
 }
@@ -250,6 +244,109 @@ fn quoted_value(text: &str) -> Option<String> {
     let rest = &text[start + 1..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+fn map_path_error<E: std::fmt::Display>(err: &serde_path_to_error::Error<E>) -> AuthError {
+    let inner = err.inner().to_string();
+    if inner.contains("expected ident")
+        || inner.contains("EOF while parsing")
+        || inner.to_ascii_lowercase().contains("syntax")
+        || inner.contains("invalid JSON")
+        || inner.contains("trailing comma")
+        || inner.starts_with("expected value")
+        || inner.contains("invalid escape")
+        || inner.contains("control character")
+    {
+        return AuthError::unprocessable_at(&["body"], "JSON decode error", "json_invalid");
+    }
+    let missing = missing_field_name(&inner);
+    let loc = loc_from_path(&err.path().to_string(), missing.as_deref());
+    let loc_refs: Vec<&str> = loc.iter().map(String::as_str).collect();
+    let input = quoted_value(&inner)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    map_typed_error(&inner, &loc_refs, input)
+}
+
+fn loc_from_path(path: &str, extra_field: Option<&str>) -> Vec<String> {
+    let mut loc = vec!["body".to_string()];
+    let normalized = path.replace(']', "").replace('[', ".");
+    for part in normalized.split('.') {
+        if !part.is_empty() {
+            loc.push(part.to_string());
+        }
+    }
+    if let Some(field) = extra_field {
+        if loc.last().map(String::as_str) != Some(field) {
+            loc.push(field.to_string());
+        }
+    }
+    loc
+}
+
+fn map_typed_error(inner: &str, loc: &[&str], input: Value) -> AuthError {
+    if missing_field_name(inner).is_some() {
+        return AuthError::unprocessable_at_input(loc, "Field required", "missing", Value::Null);
+    }
+    if inner.contains("expected a sequence") {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid list",
+            "list_type",
+            input,
+        );
+    }
+    if inner.contains("expected a boolean") || inner.contains("invalid boolean") {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid boolean, unable to interpret input",
+            "bool_parsing",
+            input,
+        );
+    }
+    if inner.contains("expected u64")
+        || inner.contains("expected i64")
+        || inner.contains("expected u32")
+        || inner.contains("expected i32")
+        || inner.contains("expected usize")
+        || inner.contains("invalid integer")
+    {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid integer, unable to parse string as an integer",
+            "int_parsing",
+            input,
+        );
+    }
+    if inner.contains("expected f64")
+        || inner.contains("expected a float")
+        || inner.contains("invalid number")
+    {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid number, unable to parse string as a number",
+            "float_parsing",
+            input,
+        );
+    }
+    if inner.contains("expected a string") {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid string",
+            "string_type",
+            input,
+        );
+    }
+    if loc.len() <= 1 {
+        AuthError::unprocessable_at(&["body"], "Input should be a valid object", "model_type")
+    } else {
+        AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid dictionary",
+            "dict_type",
+            input,
+        )
+    }
 }
 
 fn map_data_error(text: &str) -> AuthError {
@@ -423,5 +520,68 @@ mod tests {
         assert_eq!(err.error_type, "int_parsing");
         assert_eq!(err.loc, vec!["query".to_string(), "limit".to_string()]);
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn wrong_type_history_is_list_type_at_field() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            query: String,
+            #[serde(default, deserialize_with = "null_as_default")]
+            history: Vec<HistoryItem>,
+        }
+        #[derive(serde::Deserialize)]
+        struct HistoryItem {
+            role: String,
+            content: String,
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"query":"差旅","history":{"role":"user"}}"#,
+            ))
+            .unwrap();
+        let err = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(_) => panic!("expected list_type"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "list_type");
+        assert_eq!(err.loc, vec!["body".to_string(), "history".to_string()]);
+        assert_eq!(err.detail, "Input should be a valid list");
+    }
+
+    #[tokio::test]
+    async fn nested_missing_history_content_keeps_index_loc() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            history: Vec<HistoryItem>,
+        }
+        #[derive(serde::Deserialize)]
+        struct HistoryItem {
+            role: String,
+            content: String,
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"history":[{"role":"user"}]}"#))
+            .unwrap();
+        let err = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(_) => panic!("expected missing content"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "missing");
+        assert_eq!(
+            err.loc,
+            vec![
+                "body".to_string(),
+                "history".to_string(),
+                "0".to_string(),
+                "content".to_string()
+            ]
+        );
     }
 }
