@@ -39,7 +39,7 @@ pub struct ChatStreamRequest {
     pub top_k: usize,
     #[serde(default = "default_true", deserialize_with = "crate::extract::coerce_bool")]
     pub use_retrieval: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::optional_nonnull_string")]
     pub retrieval_method: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
@@ -47,7 +47,7 @@ pub struct ChatStreamRequest {
     pub model: Option<String>,
     #[serde(default, deserialize_with = "crate::extract::coerce_opt_f64")]
     pub temperature: Option<f64>,
-    #[serde(default = "default_short_memory_strategy")]
+    #[serde(default = "default_short_memory_strategy", deserialize_with = "crate::extract::required_nonnull_string")]
     pub short_memory_strategy: String,
     #[serde(default = "default_short_memory_n", deserialize_with = "crate::extract::coerce_usize")]
     pub short_memory_n: usize,
@@ -2332,6 +2332,12 @@ mod tests {
         assert_eq!(coerced.top_k, 5);
         assert!(coerced.use_retrieval);
         assert_eq!(coerced.temperature, Some(0.7));
+        assert!(omitted.retrieval_method.is_none());
+        assert!(serde_json::from_str::<ChatStreamRequest>(
+            r#"{"query":"差旅","retrieval_method":null}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ChatStreamRequest>(r#"{"query":"差旅","top_k":null}"#).is_err());
     }
 
     #[test]

@@ -18,12 +18,16 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// 对齐 Pydantic 宽松整数：`"5"` / `5` / `5.0`。
+/// 对齐 Pydantic 宽松整数：`"5"` / `5` / `5.0`；显式 `null` 走 `int_type`。
 pub fn coerce_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
     D: Deserializer<'de>,
 {
-    value_as_usize(Value::deserialize(deserializer)?).ok_or_else(|| DeError::custom("invalid integer"))
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Err(DeError::custom("invalid integer type"));
+    }
+    value_as_usize(value).ok_or_else(|| DeError::custom("invalid integer"))
 }
 
 /// 对齐 Pydantic `Optional[int]`：缺省/null → None，字符串数字也可。
@@ -36,6 +40,28 @@ where
         Some(value) => value_as_usize(value)
             .map(Some)
             .ok_or_else(|| DeError::custom("invalid integer")),
+    }
+}
+
+/// 对齐非 Optional `Literal`：字段缺省走 `default`，显式 `null` 拒绝。
+pub fn optional_nonnull_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => Ok(Some(value)),
+        _ => Err(DeError::custom("invalid literal")),
+    }
+}
+
+/// 对齐非 Optional 字符串 Literal：缺省走 `default = "..."`，显式 `null` 拒绝。
+pub fn required_nonnull_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => Ok(value),
+        _ => Err(DeError::custom("invalid literal")),
     }
 }
 
@@ -301,6 +327,19 @@ fn map_typed_error(inner: &str, loc: &[&str], input: Value) -> AuthError {
             loc,
             "Input should be a valid boolean, unable to interpret input",
             "bool_parsing",
+            input,
+        );
+    }
+    if inner.contains("invalid literal") {
+        if let Some(err) = crate::validate::literal_error_for_loc(loc, input.clone()) {
+            return err;
+        }
+    }
+    if inner.contains("invalid integer type") {
+        return AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid integer",
+            "int_type",
             input,
         );
     }
@@ -583,5 +622,73 @@ mod tests {
                 "content".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn retrieval_method_null_is_literal_error() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            #[serde(default, deserialize_with = "optional_nonnull_string")]
+            retrieval_method: Option<String>,
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"retrieval_method":null}"#))
+            .unwrap();
+        let err = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(_) => panic!("expected literal_error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "literal_error");
+        assert_eq!(err.loc, vec!["body".to_string(), "retrieval_method".to_string()]);
+        assert_eq!(err.detail, "Input should be 'hybrid', 'dense' or 'sparse'");
+        assert_eq!(err.input, serde_json::json!(null));
+        let omitted = Request::builder()
+            .method("POST")
+            .uri("http://example.com/chat")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let parsed = ApiJson::<Payload>::from_request(omitted, &())
+            .await
+            .expect("omitted retrieval_method stays default");
+        assert!(parsed.0.retrieval_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn top_k_null_is_int_type() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            #[serde(default = "default_five", deserialize_with = "coerce_usize")]
+            top_k: usize,
+        }
+        fn default_five() -> usize {
+            5
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/search")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"top_k":null}"#))
+            .unwrap();
+        let err = match ApiJson::<Payload>::from_request(request, &()).await {
+            Ok(_) => panic!("expected int_type"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error_type, "int_type");
+        assert_eq!(err.loc, vec!["body".to_string(), "top_k".to_string()]);
+        assert_eq!(err.detail, "Input should be a valid integer");
+        let omitted = Request::builder()
+            .method("POST")
+            .uri("http://example.com/search")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let parsed = ApiJson::<Payload>::from_request(omitted, &())
+            .await
+            .expect("omitted top_k uses default");
+        assert_eq!(parsed.0.top_k, 5);
     }
 }

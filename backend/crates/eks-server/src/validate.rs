@@ -158,6 +158,40 @@ fn literal_message(allowed: &[&str]) -> String {
     }
 }
 
+pub fn literal_error(allowed: &[&str], loc: &[&str], input: serde_json::Value) -> AuthError {
+    AuthError::unprocessable_at_ctx(
+        loc,
+        &literal_message(allowed),
+        "literal_error",
+        input,
+        serde_json::json!({ "expected": literal_expected(allowed) }),
+    )
+}
+
+/// 反序列化阶段拒绝 JSON `null` 时，按字段名补齐 Pydantic `literal_error` 文案。
+pub fn literal_error_for_loc(loc: &[&str], input: serde_json::Value) -> Option<AuthError> {
+    let allowed: &[&str] = match loc.last().copied() {
+        Some("retrieval_method") => &["hybrid", "dense", "sparse"],
+        Some("short_memory_strategy") => &["window", "summary"],
+        _ => return None,
+    };
+    Some(literal_error(allowed, loc, input))
+}
+
+/// 对齐 Pydantic `Optional[str]`：缺省/`null` → None，非字符串 422 `string_type`。
+pub fn optional_string_value(value: &serde_json::Value, loc: &[&str]) -> Result<Option<String>, AuthError> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(text) => Ok(Some(text.clone())),
+        other => Err(AuthError::unprocessable_at_input(
+            loc,
+            "Input should be a valid string",
+            "string_type",
+            other.clone(),
+        )),
+    }
+}
+
 pub fn login_fields(username: &str, password: &str) -> Result<(), AuthError> {
     bounded_string_at(username, 1, 128, &["body", "username"])?;
     bounded_string_at(password, 1, 128, &["body", "password"])
@@ -510,5 +544,23 @@ mod tests {
             model_err.detail_json()["detail"][0]["ctx"]["class_name"],
             "SkillExecutionContextRequest"
         );
+        assert!(optional_string_value(&serde_json::Value::Null, &["body", "context", "query"])
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            optional_string_value(
+                &serde_json::json!("c1"),
+                &["body", "context", "conversation_id"]
+            )
+            .unwrap(),
+            Some("c1".into())
+        );
+        let string_err = optional_string_value(
+            &serde_json::json!(true),
+            &["body", "context", "session_id"],
+        )
+        .unwrap_err();
+        assert_eq!(string_err.error_type, "string_type");
+        assert_eq!(string_err.input, serde_json::json!(true));
     }
 }

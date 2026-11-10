@@ -534,11 +534,15 @@ pub async fn json_method_not_allowed() -> impl IntoResponse {
     )
 }
 
+fn default_retrieval_top_k() -> usize {
+    5
+}
+
 #[derive(Deserialize)]
 pub struct RetrievalRequest {
     pub query: String,
-    #[serde(default, deserialize_with = "crate::extract::coerce_opt_usize")]
-    pub top_k: Option<usize>,
+    #[serde(default = "default_retrieval_top_k", deserialize_with = "crate::extract::coerce_usize")]
+    pub top_k: usize,
 }
 
 fn reject_empty_query(query: &str) -> Result<(), AuthError> {
@@ -578,7 +582,7 @@ async fn retrieval_simple(
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
-    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
+    let top_k = crate::validate::retrieval_top_k(Some(request.top_k))?;
     let query = retrieval_search_query(&request.query);
     let mut results = if method == "dense" {
         state.engine.search_dense(query, top_k).await
@@ -609,11 +613,14 @@ where
     Value::deserialize(deserializer)
 }
 
-fn json_opt_string(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|item| item.to_string())
+fn json_opt_string(value: &Value, key: &str) -> Result<Option<String>, AuthError> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(item) => crate::validate::optional_string_value(
+            item,
+            &["body", "context", key],
+        ),
+    }
 }
 
 fn skill_execute_context(body: &SkillExecuteBody) -> Result<SkillExecuteContext, AuthError> {
@@ -630,10 +637,10 @@ fn skill_execute_context(body: &SkillExecuteBody) -> Result<SkillExecuteContext,
         .unwrap_or_else(default_json_object);
     crate::validate::require_dict(&metadata, &["body", "context", "metadata"])?;
     Ok(SkillExecuteContext {
-        conversation_id: json_opt_string(&body.context, "conversation_id"),
-        session_id: json_opt_string(&body.context, "session_id"),
-        query: json_opt_string(&body.context, "query"),
-        trace_id: json_opt_string(&body.context, "trace_id"),
+        conversation_id: json_opt_string(&body.context, "conversation_id")?,
+        session_id: json_opt_string(&body.context, "session_id")?,
+        query: json_opt_string(&body.context, "query")?,
+        trace_id: json_opt_string(&body.context, "trace_id")?,
         metadata,
     })
 }
@@ -773,7 +780,7 @@ pub async fn retrieval_hybrid(
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
-    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
+    let top_k = crate::validate::retrieval_top_k(Some(request.top_k))?;
     let query = retrieval_search_query(&request.query);
     let (recalled, _) = state
         .engine
@@ -805,7 +812,7 @@ pub async fn retrieval_rag(
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
     reject_empty_query(&request.query)?;
-    let top_k = crate::validate::retrieval_top_k(request.top_k)?;
+    let top_k = crate::validate::retrieval_top_k(Some(request.top_k))?;
     let query = retrieval_search_query(&request.query);
     let planned = state
         .engine
@@ -925,6 +932,27 @@ mod health_tests {
                 "metadata".to_string()
             ]
         );
+        let number_id: SkillExecuteBody = serde_json::from_str(
+            r#"{"name":"memory_query","context":{"conversation_id":123}}"#,
+        )
+        .unwrap();
+        let id_err = skill_execute_context(&number_id).unwrap_err();
+        assert_eq!(id_err.error_type, "string_type");
+        assert_eq!(
+            id_err.loc,
+            vec![
+                "body".to_string(),
+                "context".to_string(),
+                "conversation_id".to_string()
+            ]
+        );
+        assert_eq!(id_err.detail, "Input should be a valid string");
+        assert_eq!(id_err.input, json!(123));
+        let null_id: SkillExecuteBody = serde_json::from_str(
+            r#"{"name":"memory_query","context":{"conversation_id":null}}"#,
+        )
+        .unwrap();
+        assert!(skill_execute_context(&null_id).unwrap().conversation_id.is_none());
     }
 
     #[test]
