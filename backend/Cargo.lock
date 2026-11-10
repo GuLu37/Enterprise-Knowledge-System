@@ -966,6 +966,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "lopdf",
  "ort",
  "parquet",

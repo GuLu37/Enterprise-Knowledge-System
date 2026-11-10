@@ -38,3 +38,4 @@ parquet = { version = "53", features = ["arrow"] }
 arrow = "53"
 arrow-array = "53"
 encoding_rs = "0.8"
+libc = "0.2"

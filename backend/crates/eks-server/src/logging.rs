@@ -1,11 +1,14 @@
 //! 对齐 Python loguru：控制台 + LOG_DIR 文件，按自然日或 100MB 轮转，保留 10 天。
+//! stdout/stderr 按行灌进 tracing，对齐 `_StreamToLogger`。
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub const LOG_ROTATION_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -169,12 +172,153 @@ impl<'a> MakeWriter<'a> for MutexWriter {
     }
 }
 
+struct MutexWriterFd(Mutex<File>);
+
+struct GuardWriterFd<'a>(std::sync::MutexGuard<'a, File>);
+
+impl Write for GuardWriterFd<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for MutexWriterFd {
+    type Writer = GuardWriterFd<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        GuardWriterFd(self.0.lock().unwrap_or_else(|err| err.into_inner()))
+    }
+}
+
+static STDIO_INTERCEPT_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// 对齐 Python `_StreamToLogger.write`：按行切、去掉行尾 CR、空行丢弃。
+pub fn take_stdio_lines(buffer: &mut String, chunk: &str) -> Vec<String> {
+    buffer.push_str(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.find('\n') {
+        let mut line = buffer[..pos].to_string();
+        buffer.drain(..=pos);
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// 对齐 Python `_StreamToLogger.flush`：剩余缓冲去空白后记一行。
+pub fn flush_stdio_buffer(buffer: &mut String) -> Option<String> {
+    let line = buffer.trim().to_string();
+    buffer.clear();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+fn duplicate_stderr() -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd, RawFd};
+        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(dup as RawFd) })
+    }
+    #[cfg(not(unix))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stdio intercept requires unix",
+    ))
+}
+
+fn intercept_process_stdio() {
+    if STDIO_INTERCEPT_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let _ = redirect_stdio_fd(libc::STDOUT_FILENO, false);
+        let _ = redirect_stdio_fd(libc::STDERR_FILENO, true);
+    }
+}
+
+#[cfg(unix)]
+fn redirect_stdio_fd(target: i32, error_level: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (reader, writer) = io::pipe()?;
+    if unsafe { libc::dup2(writer.as_raw_fd(), target) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(writer);
+    std::thread::Builder::new()
+        .name(if error_level {
+            "stderr-log".into()
+        } else {
+            "stdout-log".into()
+        })
+        .spawn(move || drain_stdio_pipe(reader, error_level))
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+fn emit_stdio_line(line: String, error_level: bool) {
+    if error_level {
+        tracing::error!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
+}
+
+#[cfg(unix)]
+fn drain_stdio_pipe(reader: impl io::Read, error_level: bool) {
+    use std::io::BufRead;
+    let mut reader = io::BufReader::new(reader);
+    let mut chunk = String::new();
+    let mut buffer = String::new();
+    loop {
+        chunk.clear();
+        match reader.read_line(&mut chunk) {
+            Ok(0) => {
+                if let Some(line) = flush_stdio_buffer(&mut buffer) {
+                    emit_stdio_line(line, error_level);
+                }
+                break;
+            }
+            Ok(_) => {
+                for line in take_stdio_lines(&mut buffer, &chunk) {
+                    emit_stdio_line(line, error_level);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn console_writer() -> BoxMakeWriter {
+    match duplicate_stderr() {
+        Ok(file) => BoxMakeWriter::new(MutexWriterFd(Mutex::new(file))),
+        Err(_) => BoxMakeWriter::new(std::io::stderr),
+    }
+}
+
 /// 控制台 + 滚动文件。文件初始化失败时仅保留 stderr。
 pub fn init_tracing(log_dir: &str, log_level: &str) {
     install_panic_hook();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(parse_log_level(log_level)));
-    let stdout_layer = fmt::layer().with_writer(std::io::stderr).with_target(true);
+    let stdout_layer = fmt::layer()
+        .with_writer(console_writer())
+        .with_target(true);
     let dir = resolve_log_dir(log_dir);
     match RotatingFile::open(dir.clone()) {
         Ok(file) => {
@@ -195,6 +339,7 @@ pub fn init_tracing(log_dir: &str, log_level: &str) {
             tracing::warn!(path = %dir.display(), "日志目录不可用，仅输出到控制台: {err}");
         }
     }
+    intercept_process_stdio();
 }
 
 pub fn format_uncaught_exception() -> &'static str {
@@ -267,6 +412,21 @@ mod tests {
             format_thread_uncaught_exception("memory-persist"),
             "线程未捕获异常: memory-persist"
         );
+    }
+
+    #[test]
+    fn stdio_line_buffer_matches_python_stream_to_logger() {
+        let mut buffer = String::new();
+        assert_eq!(take_stdio_lines(&mut buffer, "hello"), Vec::<String>::new());
+        assert_eq!(buffer, "hello");
+        assert_eq!(
+            take_stdio_lines(&mut buffer, "\nworld\r\n\n"),
+            vec!["hello".to_string(), "world".to_string()]
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(take_stdio_lines(&mut buffer, "tail"), Vec::<String>::new());
+        assert_eq!(flush_stdio_buffer(&mut buffer).as_deref(), Some("tail"));
+        assert!(flush_stdio_buffer(&mut buffer).is_none());
     }
 
     #[test]
