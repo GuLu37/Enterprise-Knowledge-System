@@ -1,2 +1,4 @@
 *
 !.gitignore
+!py_vs_rust.json
+!py_vs_rust.md

@@ -17,7 +17,9 @@
 - **Reject@k**：不可回答题的 `bait_sources` 未进入 top-k
 - **p50 / p95 / QPS**：逐查询清缓存后的端到端延迟
 
-历史 41 条 enterprise 基线见 `docs/acceptance_py_vs_rust_report.md`（2026-11-06，dense/sparse Hit@5 两侧 95.12% / 100%，hybrid 90.24%）。
+最新全量 74 条对拍见 `docs/rag_acceptance_eval_report.md`（2026-11-12）。历史 41 条 enterprise 基线见 `docs/acceptance_py_vs_rust_report.md`（2026-11-06，dense/sparse Hit@5 两侧 95.12% / 100%，hybrid 90.24%）。
+
+Python FastAPI 后台入库不会让 cached BM25 失效。语料 `ready` 后若 sparse 空结果，重启 Python 再跑（本轮重启后索引 559 行）。
 
 ## 离线自检（不启服务）
 

@@ -257,13 +257,23 @@ class ApiClient:
         self.tls = parsed.scheme == "https"
         self.prefix = prefix.rstrip("/")
         self.token = ""
+        self.username = ""
+        self.password = ""
 
-    def _conn(self):
+    def _conn(self, timeout: int = 300):
         if self.tls:
-            return HTTPSConnection(self.host, self.port, timeout=120)
-        return HTTPConnection(self.host, self.port, timeout=120)
+            return HTTPSConnection(self.host, self.port, timeout=timeout)
+        return HTTPConnection(self.host, self.port, timeout=timeout)
 
-    def request(self, method: str, path: str, body: Any = None, raw: bytes | None = None, headers: dict | None = None) -> tuple[int, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        raw: bytes | None = None,
+        headers: dict | None = None,
+        retry_auth: bool = True,
+    ) -> tuple[int, Any]:
         hdrs = {"Accept": "application/json"}
         if self.token:
             hdrs["Authorization"] = f"Bearer {self.token}"
@@ -277,7 +287,11 @@ class ApiClient:
         try:
             conn.request(method, self.prefix + path, payload, hdrs)
             resp = conn.getresponse()
+            renewed = resp.getheader("X-Access-Token") or resp.getheader("x-access-token")
+            if renewed:
+                self.token = renewed
             text = resp.read().decode("utf-8")
+            status = resp.status
         finally:
             conn.close()
         data: Any = {}
@@ -286,10 +300,17 @@ class ApiClient:
                 data = json.loads(text)
             except json.JSONDecodeError:
                 data = {"raw": text}
-        return resp.status, data
+        if status == 401 and retry_auth and path != "/auth/login" and self.username:
+            self.login(self.username, self.password)
+            return self.request(method, path, body=body, raw=raw, headers=headers, retry_auth=False)
+        return status, data
 
     def login(self, username: str, password: str) -> None:
-        status, payload = self.request("POST", "/auth/login", {"username": username, "password": password})
+        self.username = username
+        self.password = password
+        status, payload = self.request(
+            "POST", "/auth/login", {"username": username, "password": password}, retry_auth=False
+        )
         if status != 200 or not payload.get("access_token"):
             raise SystemExit(f"登录失败 {status}: {payload}")
         self.token = payload["access_token"]
@@ -336,20 +357,33 @@ class ApiClient:
             raise RuntimeError(f"上传失败 {filename} {status}: {payload}")
         return payload
 
-    def wait_ready(self, filenames: set[str], timeout_s: int = 180) -> None:
+    def wait_ready(self, filenames: set[str], timeout_s: int = 1200) -> None:
         wanted = {path.name for path in (Path(name) for name in filenames)}
         deadline = time.time() + timeout_s
+        last_note = ""
         while time.time() < deadline:
             listed = self.list_documents()
             by_name = {item.get("original_filename"): item for item in listed}
             pending = []
+            failed = []
             for name in wanted:
                 row = by_name.get(name)
-                if not row or row.get("status") != "ready":
-                    pending.append(name)
+                status = (row or {}).get("status")
+                if status == "ready":
+                    continue
+                if status in {"failed", "error"}:
+                    failed.append(f"{name}:{status}")
+                    continue
+                pending.append(f"{name}:{status or 'missing'}")
+            if failed:
+                raise RuntimeError(f"文档入库失败: {failed}")
             if not pending:
                 return
-            time.sleep(1.5)
+            note = f"等待 ready: {', '.join(pending)}"
+            if note != last_note:
+                print(f"[ingest] {note}")
+                last_note = note
+            time.sleep(2.0)
         raise TimeoutError(f"文档未在 {timeout_s}s 内变为 ready: {sorted(pending)}")
 
 
@@ -357,15 +391,18 @@ def ingest_slice(client: ApiClient, spec: dict[str, Any]) -> None:
     files = corpus_files(spec)
     if not files:
         raise SystemExit(f"语料为空: {spec['corpus_glob']}")
-    existing = {item.get("original_filename") for item in client.list_documents()}
+    listed = {item.get("original_filename"): item for item in client.list_documents()}
     uploaded = []
     for path in files:
-        if path.name in existing:
+        row = listed.get(path.name)
+        if row and row.get("status") == "ready":
             continue
-        print(f"[ingest] 上传 {path.name}")
-        client.upload(path)
-        uploaded.append(path.name)
-    client.wait_ready({path.name for path in files})
+        if not row:
+            print(f"[ingest] 上传 {path.name}")
+            client.upload(path)
+            uploaded.append(path.name)
+        client.wait_ready({path.name})
+        listed[path.name] = {"original_filename": path.name, "status": "ready"}
     if uploaded:
         print(f"[ingest] 新上传 {len(uploaded)} 份，已全部 ready")
     else:
