@@ -887,26 +887,28 @@ impl SparseIndexSnapshot {
     pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, f64, f64)> {
         let query_tokens = tokenize_cjk(query);
         let global_scores = self.bm25.get_scores(&query_tokens);
-        let mut order: Vec<usize> = (0..global_scores.len()).collect();
+        let mut order: Vec<usize> = (0..global_scores.len())
+            .filter(|&index| global_scores[index] > 0.0)
+            .collect();
         order.sort_by(|&a, &b| {
             global_scores[b]
                 .partial_cmp(&global_scores[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut slice: Vec<usize> = Vec::new();
-        for index in order.into_iter().take(limit.max(1)) {
-            if global_scores[index] <= 0.0 {
-                break;
-            }
-            slice.push(index);
+        let cap = limit.max(1);
+        if order.len() > cap {
+            order.truncate(cap);
         }
-        if slice.is_empty() {
+        if order.is_empty() {
             return Vec::new();
         }
-        let slice_corpus: Vec<Vec<String>> = slice.iter().map(|&i| self.row_tokens[i].clone()).collect();
-        let slice_bm25 = BM25Okapi::build(&slice_corpus);
+        let slice_corpus: Vec<&[String]> = order
+            .iter()
+            .map(|&index| self.row_tokens[index].as_slice())
+            .collect();
+        let slice_bm25 = BM25Okapi::build_from_slices(&slice_corpus);
         let slice_scores = slice_bm25.get_scores(&query_tokens);
-        slice
+        order
             .iter()
             .enumerate()
             .map(|(position, &text_index)| {
