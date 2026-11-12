@@ -208,14 +208,16 @@ struct SkillActionInput<'a> {
 impl<'a> SkillActionInput<'a> {
     /// 对齐 Python `_build_skill_execution_context`：聊天请求的 provider/model 写入 skill context。
     fn execution_context(&self) -> crate::skills::SkillExecutionContext<'a> {
-        chat_skill_context(
+        let mut context = chat_skill_context(
             self.user_id,
             self.conversation_id,
             self.session_id,
             self.query,
             self.provider,
             self.model,
-        )
+        );
+        context.memory = self.memory;
+        context
     }
 }
 
@@ -239,6 +241,15 @@ const PROGRESSIVE_DISCLOSURE_REASON: &str = "progressive_disclosure";
 /// 对齐 Python `_run_agent_tool_turn`：披露后直接 complete，不再用合并结果判定不足。
 fn agent_turn_complete_after_disclosure(disclosed: bool, query_sufficient: bool) -> bool {
     disclosed || query_sufficient
+}
+
+/// 规则命中的本地技能（记忆/热词/清单）一次执行即可收尾，避免空结果再走 LLM 二次编排。
+fn rule_local_skill_finishes_turn(skill_name: &str, intent: &crate::intent::QueryIntent) -> bool {
+    intent.source == "rule" && skill_name != "search_knowledge_base"
+}
+
+fn skill_turn_is_complete(prepared: &PreparedSkill, intent: &crate::intent::QueryIntent) -> bool {
+    prepared.sufficient || rule_local_skill_finishes_turn(&prepared.name, intent)
 }
 
 fn wrap_prepared_skill(
@@ -1086,6 +1097,7 @@ fn chat_skill_context<'a>(
         model,
         trace_id: None,
         metadata: json!({}),
+        memory: None,
     }
 }
 
@@ -1870,7 +1882,7 @@ pub async fn stream_chat(
                             ));
                             last_skill_name = "memory_retrieve_original".into();
                         }
-                        if prepared.sufficient {
+                        if skill_turn_is_complete(&prepared, &intent) {
                             if let Some(messages) = prepared.messages.clone() {
                                 match llm_client.stream(&messages).await {
                                     Ok(mut rx) => {
@@ -2880,6 +2892,37 @@ mod tests {
         assert!(agent_turn_complete_after_disclosure(true, false));
         assert!(!agent_turn_complete_after_disclosure(false, false));
         assert_eq!(PROGRESSIVE_DISCLOSURE_REASON, "progressive_disclosure");
+
+        let rule_intent = crate::intent::QueryIntent {
+            route: "skill".into(),
+            needs_retrieval: false,
+            reason: "memory_keyword".into(),
+            source: "rule".into(),
+            confidence: None,
+            rewritten_query: String::new(),
+            skill_name: Some("memory_query".into()),
+            skill_arguments: json!({}),
+            clarify_question: String::new(),
+        };
+        assert!(rule_local_skill_finishes_turn("memory_query", &rule_intent));
+        assert!(!rule_local_skill_finishes_turn(
+            "search_knowledge_base",
+            &rule_intent
+        ));
+        let mut llm_intent = rule_intent.clone();
+        llm_intent.source = "llm".into();
+        assert!(!rule_local_skill_finishes_turn("memory_query", &llm_intent));
+        let empty_memory = PreparedSkill {
+            name: "memory_query".into(),
+            wrapped: json!({}),
+            fallback: String::new(),
+            messages: None,
+            generate_messages: None,
+            sufficient: false,
+            disclosure: None,
+        };
+        assert!(skill_turn_is_complete(&empty_memory, &rule_intent));
+        assert!(!skill_turn_is_complete(&empty_memory, &llm_intent));
     }
 
     #[test]
