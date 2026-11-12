@@ -11,6 +11,7 @@
 | `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` | Rust workspace（eks-kernels + eks-server），工具链 1.92.0 | 是 |
 | `crates/` | 源码：`eks-kernels`（检索内核）与 `eks-server`（HTTP 服务） | 是 |
 | `scripts/bench_retrieval.py` | 纯 HTTP 检索基准（登录→清缓存→`/retrieval/rag`） | 是 |
+| `../eval/rag_acceptance/` | Python/Rust 对拍验收集（BEIR 任务类型 + enterprise 41 条 GT） | 是 |
 | `Dockerfile` | 服务镜像构建（compose 的构建上下文即本目录） | 是 |
 | `.env.example` | 环境变量模板，复制为 `.env` 后供 eks-server 读取（默认 `./.env`） | 是 |
 | `.env` | 实际环境配置（含密钥） | 否 |

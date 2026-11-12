@@ -7,7 +7,10 @@
     python scripts/bench_retrieval.py | tee bench_out.json   # 需留档时重定向
 
 原 Python 进程内基准已随 Python 后端退役；本脚本打 /api/v1/retrieval/rag，
-逐查询清缓存计时。41 条查询内联自 docs/rrf_ablation_eval.json（更新数据集时同步）。
+逐查询清缓存计时。查询集读取 docs/rrf_ablation_eval.json（与 eval/rag_acceptance 企业切片同源）。
+
+完整 Python/Rust 对拍请用仓库根目录：
+    python eval/rag_acceptance/run.py compare --system rust=http://127.0.0.1:8000 --ingest
 
 指标: 每条查询端到端耗时、P50/P95/均值、recall@k / MRR@10（依据 relevant_sources 判断命中）。
 """
@@ -17,52 +20,26 @@ import json
 import os
 import statistics
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
-# (id, query, relevant_sources) — 源: docs/rrf_ablation_eval.json
-EVAL_QUERIES = [
-    ("travel_01", "出差结束后最晚多久要提交报销单？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_02", "晚上十点以后从机场打车回去，这笔费用能报销吗？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_03", "高铁单程超过六个小时，可以买一等座吗？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_04", "电子发票重复打印后，能不能再报销一次？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_05", "酒店已经提供早餐，当天餐补应该扣多少钱？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_06", "几个人一起住酒店，住宿费怎么分摊报销？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_07", "出差期间因为个人原因多住几天，公司还承担这几天的住宿和餐补吗？", ["01_差旅报销制度_V2.0.docx"]),
-    ("travel_08", "因为客户临时取消行程产生的退票费可以报吗，需要留什么材料？", ["01_差旅报销制度_V2.0.docx"]),
-    ("procurement_01", "含税金额不超过5000元的采购由谁审批？", ["02_采购审批流程.docx"]),
-    ("procurement_02", "采购金额在5万到20万之间，需要哪些审批人和材料？", ["02_采购审批流程.docx"]),
-    ("procurement_03", "紧急采购可以先做，之后多长时间内补录申请？", ["02_采购审批流程.docx"]),
-    ("procurement_04", "采购申请审批通过后，能不能先给供应商下订单？", ["02_采购审批流程.docx"]),
-    ("procurement_05", "单一来源采购需要提供什么价格合理性证明？", ["02_采购审批流程.docx"]),
-    ("procurement_06", "第一次合作的供应商在下单前要完成哪些准入核验？", ["02_采购审批流程.docx"]),
-    ("procurement_07", "同一个供应商在30天内多次购买同类服务，金额怎么计算？", ["02_采购审批流程.docx"]),
-    ("alpha_01", "项目 Alpha 常规生产发布窗口是每周什么时候？", ["03_项目Alpha上线手册.docx"]),
-    ("alpha_02", "哪些情况发生时应该立即停止扩容并启动回滚？", ["03_项目Alpha上线手册.docx"]),
-    ("alpha_03", "Alpha 生产回滚要求在多长时间内恢复？", ["03_项目Alpha上线手册.docx"]),
-    ("alpha_04", "测试环境验证通过后，可以直接把版本发到生产吗？", ["03_项目Alpha上线手册.docx"]),
-    ("alpha_05", "如果数据库迁移不可逆，发生故障时应该先回滚什么？", ["03_项目Alpha上线手册.docx"]),
-    ("alpha_06", "生产全量发布后至少要观察多久才能结束首轮观察？", ["03_项目Alpha上线手册.docx"]),
-    ("faq_01", "还能正常登录时，修改密码应该怎么操作？", ["04_产品与账号常见问题.md"]),
-    ("faq_02", "管理员和系统管理员的权限边界有什么不同？", ["04_产品与账号常见问题.md"]),
-    ("faq_03", "项目 Alpha 的生产环境访问权限最长可以申请多久？", ["04_产品与账号常见问题.md"]),
-    ("faq_04", "连续输错几次密码会锁定账号，锁多久？", ["04_产品与账号常见问题.md"]),
-    ("faq_05", "文档上传后为什么不能马上搜索到？", ["04_产品与账号常见问题.md"]),
-    ("faq_06", "什么情况下回答不会显示知识库引用资料？", ["04_产品与账号常见问题.md"]),
-    ("expense_01", "一线城市 P5 员工每晚住宿费上限是多少？", ["05_费用标准表.xlsx"]),
-    ("expense_02", "新一线或省会城市的 P4 员工每天餐补标准是多少？", ["05_费用标准表.xlsx"]),
-    ("expense_03", "酒店含早餐时，餐补按什么规则扣减？", ["05_费用标准表.xlsx"]),
-    ("expense_04", "客户宴请可以算在差旅餐补里吗？", ["05_费用标准表.xlsx"]),
-    ("expense_05", "出差地的公交、地铁和机场快线能否据实报销？", ["05_费用标准表.xlsx"]),
-    ("employee_01", "员工号 E0011 的姓名和所属部门是什么？", ["06_企业内部信息总表.xlsx"]),
-    ("employee_02", "采购部的部门邮箱是什么？", ["06_企业内部信息总表.xlsx"]),
-    ("employee_03", "哪些产品适合运维部采购使用？", ["06_企业内部信息总表.xlsx"]),
-    ("employee_04", "产品号 P90003 主要适合什么业务场景？", ["06_企业内部信息总表.xlsx"]),
-    ("employee_05", "财务部负责费用审核和付款的员工是谁？", ["06_企业内部信息总表.xlsx"]),
-    ("salary_01", "员工号 E0008 的实发工资是多少？", ["07_本月工资表.xlsx"]),
-    ("salary_02", "员工工资明细表里有哪些字段？", ["07_本月工资表.xlsx"]),
-    ("salary_03", "运维部员工 E0013 当前是什么状态，实发工资多少？", ["07_本月工资表.xlsx"]),
-    ("salary_04", "员工号 E0024 的岗位和实发工资是什么？", ["07_本月工资表.xlsx"]),
-]
+
+def _eval_queries() -> list[tuple[str, str, list[str]]]:
+    here = Path(__file__).resolve()
+    for candidate in (
+        here.parents[2] / "docs" / "rrf_ablation_eval.json",
+        here.parents[1] / "docs" / "rrf_ablation_eval.json",
+    ):
+        if candidate.is_file():
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            return [
+                (item["id"], item["query"], list(item.get("relevant_sources") or []))
+                for item in payload
+            ]
+    raise FileNotFoundError("找不到 docs/rrf_ablation_eval.json")
+
+
+EVAL_QUERIES = _eval_queries()
 
 
 def _source_stem(name: str) -> str:

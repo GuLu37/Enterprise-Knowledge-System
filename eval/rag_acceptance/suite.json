@@ -1,0 +1,37 @@
+{
+  "name": "eks-rag-acceptance",
+  "version": "1.0.0",
+  "description": "Python → Rust 重构验收评测集：用 RAG 常见任务类型（单跳事实、多跳、领域 FAQ、结构化查找、声明核验、不可回答/拒识）衡量检索准确度与延迟。",
+  "top_k": 5,
+  "k_values": [1, 5, 10],
+  "methods": ["dense", "sparse", "hybrid"],
+  "shared_endpoints": [
+    "/api/v1/retrieval/search/dense",
+    "/api/v1/retrieval/search/sparse",
+    "/api/v1/retrieval/search/hybrid"
+  ],
+  "rust_only_endpoints": ["/api/v1/retrieval/rag"],
+  "metrics": {
+    "hit@k": "top-k 是否命中至少一个 relevant_sources（文档级 Success@k）",
+    "recall@k": "top-k 命中的 relevant_sources 比例",
+    "mrr@k": "首个相关文档排名倒数的均值",
+    "ndcg@k": "二元相关的 nDCG",
+    "reject@k": "不可回答题：bait_sources 未进入 top-k 则为成功"
+  },
+  "slices": {
+    "enterprise": {
+      "inspired_by": ["FiQA", "domain RAG"],
+      "description": "企业内部制度/FAQ/表格，沿用验收 7 文档 + 41 条 GT。",
+      "corpus_glob": "docs/rag_accuracy_demo/*",
+      "queries": "docs/rrf_ablation_eval.json",
+      "query_format": "json_array"
+    },
+    "standard": {
+      "inspired_by": ["BEIR", "Natural Questions", "HotpotQA", "SciFact", "RGB"],
+      "description": "自建迷你语料，覆盖公开 RAG 基准的任务类型（非搬运受版权语料）。",
+      "corpus_glob": "eval/rag_acceptance/datasets/standard/corpus/*.md",
+      "queries": "eval/rag_acceptance/datasets/standard/queries.jsonl",
+      "query_format": "jsonl"
+    }
+  }
+}

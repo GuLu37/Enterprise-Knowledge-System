@@ -1,0 +1,33 @@
+{"id":"nq_01","task":"single_hop","inspired_by":"Natural Questions / CMRC","query":"星澜高铁云栖站到滨江站要多久？","relevant_sources":["10_百科_交通地理.md"],"answers":["47 分钟"]}
+{"id":"nq_02","task":"single_hop","inspired_by":"Natural Questions / CMRC","query":"青萝江全长多少公里？","relevant_sources":["10_百科_交通地理.md"],"answers":["286 公里"]}
+{"id":"nq_03","task":"single_hop","inspired_by":"Natural Questions / CMRC","query":"云栖大桥的主跨是多少米？","relevant_sources":["10_百科_交通地理.md"],"answers":["1088 米"]}
+{"id":"nq_04","task":"single_hop","inspired_by":"Natural Questions / CMRC","query":"北辰磁悬浮试验线最高运营时速是多少？","relevant_sources":["10_百科_交通地理.md"],"answers":["430 公里/小时"]}
+{"id":"nq_05","task":"single_hop","inspired_by":"Natural Questions / CMRC","query":"磁悬浮试验线是哪一天开通的？","relevant_sources":["10_百科_交通地理.md"],"answers":["2018 年 9 月 16 日"]}
+{"id":"fiqa_01","task":"domain_faq","inspired_by":"FiQA","query":"增值税专用发票最晚要在开具后多少天内勾选抵扣？","relevant_sources":["12_财务_进项发票与退税.md"],"answers":["360 日"]}
+{"id":"fiqa_02","task":"domain_faq","inspired_by":"FiQA","query":"普通发票能不能代替专用发票做进项抵扣？","relevant_sources":["12_财务_进项发票与退税.md"],"answers":["不得替代"]}
+{"id":"fiqa_03","task":"domain_faq","inspired_by":"FiQA","query":"电子元器件现行出口退税率是多少？","relevant_sources":["12_财务_进项发票与退税.md"],"answers":["13%"]}
+{"id":"fiqa_04","task":"domain_faq","inspired_by":"FiQA","query":"出口退税申报必须在报关后多久内提交？","relevant_sources":["12_财务_进项发票与退税.md"],"answers":["90 日"]}
+{"id":"sre_01","task":"domain_faq","inspired_by":"FiQA / ops runbook","query":"北辰云可用性 SLO 对应的月度错误预算是多少分钟？","relevant_sources":["13_运维_SLO与故障分级.md"],"answers":["21.6 分钟"]}
+{"id":"sre_02","task":"domain_faq","inspired_by":"FiQA / ops runbook","query":"SEV-1 故障要在多长时间内拉起战室？","relevant_sources":["13_运维_SLO与故障分级.md"],"answers":["15 分钟"]}
+{"id":"sre_03","task":"domain_faq","inspired_by":"FiQA / ops runbook","query":"错误预算耗尽以后还能做非紧急生产发布吗？","relevant_sources":["13_运维_SLO与故障分级.md"],"answers":["冻结非紧急发布"]}
+{"id":"sre_04","task":"identifier","inspired_by":"BEIR identifier / SciFact claims","query":"4xx 请求会计入错误预算吗？","relevant_sources":["13_运维_SLO与故障分级.md"],"answers":["4xx 不计入"]}
+{"id":"claim_01","task":"claim","inspired_by":"SciFact","query":"霜晶固态电池能量密度是 420 Wh/kg，这一说法有依据吗？","relevant_sources":["11_百科_能源材料.md"],"answers":["420 Wh/kg"]}
+{"id":"claim_02","task":"claim","inspired_by":"SciFact","query":"剪枝-7 核酸酶的识别序列是什么？","relevant_sources":["11_百科_能源材料.md"],"answers":["5'-TTGGAAT-3'"]}
+{"id":"claim_03","task":"claim","inspired_by":"SciFact","query":"霜晶电芯能否和液态电解液电芯混装？","relevant_sources":["11_百科_能源材料.md"],"answers":["禁止混装"]}
+{"id":"struct_01","task":"structured","inspired_by":"table QA / HybridQA","query":"员工号 EMP-2048 的姓名和部门是什么？","relevant_sources":["14_人事_请假与编制名册.md"],"answers":["林晓荷", "数据平台"]}
+{"id":"struct_02","task":"structured","inspired_by":"table QA / HybridQA","query":"韩澄的员工号和职级是什么？","relevant_sources":["14_人事_请假与编制名册.md"],"answers":["EMP-4401", "P7"]}
+{"id":"struct_03","task":"structured","inspired_by":"table QA / HybridQA","query":"产品号 NC-OSS-IA 的存储单价是多少？","relevant_sources":["15_产品_北辰云定价.md"],"answers":["0.051 元/GB/月"]}
+{"id":"struct_04","task":"structured","inspired_by":"table QA / HybridQA","query":"北辰云标准存储每月每 GB 多少钱？","relevant_sources":["15_产品_北辰云定价.md"],"answers":["0.099 元/GB/月"]}
+{"id":"struct_05","task":"structured","inspired_by":"table QA / HybridQA","query":"归档存储加急取回要多久，加收多少钱？","relevant_sources":["15_产品_北辰云定价.md"],"answers":["2 小时", "0.03 元/GB"]}
+{"id":"hr_01","task":"domain_faq","inspired_by":"policy QA","query":"入职满一年的员工年假有几天？","relevant_sources":["14_人事_请假与编制名册.md"],"answers":["10 个工作日"]}
+{"id":"hr_02","task":"domain_faq","inspired_by":"policy QA","query":"病假连续超过几天必须提供三甲医院证明？","relevant_sources":["14_人事_请假与编制名册.md"],"answers":["3 个工作日"]}
+{"id":"para_01","task":"paraphrase","inspired_by":"BEIR robustness","query":"从云栖坐高铁去滨江，路上大概得花多少时间？","relevant_sources":["10_百科_交通地理.md"],"answers":["47 分钟"]}
+{"id":"para_02","task":"paraphrase","inspired_by":"BEIR robustness","query":"专票拖过一年还能不能抵扣进项税？","relevant_sources":["12_财务_进项发票与退税.md"],"answers":["360 日内，逾期不得抵扣"]}
+{"id":"para_03","task":"paraphrase","inspired_by":"BEIR robustness","query":"对象存储一个月里可以挂多久？超过这个时间还能不能发版？","relevant_sources":["13_运维_SLO与故障分级.md"],"answers":["21.6 分钟", "冻结非紧急发布"]}
+{"id":"hop_01","task":"multi_hop","inspired_by":"HotpotQA","query":"从星澜高铁下车后步行多久能到北辰集团全球总部？","relevant_sources":["16_组织_北辰总部地点.md","17_交通_云栖园区接驳.md"],"answers":["6 分钟"]}
+{"id":"hop_02","task":"multi_hop","inspired_by":"HotpotQA","query":"去北辰总部应该走云栖站几号口？总部在哪一栋？","relevant_sources":["16_组织_北辰总部地点.md","17_交通_云栖园区接驳.md"],"answers":["2 号口", "A3 栋"]}
+{"id":"hop_03","task":"multi_hop","inspired_by":"HotpotQA","query":"绿闪暴雨时去北辰总部还走 2 号口吗？总部前台在哪栋楼？","relevant_sources":["16_组织_北辰总部地点.md","17_交通_云栖园区接驳.md"],"answers":["改走 1 号口", "A3 栋"]}
+{"id":"reject_01","task":"unanswerable","inspired_by":"RGB 拒绝","query":"北辰集团现任董事长是谁？","relevant_sources":[],"bait_sources":["16_组织_北辰总部地点.md","14_人事_请假与编制名册.md"]}
+{"id":"reject_02","task":"unanswerable","inspired_by":"RGB 拒绝","query":"CRISPR-Cas9 的 PAM 序列是 NGG 吗？","relevant_sources":[],"bait_sources":["11_百科_能源材料.md"]}
+{"id":"reject_03","task":"unanswerable","inspired_by":"RGB 拒绝","query":"三峡大坝坝高是多少米？","relevant_sources":[],"bait_sources":["10_百科_交通地理.md"]}
+{"id":"noise_01","task":"noise","inspired_by":"RGB 噪声","query":"织女座流星雨极大期是哪一天？","relevant_sources":["18_干扰_天文与烹饪.md"],"answers":["8 月中旬"]}
