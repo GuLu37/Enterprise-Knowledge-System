@@ -17,6 +17,7 @@
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
 | 1041 题全量 | 2026-11-13 16:22 | enterprise 41 + standard 1000 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1041.json`](../eval/rag_acceptance/runs/full_1041.json) |
+| 多跳 500 题 | 2026-11-13 | multihop 500 | 未跑 |  |  | 题目在 [`eval/rag_acceptance/datasets/multihop/queries.jsonl`](../eval/rag_acceptance/datasets/multihop/queries.jsonl)，尚未检索 |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -202,3 +203,9 @@ hybrid 的可答 Hit@5 从 933/964 升到 963/964。唯一没进 top-5 的可答
 Reject@5 降到 0/77，是因为诱饵文档仍被召回，而且现在 top-5 能放下更多文档。这不是把诱饵藏起来。Abstain@5 是 74/77：返回切块写明该字段未记载。没标上的 3 题是原 standard 的 `reject_01`、`reject_02`、`reject_03`，它们的诱饵正文没有「不记载 / 没有记载 / 未记载」。
 
 延迟是结果缓存清空、稀疏索引保持的数字。上一节 sparse 122 ms、hybrid 184 ms，主要花在每题重建 7921 行 BM25。进程刚启动时的第一条 hybrid 大约 93 ms（含建索引），之后同一条查询在清掉结果缓存后是 77 ms。本表 hybrid p50 60 ms、p95 75 ms，sparse p50 4 ms。dense 的命中数没有变。
+
+## 2026-11-13：新增 500 道多跳检索
+
+在 1041 题之外增加切片 `multihop`，500 题，场景都是多跳推理。语料是 4 份朔方精密台账，按 `27`–`30` 放在 `docs/rag_accuracy_demo`：人员台账、系统台账、规程台账、升级组台账。每份约一百行，一行一条对应关系，不写进企业 01–07，也不写进澄川合订卷。
+
+跳数按难度固定：简单 200 题读 2 份，中等 200 题读 3 份，困难 100 题读 4 份。答案句只出现在链条终点那一份台账里。这一套仍是一问一次检索，看同一次 top-5 能否把该读的台账都召回，不调用聊天里的多轮 ReAct。重新生成用 `python eval/rag_acceptance/expand_multihop_500.py`。这 500 题还没有检索跑分。

@@ -665,6 +665,14 @@ def cmd_check(args: argparse.Namespace) -> int:
                 difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
                 diff_bucket = slice_difficulty.setdefault(slice_name, {})
                 diff_bucket[item["difficulty"]] = diff_bucket.get(item["difficulty"], 0) + 1
+            if slice_name == "multihop":
+                hop_by_difficulty = {"简单": 2, "中等": 3, "困难": 4}
+                if item["task"] != "multi_hop" or item["scenario"] != "多跳推理":
+                    errors.append(f"{qid}: 多跳切片的 task 与场景必须是多跳")
+                elif item["difficulty"] in hop_by_difficulty:
+                    need = hop_by_difficulty[item["difficulty"]]
+                    if len(item["relevant_sources"]) != need:
+                        errors.append(f"{qid}: {item['difficulty']}题应串联 {need} 份文档")
             if item["scenario"] not in SCENARIOS:
                 errors.append(f"{qid}: 场景分类无效：{item['scenario'] or '空'}")
             else:
@@ -729,6 +737,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     std_diff = slice_difficulty.get("standard", {})
     if std_diff != expect_diff:
         errors.append(f"standard 难度分布应为 {expect_diff}，当前 {std_diff}")
+    hop_n = counts["slices"].get("multihop", {}).get("queries", 0)
+    if hop_n != 500:
+        errors.append(f"multihop 应为 500 题，当前 {hop_n}")
+    hop_docs = counts["slices"].get("multihop", {}).get("docs", 0)
+    if hop_docs != 4:
+        errors.append(f"multihop 语料应为 4 份台账，当前 {hop_docs}")
+    hop_diff = slice_difficulty.get("multihop", {})
+    if hop_diff != {"简单": 200, "中等": 200, "困难": 100}:
+        errors.append(f"multihop 难度应为简单 200、中等 200、困难 100，当前 {hop_diff}")
     if errors:
         print("数据集检查失败：")
         for err in errors:
