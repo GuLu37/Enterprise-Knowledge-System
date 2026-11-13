@@ -615,6 +615,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     scenario_counts: dict[str, int] = {}
     difficulty_counts: dict[str, int] = {}
     slice_scenario: dict[str, dict[str, int]] = {}
+    slice_difficulty: dict[str, dict[str, int]] = {}
     for slice_name, spec in suite["slices"].items():
         files = corpus_files(spec)
         if not files:
@@ -636,6 +637,8 @@ def cmd_check(args: argparse.Namespace) -> int:
                 errors.append(f"{qid}: 难度必须是简单/中等/困难")
             else:
                 difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
+                diff_bucket = slice_difficulty.setdefault(slice_name, {})
+                diff_bucket[item["difficulty"]] = diff_bucket.get(item["difficulty"], 0) + 1
             if item["scenario"] not in SCENARIOS:
                 errors.append(f"{qid}: 场景分类无效：{item['scenario'] or '空'}")
             else:
@@ -686,8 +689,20 @@ def cmd_check(args: argparse.Namespace) -> int:
         errors.append("nDCG@2 自检失败")
 
     standard_n = counts["slices"].get("standard", {}).get("queries", 0)
-    if standard_n != 100:
-        errors.append(f"standard 场景集应为 100 题，当前 {standard_n}")
+    if standard_n != 1000:
+        errors.append(f"standard 场景集应为 1000 题，当前 {standard_n}")
+    std_scenario = slice_scenario.get("standard", {})
+    if set(std_scenario) != SCENARIOS:
+        missing = sorted(SCENARIOS - set(std_scenario))
+        extra = sorted(set(std_scenario) - SCENARIOS)
+        errors.append(f"standard 场景集合不完整：缺 {missing} 多 {extra}")
+    off_balance = {name: n for name, n in std_scenario.items() if n not in (76, 77)}
+    if off_balance:
+        errors.append(f"standard 各场景应接近均分（76 或 77 题）：{off_balance}")
+    expect_diff = {"简单": 300, "中等": 400, "困难": 300}
+    std_diff = slice_difficulty.get("standard", {})
+    if std_diff != expect_diff:
+        errors.append(f"standard 难度分布应为 {expect_diff}，当前 {std_diff}")
     if errors:
         print("数据集检查失败：")
         for err in errors:

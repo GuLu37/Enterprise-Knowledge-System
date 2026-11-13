@@ -7,9 +7,9 @@
 | 切片 | 任务 | 对标 | 规模 |
 | --- | --- | --- | --- |
 | `enterprise` | 制度 / FAQ / 表格 / 工号 | 领域 RAG（FiQA 类） | 7 文档，41 条 GT（`docs/rag_accuracy_demo` + `docs/rrf_ablation_eval.json`） |
-| `standard` | 单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表、声明核验 | BEIR / NQ / HotpotQA / SciFact / RGB | 25 篇 Markdown，100 条 GT |
+| `standard` | 单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表、声明核验 | BEIR / NQ / HotpotQA / SciFact / RGB | 186 篇 Markdown，1000 条 GT |
 
-`standard` 100 题是场景评测口径，原 33 题全部保留。`enterprise` 41 题继续作为历史回归，不并进这 100 题，避免改掉旧的 41 条对拍口径。两套一起跑是 141 题。
+`standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留；新增 900 题和 161 篇澄川实验室卷册，供入库后做检索评测。`enterprise` 41 题继续作为历史回归，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 的 141 题跑分只覆盖当时的 100 题，不能当成这 1000 题的结果。
 
 每题都有：
 
@@ -20,9 +20,15 @@
 - `difficulty`：简单 / 中等 / 困难
 - `scenario`：场景分类
 
-`standard` 场景分布：单跳事实 10、领域问答 10、拒答边界 10、表格图表 9、模糊查询 8、多跳推理 8、时效性 8、长上下文 7、知识冲突 7、跨语言 7、噪声干扰 7、多文档综合 6、声明核验 3。新增事实使用砚台打印、鹤鸣 SDK、青岚涂料、折纸项目、泊岸仓班车，不改写原来 33 题的数字和工号。
+`standard` 场景尽量拉平：单跳事实、领域问答、表格图表、模糊查询、多跳推理、拒答边界、噪声干扰、长上下文、知识冲突、时效性、跨语言、多文档综合各 77 题，声明核验 76 题。难度是简单 300、中等 400、困难 300。
 
-`standard` 难度是简单 33、中等 39、困难 28。全量 141 题是简单 45、中等 63、困难 33。极端题（冲突、跨语言、长上下文里的易混数字、多跳）标成困难；单跳查表和现行口径标成简单。
+新增题用课题代号 `CX-E001` 起编，和原来的砚台、鹤鸣、青岚、折纸、泊岸数字分开。每道可答题的答案和证据句都能在 gold 原文里逐字找到；综合题的差值直接写在现行卷里，并与两年电价一致。多跳里有 15 道要串三篇文档。长文把事故针点埋在巡检垫文里，困难题另放带 `X` 后缀的邻近针点。冲突、时效题同时给出现行卷和已废止卷。跨语言困难题用英文提问，数字只写在中文句。拒答题的档案写明预算、证件或手机号没有记载。
+
+重新生成新增卷册和 `ex_` 题目：
+
+```bash
+python eval/rag_acceptance/expand_to_1000.py
+```
 
 指标（文档级，按 `metadata.source_name` 对齐 `relevant_sources`）：
 
@@ -46,7 +52,7 @@ Python FastAPI 后台入库不会让 cached BM25 失效。语料 `ready` 后若 
 python eval/rag_acceptance/run.py check
 ```
 
-检查：query id 唯一、`standard` 恰好 100 题、难度和场景合法、gold 文件存在、可答题与 gold 有词法重叠、标准答案和 `evidence` 能在 gold 原文中逐字对上（含 docx/xlsx）、拒答题带诱饵文档、nDCG 公式钉扎。
+检查：query id 唯一、`standard` 恰好 1000 题、13 类场景各 76 或 77 题、难度为简单 300 / 中等 400 / 困难 300、gold 文件存在、可答题与 gold 有词法重叠、标准答案和 `evidence` 能在 gold 原文中逐字对上（含 docx/xlsx）、拒答题带诱饵文档、nDCG 公式钉扎。
 
 ## 对拍 Python / Rust
 
@@ -76,8 +82,9 @@ python eval/rag_acceptance/run.py compare \
 ```
 eval/rag_acceptance/
   suite.json                          # 切片、指标、端点
-  datasets/standard/corpus/*.md       # 自建标准切片语料（含长文、冲突、时效、双语、图表）
-  datasets/standard/queries.jsonl     # 100 题：query、答案、证据、难度、场景
+  datasets/standard/corpus/*.md       # 自建标准切片语料；60_扩_* 为 1000 题新增卷册
+  datasets/standard/queries.jsonl     # 1000 题：query、答案、证据、难度、场景
+  expand_to_1000.py                   # 按同一规则重生 60_扩_* 与 ex_ 题
   run.py                              # check / compare
   README.md
 docs/rag_accuracy_demo/               # enterprise 语料

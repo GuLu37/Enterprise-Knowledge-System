@@ -115,3 +115,7 @@ sparse 在 standard 的可答题上 Hit@5 和 Recall@5 都是 100%。dense 的�
 `struct_03` 和 `sh_01` 在 dense、sparse 单独检索时都是第 1 名，hybrid 的响应是空列表。`tm_07` 的 sparse 把现行 2026 时刻表排在第 1，hybrid 把已废止的 2024 年表排到了前面。
 
 拒答失败的共同情况是：诱饵文档就是题目提到的那份材料，文中写明没有预算、手机号、售价或司机姓名。词面检索会把这份材料召回，Reject@5 于是记为失败。
+
+## 数据集扩到 1000 题
+
+上面三轮跑分都停在当时的题集。standard 后来在保留这 100 题的前提下扩到 1000 题，并新增 161 篇澄川实验室卷册（`eval/rag_acceptance/datasets/standard/corpus/60_扩_*.md`）。场景各 76 或 77 题，难度是简单 300、中等 400、困难 300。这 900 道新题还没有检索跑分，不能把 141 题的 Hit / Reject 当成 1000 题的结果。离线结构检查用 `python eval/rag_acceptance/run.py check`。
