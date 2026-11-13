@@ -63,18 +63,13 @@ fn take_return_limit<T>(items: Vec<T>, return_limit: usize) -> Vec<T> {
     items.into_iter().take(return_limit.max(1)).collect()
 }
 
-/// 前两名来自不同文档，或规则分差过小，视为排序不确定，值得走精排。
+/// 只有前两名规则分差小于 margin 时才视为排序不确定。
+/// 来自不同文档但分差已经拉开的，不再因此触发精排。
 fn rank_is_ambiguous(items: &[crate::retrieval::RetrievalItem], margin: f64) -> bool {
     let Some(second) = items.get(1) else {
         return false;
     };
-    let top = &items[0];
-    if (top.score - second.score) < margin {
-        return true;
-    }
-    let left = top.source_name.trim();
-    let right = second.source_name.trim();
-    !left.is_empty() && !right.is_empty() && left != right
+    items[0].score - second.score < margin
 }
 
 /// 复刻 `_attach_rule_only_metadata`：跳过精排时写入可观测标记并截断。
@@ -383,16 +378,21 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_when_margin_is_small_or_sources_differ() {
+    fn ambiguous_only_when_score_margin_is_small() {
         let close = vec![item("报销标准", 0.90), item("差旅流程", 0.89)];
         assert!(rank_is_ambiguous(&close, 0.08));
         let same_source = vec![item("报销标准", 0.90), item("差旅流程", 0.40)];
         assert!(!rank_is_ambiguous(&same_source, 0.08));
-        let different = vec![
+        let different_far = vec![
             item_from("02_采购审批流程.docx", "采购审批", 0.90),
             item_from("04_产品与账号常见问题.md", "引用资料", 0.70),
         ];
-        assert!(rank_is_ambiguous(&different, 0.08));
+        assert!(!rank_is_ambiguous(&different_far, 0.08));
+        let different_close = vec![
+            item_from("02_采购审批流程.docx", "采购审批", 0.90),
+            item_from("04_产品与账号常见问题.md", "引用资料", 0.85),
+        ];
+        assert!(rank_is_ambiguous(&different_close, 0.08));
         assert!(!rank_is_ambiguous(&close[..1], 0.08));
     }
 }
