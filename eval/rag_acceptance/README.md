@@ -32,7 +32,11 @@
 - **Reject@k**：不可回答题的 `bait_sources` 未进入 top-k
 - **p50 / p95 / QPS**：逐查询清缓存后的端到端延迟
 
-扩充前的全量 74 条对拍见 `docs/rag_acceptance_eval_report.md`（2026-11-12）。历史 41 条 enterprise 基线见 `docs/acceptance_py_vs_rust_report.md`（2026-11-06，dense/sparse Hit@5 两侧 95.12% / 100%，hybrid 90.24%）。新的 100 题场景集需要重新入库后再出对拍数。
+三轮结果的口径和对照写在 `docs/rag_acceptance_history.md`。分轮原文：
+
+- 2026-11-06，enterprise 41 题：`docs/acceptance_py_vs_rust_report.md`（dense/sparse Hit@5 两侧 95.12% / 100%，hybrid 90.24%）
+- 2026-11-12，74 题 Python / Rust 对拍：`docs/rag_acceptance_eval_report.md`，明细 `eval/rag_acceptance/runs/py_vs_rust.json`
+- 2026-11-13，141 题 Rust 全量：明细 `eval/rag_acceptance/runs/full_141.json`
 
 Python FastAPI 后台入库不会让 cached BM25 失效。语料 `ready` 后若 sparse 空结果，重启 Python 再跑（本轮重启后索引 559 行）。
 
