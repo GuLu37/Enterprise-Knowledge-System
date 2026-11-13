@@ -17,7 +17,7 @@
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
 | 1041 题全量 | 2026-11-13 16:22 | enterprise 41 + standard 1000 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1041.json`](../eval/rag_acceptance/runs/full_1041.json) |
-| 1500 题补齐 | 2026-11-13 | enterprise 41 + standard 1000 + supplement 459 | 未跑 |  |  | 题目在 [`eval/rag_acceptance/datasets/supplement/queries.jsonl`](../eval/rag_acceptance/datasets/supplement/queries.jsonl)，尚未检索 |
+| 1500 题全量 | 2026-11-13 17:28 | enterprise 41 + standard 1000 + supplement 459 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1500.json`](../eval/rag_acceptance/runs/full_1500.json) |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -210,4 +210,26 @@ Reject@5 降到 0/77，是因为诱饵文档仍被召回，而且现在 top-5 �
 
 补切片 `supplement` 共 459 题，使全库正好 1500 题。十二个场景各 100 题，多跳推理 300 题。其中多跳新增 223 题（简单 23 道 2 跳、中等 100 道 3 跳、困难 100 道 4 跳），其余 236 题按差额补进另外十二个场景。
 
-语料是 13 份朔方精密短文档，按 `27`–`39` 放在 `docs/rag_accuracy_demo`，不并进企业 01–07，也不并进澄川合订卷。多跳的四份台账仍是一行一条对应关系。这一套仍是一问一次检索，不调用聊天里的多轮 ReAct。重新生成用 `python eval/rag_acceptance/expand_to_1500.py`。这 459 题还没有检索跑分。
+语料是 13 份朔方精密短文档，按 `27`–`39` 放在 `docs/rag_accuracy_demo`，不并进企业 01–07，也不并进澄川合订卷。多跳的四份台账仍是一行一条对应关系。这一套仍是一问一次检索，不调用聊天里的多轮 ReAct。重新生成用 `python eval/rag_acceptance/expand_to_1500.py`。
+
+## 2026-11-13 17:28（北京时间）：1500 题 Rust 全量
+
+三套切片一起入库后检索。语料在上一轮 51 份之外加上 13 份朔方精密文档。模型仍是 Xenova `bge-base-zh-v1.5` fp32 ONNX，CPU，1 个会话，Cross-Encoder 关闭。每题先清结果缓存，稀疏索引保持。可答题 1400，拒答题 100。
+
+| 方法 | Hit@5 | Recall@5 | MRR@10 | nDCG@10 | Reject@5 | Abstain@5 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dense | 89.7%（1256/1400） | 74.9% | 0.894 | 0.783 | 29%（29/100） | 69%（69/100） | 29 ms | 36 ms |
+| sparse | 93.9%（1314/1400） | 81.9% | 0.898 | 0.818 | 4%（4/100） | 96%（96/100） | 4 ms | 6 ms |
+| hybrid | 99.9%（1399/1400） | 95.2% | 0.976 | 0.937 | 3%（3/100） | 95%（95/100） | 66 ms | 112 ms |
+
+综合成功（可答则 top-5 命中，拒答则诱饵不进 top-5）：
+
+| 方法 | enterprise 41 | standard 1000 | supplement 459 | 合计 1500 |
+| --- | --- | --- | --- | --- |
+| dense | 37/41 | 809/1000 | 439/459 | 1285/1500 |
+| sparse | 41/41 | 853/1000 | 424/459 | 1318/1500 |
+| hybrid | 41/41 | 922/1000 | 439/459 | 1402/1500 |
+
+hybrid 在 supplement 的 436 道可答题上 Hit@5 是 436/436。多跳 223/223 都命中至少一份 gold：2 跳 23 道的 Recall@5 是 100%，3 跳 100 道里有 62 道把三份都放进 top-5，4 跳 100 道平均只召回约一半文档。全库唯一没进 top-5 的可答题仍是 `struct_02`。企业 41 题和 standard 的 922/1000 与 16:58 那轮相同，新文档没有把这两套挤丢。
+
+supplement 的 23 道拒答里，有 3 道诱饵没进 top-5：`sf_rj_07`、`sf_rj_10`、`sf_rj_11`。其余拒答仍是诱饵被召回，切块里写了未记载。明细在 `eval/rag_acceptance/runs/full_1500.json`。
