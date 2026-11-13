@@ -1,5 +1,7 @@
 # 企业知识库系统 Python → Rust 重构验收对比报告
 
+本轮是评测历史的第一轮（企业 41 题，2026-11-06）。三轮对照见 `docs/rag_acceptance_history.md`。
+
 生成时间：2026-11-06 12:47:28
 
 环境：同机同语料同 Mock LLM（OpenAI 兼容、确定性策略、5ms 模拟延迟）；Python=纯 Python 内核（torch CPU BGE + rank_bm25 + torch CE），Rust=ONNX（DirectML GPU BGE 会话池 ×4 + ONNX CE(DirectML)，吞吐优化轮之后；优化前 auto 被解析为纯 CPU，见 3.4 节）。语料：docs/rag_accuracy_demo 7 份企业文档；查询集：docs/rrf_ablation_eval.json 41 条带 ground truth。

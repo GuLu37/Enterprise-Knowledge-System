@@ -3,246 +3,720 @@
     "id": "travel_01",
     "category": "差旅制度",
     "query": "出差结束后最晚多久要提交报销单？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "5 个工作日内"
+    ],
+    "evidence": [
+      "出差结束后 5 个工作日内提交报销单"
+    ]
   },
   {
     "id": "travel_02",
     "category": "差旅制度",
     "query": "晚上十点以后从机场打车回去，这笔费用能报销吗？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "22:00 后的市内出行可据实报销"
+    ],
+    "evidence": [
+      "机场、火车站往返及 22:00 后的市内出行可据实报销。"
+    ]
   },
   {
     "id": "travel_03",
     "category": "差旅制度",
     "query": "高铁单程超过六个小时，可以买一等座吗？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "行程超过 6 小时可选择一等座"
+    ],
+    "evidence": [
+      "原则上乘坐二等座；行程超过 6 小时可选择一等座。"
+    ]
   },
   {
     "id": "travel_04",
     "category": "差旅制度",
     "query": "电子发票重复打印后，能不能再报销一次？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "电子发票只能报销一次"
+    ],
+    "evidence": [
+      "电子发票不得重复报销。",
+      "电子发票只能报销一次"
+    ]
   },
   {
     "id": "travel_05",
     "category": "差旅制度",
     "query": "酒店已经提供早餐，当天餐补应该扣多少钱？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "扣减 40 元"
+    ],
+    "evidence": [
+      "酒店已提供早餐的，当日餐补按标准扣减 40 元"
+    ]
   },
   {
     "id": "travel_06",
     "category": "差旅制度",
     "query": "几个人一起住酒店，住宿费怎么分摊报销？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "困难",
+    "answers": [
+      "按实际入住人分摊报销"
+    ],
+    "evidence": [
+      "可按实际入住人分摊报销，或者分别开票"
+    ]
   },
   {
     "id": "travel_07",
     "category": "差旅制度",
     "query": "出差期间因为个人原因多住几天，公司还承担这几天的住宿和餐补吗？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "由个人承担"
+    ],
+    "evidence": [
+      "延长期间住宿、餐补和市内交通由个人承担"
+    ]
   },
   {
     "id": "travel_08",
     "category": "差旅制度",
     "query": "因为客户临时取消行程产生的退票费可以报吗，需要留什么材料？",
-    "relevant_sources": ["01_差旅报销制度_V2.0.docx", "05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "01_差旅报销制度_V2.0.docx",
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "可据实报销"
+    ],
+    "evidence": [
+      "火车票、机票、酒店改签费和退票费可据实报销"
+    ]
   },
   {
     "id": "procurement_01",
     "category": "采购流程",
     "query": "含税金额不超过5000元的采购由谁审批？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "部门负责人"
+    ],
+    "evidence": [
+      "由部门负责人审批"
+    ]
   },
   {
     "id": "procurement_02",
     "category": "采购流程",
     "query": "采购金额在5万到20万之间，需要哪些审批人和材料？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "困难",
+    "answers": [
+      "采购部负责人 + 财务部",
+      "比价记录、预算归属、供应商准入信息"
+    ],
+    "evidence": [
+      "超过 50,000 元至 200,000 元",
+      "采购部负责人 + 财务部"
+    ]
   },
   {
     "id": "procurement_03",
     "category": "采购流程",
     "query": "紧急采购可以先做，之后多长时间内补录申请？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "24 小时内"
+    ],
+    "evidence": [
+      "采购发生后 24 小时内补录申请"
+    ]
   },
   {
     "id": "procurement_04",
     "category": "采购流程",
     "query": "采购申请审批通过后，能不能先给供应商下订单？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "未经审批不得口头下单"
+    ],
+    "evidence": [
+      "未经审批不得口头下单"
+    ]
   },
   {
     "id": "procurement_05",
     "category": "采购流程",
     "query": "单一来源采购需要提供什么价格合理性证明？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "历史采购价、市场公开价格、原厂报价或同类项目对比"
+    ],
+    "evidence": [
+      "提供历史采购价、市场公开价格、原厂报价或同类项目对比。"
+    ]
   },
   {
     "id": "procurement_06",
     "category": "采购流程",
     "query": "第一次合作的供应商在下单前要完成哪些准入核验？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "营业执照、收款账户、联系人信息"
+    ],
+    "evidence": [
+      "核验营业执照、收款账户、联系人信息和历史合作风险"
+    ]
   },
   {
     "id": "procurement_07",
     "category": "采购流程",
     "query": "同一个供应商在30天内多次购买同类服务，金额怎么计算？",
-    "relevant_sources": ["02_采购审批流程.docx"]
+    "relevant_sources": [
+      "02_采购审批流程.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "合并计算采购金额"
+    ],
+    "evidence": [
+      "应合并计算采购金额"
+    ]
   },
   {
     "id": "alpha_01",
     "category": "项目上线",
     "query": "项目 Alpha 常规生产发布窗口是每周什么时候？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "每周三 20:00 至 22:00"
+    ],
+    "evidence": [
+      "每周三 20:00 至 22:00"
+    ]
   },
   {
     "id": "alpha_02",
     "category": "项目上线",
     "query": "哪些情况发生时应该立即停止扩容并启动回滚？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "困难",
+    "answers": [
+      "停止扩容并启动回滚"
+    ],
+    "evidence": [
+      "运维负责人有权立即停止扩容并启动回滚。"
+    ]
   },
   {
     "id": "alpha_03",
     "category": "项目上线",
     "query": "Alpha 生产回滚要求在多长时间内恢复？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "15 分钟内"
+    ],
+    "evidence": [
+      "在 15 分钟内恢复到上一稳定应用版本"
+    ]
   },
   {
     "id": "alpha_04",
     "category": "项目上线",
     "query": "测试环境验证通过后，可以直接把版本发到生产吗？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "不可以"
+    ],
+    "evidence": [
+      "测试环境通过不等于生产可发布。"
+    ]
   },
   {
     "id": "alpha_05",
     "category": "项目上线",
     "query": "如果数据库迁移不可逆，发生故障时应该先回滚什么？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "困难",
+    "answers": [
+      "先执行数据修复脚本，再回滚应用版本"
+    ],
+    "evidence": [
+      "必须先执行发布单中列出的数据修复脚本，再回滚应用版本。"
+    ]
   },
   {
     "id": "alpha_06",
     "category": "项目上线",
     "query": "生产全量发布后至少要观察多久才能结束首轮观察？",
-    "relevant_sources": ["03_项目Alpha上线手册.docx"]
+    "relevant_sources": [
+      "03_项目Alpha上线手册.docx"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "30 分钟"
+    ],
+    "evidence": [
+      "全量发布后保持 30 分钟稳定观察"
+    ]
   },
   {
     "id": "faq_01",
     "category": "产品账号FAQ",
     "query": "还能正常登录时，修改密码应该怎么操作？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "修改密码"
+    ],
+    "evidence": [
+      "选择“修改密码”，输入当前密码、新密码和重复的新密码后提交。"
+    ]
   },
   {
     "id": "faq_02",
     "category": "产品账号FAQ",
     "query": "管理员和系统管理员的权限边界有什么不同？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "不能重置其他部门用户的登录密码"
+    ],
+    "evidence": [
+      "不能重置其他部门用户的登录密码"
+    ]
   },
   {
     "id": "faq_03",
     "category": "产品账号FAQ",
     "query": "项目 Alpha 的生产环境访问权限最长可以申请多久？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "90 天"
+    ],
+    "evidence": [
+      "有效期最长为 90 天"
+    ]
   },
   {
     "id": "faq_04",
     "category": "产品账号FAQ",
     "query": "连续输错几次密码会锁定账号，锁多久？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "简单",
+    "answers": [
+      "5 次",
+      "30 分钟"
+    ],
+    "evidence": [
+      "连续 5 次输入错误密码后，账号将被锁定 30 分钟。"
+    ]
   },
   {
     "id": "faq_05",
     "category": "产品账号FAQ",
     "query": "文档上传后为什么不能马上搜索到？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "已完成"
+    ],
+    "evidence": [
+      "文档状态显示“已完成”后才可参与检索。"
+    ]
   },
   {
     "id": "faq_06",
     "category": "产品账号FAQ",
     "query": "什么情况下回答不会显示知识库引用资料？",
-    "relevant_sources": ["04_产品与账号常见问题.md"]
+    "relevant_sources": [
+      "04_产品与账号常见问题.md"
+    ],
+    "scenario": "领域问答",
+    "difficulty": "中等",
+    "answers": [
+      "资料不足"
+    ],
+    "evidence": [
+      "系统应明确提示资料不足"
+    ]
   },
   {
     "id": "expense_01",
     "category": "费用标准表",
     "query": "一线城市 P5 员工每晚住宿费上限是多少？",
-    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+    "relevant_sources": [
+      "05_费用标准表.xlsx",
+      "01_差旅报销制度_V2.0.docx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "简单",
+    "answers": [
+      "650 元"
+    ],
+    "evidence": [
+      "一线城市 P5-P6 员工单晚住宿上限为 650 元",
+      "650 元/晚"
+    ]
   },
   {
     "id": "expense_02",
     "category": "费用标准表",
     "query": "新一线或省会城市的 P4 员工每天餐补标准是多少？",
-    "relevant_sources": ["05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "简单",
+    "answers": [
+      "100 元/天"
+    ],
+    "evidence": [
+      "100 元/天"
+    ]
   },
   {
     "id": "expense_03",
     "category": "费用标准表",
     "query": "酒店含早餐时，餐补按什么规则扣减？",
-    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+    "relevant_sources": [
+      "05_费用标准表.xlsx",
+      "01_差旅报销制度_V2.0.docx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "扣减 40 元"
+    ],
+    "evidence": [
+      "酒店已提供早餐的，当日餐补按标准扣减 40 元"
+    ]
   },
   {
     "id": "expense_04",
     "category": "费用标准表",
     "query": "客户宴请可以算在差旅餐补里吗？",
-    "relevant_sources": ["05_费用标准表.xlsx", "01_差旅报销制度_V2.0.docx"]
+    "relevant_sources": [
+      "05_费用标准表.xlsx",
+      "01_差旅报销制度_V2.0.docx"
+    ],
+    "scenario": "多文档综合",
+    "difficulty": "中等",
+    "answers": [
+      "业务招待费"
+    ],
+    "evidence": [
+      "应按业务招待费流程单独申请"
+    ]
   },
   {
     "id": "expense_05",
     "category": "费用标准表",
     "query": "出差地的公交、地铁和机场快线能否据实报销？",
-    "relevant_sources": ["05_费用标准表.xlsx"]
+    "relevant_sources": [
+      "05_费用标准表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "简单",
+    "answers": [
+      "据实报销"
+    ],
+    "evidence": [
+      "出差地公交、地铁、机场快线"
+    ]
   },
   {
     "id": "employee_01",
     "category": "员工信息表",
     "query": "员工号 E0011 的姓名和所属部门是什么？",
-    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+    "relevant_sources": [
+      "06_企业内部信息总表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "简单",
+    "answers": [
+      "卫雅琪",
+      "采购部"
+    ],
+    "evidence": [
+      "卫雅琪",
+      "采购部"
+    ]
   },
   {
     "id": "employee_02",
     "category": "员工信息表",
     "query": "采购部的部门邮箱是什么？",
-    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+    "relevant_sources": [
+      "06_企业内部信息总表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "简单",
+    "answers": [
+      "procurement@northstar-enterprise.cn"
+    ],
+    "evidence": [
+      "procurement@northstar-enterprise.cn"
+    ]
   },
   {
     "id": "employee_03",
     "category": "员工信息表",
     "query": "哪些产品适合运维部采购使用？",
-    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+    "relevant_sources": [
+      "06_企业内部信息总表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "困难",
+    "answers": [
+      "研发协作平台1",
+      "研发协作平台2",
+      "研发协作平台3",
+      "数据库订阅1",
+      "数据库订阅2",
+      "数据库订阅3",
+      "日志平台订阅1",
+      "日志平台订阅2",
+      "日志平台订阅3",
+      "向量检索服务1",
+      "向量检索服务2",
+      "向量检索服务3",
+      "知识库向量检索服务",
+      "项目上线应急包"
+    ],
+    "evidence": [
+      "研发协作平台1",
+      "研发协作平台2",
+      "研发协作平台3",
+      "数据库订阅1",
+      "数据库订阅2",
+      "数据库订阅3",
+      "日志平台订阅1",
+      "日志平台订阅2",
+      "日志平台订阅3",
+      "向量检索服务1",
+      "向量检索服务2",
+      "向量检索服务3",
+      "知识库向量检索服务",
+      "项目上线应急包"
+    ]
   },
   {
     "id": "employee_04",
     "category": "员工信息表",
     "query": "产品号 P90003 主要适合什么业务场景？",
-    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+    "relevant_sources": [
+      "06_企业内部信息总表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "中等",
+    "answers": [
+      "差旅报销核验模块",
+      "适合差旅制度检索与报销规则演示"
+    ],
+    "evidence": [
+      "差旅报销核验模块",
+      "适合差旅制度检索与报销规则演示"
+    ]
   },
   {
     "id": "employee_05",
     "category": "员工信息表",
     "query": "财务部负责费用审核和付款的员工是谁？",
-    "relevant_sources": ["06_企业内部信息总表.xlsx"]
+    "relevant_sources": [
+      "06_企业内部信息总表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "中等",
+    "answers": [
+      "陈思远"
+    ],
+    "evidence": [
+      "陈思远"
+    ]
   },
   {
     "id": "salary_01",
     "category": "工资表",
     "query": "员工号 E0008 的实发工资是多少？",
-    "relevant_sources": ["07_本月工资表.xlsx"]
+    "relevant_sources": [
+      "07_本月工资表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "简单",
+    "answers": [
+      "25956.25"
+    ],
+    "evidence": [
+      "25956.25"
+    ]
   },
   {
     "id": "salary_02",
     "category": "工资表",
     "query": "员工工资明细表里有哪些字段？",
-    "relevant_sources": ["07_本月工资表.xlsx"]
+    "relevant_sources": [
+      "07_本月工资表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "中等",
+    "answers": [
+      "员工号",
+      "员工姓名",
+      "所属部门",
+      "岗位名称",
+      "岗位等级",
+      "员工状态",
+      "入职日期",
+      "应出勤天数",
+      "实际出勤天数",
+      "基本工资",
+      "岗位津贴",
+      "绩效奖金",
+      "应发工资",
+      "社保公积金",
+      "个税",
+      "其他扣款",
+      "实发工资"
+    ],
+    "evidence": [
+      "实发工资"
+    ]
   },
   {
     "id": "salary_03",
     "category": "工资表",
     "query": "运维部员工 E0013 当前是什么状态，实发工资多少？",
-    "relevant_sources": ["07_本月工资表.xlsx"]
+    "relevant_sources": [
+      "07_本月工资表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "中等",
+    "answers": [
+      "试用",
+      "21251.18"
+    ],
+    "evidence": [
+      "试用",
+      "21251.18"
+    ]
   },
   {
     "id": "salary_04",
     "category": "工资表",
     "query": "员工号 E0024 的岗位和实发工资是什么？",
-    "relevant_sources": ["07_本月工资表.xlsx"]
+    "relevant_sources": [
+      "07_本月工资表.xlsx"
+    ],
+    "scenario": "表格图表",
+    "difficulty": "中等",
+    "answers": [
+      "资产管理员",
+      "46334.06"
+    ],
+    "evidence": [
+      "资产管理员",
+      "46334.06"
+    ]
   }
 ]
