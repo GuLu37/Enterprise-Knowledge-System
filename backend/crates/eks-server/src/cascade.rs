@@ -63,6 +63,20 @@ fn take_return_limit<T>(items: Vec<T>, return_limit: usize) -> Vec<T> {
     items.into_iter().take(return_limit.max(1)).collect()
 }
 
+/// 前两名来自不同文档，或规则分差过小，视为排序不确定，值得走精排。
+fn rank_is_ambiguous(items: &[crate::retrieval::RetrievalItem], margin: f64) -> bool {
+    let Some(second) = items.get(1) else {
+        return false;
+    };
+    let top = &items[0];
+    if (top.score - second.score) < margin {
+        return true;
+    }
+    let left = top.source_name.trim();
+    let right = second.source_name.trim();
+    !left.is_empty() && !right.is_empty() && left != right
+}
+
 /// 复刻 `_attach_rule_only_metadata`：跳过精排时写入可观测标记并截断。
 fn attach_rule_only(
     mut items: Vec<crate::retrieval::RetrievalItem>,
@@ -146,7 +160,8 @@ impl crate::retrieval_engine::RetrievalEngine {
         }
         if trigger_mode != "always" {
             let confidence = rule_top1_confidence(&rule_ranked);
-            if rule_ranked.len() <= return_limit {
+            let ambiguous = rank_is_ambiguous(&rule_ranked, self.ce_margin);
+            if rule_ranked.len() <= return_limit && !ambiguous {
                 return attach_rule_only(
                     rule_ranked,
                     "rule_only_small_pool",
@@ -154,9 +169,7 @@ impl crate::retrieval_engine::RetrievalEngine {
                     return_limit,
                 );
             }
-            let top1 = rule_ranked[0].score;
-            let top2 = rule_ranked.get(1).map(|item| item.score).unwrap_or(0.0);
-            if confidence >= self.ce_threshold && (top1 - top2) >= self.ce_margin {
+            if confidence >= self.ce_threshold && !ambiguous {
                 return attach_rule_only(
                     rule_ranked,
                     "rule_only_high_confidence",
@@ -253,12 +266,16 @@ mod tests {
     use crate::retrieval::{ItemSignals, RetrievalItem, RerankTrace};
 
     fn item(content: &str, score: f64) -> RetrievalItem {
+        item_from("手册.md", content, score)
+    }
+
+    fn item_from(source_name: &str, content: &str, score: f64) -> RetrievalItem {
         RetrievalItem {
             content: content.into(),
             score,
             source: "hybrid".into(),
-            document_id: "d1".into(),
-            source_name: "手册.md".into(),
+            document_id: source_name.into(),
+            source_name: source_name.into(),
             chunk_index: 0,
             child_id: "c1".into(),
             parent_id: "p1".into(),
@@ -363,5 +380,19 @@ mod tests {
         assert!(outside_json["metadata"]["cross_encoder_score"].is_null());
         assert!(outside_json["metadata"]["cross_encoder_candidate_rank"].is_null());
         assert_eq!(outside_json["metadata"]["rule_score"], 0.1);
+    }
+
+    #[test]
+    fn ambiguous_when_margin_is_small_or_sources_differ() {
+        let close = vec![item("报销标准", 0.90), item("差旅流程", 0.89)];
+        assert!(rank_is_ambiguous(&close, 0.08));
+        let same_source = vec![item("报销标准", 0.90), item("差旅流程", 0.40)];
+        assert!(!rank_is_ambiguous(&same_source, 0.08));
+        let different = vec![
+            item_from("02_采购审批流程.docx", "采购审批", 0.90),
+            item_from("04_产品与账号常见问题.md", "引用资料", 0.70),
+        ];
+        assert!(rank_is_ambiguous(&different, 0.08));
+        assert!(!rank_is_ambiguous(&close[..1], 0.08));
     }
 }

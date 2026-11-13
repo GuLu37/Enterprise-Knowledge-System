@@ -274,6 +274,187 @@ fn structured_schema_score(item: &RetrievalItem, query: &str) -> f64 {
     score.min(1.0)
 }
 
+fn item_contains_identifier(item: &RetrievalItem, identifier: &str) -> bool {
+    let key: String = identifier
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect::<String>()
+        .to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    let text = format!("{}\n{}\n{}", item.content, item.source_name, item.document_id);
+    let text_key: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect::<String>()
+        .to_lowercase();
+    text_key.contains(&key)
+}
+
+fn identifier_table_score(item: &RetrievalItem, query: &str) -> f64 {
+    let schema = structured_schema_score(item, query);
+    let source = eks_kernels::text::normalize_text(&item.source_name);
+    let (sheet, header) = structured_schema_parts(&item.content);
+    let haystack = eks_kernels::text::normalize_text(&format!("{sheet}\n{header}\n{source}"));
+    let query_text = eks_kernels::text::normalize_text(&query.split_whitespace().collect::<String>());
+    let has_query = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|term| query_text.contains(&eks_kernels::text::normalize_text(term)))
+    };
+    let has_table = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|term| haystack.contains(&eks_kernels::text::normalize_text(term)))
+    };
+    let mut bonus = 0.0;
+    if has_query(&["实发", "应发", "工资", "薪资", "薪酬"]) {
+        if has_table(&["工资", "薪资", "实发", "应发"]) {
+            bonus += 0.4;
+        }
+        if has_table(&["花名册", "名册", "信息总表"]) {
+            bonus -= 0.2;
+        }
+    } else if has_query(&["部门", "所属部门", "姓名", "花名册"]) {
+        if has_table(&["部门", "花名册", "名册", "信息总表"]) {
+            bonus += 0.4;
+        }
+        if has_table(&["工资", "薪资"]) {
+            bonus -= 0.2;
+        }
+    }
+    schema + bonus
+}
+
+fn best_identifier_match(
+    ranking_pool: &[usize],
+    reranked: &[RetrievalItem],
+    identifier: &str,
+    query: &str,
+) -> Option<usize> {
+    ranking_pool
+        .iter()
+        .copied()
+        .filter(|&index| item_contains_identifier(&reranked[index], identifier))
+        .max_by(|&left, &right| {
+            identifier_table_score(&reranked[left], query)
+                .partial_cmp(&identifier_table_score(&reranked[right], query))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    reranked[left]
+                        .score
+                        .partial_cmp(&reranked[right].score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| right.cmp(&left))
+        })
+}
+
+fn source_query_overlap(item: &RetrievalItem, query: &str) -> usize {
+    let keywords = build_query_keywords(query, 24);
+    let preview: String = item.content.chars().take(160).collect();
+    let haystack = eks_kernels::text::normalize_text(&format!("{}\n{preview}", item.source_name));
+    keywords
+        .iter()
+        .filter(|term| {
+            term.chars().count() >= 2
+                && haystack.contains(&eks_kernels::text::normalize_text(term))
+        })
+        .count()
+}
+
+fn citation_index_key(item: &RetrievalItem, structured_lookup: bool) -> (String, String, String) {
+    if structured_lookup {
+        (
+            item.document_id.clone(),
+            item.parent_id.clone(),
+            if item.child_id.is_empty() {
+                item.chunk_index.to_string()
+            } else {
+                item.child_id.clone()
+            },
+        )
+    } else {
+        citation_chunk_key(item)
+    }
+}
+
+fn select_final_indexes(
+    protected: &[usize],
+    filtered: &[usize],
+    ranking_pool: &[usize],
+    reranked: &[RetrievalItem],
+    query: &str,
+    limit: usize,
+    structured_lookup: bool,
+) -> Vec<usize> {
+    let mut selected: Vec<usize> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let push = |index: usize, selected: &mut Vec<usize>, seen: &mut HashSet<(String, String, String)>| {
+        if selected.len() >= limit {
+            return false;
+        }
+        let key = citation_index_key(&reranked[index], structured_lookup);
+        if !seen.insert(key) {
+            return false;
+        }
+        selected.push(index);
+        true
+    };
+
+    for &index in protected {
+        push(index, &mut selected, &mut seen);
+    }
+    if structured_lookup {
+        for &index in filtered {
+            push(index, &mut selected, &mut seen);
+        }
+        return selected;
+    }
+
+    let mut seen_sources: HashSet<String> = selected
+        .iter()
+        .map(|&index| reranked[index].source_name.clone())
+        .collect();
+    let mut unique_candidates: Vec<usize> = Vec::new();
+    for source_pool in [filtered, ranking_pool] {
+        for &index in source_pool {
+            let source = &reranked[index].source_name;
+            if source.is_empty() || seen_sources.contains(source) {
+                continue;
+            }
+            if unique_candidates
+                .iter()
+                .any(|&existing| reranked[existing].source_name == *source)
+            {
+                continue;
+            }
+            unique_candidates.push(index);
+        }
+    }
+    unique_candidates.sort_by(|&left, &right| {
+        source_query_overlap(&reranked[right], query)
+            .cmp(&source_query_overlap(&reranked[left], query))
+            .then_with(|| {
+                reranked[right]
+                    .score
+                    .partial_cmp(&reranked[left].score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.cmp(&right))
+    });
+    for index in unique_candidates {
+        if push(index, &mut selected, &mut seen) {
+            seen_sources.insert(reranked[index].source_name.clone());
+        }
+    }
+    for &index in filtered {
+        push(index, &mut selected, &mut seen);
+    }
+    selected
+}
+
 pub struct RetrievalEngine {
     pub store: MilvusLiteStore,
     pub embedder: Arc<Embedder>,
@@ -731,8 +912,11 @@ impl RetrievalEngine {
         method: &str,
         llm: Option<&LlmClient>,
     ) -> Result<(Vec<RetrievalItem>, Vec<String>), String> {
+        let identifier_query = eks_kernels::rerank::is_identifier_query(query);
         let mut queries = expand_multi_query_with_llm(query, llm, MAX_MULTI_QUERY_COUNT).await;
-        if !eks_kernels::rerank::is_identifier_query(query) {
+        if identifier_query {
+            queries.truncate(1);
+        } else {
             queries.truncate(MAX_MULTI_QUERY_COUNT);
         }
         if queries.is_empty() {
@@ -786,6 +970,11 @@ impl RetrievalEngine {
             Vec::new()
         };
         let dense_ready = want_dense && query_vectors.len() == queries.len();
+        let (dense_weight, sparse_weight) = if identifier_query {
+            (0.3, 0.7)
+        } else {
+            (self.dense_weight, self.sparse_weight)
+        };
         let mut variant_sets: Vec<Vec<RetrievalItem>> = Vec::with_capacity(queries.len());
         for (position, q) in queries.iter().enumerate() {
             let mut channel_sets: Vec<Vec<FuseItem<RetrievalItem>>> = Vec::new();
@@ -807,7 +996,7 @@ impl RetrievalEngine {
                             .collect();
                         if !dense.is_empty() {
                             channel_sets.push(dense);
-                            channel_weights.push(self.dense_weight);
+                            channel_weights.push(dense_weight);
                             channel_labels.push("dense");
                         }
                     }
@@ -830,7 +1019,7 @@ impl RetrievalEngine {
                         .collect();
                 if !sparse.is_empty() {
                     channel_sets.push(sparse);
-                    channel_weights.push(self.sparse_weight);
+                    channel_weights.push(sparse_weight);
                     channel_labels.push("sparse");
                 }
             }
@@ -1213,62 +1402,28 @@ impl RetrievalEngine {
             chosen
         };
 
-        // 多编号保护
+        // 多编号保护：同一工号出现在多张表时，按问句 schema 选表，而不是候选池出现顺序。
         let mut protected: Vec<usize> = Vec::new();
         for identifier in &identifiers {
-            let key: String = identifier
-                .chars()
-                .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
-                .collect::<String>()
-                .to_lowercase();
-            let matched = ranking_pool.iter().find(|&&i| {
-                let item = &reranked[i];
-                let text = format!("{}\n{}\n{}", item.content, item.source_name, item.document_id);
-                let text_key: String = text
-                    .chars()
-                    .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
-                    .collect::<String>()
-                    .to_lowercase();
-                text_key.contains(&key)
-            });
-            if let Some(&index) = matched {
-                protected.push(index);
+            if let Some(index) = best_identifier_match(&ranking_pool, &reranked, identifier, query) {
+                if !protected.contains(&index) {
+                    protected.push(index);
+                }
             }
         }
 
-        let mut deduplicated: Vec<RetrievalItem> = Vec::new();
-        let mut seen: HashSet<(String, String, String)> = HashSet::new();
-        let mut append = |item: &RetrievalItem,
-                          out: &mut Vec<RetrievalItem>,
-                          seen: &mut HashSet<(String, String, String)>| {
-            if out.len() >= resolved_top_k {
-                return;
-            }
-            let key = if structured_lookup {
-                (
-                    item.document_id.clone(),
-                    item.parent_id.clone(),
-                    if item.child_id.is_empty() { item.chunk_index.to_string() } else { item.child_id.clone() },
-                )
-            } else {
-                citation_chunk_key(item)
-            };
-            if seen.contains(&key) {
-                return;
-            }
-            seen.insert(key);
-            out.push(item.clone());
-        };
-        for &index in &protected {
-            append(&reranked[index], &mut deduplicated, &mut seen);
-        }
-        for &index in &filtered_indexes {
-            if deduplicated.len() >= resolved_top_k {
-                break;
-            }
-            append(&reranked[index], &mut deduplicated, &mut seen);
-        }
-        deduplicated
+        select_final_indexes(
+            &protected,
+            &filtered_indexes,
+            &ranking_pool,
+            &reranked,
+            query,
+            resolved_top_k,
+            structured_lookup,
+        )
+        .into_iter()
+        .map(|index| reranked[index].clone())
+        .collect()
     }
 
     async fn expand_parent_evidence(
@@ -1836,6 +1991,102 @@ mod tests {
             format_dense_debug("差旅报销", 5),
             "密集检索: 差旅报销 (top_k: 5)"
         );
+    }
+
+    fn sheet_item(source: &str, content: &str, score: f64, child: &str) -> RetrievalItem {
+        RetrievalItem {
+            content: content.into(),
+            score,
+            source: "hybrid".into(),
+            document_id: source.into(),
+            source_name: source.into(),
+            chunk_index: 0,
+            child_id: child.into(),
+            parent_id: format!("{source}:p"),
+            parent_index: 0,
+            file_type: "xlsx".into(),
+            content_type: "spreadsheet".into(),
+            signals: None,
+            parent_context_text: None,
+            rerank_stage: None,
+            cross_encoder_score: None,
+            rerank_trace: crate::retrieval::RerankTrace::default(),
+            structured_aggregation: false,
+            section_name: None,
+            chunk_indices: Vec::new(),
+            matched_sources: Vec::new(),
+            fusion_score: None,
+        }
+    }
+
+    #[test]
+    fn identifier_protection_prefers_schema_over_pool_order() {
+        let salary = sheet_item(
+            "07_本月工资表.xlsx",
+            "[Sheet]工资明细\n工号,姓名,实发工资\nE0011,张三,12000",
+            0.9,
+            "sal",
+        );
+        let roster = sheet_item(
+            "06_企业内部信息总表.xlsx",
+            "[Sheet]员工花名册\n工号,姓名,所属部门\nE0011,张三,研发",
+            0.8,
+            "roster",
+        );
+        let reranked = vec![salary, roster];
+        let pool = vec![0usize, 1];
+        let salary_query = "员工号 E0011 的实发工资是多少？";
+        let dept_query = "员工号 E0011 的姓名和所属部门是什么？";
+        assert_eq!(
+            best_identifier_match(&pool, &reranked, "E0011", salary_query),
+            Some(0)
+        );
+        assert_eq!(
+            best_identifier_match(&pool, &reranked, "E0011", dept_query),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn final_indexes_keep_second_source_for_multi_hop() {
+        let traffic = sheet_item("10_百科_交通地理.md", "星澜高铁站出站后步行。", 0.9, "a");
+        let traffic2 = sheet_item("10_百科_交通地理.md", "高铁线路说明。", 0.85, "b");
+        let finance = sheet_item("12_财务_进项发票与退税.md", "专票抵扣。", 0.8, "c");
+        let hq = sheet_item("16_组织_北辰总部地点.md", "北辰集团全球总部在云栖园区。", 0.7, "d");
+        let shuttle = sheet_item("17_交通_云栖园区接驳.md", "云栖站2号口步行到总部。", 0.75, "e");
+        let mut traffic = traffic;
+        traffic.file_type = "md".into();
+        let mut traffic2 = traffic2;
+        traffic2.file_type = "md".into();
+        let mut finance = finance;
+        finance.file_type = "md".into();
+        let mut hq = hq;
+        hq.file_type = "md".into();
+        let mut shuttle = shuttle;
+        shuttle.file_type = "md".into();
+        let reranked = vec![traffic, traffic2, finance, shuttle, hq];
+        let filtered = vec![0usize, 1, 2];
+        let ranking_pool = vec![0usize, 1, 2, 3, 4];
+        let selected = select_final_indexes(
+            &[],
+            &filtered,
+            &ranking_pool,
+            &reranked,
+            "从星澜高铁下车后步行多久能到北辰集团全球总部？",
+            3,
+            false,
+        );
+        let sources: Vec<&str> = selected
+            .iter()
+            .map(|&index| reranked[index].source_name.as_str())
+            .collect();
+        assert!(
+            sources.iter().any(|name| name.contains("北辰总部") || name.contains("云栖园区")),
+            "多跳应给第二篇相关文档留位，当前 {sources:?}"
+        );
+        assert_eq!(sources.len(), 3);
+        let unique = sources.iter().copied().collect::<std::collections::HashSet<_>>();
+        assert!(unique.len() >= 2, "不应让同一文档占满短名单: {sources:?}");
     }
 
     #[test]

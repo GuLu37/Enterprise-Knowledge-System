@@ -283,6 +283,40 @@ pub fn collapse_spaces(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn compact_query_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !"：:，,。？?、.-".contains(*c))
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 丢掉几乎重复的改写，避免 hybrid 为同一句话嵌三次向量。
+pub fn collapse_near_duplicate_queries(queries: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    for query in queries {
+        let key = compact_query_key(&query);
+        if key.is_empty() {
+            continue;
+        }
+        let duplicate = keys.iter().any(|existing| {
+            if existing == &key {
+                return true;
+            }
+            let shorter = existing.len().min(key.len());
+            let longer = existing.len().max(key.len());
+            shorter * 10 >= longer * 8
+                && (existing.contains(&key) || key.contains(existing))
+        });
+        if duplicate {
+            continue;
+        }
+        keys.push(key);
+        kept.push(query);
+    }
+    kept
+}
+
 fn normalize_query_variants(candidates: &[String], base_query: &str, max_queries: usize) -> Vec<String> {
     let normalized_base = collapse_spaces(base_query.trim());
     let mut expanded: Vec<String> = Vec::new();
@@ -600,10 +634,12 @@ fn expand_multi_query_with_limit(query: &str, max_queries: usize) -> Vec<String>
     if normalized_query.is_empty() {
         return Vec::new();
     }
-    if is_identifier_query(&normalized_query) {
-        return identifier_query_variants(&normalized_query);
-    }
-    heuristic_multi_query_variants(&normalized_query, max_queries.max(1))
+    let variants = if is_identifier_query(&normalized_query) {
+        identifier_query_variants(&normalized_query)
+    } else {
+        heuristic_multi_query_variants(&normalized_query, max_queries.max(1))
+    };
+    collapse_near_duplicate_queries(variants)
 }
 
 fn variant_text(value: &Value) -> String {
@@ -675,6 +711,7 @@ pub async fn expand_multi_query_with_llm(
             let payload = parse_multi_query_payload(&result.content);
             if let Some(variants) = apply_llm_multi_query_payload(&normalized_query, &payload, max_queries)
             {
+                let variants = collapse_near_duplicate_queries(variants);
                 tracing::info!(
                     query = normalized_query.as_str(),
                     count = variants.len(),
@@ -691,12 +728,11 @@ pub async fn expand_multi_query_with_llm(
 
 fn identifier_query_variants(query: &str) -> Vec<String> {
     let normalized_query = collapse_spaces(query.trim());
-    let mut candidates = vec![normalized_query.clone()];
-    for term in canonical_identifier_terms(&normalized_query) {
-        candidates.push(term);
+    if normalized_query.is_empty() {
+        return Vec::new();
     }
-    let max = MAX_MULTI_QUERY_COUNT.max(candidates.len());
-    normalize_query_variants(&candidates, &normalized_query, max)
+    // 工号题只保留原句。把裸编号再当一条查询会把工资表和花名册一起抬上来。
+    vec![normalized_query]
 }
 
 /// 复刻 _canonical_identifier_terms：编号按压缩键去重保留代表值。
@@ -1011,6 +1047,22 @@ mod tests {
     fn identifier_query_keeps_number_terms() {
         let queries = expand_multi_query("查询工号 E0011");
         assert!(queries.iter().any(|item| item.contains("E0011")));
+        assert_eq!(
+            expand_multi_query("员工号 E0011 的姓名和所属部门是什么？").len(),
+            1,
+            "工号题不应再扩出裸编号变体"
+        );
+    }
+
+    #[test]
+    fn near_duplicate_query_variants_collapse() {
+        let collapsed = collapse_near_duplicate_queries(vec![
+            "差旅报销流程是什么".into(),
+            "差旅报销流程是什么".into(),
+            "差旅报销流程是什么吗".into(),
+            "费用标准".into(),
+        ]);
+        assert_eq!(collapsed, vec!["差旅报销流程是什么", "费用标准"]);
     }
 
     #[test]
