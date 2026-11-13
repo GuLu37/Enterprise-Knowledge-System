@@ -284,6 +284,7 @@ pub struct SkillExecutionContext<'a> {
     pub model: Option<&'a str>,
     pub trace_id: Option<&'a str>,
     pub metadata: Value,
+    pub memory: Option<&'a crate::memory::MemoryContext<'a>>,
 }
 
 impl<'a> SkillExecutionContext<'a> {
@@ -297,6 +298,7 @@ impl<'a> SkillExecutionContext<'a> {
             model: None,
             trace_id: None,
             metadata: json!({}),
+            memory: None,
         }
     }
 
@@ -465,6 +467,7 @@ pub async fn execute_named_from(
                 context.session_id,
                 recent_history,
                 embedder,
+                context.memory,
             )
             .await
         }
@@ -1749,6 +1752,7 @@ async fn memory_query(
     session_id: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
     embedder: Option<&crate::embedder::Embedder>,
+    memory: Option<&crate::memory::MemoryContext<'_>>,
 ) -> Result<Value, String> {
     let user_id = crate::memory::require_user_id(user_id)?;
     let query = arg_str(arguments, "query");
@@ -1763,6 +1767,9 @@ async fn memory_query(
         scope = "all".to_string();
         include_profile = true;
         include_event = true;
+    }
+    if include_event && crate::memory::prefers_profile_memory_only(&query) {
+        include_event = false;
     }
 
     let profile_memories = if include_profile {
@@ -1794,16 +1801,22 @@ async fn memory_query(
     };
 
     let matched_memories = if include_event && !query.trim().is_empty() {
-        let stored = crate::memory::search_event_memories(
-            pool,
-            user_id,
-            &query,
-            conversation_id,
-            session_id,
-            top_k,
-            embedder,
-        )
+        let stored = if let Some(memory) = memory {
+            memory
+                .search_events(&query, conversation_id, session_id, top_k)
+                .await?
+        } else {
+            crate::memory::search_event_memories(
+                pool,
+                user_id,
+                &query,
+                conversation_id,
+                session_id,
+                top_k,
+                embedder,
+            )
             .await?
+        }
             .into_iter()
             .map(|hit| json!({
                 "memory_id": hit.memory_id,
@@ -2719,6 +2732,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
             .await
             .unwrap();
@@ -2733,6 +2747,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2745,6 +2760,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -2797,6 +2813,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2818,6 +2835,58 @@ mod tests {
         assert_eq!(intent.name, "memory_retrieve_original");
         assert_eq!(intent.arguments.get("top_k").and_then(Value::as_u64), Some(8));
         assert_eq!(intent.arguments.get("max_chars").and_then(Value::as_u64), Some(12000));
+    }
+
+    #[tokio::test]
+    async fn profile_listing_query_skips_event_search_when_scope_all() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::memory::ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO memory_records (\
+                memory_id, user_id, memory_type, memory_key, content, importance_score, \
+                confidence_score, access_count, status, created_at, updated_at\
+             ) VALUES (\
+                'p1','u1','profile','profile.name','张三',80,0.9,0,'active',\
+                '2026-01-01 00:00:00.000000','2026-01-01 00:00:00.000000'\
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::memory::insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限几天？\n助手: 3 天内提交。",
+            70.0,
+            90,
+        )
+        .await
+        .unwrap();
+        let queried = memory_query(
+            &pool,
+            "u1",
+            &json!({"query":"我的画像记忆里有什么","memory_scope":"all","top_k":5}),
+            Some("c1"),
+            Some("s1"),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queried.pointer("/summary/profile_count").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            queried.pointer("/summary/matched_count").and_then(|value| value.as_u64()),
+            Some(0),
+            "画像清单不应再跑事件向量召回"
+        );
+        assert_eq!(queried["memory_scope"], "all");
     }
 
     #[tokio::test]
@@ -2859,6 +2928,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -3012,6 +3082,7 @@ mod tests {
                 ("assistant", "已记录在案"),
             ]),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3065,6 +3136,7 @@ mod tests {
                 ("assistant", "已记录在案"),
             ]),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3100,6 +3172,7 @@ mod tests {
             Some("c1"),
             Some("s1"),
             &history(&[("user", "我刚才说过项目 Alpha 的上线计划")]),
+            None,
             None,
         )
         .await

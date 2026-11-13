@@ -45,6 +45,12 @@ const LONG_TERM_MEMORY_HINTS: &[&str] = &[
 
 const LONG_TERM_MEMORY_REFERENCE_HINTS: &[&str] = &["这个", "那个", "它", "这件事", "该问题"];
 
+const PROFILE_LISTING_HINTS: &[&str] = &["画像", "偏好", "我的名字", "我叫什么"];
+
+const PROFILE_LISTING_EVENT_HINTS: &[&str] = &[
+    "之前", "刚才", "上次", "说过", "完整对话", "原始对话", "展开", "细节", "原文", "逐字",
+];
+
 const MEMORY_TYPE_EVENT: &str = "event";
 const MEMORY_STATUS_ACTIVE: &str = "active";
 const DEFAULT_EVENT_EXPIRY_DAYS: i64 = 90;
@@ -821,9 +827,12 @@ pub async fn build_long_term_memory_messages(
         route,
         recent_history,
         None,
+        None,
     )
     .await
 }
+
+type EventSearchKey = (String, String, String, usize);
 
 /// 对齐 Python `MemoryContext`：一次请求内复用画像读取与按 route 的最终消息，
 /// 消除 skill 多轮 + 最终组消息路径上的重复画像 SQL 与事件记忆检索。
@@ -837,6 +846,18 @@ pub struct MemoryContext<'a> {
     profile: std::sync::Mutex<Option<String>>,
     routes:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<ChatMessage>>>>,
+    event_search: std::sync::Mutex<HashMap<EventSearchKey, std::sync::Arc<Vec<EventMemoryHit>>>>,
+}
+
+impl std::fmt::Debug for MemoryContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryContext")
+            .field("user_id", &self.user_id)
+            .field("query", &self.query)
+            .field("conversation_id", &self.conversation_id)
+            .field("session_id", &self.session_id)
+            .finish()
+    }
 }
 
 impl<'a> MemoryContext<'a> {
@@ -857,7 +878,45 @@ impl<'a> MemoryContext<'a> {
             embedder,
             profile: std::sync::Mutex::new(None),
             routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            event_search: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 对齐 Python `MemoryContext.search`：同一请求内相同 query/会话/top_k 复用事件召回。
+    /// 更大的 top_k 命中后，较小 top_k 直接截断，避免 memory_query 与组消息各搜一次。
+    pub async fn search_events(
+        &self,
+        query: &str,
+        conversation_id: Option<&str>,
+        session_id: Option<&str>,
+        top_k: usize,
+    ) -> Result<Vec<EventMemoryHit>, String> {
+        let query = query.trim();
+        let conversation_id = conversation_id.map(str::trim).filter(|item| !item.is_empty());
+        let session_id = session_id.map(str::trim).filter(|item| !item.is_empty());
+        let conv_key = conversation_id.unwrap_or("").to_string();
+        let sess_key = session_id.unwrap_or("").to_string();
+        {
+            let cache = self.event_search.lock().unwrap();
+            if let Some(hits) = cached_event_hits(&cache, query, &conv_key, &sess_key, top_k) {
+                return Ok(hits);
+            }
+        }
+        let hits = search_event_memories(
+            self.pool,
+            self.user_id,
+            query,
+            conversation_id,
+            session_id,
+            top_k,
+            self.embedder,
+        )
+        .await?;
+        self.event_search.lock().unwrap().insert(
+            (query.to_string(), conv_key, sess_key, top_k),
+            std::sync::Arc::new(hits.clone()),
+        );
+        Ok(hits)
     }
 
     /// 等价 `build_long_term_memory_messages`，同 route 二次调用直接命中缓存。
@@ -883,6 +942,7 @@ impl<'a> MemoryContext<'a> {
                 route,
                 recent_history,
                 Some(&self.profile),
+                Some(self),
             )
             .await,
         );
@@ -905,6 +965,7 @@ async fn build_long_term_memory_messages_inner(
     route: Option<&str>,
     recent_history: &[crate::short_memory::MemoryMessage],
     profile_cache: Option<&std::sync::Mutex<Option<String>>>,
+    event_cache: Option<&MemoryContext<'_>>,
 ) -> Vec<ChatMessage> {
     if user_id.trim().is_empty() {
         return Vec::new();
@@ -941,21 +1002,70 @@ async fn build_long_term_memory_messages_inner(
     if !recent.is_empty() {
         messages.push(ChatMessage::new("system", recent));
     }
-    let event = hierarchical_prompt(
-        pool,
-        user_id,
-        query,
-        conversation_id,
-        session_id,
-        top_k,
-        embedder,
-        route,
-    )
-    .await;
+    let event = if prefers_profile_memory_only(query) {
+        String::new()
+    } else {
+        hierarchical_prompt_cached(
+            pool,
+            user_id,
+            query,
+            conversation_id,
+            session_id,
+            top_k,
+            embedder,
+            route,
+            event_cache,
+        )
+        .await
+    };
     if !event.is_empty() {
         messages.push(ChatMessage::new("system", event));
     }
     messages
+}
+
+fn cached_event_hits(
+    cache: &HashMap<EventSearchKey, std::sync::Arc<Vec<EventMemoryHit>>>,
+    query: &str,
+    conversation_id: &str,
+    session_id: &str,
+    top_k: usize,
+) -> Option<Vec<EventMemoryHit>> {
+    let mut best: Option<&[EventMemoryHit]> = None;
+    let mut best_k = usize::MAX;
+    for ((cached_query, cached_conv, cached_sess, cached_k), hits) in cache {
+        if cached_query == query
+            && cached_conv == conversation_id
+            && cached_sess == session_id
+            && *cached_k >= top_k
+            && *cached_k < best_k
+        {
+            best = Some(hits.as_slice());
+            best_k = *cached_k;
+        }
+    }
+    best.map(|hits| hits.iter().take(top_k).cloned().collect())
+}
+
+/// 画像/偏好清单类问题不需要事件向量召回：避免与 memory_query 再走一轮 ANN。
+pub fn prefers_profile_memory_only(query: &str) -> bool {
+    let compact: String = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    if compact.is_empty() {
+        return false;
+    }
+    if !PROFILE_LISTING_HINTS
+        .iter()
+        .any(|hint| compact.contains(hint))
+    {
+        return false;
+    }
+    !PROFILE_LISTING_EVENT_HINTS
+        .iter()
+        .any(|hint| compact.contains(hint))
 }
 
 /// 对齐 Python `_should_retrieve_long_term_memory`：direct/clarify 跳过，其余看记忆线索。
@@ -1135,6 +1245,58 @@ pub async fn hierarchical_prompt(
         Err(err) => {
             tracing::warn!("长期记忆层级召回失败: {err}");
             Vec::new()
+        }
+    };
+    format_hierarchical_prompt(&hits)
+}
+
+async fn hierarchical_prompt_cached(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    query: &str,
+    conversation_id: Option<&str>,
+    session_id: Option<&str>,
+    top_k: usize,
+    embedder: Option<&Embedder>,
+    route: Option<&str>,
+    event_cache: Option<&MemoryContext<'_>>,
+) -> String {
+    if !should_retrieve_event_memory(query, route) {
+        return String::new();
+    }
+    let top_k = if top_k == 0 {
+        LONG_TERM_MEMORY_TOP_K
+    } else {
+        top_k
+    };
+    let hits = if let Some(cache) = event_cache {
+        match cache
+            .search_events(query, conversation_id, session_id, top_k)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!("长期记忆层级召回失败: {err}");
+                Vec::new()
+            }
+        }
+    } else {
+        match search_event_memories(
+            pool,
+            user_id,
+            query,
+            conversation_id,
+            session_id,
+            top_k,
+            embedder,
+        )
+        .await
+        {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!("长期记忆层级召回失败: {err}");
+                Vec::new()
+            }
         }
     };
     format_hierarchical_prompt(&hits)
@@ -3578,6 +3740,53 @@ mod tests {
         assert!(!should_retrieve_event_memory("你还记得上次说的吗", Some("direct")));
         assert!(!should_retrieve_event_memory("你还记得吗", Some("clarify")));
         assert!(!should_retrieve_event_memory("", Some("rag")));
+        assert!(prefers_profile_memory_only("我的画像记忆里有什么"));
+        assert!(prefers_profile_memory_only("我的偏好是什么"));
+        assert!(!prefers_profile_memory_only("还记得上次说过的报销时限吗"));
+        assert!(!prefers_profile_memory_only("差旅报销流程是什么"));
+    }
+
+    #[tokio::test]
+    async fn memory_context_reuses_larger_event_search() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "dialogue",
+            "用户: 报销时限几天？\n助手: 3 天内提交。",
+            70.0,
+            90,
+        )
+        .await
+        .unwrap();
+        insert_event_memory(
+            &pool,
+            "u1",
+            "c1",
+            "s1",
+            "semantic_memory_l1",
+            "差旅报销时限是发生后 3 天。",
+            80.0,
+            90,
+        )
+        .await
+        .unwrap();
+        let ctx = MemoryContext::new(&pool, "u1", "报销时限", Some("c1"), Some("s1"), None);
+        let first = ctx
+            .search_events("报销时限", Some("c1"), Some("s1"), 5)
+            .await
+            .unwrap();
+        let second = ctx
+            .search_events("报销时限", Some("c1"), Some("s1"), 1)
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].memory_id, first[0].memory_id);
+        assert_eq!(ctx.event_search.lock().unwrap().len(), 1);
     }
 
     fn mem(role: &str, content: &str) -> crate::short_memory::MemoryMessage {

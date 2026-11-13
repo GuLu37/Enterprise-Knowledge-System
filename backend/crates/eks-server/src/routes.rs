@@ -742,6 +742,7 @@ pub async fn execute_skill(
         model: None,
         trace_id: trace_id.as_deref(),
         metadata,
+        memory: None,
     };
     let result = crate::skills::execute_named_from(
         &state.pool,
