@@ -16,6 +16,7 @@
 | 企业基线 | 2026-11-06 12:47 | enterprise 41 | Python 与 Rust | 开启 | Rust 为 DirectML GPU | [`docs/acceptance_py_vs_rust_report.md`](acceptance_py_vs_rust_report.md) |
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
+| 141 题复跑 | 2026-11-13 15:12 | 同一 141 题 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_141_release.json`](../eval/rag_acceptance/runs/full_141_release.json) |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -115,3 +116,21 @@ sparse 在 standard 的可答题上 Hit@5 和 Recall@5 都是 100%。dense 的�
 `struct_03` 和 `sh_01` 在 dense、sparse 单独检索时都是第 1 名，hybrid 的响应是空列表。`tm_07` 的 sparse 把现行 2026 时刻表排在第 1，hybrid 把已废止的 2024 年表排到了前面。
 
 拒答失败的共同情况是：诱饵文档就是题目提到的那份材料，文中写明没有预算、手机号、售价或司机姓名。词面检索会把这份材料召回，Reject@5 于是记为失败。
+
+## 2026-11-13 15:12：同一 141 题，release 复跑
+
+查表过滤收窄之后重跑。只有问句里同时有「工号 / 员工号」和具体编号（如 E0011）才丢弃非表格结果。四位数字（5000、2024）和「账号 / 邮箱 / 编号」不再触发整表聚合。问「今天 / 是否仍是」时，已召回的现行文档排在已废止文档前面。dense、sparse 的 HTTP 路径没有改，也没有增加嵌入、BM25 或 Cross-Encoder。
+
+可答题 131，拒答题 10。设备仍是同机 CPU，二进制改为 release。
+
+| 方法 | Hit@5 | Recall@5 | MRR@10 | nDCG@10 | Reject@5 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dense | 91.6% | 90.8% | 0.897 | 0.894 | 40% | 22.7 ms | 29.9 ms |
+| sparse | 99.2% | 99.2% | 0.933 | 0.947 | 10% | 16.9 ms | 21.6 ms |
+| hybrid | 100% | 98.9% | 0.962 | 0.962 | 10% | 57.9 ms | 84.6 ms |
+
+dense、sparse 的准确度和 14:36 那次逐项相同。延迟低于那次，是因为那次是 debug 构建；这两路的检索代码没有改。和 11 月 12 日的 release 比（当时 74 题、语料更少）：dense p50 35.6 → 22.7 ms，sparse 24.7 → 16.9 ms，hybrid 111.5 → 57.9 ms；p95 分别是 40.9 → 29.9、33.8 → 21.6、138.8 → 84.6 ms。三路都没有变慢。
+
+hybrid 可答 Hit@5 从 91.6% 到 100%。14:36 没进 top-5 的 11 道可答题全部命中，包括 `expense_01`、`expense_02`、`faq_04`、`procurement_01`、`hr_01`、`struct_02`、`struct_03`、`fz_03`、`sh_01`、`sh_03`、`tm_07`。没有可答题从命中变成未命中。
+
+Reject@5 从 30% 降到 10%。`rj_05`（顾清和的手机号）和 `rj_07`（鹤鸣 SDK 仓库地址）原先返回空列表或员工总表，诱饵不在 top-5，指标算成功。现在返回写明「没有这项」的那篇文档，和 dense、sparse 一致。其余拒答题的成败没有变。

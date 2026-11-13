@@ -36,7 +36,8 @@
 
 - 2026-11-06，enterprise 41 题：`docs/acceptance_py_vs_rust_report.md`（dense/sparse Hit@5 两侧 95.12% / 100%，hybrid 90.24%）
 - 2026-11-12，74 题 Python / Rust 对拍：`docs/rag_acceptance_eval_report.md`，明细 `eval/rag_acceptance/runs/py_vs_rust.json`
-- 2026-11-13，141 题 Rust 全量：明细 `eval/rag_acceptance/runs/full_141.json`
+- 2026-11-13 14:36，141 题 Rust debug 全量：明细 `eval/rag_acceptance/runs/full_141.json`
+- 2026-11-13 15:12，同一 141 题 release 复跑：明细 `eval/rag_acceptance/runs/full_141_release.json`（hybrid Hit@5 100%，p50 57.9 ms，p95 84.6 ms）
 
 Python FastAPI 后台入库不会让 cached BM25 失效。语料 `ready` 后若 sparse 空结果，重启 Python 再跑（本轮重启后索引 559 行）。
 

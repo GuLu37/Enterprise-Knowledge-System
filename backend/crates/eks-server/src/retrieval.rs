@@ -39,10 +39,8 @@ pub const STRUCTURED_CONTEXT_MAX_CHARS: usize = 30000;
 pub const MIN_FINAL_RELEVANCE_SCORE: f64 = 0.28;
 const MIN_RAG_CANDIDATE_POOL: usize = 60;
 
-const STRUCTURED_QUERY_HINT_TERMS: [&str; 19] = [
-    "员工", "部门", "岗位", "职位", "工号", "姓名", "婚姻", "状态", "入职", "离职", "手机号",
-    "电话", "邮箱", "地址", "身份证", "证件", "账号", "编码", "编号",
-];
+/// 这些词加上具体工号，才允许丢掉非表格结果。
+const RECORD_LOOKUP_HINTS: [&str; 5] = ["员工编号", "员工号", "工号", "人员编号", "用户编号"];
 
 const STRUCTURED_META_SCHEMA_TERMS: [&str; 12] = [
     "说明", "填表说明", "字段说明", "版本", "变更", "速查", "索引", "目录", "FAQ", "常见问题",
@@ -961,19 +959,27 @@ impl SparseIndexSnapshot {
 }
 
 
-/// 复刻 _is_structured_lookup_query。
+/// 只有「带具体工号的查表」才走结构化过滤。
+///
+/// 短问句里的「员工 / 账号 / 邮箱 / 编号」，以及 5000、2024 这类四位数字，
+/// 不再整表聚合。dense / sparse 接口本来就不进这里；hybrid 因此少一次
+/// SQLite 父块扫描，也不多做嵌入或 BM25。
 pub fn is_structured_lookup_query(query: &str) -> bool {
     let normalized: String = query.split_whitespace().collect();
-    if normalized.is_empty() {
+    if normalized.is_empty() || !query_has_record_code(&normalized) {
         return false;
     }
-    if eks_kernels::rerank::is_identifier_query(&normalized) {
-        return true;
-    }
-    if normalized.chars().count() > 32 {
-        return false;
-    }
-    STRUCTURED_QUERY_HINT_TERMS.iter().any(|t| normalized.contains(t))
+    RECORD_LOOKUP_HINTS.iter().any(|term| normalized.contains(term))
+}
+
+/// 字母加至少两位数字（E0011），或不少于 5 位的纯数字。
+/// 四位数字留给年份和金额，不当作工号。
+fn query_has_record_code(query: &str) -> bool {
+    extract_identifier_terms(query).into_iter().any(|term| {
+        let letters = term.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+        let digits = term.chars().filter(|ch| ch.is_ascii_digit()).count();
+        (letters > 0 && digits >= 2) || digits >= 5
+    })
 }
 
 /// 复刻 _citation_chunk_key。
@@ -1041,6 +1047,24 @@ mod tests {
         assert!(expand_multi_query("报销").len() < 2);
         assert!(expand_multi_query("差旅报销流程是什么").len() >= 2);
         assert!(expand_multi_query("").is_empty());
+    }
+
+    #[test]
+    fn structured_lookup_only_for_concrete_employee_id() {
+        assert!(is_structured_lookup_query("员工号 E0011 的实发工资是多少？"));
+        assert!(is_structured_lookup_query("员工号 E0011 的姓名和所属部门是什么？"));
+        assert!(!is_structured_lookup_query("一线城市 P5 员工每晚住宿费上限是多少？"));
+        assert!(!is_structured_lookup_query("连续输错几次密码会锁定账号，锁多久？"));
+        assert!(!is_structured_lookup_query("含税金额不超过5000元的采购由谁审批？"));
+        assert!(!is_structured_lookup_query("入职满一年的员工年假有几天？"));
+        assert!(!is_structured_lookup_query("折纸项目值班邮箱是什么？"));
+        assert!(!is_structured_lookup_query("折纸那个牵头的人工号是多少？"));
+        assert!(!is_structured_lookup_query("青岚现行规程的编号是什么？"));
+        assert!(!is_structured_lookup_query("产品号 NC-OSS-IA 的存储单价是多少？"));
+        assert!(!is_structured_lookup_query("韩澄的员工号和职级是什么？"));
+        assert!(!is_structured_lookup_query(
+            "还有人按 2024 年班车表在 07:40 等泊岸仓首班，今天首班是否仍是 07:40？"
+        ));
     }
 
     #[test]
