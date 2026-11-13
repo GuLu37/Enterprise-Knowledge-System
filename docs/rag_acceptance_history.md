@@ -17,7 +17,7 @@
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
 | 1041 题全量 | 2026-11-13 16:22 | enterprise 41 + standard 1000 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1041.json`](../eval/rag_acceptance/runs/full_1041.json) |
-| 多跳 500 题 | 2026-11-13 | multihop 500 | 未跑 |  |  | 题目在 [`eval/rag_acceptance/datasets/multihop/queries.jsonl`](../eval/rag_acceptance/datasets/multihop/queries.jsonl)，尚未检索 |
+| 1500 题补齐 | 2026-11-13 | enterprise 41 + standard 1000 + supplement 459 | 未跑 |  |  | 题目在 [`eval/rag_acceptance/datasets/supplement/queries.jsonl`](../eval/rag_acceptance/datasets/supplement/queries.jsonl)，尚未检索 |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -204,8 +204,10 @@ Reject@5 降到 0/77，是因为诱饵文档仍被召回，而且现在 top-5 �
 
 延迟是结果缓存清空、稀疏索引保持的数字。上一节 sparse 122 ms、hybrid 184 ms，主要花在每题重建 7921 行 BM25。进程刚启动时的第一条 hybrid 大约 93 ms（含建索引），之后同一条查询在清掉结果缓存后是 77 ms。本表 hybrid p50 60 ms、p95 75 ms，sparse p50 4 ms。dense 的命中数没有变。
 
-## 2026-11-13：新增 500 道多跳检索
+## 2026-11-13：补到 1500 题，场景收成整百
 
-在 1041 题之外增加切片 `multihop`，500 题，场景都是多跳推理。语料是 4 份朔方精密台账，按 `27`–`30` 放在 `docs/rag_accuracy_demo`：人员台账、系统台账、规程台账、升级组台账。每份约一百行，一行一条对应关系，不写进企业 01–07，也不写进澄川合订卷。
+原 1041 题全部保留，每题本来就有场景，没有无归类的题可删。不齐的是题数：standard 里声明核验是 76，其余场景是 77；企业 41 题又堆在领域问答、多文档综合和表格图表上，全库变成 98、86、88、76 和九个 77。
 
-跳数按难度固定：简单 200 题读 2 份，中等 200 题读 3 份，困难 100 题读 4 份。答案句只出现在链条终点那一份台账里。这一套仍是一问一次检索，看同一次 top-5 能否把该读的台账都召回，不调用聊天里的多轮 ReAct。重新生成用 `python eval/rag_acceptance/expand_multihop_500.py`。这 500 题还没有检索跑分。
+补切片 `supplement` 共 459 题，使全库正好 1500 题。十二个场景各 100 题，多跳推理 300 题。其中多跳新增 223 题（简单 23 道 2 跳、中等 100 道 3 跳、困难 100 道 4 跳），其余 236 题按差额补进另外十二个场景。
+
+语料是 13 份朔方精密短文档，按 `27`–`39` 放在 `docs/rag_accuracy_demo`，不并进企业 01–07，也不并进澄川合订卷。多跳的四份台账仍是一行一条对应关系。这一套仍是一问一次检索，不调用聊天里的多轮 ReAct。重新生成用 `python eval/rag_acceptance/expand_to_1500.py`。这 459 题还没有检索跑分。

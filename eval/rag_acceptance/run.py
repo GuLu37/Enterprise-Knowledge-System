@@ -665,10 +665,10 @@ def cmd_check(args: argparse.Namespace) -> int:
                 difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
                 diff_bucket = slice_difficulty.setdefault(slice_name, {})
                 diff_bucket[item["difficulty"]] = diff_bucket.get(item["difficulty"], 0) + 1
-            if slice_name == "multihop":
+            if slice_name == "supplement" and item["task"] == "multi_hop":
                 hop_by_difficulty = {"简单": 2, "中等": 3, "困难": 4}
-                if item["task"] != "multi_hop" or item["scenario"] != "多跳推理":
-                    errors.append(f"{qid}: 多跳切片的 task 与场景必须是多跳")
+                if item["scenario"] != "多跳推理":
+                    errors.append(f"{qid}: 多跳题的场景必须是多跳推理")
                 elif item["difficulty"] in hop_by_difficulty:
                     need = hop_by_difficulty[item["difficulty"]]
                     if len(item["relevant_sources"]) != need:
@@ -737,15 +737,31 @@ def cmd_check(args: argparse.Namespace) -> int:
     std_diff = slice_difficulty.get("standard", {})
     if std_diff != expect_diff:
         errors.append(f"standard 难度分布应为 {expect_diff}，当前 {std_diff}")
-    hop_n = counts["slices"].get("multihop", {}).get("queries", 0)
-    if hop_n != 500:
-        errors.append(f"multihop 应为 500 题，当前 {hop_n}")
-    hop_docs = counts["slices"].get("multihop", {}).get("docs", 0)
-    if hop_docs != 4:
-        errors.append(f"multihop 语料应为 4 份台账，当前 {hop_docs}")
-    hop_diff = slice_difficulty.get("multihop", {})
-    if hop_diff != {"简单": 200, "中等": 200, "困难": 100}:
-        errors.append(f"multihop 难度应为简单 200、中等 200、困难 100，当前 {hop_diff}")
+    if counts["queries"] != 1500:
+        errors.append(f"全库应为 1500 题，当前 {counts['queries']}")
+    expect_scenario = {
+        "单跳事实": 100,
+        "领域问答": 100,
+        "声明核验": 100,
+        "表格图表": 100,
+        "模糊查询": 100,
+        "多跳推理": 300,
+        "多文档综合": 100,
+        "拒答边界": 100,
+        "噪声干扰": 100,
+        "长上下文": 100,
+        "知识冲突": 100,
+        "时效性": 100,
+        "跨语言": 100,
+    }
+    if scenario_counts != expect_scenario:
+        errors.append(f"全库场景应为整百（多跳 300），当前 {scenario_counts}")
+    supplement_n = counts["slices"].get("supplement", {}).get("queries", 0)
+    if supplement_n != 459:
+        errors.append(f"supplement 应为 459 题，当前 {supplement_n}")
+    supplement_docs = counts["slices"].get("supplement", {}).get("docs", 0)
+    if supplement_docs != 13:
+        errors.append(f"supplement 语料应为 13 份朔方精密文档，当前 {supplement_docs}")
     if errors:
         print("数据集检查失败：")
         for err in errors:

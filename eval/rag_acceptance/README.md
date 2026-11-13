@@ -11,13 +11,13 @@
 
 `standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留，仍指向 `datasets/standard/corpus` 的 25 篇。新增 900 题的语料合并成 19 篇澄川实验室合订卷，文件名按 `08` 到 `26` 排序，放在 `docs/rag_accuracy_demo`，可直接整份入库。合订后文档级命中以整份卷宗为单位。`enterprise` 41 题继续作为历史回归，只入库同目录的 `01`–`07`，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 14:36 的 141 题跑分只覆盖当时的 100 题。合订卷入库后的基线在 `eval/rag_acceptance/runs/full_1041.json`。同一题集上保位、按文档去重并让稀疏索引常驻之后的结果在 `eval/rag_acceptance/runs/full_1041_opt.json`。口径写在 `docs/rag_acceptance_history.md`。
 
-`multihop` 另有 500 道多跳检索，不并进上面的 1000 题。语料是 4 份朔方精密台账，放在 `docs/rag_accuracy_demo` 的 `27`–`30`：人员、系统、规程、升级组各一份。每份只写一种对应关系，一行一条。简单题串 2 份，中等题串 3 份，困难题串 4 份。评测仍是一问一次检索，用一次结果里的文档是否凑齐来打分，不走聊天里的多轮 ReAct。三套一起是 1541 题。只跑这一套：
+`supplement` 再补 459 题，和上面的 1041 题合在一起是 **1500 题**。原 1041 题都已经有场景，没有删题。补进来之后，单跳事实、领域问答、声明核验、表格图表、模糊查询、多文档综合、拒答边界、噪声干扰、长上下文、知识冲突、时效性、跨语言各 **100** 题，多跳推理 **300** 题。新增语料是 13 份朔方精密短文档，放在 `docs/rag_accuracy_demo` 的 `27`–`39`。多跳仍是一问一次检索：简单串 2 份，中等串 3 份，困难串 4 份，不走聊天里的多轮 ReAct。默认 `compare` 仍是 `enterprise,standard`。只跑补齐切片：
 
 ```bash
 python eval/rag_acceptance/run.py compare \
     --system rust=http://127.0.0.1:8000 \
-    --slices multihop --methods dense,sparse,hybrid --ingest \
-    --out eval/rag_acceptance/runs/multihop_500.json
+    --slices supplement --methods dense,sparse,hybrid --ingest \
+    --out eval/rag_acceptance/runs/supplement_459.json
 ```
 
 每题都有：
