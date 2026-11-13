@@ -410,6 +410,7 @@ fn select_final_indexes(
         for &index in filtered {
             push(index, &mut selected, &mut seen);
         }
+        promote_current_revision(&mut selected, reranked, query);
         return selected;
     }
 
@@ -452,7 +453,33 @@ fn select_final_indexes(
     for &index in filtered {
         push(index, &mut selected, &mut seen);
     }
+    promote_current_revision(&mut selected, reranked, query);
     selected
+}
+
+/// 问的是「今天 / 是否仍是」时，把现行文档排到已废止文档前面。
+/// 只重排已经召回的条目，不再检索。
+fn promote_current_revision(selected: &mut [usize], reranked: &[RetrievalItem], query: &str) {
+    let normalized: String = query.split_whitespace().collect();
+    let asks_current = ["今天", "是否仍", "现在是否", "目前是否"]
+        .iter()
+        .any(|term| normalized.contains(term));
+    if !asks_current || selected.len() < 2 {
+        return;
+    }
+    let kind = |index: usize| {
+        let text = &reranked[index].content;
+        let current = text.contains("当前有效") || text.contains("现行");
+        let superseded = text.contains("已废止") || text.contains("不得用于");
+        if current && !superseded {
+            0
+        } else if superseded && !current {
+            2
+        } else {
+            1
+        }
+    };
+    selected.sort_by(|&left, &right| kind(left).cmp(&kind(right)));
 }
 
 pub struct RetrievalEngine {
@@ -1383,7 +1410,11 @@ impl RetrievalEngine {
                             reranked[b].score.partial_cmp(&reranked[a].score).unwrap_or(std::cmp::Ordering::Equal)
                         })
                 });
-                chosen
+                if chosen.is_empty() {
+                    ranking_pool[..resolved_top_k.min(ranking_pool.len())].to_vec()
+                } else {
+                    chosen
+                }
             } else {
                 ranking_pool[..resolved_top_k.min(ranking_pool.len())].to_vec()
             }
@@ -2087,6 +2118,28 @@ mod tests {
         assert_eq!(sources.len(), 3);
         let unique = sources.iter().copied().collect::<std::collections::HashSet<_>>();
         assert!(unique.len() >= 2, "不应让同一文档占满短名单: {sources:?}");
+    }
+
+    #[test]
+    fn current_revision_moves_ahead_of_superseded_when_question_asks_today() {
+        let mut old = sheet_item(
+            "26_时效_泊岸班车_2024.md",
+            "文档状态：已废止\n泊岸仓班车首班 07:40。本表不得用于 2026 年及以后的出行。",
+            0.95,
+            "old",
+        );
+        old.file_type = "md".into();
+        let mut current = sheet_item(
+            "27_时效_泊岸班车_2026.md",
+            "文档状态：当前有效\n泊岸仓班车现行首班 07:10。2024 年表均已废止。今天首班不是 07:40。",
+            0.7,
+            "new",
+        );
+        current.file_type = "md".into();
+        let reranked = vec![old, current];
+        let query = "还有人按 2024 年班车表在 07:40 等泊岸仓首班，今天首班是否仍是 07:40？";
+        let selected = select_final_indexes(&[], &[0, 1], &[0, 1], &reranked, query, 2, false);
+        assert_eq!(reranked[selected[0]].source_name, "27_时效_泊岸班车_2026.md");
     }
 
     #[test]
