@@ -1,7 +1,7 @@
 {
   "name": "eks-rag-acceptance",
-  "version": "1.0.0",
-  "description": "Python → Rust 重构验收评测集：用 RAG 常见任务类型（单跳事实、多跳、领域 FAQ、结构化查找、声明核验、不可回答/拒识）衡量检索准确度与延迟。",
+  "version": "1.1.0",
+  "description": "Python → Rust 重构验收评测集。standard 为 100 题场景集，覆盖单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答与表格图表；enterprise 保留 41 题历史回归。每题含标准答案、参考上下文、难度（简单/中等/困难）与场景。",
   "top_k": 5,
   "k_values": [1, 5, 10],
   "methods": ["dense", "sparse", "hybrid"],
@@ -28,7 +28,7 @@
     },
     "standard": {
       "inspired_by": ["BEIR", "Natural Questions", "HotpotQA", "SciFact", "RGB"],
-      "description": "自建迷你语料，覆盖公开 RAG 基准的任务类型（非搬运受版权语料）。",
+      "description": "自建语料 100 题。原 33 题保留，新增长上下文、知识冲突、跨语言、时效性、模糊查询、噪声、拒答、图表与多文档题。答案可在 gold 原文中逐字核对。",
       "corpus_glob": "eval/rag_acceptance/datasets/standard/corpus/*.md",
       "queries": "eval/rag_acceptance/datasets/standard/queries.jsonl",
       "query_format": "jsonl"
