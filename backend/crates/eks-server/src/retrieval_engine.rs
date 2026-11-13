@@ -591,7 +591,7 @@ impl RetrievalEngine {
             similarity_threshold: 0.5,
             search_top_k: 5,
             cross_encoder: None,
-            ce_candidate_k: 30,
+            ce_candidate_k: 8,
             ce_weight: 0.65,
             rule_weight: 0.35,
             ce_threshold: 0.60,

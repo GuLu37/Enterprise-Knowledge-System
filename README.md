@@ -293,7 +293,7 @@ docker compose --profile mysql up -d --build
 | `SEARCH_TOP_K` | 默认检索数量 |
 | `SIMILARITY_THRESHOLD` | Dense 检索阈值配置 |
 | `CROSS_ENCODER_ENABLED` | 是否启用 Cross-Encoder 精排，默认关闭 |
-| `CROSS_ENCODER_CANDIDATE_K` | Cross-Encoder 精排候选数 |
+| `CROSS_ENCODER_CANDIDATE_K` | Cross-Encoder 精排候选数，默认 8 |
 | `ENABLE_CACHE` / `CACHE_TTL` | 检索结果缓存开关和 TTL |
 | `REACT_MAX_ITERATIONS` | RAG ReAct 最大迭代轮数，默认 3 |
 | `UNIFIED_REACT_ENABLED` | 统一 ReAct 编排开关，默认 `true`；关闭后回退 rag 专用循环 |
