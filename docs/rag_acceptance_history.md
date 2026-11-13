@@ -16,6 +16,7 @@
 | 企业基线 | 2026-11-06 12:47 | enterprise 41 | Python 与 Rust | 开启 | Rust 为 DirectML GPU | [`docs/acceptance_py_vs_rust_report.md`](acceptance_py_vs_rust_report.md) |
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
+| 1041 题全量 | 2026-11-13 16:22 | enterprise 41 + standard 1000 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1041.json`](../eval/rag_acceptance/runs/full_1041.json) |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -118,4 +119,52 @@ sparse 在 standard 的可答题上 Hit@5 和 Recall@5 都是 100%。dense 的�
 
 ## 数据集扩到 1000 题
 
-上面三轮跑分都停在当时的题集。standard 后来在保留这 100 题的前提下扩到 1000 题。新增语料合并为 19 篇澄川实验室合订卷，按 `08`–`26` 放在 `docs/rag_accuracy_demo`。场景各 76 或 77 题，难度是简单 300、中等 400、困难 300。这 900 道新题还没有检索跑分，不能把 141 题的 Hit / Reject 当成 1000 题的结果。离线结构检查用 `python eval/rag_acceptance/run.py check`。
+上面三轮跑分都停在当时的题集。standard 后来在保留这 100 题的前提下扩到 1000 题。新增语料合并为 19 篇澄川实验室合订卷，按 `08`–`26` 放在 `docs/rag_accuracy_demo`。场景各 76 或 77 题，难度是简单 300、中等 400、困难 300。合订前后，900 道新题的问题、标准答案和证据句逐字相同，变的只是检索目标文件名。全量检索见下一节。
+
+## 2026-11-13：1041 题 Rust 全量
+
+合订卷入库后重跑。语料是企业 `01`–`07`、原 standard 25 篇，再加上 19 份澄川合订卷，共 51 份、7921 个 child chunk。两个切片写进同一个库再检索。模型是 Xenova `bge-base-zh-v1.5` fp32 ONNX，CPU，1 个会话，Cross-Encoder 关闭。这次是 release 构建，延迟不能和 14:36 那轮的 debug 数字比较。
+
+跑之前核对过答案：相对合订前的 `b549e5f`，1000 道 standard 题的问题、答案、证据句都没有改；900 道新题只把 `relevant_sources` / `bait_sources` 从已删除的 `60_扩_*.md` 改到 `08`–`26`。企业 41 题的 JSON 没有改。`run.py check` 确认这些答案和证据句仍能在当前 gold 原文里逐字找到。
+
+可答题 964，拒答题 77。
+
+| 方法 | Hit@5 | Recall@5 | MRR@10 | nDCG@10 | Reject@5 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dense | 87.1%（840/964） | 80.1% | 0.867 | 0.817 | 7.8%（6/77） | 34 ms | 41 ms |
+| sparse | 92.6%（893/964） | 89.3% | 0.876 | 0.860 | 1.3%（1/77） | 122 ms | 152 ms |
+| hybrid | 96.8%（933/964） | 95.5% | 0.960 | 0.949 | 35.1%（27/77） | 184 ms | 225 ms |
+
+综合成功（可答则 top-5 命中，拒答则诱饵不进 top-5）：
+
+| 方法 | enterprise 41 | standard 1000 | 合计 1041 |
+| --- | --- | --- | --- |
+| dense | 37/41（90.2%） | 809/1000 | 846/1041 |
+| sparse | 41/41（100%） | 853/1000 | 894/1041 |
+| hybrid | 37/41（90.2%） | 923/1000 | 960/1041 |
+
+hybrid 在 standard 上：可答 923 题 Hit@5 为 896/923（97.1%），77 道拒答的 Reject@5 为 27/77（35.1%）。
+
+standard 上 hybrid 的 Hit@5：
+
+| 场景 | 可答 Hit@5 | 拒答 Reject@5 |
+| --- | --- | --- |
+| 单跳事实 | 68/77 | |
+| 领域问答 | 76/77 | |
+| 表格图表 | 75/77 | |
+| 模糊查询 | 76/77 | |
+| 多跳推理 | 76/77 | |
+| 时效性 | 64/77 | |
+| 长上下文 | 77/77 | |
+| 噪声干扰 | 77/77 | |
+| 知识冲突 | 77/77 | |
+| 跨语言 | 77/77 | |
+| 多文档综合 | 77/77 | |
+| 声明核验 | 76/76 | |
+| 拒答边界 | | 27/77 |
+
+### 和 14:36 同一批 141 题
+
+hybrid 上，企业 41 题仍是 37/41，没成功的还是 `procurement_01`、`faq_04`、`expense_01`、`expense_02`。原 standard 100 题里有两题从成功变成失败：`hp_07`、`tm_04`。它们的 top-5 现在是 `16_澄川实验室_班车时刻表_2024.md`，把原来的泊岸时刻表挤出去了。dense 上企业题 `salary_01`、`salary_04` 也从成功变成失败，top 结果落在澄川合订卷。sparse 上 `salary_02` 这次命中，`sh_03` 不再命中。
+
+这是同一个库同时装着两套切片造成的：新合订卷和旧题一起被检索。文档级命中在合订之后也更粗，一份卷宗里有几十个课题。
