@@ -6,10 +6,10 @@
 
 | 切片 | 任务 | 对标 | 规模 |
 | --- | --- | --- | --- |
-| `enterprise` | 制度 / FAQ / 表格 / 工号 | 领域 RAG（FiQA 类） | 7 文档，41 条 GT（`docs/rag_accuracy_demo` + `docs/rrf_ablation_eval.json`） |
-| `standard` | 单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表、声明核验 | BEIR / NQ / HotpotQA / SciFact / RGB | 186 篇 Markdown，1000 条 GT |
+| `enterprise` | 制度 / FAQ / 表格 / 工号 | 领域 RAG（FiQA 类） | `docs/rag_accuracy_demo` 的 01–07，41 条 GT |
+| `standard` | 单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表、声明核验 | BEIR / NQ / HotpotQA / SciFact / RGB | 原 25 篇 Markdown + 19 篇澄川合订卷，1000 条 GT |
 
-`standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留；新增 900 题和 161 篇澄川实验室卷册，供入库后做检索评测。`enterprise` 41 题继续作为历史回归，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 的 141 题跑分只覆盖当时的 100 题，不能当成这 1000 题的结果。
+`standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留，仍指向 `datasets/standard/corpus` 的 25 篇。新增 900 题的语料合并成 19 篇澄川实验室合订卷，文件名按 `08` 到 `26` 排序，放在 `docs/rag_accuracy_demo`，可直接整份入库。合订后文档级命中以整份卷宗为单位。`enterprise` 41 题继续作为历史回归，只入库同目录的 `01`–`07`，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 的 141 题跑分只覆盖当时的 100 题，不能当成这 1000 题的结果。
 
 每题都有：
 
@@ -82,12 +82,12 @@ python eval/rag_acceptance/run.py compare \
 ```
 eval/rag_acceptance/
   suite.json                          # 切片、指标、端点
-  datasets/standard/corpus/*.md       # 自建标准切片语料；60_扩_* 为 1000 题新增卷册
+  datasets/standard/corpus/*.md       # 原 100 题使用的 25 篇语料
   datasets/standard/queries.jsonl     # 1000 题：query、答案、证据、难度、场景
-  expand_to_1000.py                   # 按同一规则重生 60_扩_* 与 ex_ 题
+  expand_to_1000.py                   # 按同一规则重生澄川合订卷与 ex_ 题
   run.py                              # check / compare
   README.md
-docs/rag_accuracy_demo/               # enterprise 语料
+docs/rag_accuracy_demo/               # 01–07 为企业 41 题语料；08–26 为澄川合订卷
 docs/rrf_ablation_eval.json           # enterprise 41 条 GT（含答案、证据、难度、场景）
 ```
 

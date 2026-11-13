@@ -1,7 +1,7 @@
 {
   "name": "eks-rag-acceptance",
-  "version": "1.2.0",
-  "description": "Python → Rust 重构验收评测集。standard 为 1000 题场景集，覆盖单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表与声明核验；enterprise 保留 41 题历史回归。每题含标准答案、参考上下文、难度（简单/中等/困难）与场景。",
+  "version": "1.2.1",
+  "description": "Python → Rust 重构验收评测集。standard 为 1000 题场景集，覆盖单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表与声明核验；enterprise 保留 41 题历史回归。每题含标准答案、参考上下文、难度（简单/中等/困难）与场景。澄川实验室新增语料合并为 19 份合订卷，放在 docs/rag_accuracy_demo。",
   "top_k": 5,
   "k_values": [1, 5, 10],
   "methods": ["dense", "sparse", "hybrid"],
@@ -21,15 +21,18 @@
   "slices": {
     "enterprise": {
       "inspired_by": ["FiQA", "domain RAG"],
-      "description": "企业内部制度/FAQ/表格，沿用验收 7 文档 + 41 条 GT。",
-      "corpus_glob": "docs/rag_accuracy_demo/*",
+      "description": "企业内部制度/FAQ/表格，沿用验收 7 文档 + 41 条 GT。只收录 01–07，不把同目录的澄川合订卷算进这 7 份。",
+      "corpus_glob": "docs/rag_accuracy_demo/0[1-7]_*",
       "queries": "docs/rrf_ablation_eval.json",
       "query_format": "json_array"
     },
     "standard": {
       "inspired_by": ["BEIR", "Natural Questions", "HotpotQA", "SciFact", "RGB"],
-      "description": "自建语料 1000 题。原 100 题保留，其余为澄川实验室卷册上的单跳、领域、声明核验、表格图表、模糊、多跳、多文档、拒答、噪声、长上下文、知识冲突、跨语言和时效题。答案可在 gold 原文中逐字核对。",
-      "corpus_glob": "eval/rag_acceptance/datasets/standard/corpus/*.md",
+      "description": "自建语料 1000 题。原 100 题仍指向 datasets/standard/corpus 的 25 篇。新增 900 题指向 docs/rag_accuracy_demo 里 08–26 号澄川实验室合订卷。答案可在 gold 原文中逐字核对。",
+      "corpus_glob": [
+        "eval/rag_acceptance/datasets/standard/corpus/*.md",
+        "docs/rag_accuracy_demo/[0-9][0-9]_澄川实验室_*.md"
+      ],
       "queries": "eval/rag_acceptance/datasets/standard/queries.jsonl",
       "query_format": "jsonl"
     }

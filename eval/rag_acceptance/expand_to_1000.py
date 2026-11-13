@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """把 standard 场景评测从既有 100 题扩到 1000 题。
 
-保留 queries.jsonl 里原有题目，按澄川实验室卷册新增语料和 900 题。
+保留 queries.jsonl 里原有题目，按澄川实验室合订卷新增语料和 900 题。
 每道可答题的标准答案、证据句都能在 gold 原文中逐字找到；拒答题的
 标准答案固定为「资料不足，应拒答」，诱饵文档写明该字段未记载。
 
-重复运行会先删掉本脚本生成的 ``60_扩_*.md``，再按同一规则写回。
+新增语料按角色合成 19 份较长的合订卷，文件名从 08 排到 26，写入
+``docs/rag_accuracy_demo``。重复运行会删掉旧的 ``60_扩_*.md`` 和
+已生成的合订卷，再按同一规则写回。
 """
 from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import date, timedelta
@@ -20,7 +23,9 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "datasets" / "standard" / "corpus"
+DEMO = ROOT / "docs" / "rag_accuracy_demo"
 QUERIES = HERE / "datasets" / "standard" / "queries.jsonl"
+CODE_RE = re.compile(r"CX-E\d{3}")
 
 PLAN = {
     # 场景: (新增题数, 简单, 中等, 困难)
@@ -136,12 +141,127 @@ def sent(text: str) -> tuple[str, str]:
     return full, full[:-1]
 
 
+DOC_FILES = {
+    "sh": "08_澄川实验室_通讯录.md",
+    "dm": "09_澄川实验室_值班与备件制度.md",
+    "cl": "10_澄川实验室_纯度实验记录.md",
+    "tb": "11_澄川实验室_合格比季报.md",
+    "fz": "12_澄川实验室_口头口径对照.md",
+    "hpA": "13_澄川实验室_维护人索引.md",
+    "hpB": "14_澄川实验室_人员名册.md",
+    "hpC": "15_澄川实验室_房间挂牌.md",
+    "tmO": "16_澄川实验室_班车时刻表_2024.md",
+    "tmN": "17_澄川实验室_班车时刻表_2026.md",
+    "lc": "18_澄川实验室_夜班事故纪要.md",
+    "ns": "19_澄川实验室_杂录夹注.md",
+    "nz": "20_澄川实验室_俱乐部接龙.md",
+    "cfO": "21_澄川实验室_挥发物海报.md",
+    "cfN": "22_澄川实验室_挥发物规程.md",
+    "xl": "23_澄川实验室_双语条款.md",
+    "mdO": "24_澄川实验室_冷链电价_2024.md",
+    "mdN": "25_澄川实验室_冷链电价_2026.md",
+    "rj": "26_澄川实验室_档案摘录.md",
+}
+DOC_TITLES = {
+    "sh": "澄川实验室课题通讯录",
+    "dm": "澄川实验室值班与备件制度",
+    "cl": "澄川实验室纯度实验记录",
+    "tb": "澄川实验室合格比季报",
+    "fz": "澄川实验室口头口径对照",
+    "hpA": "澄川实验室维护人索引",
+    "hpB": "澄川实验室人员名册",
+    "hpC": "澄川实验室房间挂牌",
+    "tmO": "澄川实验室班车时刻表 2024",
+    "tmN": "澄川实验室班车时刻表 2026",
+    "lc": "澄川实验室夜班事故纪要",
+    "ns": "澄川实验室杂录夹注",
+    "nz": "澄川俱乐部接龙",
+    "cfO": "澄川实验室挥发物海报",
+    "cfN": "澄川实验室挥发物规程",
+    "xl": "澄川实验室双语条款",
+    "mdO": "澄川实验室冷链电价 2024",
+    "mdN": "澄川实验室冷链电价 2026",
+    "rj": "澄川实验室档案摘录",
+}
+READING_GUIDE = [
+    "阅读说明：本文件按整份上传。检索命中的是这一份合订卷，回答时仍要落到带课题代号的正式句子。",
+    "导读、分节说明和文末代号速查只帮助定位，不构成口径。",
+    "已废止海报、二零二四年档案和俱乐部接龙即使用词接近，也不能改写现行句子。",
+    "人员姓名、房间和挂牌色号分散在不同卷宗。只看到姓名时，不要在本文件里补写没有出现的员工号或色号。",
+    "英文问题如果写明数量只出现在中文句，就不要从英文提示句里另造数量。",
+    "表格和季报以核对句为准。井号和文末口述不能覆盖核对句。",
+    "事故纪要里的清洁耗时和邻近针点，都不能改写正式事故针点。",
+    "同一代号可以出现在多份卷宗。先看问题要求的字段，再读对应卷宗的正文，不要把另一份卷宗的数字抄过来。",
+]
+
+
 def chunk_of(index: int) -> int:
     return (index - 1) // 8 + 1
 
 
-def fname(kind: str, chunk: int) -> str:
-    return f"60_扩_{kind}_c{chunk:02d}.md"
+def fname(kind: str, chunk: int | None = None) -> str:
+    return DOC_FILES[kind]
+
+
+def dossier(entity, topic: str) -> list[str]:
+    """课题定位段。只说明卷宗和联系人，不复述正式口径里的数字。"""
+    return [
+        "",
+        f"### {entity.code} · {entity.project}课题",
+        (
+            f"{entity.project}课题以 {entity.code} 归档到「{topic}」。"
+            "本小节先交代卷宗位置，正式口径写在随后的正文句子里，不要用本小节的交代代替正文。"
+        ),
+        (
+            f"联系人栏登记为{entity.owner}，候补栏登记为{entity.alt}。"
+            "这两栏只说明进度找谁问，不能拿去填写员工号、房间、挂牌色号、班车时刻、电价或挥发物限值。"
+        ),
+        (
+            "通讯录、值班与备件、纯度记录、合格比、口头津贴、维护人索引、人员名册、房间挂牌、"
+            "班车时刻、事故纪要、杂录夹注、挥发物海报、挥发物规程、双语条款、冷链电价和档案摘录各自单独成卷。"
+            "俱乐部接龙、已废止印刷品和二零二四年档案即使用到同一代号，也不改写本卷正文。"
+        ),
+        "",
+    ]
+
+
+def section_block(index: int) -> list[str]:
+    label = f"{index:02d}"
+    return [
+        f"## 分节 {label}",
+        "",
+        f"分节 {label} 起笔。同一课题代号的正式句子只在本分节正文里生效。",
+        "先读本分节的正式句子，再决定要不要翻到其他卷宗。概括句、图注、接龙和已废止印刷品都不能改写正式句子。",
+        "本分节没有写出的字段，留在写出该字段的那一份卷宗里，不要在这里补写。",
+        "",
+    ]
+
+
+def code_index(lines: list[str]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        for code in CODE_RE.findall(line):
+            if code not in seen:
+                seen.add(code)
+                found.append(code)
+    if not found:
+        return [
+            "## 代号速查",
+            "",
+            "本卷不收录课题代号。俱乐部接龙不能回答课题的正式口径。",
+            "",
+        ]
+    rows = [
+        "## 代号速查",
+        "",
+        "下列代号只说明本卷收录了哪些课题，具体口径仍以正文句子为准。",
+        "",
+    ]
+    for start in range(0, len(found), 8):
+        rows.append("、".join(found[start : start + 8]) + "。")
+    rows.append("")
+    return rows
 
 
 def render(title: str, status: str, lines: list[str]) -> str:
@@ -151,9 +271,13 @@ def render(title: str, status: str, lines: list[str]) -> str:
         f"文档状态：{status}",
         "适用范围：澄川实验室知识库评测语料",
         "更新时间：2026-11-01",
+        "装订：同一角色的分节已合并为本文件，按文件名序号与 01 至 07 号企业样例一起存放。",
+        "",
+        *READING_GUIDE,
         "",
         *lines,
         "",
+        *code_index(lines),
         "本文件是 RAG 评测语料，口径只在本文件列出的课题代号上有效。",
         "",
     ]
@@ -191,17 +315,37 @@ class Nums:
 
 class Bundle:
     def __init__(self) -> None:
+        self.parts: dict[str, dict] = {}
         self.docs: dict[str, str] = {}
         self.queries: list[dict] = []
         self.nums = Nums()
         self.clocks: set[str] = set()
 
     def add_doc(self, name: str, title: str, status: str, lines: list[str]) -> None:
-        if name in self.docs:
-            raise SystemExit(f"重复文档 {name}")
+        del title
         if not lines:
             raise SystemExit(f"空文档 {name}")
-        self.docs[name] = render(title, status, lines)
+        slot = self.parts.setdefault(name, {"status": status, "blocks": []})
+        if slot["status"] != status:
+            raise SystemExit(f"状态不一致 {name}: {slot['status']} / {status}")
+        slot["blocks"].append(list(lines))
+
+    def finalize(self) -> None:
+        expected = set(DOC_FILES.values())
+        if set(self.parts) != expected:
+            missing = sorted(expected - set(self.parts))
+            extra = sorted(set(self.parts) - expected)
+            raise SystemExit(f"合订卷数量不符，缺少 {missing}，多出 {extra}")
+        kind_of = {filename: kind for kind, filename in DOC_FILES.items()}
+        self.docs = {}
+        for name in sorted(self.parts):
+            slot = self.parts[name]
+            merged: list[str] = []
+            for index, block in enumerate(slot["blocks"], start=1):
+                merged.extend(section_block(index))
+                merged.extend(block)
+                merged.append("")
+            self.docs[name] = render(DOC_TITLES[kind_of[name]], slot["status"], merged)
 
     def add_q(
         self,
@@ -326,6 +470,23 @@ def extras(*names: str | None, relevant: list[str]) -> list[str]:
     return out
 
 
+def room_manual(chunk: int) -> list[str]:
+    steps = [
+        "先在维护人索引确认现行维护人，不要填写已经卸任的姓名。",
+        "再到人员名册把现行维护人对应到房间。",
+        "最后回到本卷读取该房间的访客挂牌色号。",
+        "离开时把挂牌交回值班台。本卷不记载押金，也不记载私人联系方式。",
+        "索引、名册和本卷要一起读。少一份就不要填写色号。",
+        "已废止海报和俱乐部接龙不出现挂牌色号，不能拿来补本卷没有写出的字段。",
+    ]
+    lines = [
+        "访客挂牌按下面的顺序领取。色号只以本卷随后写出的挂牌句为准，备忘里没有色号。",
+    ]
+    for n in range(1, 41):
+        lines.append(f"挂牌流程备忘 {chunk:02d}-{n:02d}：{steps[n % len(steps)]}")
+    return lines
+
+
 def club(tag: str, count: int) -> list[str]:
     lines = []
     notes = [
@@ -343,8 +504,9 @@ def add_single(bundle: Bundle, entities: list) -> None:
     _, groups = plan_rows(entities, "单跳事实")
     count = PLAN["单跳事实"][0]
     for chunk, members in groups.items():
-        lines = ["本卷是课题通讯录。每条只回答对应课题代号，不能串到邻卷。"]
+        lines = ["本卷是课题通讯录。每条只回答对应课题代号，不要串到其他卷宗。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "通讯录"))
             kind = entity.i % 4
             if kind == 0:
                 line, answer = sent(f"{entity.code} 的值班邮箱是 {entity.email}")
@@ -397,6 +559,7 @@ def add_domain(bundle: Bundle, entities: list) -> None:
     for chunk, members in groups.items():
         lines = ["本卷是值班与备件制度。加档条件写明之前，不得套用加档金额。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "值班与备件"))
             if diff == "简单":
                 number = bundle.nums.take()
                 line, answer = sent(f"{entity.code} 普通值班津贴是 {number} 元每班")
@@ -444,6 +607,7 @@ def add_claim(bundle: Bundle, entities: list) -> None:
     for chunk, members in groups.items():
         lines = ["本卷是实验记录。外部声明与记录冲突时，以记录句为准。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "纯度实验记录"))
             purity = bundle.nums.take()
             if diff == "简单":
                 line, answer = sent(f"实验记录载明 {entity.code} 的标称纯度是 {purity} ppm")
@@ -493,6 +657,7 @@ def add_table(bundle: Bundle, entities: list) -> None:
         notes = []
         queries = []
         for entity, diff in members:
+            notes.extend(dossier(entity, "合格比季报"))
             first = bundle.nums.take()
             second = bundle.nums.reserve_ahead(first + 500 + entity.i)
             gap = second - first
@@ -540,6 +705,7 @@ def add_fuzzy(bundle: Bundle, entities: list) -> None:
     for chunk, members in groups.items():
         lines = ["本卷把口头叫法和正式津贴写在一起。餐补不是夜补。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "口头口径"))
             number = bundle.nums.take()
             line, answer = sent(
                 f"{entity.project}课题（{entity.code}，同事口头把值班津贴叫成「{entity.project}夜补」）的值班津贴是 {number} 元每班"
@@ -576,6 +742,8 @@ def add_hop(bundle: Bundle, entities: list) -> None:
         roster_lines = ["本卷按姓名记载员工号或房间。历史维护人没有员工号条目。"]
         room_lines = []
         for entity, diff in members:
+            index_lines.extend(dossier(entity, "维护人索引"))
+            roster_lines.extend(dossier(entity, "人员名册"))
             emp = f"EMP-C9{entity.i:03d}"
             room = f"R9{entity.i:03d}"
             badge = f"H9{entity.i:03d}"
@@ -584,6 +752,7 @@ def add_hop(bundle: Bundle, entities: list) -> None:
             file_b = fname("hpB", chunk)
             file_c = fname("hpC", chunk)
             if three:
+                room_lines.extend(dossier(entity, "房间挂牌"))
                 line_a, _ = sent(f"{entity.code} 的现行维护人是 {entity.owner}")
                 line_b, _ = sent(f"{entity.owner}的工位房间是 {room}")
                 line_c, answer = sent(f"{room} 的访客挂牌色号是 {badge}")
@@ -625,6 +794,7 @@ def add_hop(bundle: Bundle, entities: list) -> None:
         bundle.add_doc(fname("hpA", chunk), f"澄川实验室维护人索引（卷 {chunk:02d}）", "当前有效", index_lines)
         bundle.add_doc(fname("hpB", chunk), f"澄川实验室人员名册（卷 {chunk:02d}）", "当前有效", roster_lines)
         if room_lines:
+            room_lines[0:0] = room_manual(chunk)
             bundle.add_doc(fname("hpC", chunk), f"澄川实验室房间挂牌（卷 {chunk:02d}）", "当前有效", room_lines)
 
 
@@ -635,6 +805,8 @@ def add_temporal(bundle: Bundle, entities: list) -> None:
         old_lines = ["本卷是 2024 年时刻表，停用日是 2024-12-31，不能回答现行首班。"]
         new_lines = ["本卷自 2026-01-01 起生效。现行首班以本卷句子为准，不以已废止时刻表为准。"]
         for entity, diff in members:
+            old_lines.extend(dossier(entity, "二零二四年班车时刻"))
+            new_lines.extend(dossier(entity, "现行班车时刻"))
             old_clock = bundle.clock(entity.i, 1)
             new_clock = bundle.clock(entity.i, 2)
             old_line, old_answer = sent(f"{entity.code} 在 2024 年已废止时刻表中的班车首班是 {old_clock}")
@@ -694,14 +866,15 @@ def filler(chunk: int, seq: int, count: int) -> list[str]:
 def add_long(bundle: Bundle, entities: list) -> None:
     _, groups = plan_rows(entities, "长上下文")
     count = PLAN["长上下文"][0]
-    width = {"简单": 8, "中等": 16, "困难": 24}
+    width = {"简单": 12, "中等": 24, "困难": 36}
     for chunk, members in groups.items():
         lines = [
             "下文垫文只记录清洁耗时，不能用来回答事故针点。",
-            "邻近针点带有代号后缀 X，不能替代正式事故针点。",
+            "邻近针点带有代号后缀 X，不能改写正式事故针点。",
         ]
-        lines.extend(filler(chunk, 0, 20))
+        lines.extend(filler(chunk, 0, 36))
         for entity, diff in members:
+            lines.extend(dossier(entity, "夜班事故纪要"))
             lines.extend(filler(chunk, entity.i, width[diff]))
             duration = bundle.nums.take()
             pay = bundle.nums.take()
@@ -741,14 +914,27 @@ def add_long(bundle: Bundle, entities: list) -> None:
                 evidence=[evidence],
                 distractor=extras(neighbor("lc", chunk, count), relevant=relevant),
             )
-        lines.extend(filler(chunk, 90, 12))
+        lines.extend(filler(chunk, 90, 28))
         bundle.add_doc(fname("lc", chunk), f"澄川实验室夜班事故纪要（卷 {chunk:02d}）", "当前有效", lines)
 
 
 def add_noise_books(bundle: Bundle) -> None:
     for index in range(1, 5):
-        lines = ["本卷是俱乐部接龙和菜谱，不能回答 CX 课题的正式津贴。"]
-        lines.extend(club(f"NZ{index:02d}", 8))
+        lines = [
+            f"接龙册 {index:02d} 只收俱乐部活动。观星、面点、陶艺和合唱都写在活动室，不进入课题口径。",
+            "接龙里的津贴数字是活动室随手写的。正式值班津贴以杂录夹注里标明正式口径的句子为准。",
+            "不要把本册的菜谱、排练时段或醒发记录抄进课题通讯录、规程或电价卷。",
+            "活动室不记载课题分机、纯度、合格比、班车时刻、挥发物限值或冷链电价。",
+        ]
+        lines.extend(club(f"NZ{index:02d}", 36))
+        for offset in range(36):
+            theme = [
+                "观星小组只核对英仙座，记录留在活动室。",
+                "面点卡只写醒发状态，不写课题津贴或电价。",
+                "陶艺接龙留在活动室，不能改正式口径。",
+                "合唱排练只排曲目顺序，不记载分机或纯度。",
+            ][(index + offset) % 4]
+            lines.append(f"活动室流水 NZ{index:02d}-B{offset:02d}：{theme} 本条没有课题代号。")
         for offset in range(12):
             number = 19000 + index * 100 + offset
             lines.append(
@@ -762,8 +948,9 @@ def add_noise(bundle: Bundle, entities: list) -> None:
     count = PLAN["噪声干扰"][0]
     for chunk, members in groups.items():
         lines = ["本卷把俱乐部杂录和一条正式口径夹在一起。接龙句作废，正式口径才有效。"]
-        lines.extend(club(f"卷{chunk:02d}前", 8))
+        lines.extend(club(f"卷{chunk:02d}前", 12))
         for entity, diff in members:
+            lines.extend(dossier(entity, "杂录夹注"))
             number = bundle.nums.take()
             official, answer = sent(f"正式口径：{entity.code} 的值班津贴是 {number} 元每班")
             if diff == "困难":
@@ -788,7 +975,7 @@ def add_noise(bundle: Bundle, entities: list) -> None:
                 evidence=[official],
                 distractor=extras(bait_noise, neighbor("ns", chunk, count), relevant=relevant),
             )
-        lines.extend(club(f"卷{chunk:02d}后", 6))
+        lines.extend(club(f"卷{chunk:02d}后", 12))
         bundle.add_doc(fname("ns", chunk), f"澄川实验室杂录夹注（卷 {chunk:02d}）", "当前有效", lines)
 
 
@@ -799,6 +986,8 @@ def add_conflict(bundle: Bundle, entities: list) -> None:
         poster_lines = ["本卷是宣传海报，不是现行规程。旧限值不能当作现行限值。"]
         spec_lines = ["本卷是现行规程。海报与规程不一致时，以本卷规程编号为准。"]
         for entity, diff in members:
+            poster_lines.extend(dossier(entity, "挥发物海报"))
+            spec_lines.extend(dossier(entity, "挥发物规程"))
             old_value = bundle.nums.take()
             new_value = bundle.nums.take()
             poster, poster_answer = sent(f"海报把 {entity.code} 的挥发物限值印成 {old_value} 毫克每升")
@@ -846,6 +1035,7 @@ def add_cross(bundle: Bundle, entities: list) -> None:
     for chunk, members in groups.items():
         lines = ["This volume mixes English questions with the Chinese record. 英文问题以本卷对应句子为准。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "双语条款"))
             number = bundle.nums.take()
             if diff == "简单":
                 line, answer = sent(f"The on-call stipend of {entity.code} is {number} CNY per shift")
@@ -894,6 +1084,8 @@ def add_multi(bundle: Bundle, entities: list) -> None:
         old_lines = ["本卷只记载 2024 年冷链电价，不记载 2026 年电价，也不写降幅。"]
         new_lines = ["本卷记载 2026 年冷链电价。降幅句只在需要核对差值的课题下出现。"]
         for entity, diff in members:
+            old_lines.extend(dossier(entity, "二零二四年冷链电价"))
+            new_lines.extend(dossier(entity, "现行冷链电价"))
             file_old = fname("mdO", chunk)
             file_new = fname("mdN", chunk)
             if diff == "中等":
@@ -942,6 +1134,7 @@ def add_refusal(bundle: Bundle, entities: list) -> None:
     for chunk, members in groups.items():
         lines = ["本卷档案可以提到维护人或津贴读数，但下面点名的字段没有记载，不能用其他数字顶替。"]
         for entity, diff in members:
+            lines.extend(dossier(entity, "档案摘录"))
             file_rj = fname("rj", chunk)
             if diff == "简单":
                 line, _ = sent(f"{entity.code} 的档案不记载预算金额")
@@ -985,6 +1178,7 @@ def dump_query(item: dict) -> str:
 
 
 def validate(bundle: Bundle, runner, old_queries: list[dict]) -> None:
+    bundle.finalize()
     if sum(item[0] for item in PLAN.values()) != 900:
         raise SystemExit("新增题数不是 900")
     easy = sum(item[1] for item in PLAN.values())
@@ -1138,8 +1332,12 @@ def main() -> None:
 
     for path in CORPUS.glob("60_扩_*.md"):
         path.unlink()
-    for name, text in bundle.docs.items():
-        (CORPUS / name).write_text(text, encoding="utf-8")
+    for path in DEMO.glob("[0-9][0-9]_澄川实验室_*.md"):
+        path.unlink()
+    for path in DEMO.glob("60_扩_*.md"):
+        path.unlink()
+    for name in sorted(bundle.docs):
+        (DEMO / name).write_text(bundle.docs[name], encoding="utf-8")
     new_lines = [dump_query(item) for item in bundle.queries]
     QUERIES.write_text("\n".join([*old_lines, *new_lines]) + "\n", encoding="utf-8")
     by_scenario: dict[str, int] = defaultdict(int)
@@ -1149,6 +1347,9 @@ def main() -> None:
         by_diff[item["difficulty"]] += 1
     print(f"docs {len(bundle.docs)}")
     print(f"new_queries {len(bundle.queries)}")
+    for name in sorted(bundle.docs):
+        text = bundle.docs[name]
+        print(f"{name}\tlines={text.count(chr(10)) + 1}\tchars={len(text)}")
     print(json.dumps({"scenario": by_scenario, "difficulty": by_diff}, ensure_ascii=False, indent=2))
 
 

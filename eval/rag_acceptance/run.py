@@ -202,10 +202,29 @@ def load_queries(slice_name: str, spec: dict[str, Any]) -> list[dict[str, Any]]:
     return queries
 
 
+def corpus_patterns(spec: dict[str, Any]) -> list[str]:
+    raw = spec["corpus_glob"]
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list) and raw and all(isinstance(item, str) and item for item in raw):
+        return list(raw)
+    raise SystemExit(f"corpus_glob 必须是字符串或非空字符串列表: {raw!r}")
+
+
+def corpus_label(spec: dict[str, Any]) -> str:
+    return "；".join(corpus_patterns(spec))
+
+
 def corpus_files(spec: dict[str, Any]) -> list[Path]:
-    pattern = spec["corpus_glob"]
-    files = sorted(REPO_ROOT.glob(pattern))
-    return [path for path in files if path.is_file() and not path.name.startswith(".")]
+    found: list[Path] = []
+    seen: set[str] = set()
+    for pattern in corpus_patterns(spec):
+        for path in sorted(REPO_ROOT.glob(pattern)):
+            if not path.is_file() or path.name.startswith(".") or path.name in seen:
+                continue
+            seen.add(path.name)
+            found.append(path)
+    return found
 
 
 def source_hit(result: dict[str, Any], relevant: list[str]) -> bool:
@@ -472,7 +491,7 @@ class ApiClient:
 def ingest_slice(client: ApiClient, spec: dict[str, Any]) -> None:
     files = corpus_files(spec)
     if not files:
-        raise SystemExit(f"语料为空: {spec['corpus_glob']}")
+        raise SystemExit(f"语料为空: {corpus_label(spec)}")
     listed = {item.get("original_filename"): item for item in client.list_documents()}
     uploaded = []
     for path in files:
@@ -619,7 +638,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     for slice_name, spec in suite["slices"].items():
         files = corpus_files(spec)
         if not files:
-            errors.append(f"{slice_name}: 语料不存在 {spec['corpus_glob']}")
+            errors.append(f"{slice_name}: 语料不存在 {corpus_label(spec)}")
         names = {path.name for path in files}
         counts["docs"] += len(files)
         queries = load_queries(slice_name, spec)

@@ -326,7 +326,7 @@ docker compose --profile mysql up -d --build
 │   └── package.json
 ├── docs/
 │   ├── images/demo.png
-│   └── rag_accuracy_demo/ # RAG 演示资料
+│   └── rag_accuracy_demo/ # 01–07 企业样例，08–26 澄川评测合订卷
 ├── docker-compose.yml
 ├── docker-compose.lite.yml
 └── README.md

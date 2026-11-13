@@ -118,4 +118,4 @@ sparse 在 standard 的可答题上 Hit@5 和 Recall@5 都是 100%。dense 的�
 
 ## 数据集扩到 1000 题
 
-上面三轮跑分都停在当时的题集。standard 后来在保留这 100 题的前提下扩到 1000 题，并新增 161 篇澄川实验室卷册（`eval/rag_acceptance/datasets/standard/corpus/60_扩_*.md`）。场景各 76 或 77 题，难度是简单 300、中等 400、困难 300。这 900 道新题还没有检索跑分，不能把 141 题的 Hit / Reject 当成 1000 题的结果。离线结构检查用 `python eval/rag_acceptance/run.py check`。
+上面三轮跑分都停在当时的题集。standard 后来在保留这 100 题的前提下扩到 1000 题。新增语料合并为 19 篇澄川实验室合订卷，按 `08`–`26` 放在 `docs/rag_accuracy_demo`。场景各 76 或 77 题，难度是简单 300、中等 400、困难 300。这 900 道新题还没有检索跑分，不能把 141 题的 Hit / Reject 当成 1000 题的结果。离线结构检查用 `python eval/rag_acceptance/run.py check`。
