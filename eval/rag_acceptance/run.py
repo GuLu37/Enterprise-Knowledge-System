@@ -297,6 +297,9 @@ def summarize_records(records: list[dict[str, Any]], k_values: list[int], top_k:
         if unanswerable:
             rejected = sum(1 for item in unanswerable if item.get("bait_hit_rank") is None or item["bait_hit_rank"] > k)
             quality[f"reject@{k}"] = round(rejected / len(unanswerable), 4)
+            if k == 5:
+                abstained = sum(1 for item in unanswerable if item.get("abstain"))
+                quality["abstain@5"] = round(abstained / len(unanswerable), 4)
 
     latencies = [item["seconds"] for item in records]
     latencies_sorted = sorted(latencies)
@@ -547,6 +550,9 @@ def evaluate_system(
             bait = item["bait_sources"]
             hit_ranks, _ = match_sources(results, relevant, 10) if relevant else ([], [])
             bait_ranks, _ = match_sources(results, bait, 10) if bait else ([], [])
+            abstain = any(
+                (entry.get("metadata") or {}).get("abstain") for entry in results[:5]
+            )
             return {
                 "id": item["id"],
                 "slice": item["slice"],
@@ -559,6 +565,7 @@ def evaluate_system(
                 "relevant_count": len(relevant),
                 "hit_ranks": hit_ranks,
                 "bait_hit_rank": bait_ranks[0] if bait_ranks else None,
+                "abstain": abstain,
                 "top_sources": [
                     (entry.get("metadata") or {}).get("source_name") for entry in results[:3]
                 ],
@@ -788,7 +795,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "slices": slices,
         "systems": results,
     }
-    metric_keys = [f"hit@{args.top_k}", f"recall@{args.top_k}", "mrr@10", "ndcg@10", "reject@5"]
+    metric_keys = [
+        f"hit@{args.top_k}",
+        f"recall@{args.top_k}",
+        "mrr@10",
+        "ndcg@10",
+        "reject@5",
+        "abstain@5",
+    ]
     markdown = [f"# {suite['name']} 对拍报告", "", f"查询数 {len(queries)}；切片 {', '.join(slices)}", ""]
     for method in methods:
         markdown.append(compare_table(results, method, metric_keys))

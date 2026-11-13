@@ -9,7 +9,7 @@
 | `enterprise` | 制度 / FAQ / 表格 / 工号 | 领域 RAG（FiQA 类） | `docs/rag_accuracy_demo` 的 01–07，41 条 GT |
 | `standard` | 单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表、声明核验 | BEIR / NQ / HotpotQA / SciFact / RGB | 原 25 篇 Markdown + 19 篇澄川合订卷，1000 条 GT |
 
-`standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留，仍指向 `datasets/standard/corpus` 的 25 篇。新增 900 题的语料合并成 19 篇澄川实验室合订卷，文件名按 `08` 到 `26` 排序，放在 `docs/rag_accuracy_demo`，可直接整份入库。合订后文档级命中以整份卷宗为单位。`enterprise` 41 题继续作为历史回归，只入库同目录的 `01`–`07`，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 14:36 的 141 题跑分只覆盖当时的 100 题。合订卷入库后的 1041 题结果在 `eval/rag_acceptance/runs/full_1041.json`，口径写在 `docs/rag_acceptance_history.md`。
+`standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留，仍指向 `datasets/standard/corpus` 的 25 篇。新增 900 题的语料合并成 19 篇澄川实验室合订卷，文件名按 `08` 到 `26` 排序，放在 `docs/rag_accuracy_demo`，可直接整份入库。合订后文档级命中以整份卷宗为单位。`enterprise` 41 题继续作为历史回归，只入库同目录的 `01`–`07`，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 14:36 的 141 题跑分只覆盖当时的 100 题。合订卷入库后的基线在 `eval/rag_acceptance/runs/full_1041.json`。同一题集上保位、按文档去重并让稀疏索引常驻之后的结果在 `eval/rag_acceptance/runs/full_1041_opt.json`。口径写在 `docs/rag_acceptance_history.md`。
 
 每题都有：
 
