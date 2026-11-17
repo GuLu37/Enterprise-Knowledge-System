@@ -5,8 +5,10 @@
   python eval/rag_acceptance/run.py check
   python eval/rag_acceptance/run.py compare \\
       --system rust=http://127.0.0.1:8000 \\
-      --system python=http://127.0.0.1:8001 \\
       --methods dense,sparse,hybrid --ingest --out eval/rag_acceptance/runs/latest.json
+
+默认切片是 enterprise,standard,supplement，共 1500 题。
+只跑历史 1041 题时显式传入 --slices enterprise,standard。
 
 对拍两端共用 /api/v1/retrieval/search/{dense,sparse,hybrid}。
 Rust 独有 /retrieval/rag 在方法列表含 rag 且接口 404 时自动跳过。
@@ -665,6 +667,14 @@ def cmd_check(args: argparse.Namespace) -> int:
                 difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
                 diff_bucket = slice_difficulty.setdefault(slice_name, {})
                 diff_bucket[item["difficulty"]] = diff_bucket.get(item["difficulty"], 0) + 1
+            if slice_name == "supplement" and item["task"] == "multi_hop":
+                hop_by_difficulty = {"简单": 2, "中等": 3, "困难": 4}
+                if item["scenario"] != "多跳推理":
+                    errors.append(f"{qid}: 多跳题的场景必须是多跳推理")
+                elif item["difficulty"] in hop_by_difficulty:
+                    need = hop_by_difficulty[item["difficulty"]]
+                    if len(item["relevant_sources"]) != need:
+                        errors.append(f"{qid}: {item['difficulty']}题应串联 {need} 份文档")
             if item["scenario"] not in SCENARIOS:
                 errors.append(f"{qid}: 场景分类无效：{item['scenario'] or '空'}")
             else:
@@ -729,6 +739,31 @@ def cmd_check(args: argparse.Namespace) -> int:
     std_diff = slice_difficulty.get("standard", {})
     if std_diff != expect_diff:
         errors.append(f"standard 难度分布应为 {expect_diff}，当前 {std_diff}")
+    if counts["queries"] != 1500:
+        errors.append(f"全库应为 1500 题，当前 {counts['queries']}")
+    expect_scenario = {
+        "单跳事实": 100,
+        "领域问答": 100,
+        "声明核验": 100,
+        "表格图表": 100,
+        "模糊查询": 100,
+        "多跳推理": 300,
+        "多文档综合": 100,
+        "拒答边界": 100,
+        "噪声干扰": 100,
+        "长上下文": 100,
+        "知识冲突": 100,
+        "时效性": 100,
+        "跨语言": 100,
+    }
+    if scenario_counts != expect_scenario:
+        errors.append(f"全库场景应为整百（多跳 300），当前 {scenario_counts}")
+    supplement_n = counts["slices"].get("supplement", {}).get("queries", 0)
+    if supplement_n != 459:
+        errors.append(f"supplement 应为 459 题，当前 {supplement_n}")
+    supplement_docs = counts["slices"].get("supplement", {}).get("docs", 0)
+    if supplement_docs != 13:
+        errors.append(f"supplement 语料应为 13 份朔方精密文档，当前 {supplement_docs}")
     if errors:
         print("数据集检查失败：")
         for err in errors:
@@ -824,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check", help="离线检查语料、GT 与指标函数")
     cmp = sub.add_parser("compare", help="对一个或多个后端跑准确度 + 延迟")
     cmp.add_argument("--system", action="append", required=True, help="name=url，可重复")
-    cmp.add_argument("--slices", default="enterprise,standard")
+    cmp.add_argument("--slices", default="enterprise,standard,supplement")
     cmp.add_argument("--methods", default="dense,sparse,hybrid")
     cmp.add_argument("--top-k", type=int, default=5)
     cmp.add_argument("--limit", type=int, default=0)

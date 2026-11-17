@@ -1,7 +1,7 @@
 {
   "name": "eks-rag-acceptance",
-  "version": "1.2.1",
-  "description": "Python → Rust 重构验收评测集。standard 为 1000 题场景集，覆盖单跳、领域问答、多跳、多文档综合、长上下文、噪声、知识冲突、跨语言、时效性、模糊查询、拒答、表格图表与声明核验；enterprise 保留 41 题历史回归。每题含标准答案、参考上下文、难度（简单/中等/困难）与场景。澄川实验室新增语料合并为 19 份合订卷，放在 docs/rag_accuracy_demo。",
+  "version": "1.4.0",
+  "description": "Python → Rust 重构验收评测集。enterprise 41 题、standard 1000 题保持不变。supplement 补 459 题，使全库 1500 题，12 个场景各 100 题，多跳推理 300 题。",
   "top_k": 5,
   "k_values": [1, 5, 10],
   "methods": ["dense", "sparse", "hybrid"],
@@ -34,6 +34,13 @@
         "docs/rag_accuracy_demo/[0-9][0-9]_澄川实验室_*.md"
       ],
       "queries": "eval/rag_acceptance/datasets/standard/queries.jsonl",
+      "query_format": "jsonl"
+    },
+    "supplement": {
+      "inspired_by": ["HotpotQA", "BEIR", "SciFact", "RGB"],
+      "description": "补齐到 1500 题。223 道多跳用 4 份台账串联；其余 236 题把原 1041 题里不满 100 的场景补到 100。一次检索，不走多轮对话。",
+      "corpus_glob": "docs/rag_accuracy_demo/*_朔方精密_*.md",
+      "queries": "eval/rag_acceptance/datasets/supplement/queries.jsonl",
       "query_format": "jsonl"
     }
   }
