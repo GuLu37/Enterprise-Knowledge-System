@@ -607,7 +607,7 @@ pub fn spec(config: &Config) -> Value {
             (format!("{prefix}/retrieval/search/dense")): { "post": with_json_io(secured("密集向量检索 (语义相似度)", "dense_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
             (format!("{prefix}/retrieval/search/sparse")): { "post": with_json_io(secured("稀疏检索 (BM25 关键词)", "sparse_search", "Retrieval"), Some("RetrievalRequest"), Some("RetrievalResponse")) },
             (format!("{prefix}/retrieval/rag")): { "post": with_json_io(secured("RAG 检索生成", "retrieval_rag", "Retrieval"), Some("ChatRequest"), Some("ChatResponse")) },
-            (format!("{prefix}/retrieval/cache-clear")): { "post": secured("清空检索缓存", "retrieval_cache_clear", "Retrieval") },
+            (format!("{prefix}/retrieval/cache-clear")): { "post": secured("只清空检索结果缓存，不拆除稀疏 BM25 索引。删除文档或重新入库才会使稀疏索引失效。", "retrieval_cache_clear", "Retrieval") },
             (format!("{prefix}/chat/settings")): { "get": with_json_io(secured("返回前端需要遵守的聊天配置。", "get_chat_settings", "Chat"), None, Some("ChatSettingsResponse")) },
             (format!("{prefix}/chat/runtime-status")): { "get": with_json_io(secured("返回聊天模型和向量模型的后台初始化状态。", "get_chat_runtime_status", "Chat"), None, Some("ChatRuntimeStatusResponse")) },
             (format!("{prefix}/chat/warmup")): { "post": with_json_io(secured("预热聊天相关的 LLM 和 embedding 运行时。", "warmup_chat_runtime", "Chat"), None, Some("ChatWarmupResponse")) },

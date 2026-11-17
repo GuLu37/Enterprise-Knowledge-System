@@ -99,7 +99,7 @@ docker compose up eks-server
 | POST | `/api/v1/retrieval/search/dense` | Dense 检索 |
 | POST | `/api/v1/retrieval/search/sparse` | Sparse 检索 |
 | POST | `/api/v1/retrieval/rag` | 完整 RAG 工作流 |
-| POST | `/api/v1/retrieval/cache-clear` | 清空检索缓存 |
+| POST | `/api/v1/retrieval/cache-clear` | 只清空检索结果缓存，不拆除稀疏 BM25 索引 |
 | GET | `/api/v1/chat/settings` | 前端对话上限 |
 | GET | `/api/v1/chat/runtime-status` | 模型预热状态 |
 | POST | `/api/v1/chat/warmup` | 返回当前运行时状态 |
@@ -121,6 +121,8 @@ docker compose up eks-server
 | GET | `/api/v1/skills/capabilities` | 统一能力目录（RAG + Skill + MCP） |
 | POST | `/api/v1/skills/execute` | 执行本地技能 |
 | GET | `/health` / `/docs` / `/openapi.json` | 健康检查 / 自绘 API 文档 |
+
+`POST /api/v1/retrieval/cache-clear` 只丢掉进程内的检索结果缓存。下一次相同查询会重新检索，但已建好的稀疏 BM25 索引继续用。它不再表示「强制重建索引」。删除文档或重新入库仍会 `invalidate` 稀疏索引，下次稀疏或混合检索时重建。
 
 ## 支持的文档格式
 
@@ -300,7 +302,7 @@ docker compose up eks-server
   消除全局互斥。冷查询（缓存未命中）p50 767→108ms、p95 1007→162ms、吞吐 9.5→62.7 req/s。
 - **热路径非阻塞**：检索引擎的查询向量化移入 `spawn_blocking`，不再占住 tokio worker。
 - **SQLite 池**：连接池上限 16（WAL 多读单写），多用户读写不串队。
-- **稀疏索引 single-flight**：并发首查只构建一次 BM25 索引，其余请求等待复用。
+- **稀疏索引 single-flight**：并发首查只构建一次 BM25 索引，其余请求等待复用。`POST /retrieval/cache-clear` 不拆除这份索引；只有删除文档或重新入库才会使它失效。
 - **milvus_lite manifest 写互斥 + 原子替换**：并发上传/删除不损坏索引文件（见性能与可靠性提交）。
 - 热查询（缓存命中）p50 ~30ms 与会话数无关；SSE 流式首事件 ~50-120ms；
   并发上传 4 文档全部入库 ~3s；流式完整时长由 LLM 供应商网络主导。
