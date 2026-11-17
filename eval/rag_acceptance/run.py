@@ -5,8 +5,10 @@
   python eval/rag_acceptance/run.py check
   python eval/rag_acceptance/run.py compare \\
       --system rust=http://127.0.0.1:8000 \\
-      --system python=http://127.0.0.1:8001 \\
       --methods dense,sparse,hybrid --ingest --out eval/rag_acceptance/runs/latest.json
+
+默认切片是 enterprise,standard,supplement，共 1500 题。
+只跑历史 1041 题时显式传入 --slices enterprise,standard。
 
 对拍两端共用 /api/v1/retrieval/search/{dense,sparse,hybrid}。
 Rust 独有 /retrieval/rag 在方法列表含 rag 且接口 404 时自动跳过。
@@ -857,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check", help="离线检查语料、GT 与指标函数")
     cmp = sub.add_parser("compare", help="对一个或多个后端跑准确度 + 延迟")
     cmp.add_argument("--system", action="append", required=True, help="name=url，可重复")
-    cmp.add_argument("--slices", default="enterprise,standard")
+    cmp.add_argument("--slices", default="enterprise,standard,supplement")
     cmp.add_argument("--methods", default="dense,sparse,hybrid")
     cmp.add_argument("--top-k", type=int, default=5)
     cmp.add_argument("--limit", type=int, default=0)

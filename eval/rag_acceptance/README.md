@@ -11,7 +11,7 @@
 
 `standard` 1000 题是场景评测口径。原 100 题（含更早的 33 题）全部保留，仍指向 `datasets/standard/corpus` 的 25 篇。新增 900 题的语料合并成 19 篇澄川实验室合订卷，文件名按 `08` 到 `26` 排序，放在 `docs/rag_accuracy_demo`，可直接整份入库。合订后文档级命中以整份卷宗为单位。`enterprise` 41 题继续作为历史回归，只入库同目录的 `01`–`07`，不并进这 1000 题。两套一起跑是 1041 题。2026-11-13 14:36 的 141 题跑分只覆盖当时的 100 题。合订卷入库后的基线在 `eval/rag_acceptance/runs/full_1041.json`。同一题集上保位、按文档去重并让稀疏索引常驻之后的结果在 `eval/rag_acceptance/runs/full_1041_opt.json`。口径写在 `docs/rag_acceptance_history.md`。
 
-`supplement` 再补 459 题，和上面的 1041 题合在一起是 **1500 题**。原 1041 题都已经有场景，没有删题。补进来之后，单跳事实、领域问答、声明核验、表格图表、模糊查询、多文档综合、拒答边界、噪声干扰、长上下文、知识冲突、时效性、跨语言各 **100** 题，多跳推理 **300** 题。新增语料是 13 份朔方精密短文档，放在 `docs/rag_accuracy_demo` 的 `27`–`39`。多跳仍是一问一次检索：简单串 2 份，中等串 3 份，困难串 4 份，不走聊天里的多轮 ReAct。2026-11-13 17:28（北京时间）三套一起跑过，Cross-Encoder 关闭，结果在 `eval/rag_acceptance/runs/full_1500.json`。同日 17:50 打开 Cross-Encoder 又跑了一遍，结果在 `eval/rag_acceptance/runs/full_1500_ce.json`。18:08 把精排收成「分差小于 0.08 才触发、最多 8 条」，结果在 `eval/rag_acceptance/runs/full_1500_ce_gate.json`。默认 `compare` 仍是 `enterprise,standard`。只跑补齐切片：
+`supplement` 再补 459 题，和上面的 1041 题合在一起是 **1500 题**。原 1041 题都已经有场景，没有删题。补进来之后，单跳事实、领域问答、声明核验、表格图表、模糊查询、多文档综合、拒答边界、噪声干扰、长上下文、知识冲突、时效性、跨语言各 **100** 题，多跳推理 **300** 题。新增语料是 13 份朔方精密短文档，放在 `docs/rag_accuracy_demo` 的 `27`–`39`。多跳仍是一问一次检索：简单串 2 份，中等串 3 份，困难串 4 份，不走聊天里的多轮 ReAct。2026-11-13 17:28（北京时间）三套一起跑过，Cross-Encoder 关闭，结果在 `eval/rag_acceptance/runs/full_1500.json`。同日 17:50 打开 Cross-Encoder 又跑了一遍，结果在 `eval/rag_acceptance/runs/full_1500_ce.json`。18:08 把精排收成「分差小于 0.08 才触发、最多 8 条」，结果在 `eval/rag_acceptance/runs/full_1500_ce_gate.json`。`compare` 不写 `--slices` 时跑 `enterprise,standard,supplement`，共 1500 题。只跑补齐切片：
 
 ```bash
 python eval/rag_acceptance/run.py compare \
@@ -68,12 +68,21 @@ python eval/rag_acceptance/run.py check
 两端都要能登录（`BOOTSTRAP_ADMIN_PASSWORD`）。先各自入库同一语料，或让跑手 `--ingest`：
 
 ```bash
-# 仅 Rust
+# 当前全量：enterprise 41 + standard 1000 + supplement 459 = 1500
 python eval/rag_acceptance/run.py compare \
   --system rust=http://127.0.0.1:8000 \
-  --ingest --out eval/rag_acceptance/runs/rust.json
+  --slices enterprise,standard,supplement \
+  --methods dense,sparse,hybrid \
+  --ingest --out eval/rag_acceptance/runs/full_1500.json
 
-# Python（历史 FastAPI，commit 3900d36）与 Rust 同机对拍
+# 历史 1041 题（不含 supplement）
+python eval/rag_acceptance/run.py compare \
+  --system rust=http://127.0.0.1:8000 \
+  --slices enterprise,standard \
+  --methods dense,sparse,hybrid \
+  --ingest --out eval/rag_acceptance/runs/full_1041.json
+
+# Python（历史 FastAPI，commit 3900d36）与 Rust 同机对拍，仍是当时的 1041 题
 python eval/rag_acceptance/run.py compare \
   --system python=http://127.0.0.1:8001 \
   --system rust=http://127.0.0.1:8000 \
@@ -82,9 +91,10 @@ python eval/rag_acceptance/run.py compare \
   --ingest --out eval/rag_acceptance/runs/py_vs_rust.json
 ```
 
+- 不写 `--slices` 时与上面的 1500 题命令相同。
 - Python 无 `/retrieval/rag` 时自动跳过该方法。
 - `--limit N` 冒烟；`--concurrency 8` 测吞吐（默认 1，保证延迟口径与验收报告一致：逐条调用 `POST /retrieval/cache-clear`）。该接口现在只清检索结果缓存，不拆除稀疏 BM25 索引；删文档或重新入库才会让稀疏索引失效。
-- `--slices enterprise` 只跑原 41 条，便于对照旧报告。
+- `--slices enterprise` 只跑原 41 条，便于对照旧报告。`--slices supplement` 只跑后补的 459 题。
 
 ## 目录
 

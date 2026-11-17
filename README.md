@@ -326,11 +326,25 @@ docker compose --profile mysql up -d --build
 │   └── package.json
 ├── docs/
 │   ├── images/demo.png
-│   └── rag_accuracy_demo/ # 01–07 企业样例，08–26 澄川评测合订卷
+│   └── rag_accuracy_demo/ # 01–07 企业样例，08–26 澄川合订卷，27–39 朔方精密台账
 ├── docker-compose.yml
 ├── docker-compose.lite.yml
 └── README.md
 ```
+
+## 验收评测
+
+1500 题是 `enterprise` 41 + `standard` 1000 + `supplement` 459。`compare` 不写 `--slices` 时就跑这三套。完整命令：
+
+```bash
+python eval/rag_acceptance/run.py compare \
+  --system rust=http://127.0.0.1:8000 \
+  --slices enterprise,standard,supplement \
+  --methods dense,sparse,hybrid \
+  --ingest --out eval/rag_acceptance/runs/full_1500.json
+```
+
+只要历史 1041 题时显式传入 `--slices enterprise,standard`。口径和结果见 `eval/rag_acceptance/README.md`。
 
 ## 使用建议
 
