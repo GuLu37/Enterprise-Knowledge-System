@@ -24,6 +24,8 @@ use crate::retrieval::{
 };
 
 const MAX_MULTI_QUERY_COUNT: usize = 3;
+/// 原始查询某一路前 2 名文档的内部标记，过滤阶段提前保留，不写入对外 JSON。
+const CHANNEL_PIN: &str = "__channel_pin__";
 const MIN_RAG_CANDIDATE_POOL: usize = 60;
 const STRUCTURED_SECTION_PARENT_LIMIT: usize = 200;
 const STRUCTURED_SECTION_ROW_CHAR_LIMIT: usize = 24000;
@@ -351,6 +353,56 @@ fn best_identifier_match(
         })
 }
 
+fn query_prefers_current(query: &str) -> bool {
+    const MARKERS: [&str; 6] = ["现行", "现在", "今天", "目前", "最新", "仍生效"];
+    MARKERS.iter().any(|marker| query.contains(marker))
+}
+
+fn source_is_obsolete_edition(source_name: &str) -> bool {
+    let name = source_name.to_lowercase();
+    name.contains("_2024") || name.contains("2024年") || name.contains("已废止")
+}
+
+fn apply_edition_penalty(query: &str, source_name: &str, score: f64) -> f64 {
+    if query_prefers_current(query) && source_is_obsolete_edition(source_name) {
+        score * 0.35
+    } else {
+        score
+    }
+}
+
+fn top_source_names(items: &[FuseItem<RetrievalItem>], limit: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in items {
+        let name = item.value.source_name.as_str();
+        if name.is_empty() || !seen.insert(name) {
+            continue;
+        }
+        names.push(name.to_string());
+        if names.len() >= limit {
+            break;
+        }
+    }
+    names
+}
+
+/// 不同文档优先占前面的名额，同一文档的其余切块留在后面。
+fn prefer_distinct_sources(items: Vec<RetrievalItem>) -> Vec<RetrievalItem> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut first = Vec::with_capacity(items.len());
+    let mut rest = Vec::new();
+    for item in items {
+        if item.source_name.is_empty() || seen.insert(item.source_name.clone()) {
+            first.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    first.extend(rest);
+    first
+}
+
 fn source_query_overlap(item: &RetrievalItem, query: &str) -> usize {
     let keywords = build_query_keywords(query, 24);
     let preview: String = item.content.chars().take(160).collect();
@@ -407,8 +459,23 @@ fn select_final_indexes(
         push(index, &mut selected, &mut seen);
     }
     if structured_lookup {
+        let mut seen_sources: HashSet<String> = selected
+            .iter()
+            .map(|&index| reranked[index].source_name.clone())
+            .collect();
         for &index in filtered {
-            push(index, &mut selected, &mut seen);
+            let source = &reranked[index].source_name;
+            if !source.is_empty() && !seen_sources.insert(source.clone()) {
+                continue;
+            }
+            if !push(index, &mut selected, &mut seen) {
+                break;
+            }
+        }
+        if selected.len() < limit {
+            for &index in filtered {
+                push(index, &mut selected, &mut seen);
+            }
         }
         return selected;
     }
@@ -449,8 +516,11 @@ fn select_final_indexes(
             seen_sources.insert(reranked[index].source_name.clone());
         }
     }
-    for &index in filtered {
-        push(index, &mut selected, &mut seen);
+    // 名额先留给不同文档。同一文档的其余切块只在文档种类不足时补位。
+    if seen_sources.len() < limit {
+        for &index in filtered {
+            push(index, &mut selected, &mut seen);
+        }
     }
     selected
 }
@@ -671,8 +741,13 @@ impl RetrievalEngine {
         // parquet 并与缓存行合并），保留旧快照作增量基座；删除路径已由
         // delete_* 内部自行硬失效。稀疏索引与检索结果缓存仍需重建/清空。
         self.sparse.write().await.take();
-        self.result_cache.lock().await.clear();
+        self.clear_result_cache().await;
         tracing::info!("{}", format_sparse_index_invalidated());
+    }
+
+    /// 只清检索结果缓存，保留已建好的稀疏索引。
+    pub async fn clear_result_cache(&self) {
+        self.result_cache.lock().await.clear();
     }
 
     pub async fn delete_document_chunks(&self, document_id: &str) -> Result<bool, String> {
@@ -976,6 +1051,7 @@ impl RetrievalEngine {
             (self.dense_weight, self.sparse_weight)
         };
         let mut variant_sets: Vec<Vec<RetrievalItem>> = Vec::with_capacity(queries.len());
+        let mut pinned_sources: HashSet<String> = HashSet::new();
         for (position, q) in queries.iter().enumerate() {
             let mut channel_sets: Vec<Vec<FuseItem<RetrievalItem>>> = Vec::new();
             let mut channel_weights: Vec<f64> = Vec::new();
@@ -1021,6 +1097,11 @@ impl RetrievalEngine {
                     channel_sets.push(sparse);
                     channel_weights.push(sparse_weight);
                     channel_labels.push("sparse");
+                }
+            }
+            if position == 0 {
+                for set in &channel_sets {
+                    pinned_sources.extend(top_source_names(set, 2));
                 }
             }
             if channel_sets.is_empty() {
@@ -1123,6 +1204,11 @@ impl RetrievalEngine {
                 }
             }
         }
+        for item in &mut selected {
+            if pinned_sources.contains(&item.source_name) {
+                item.section_name = Some(CHANNEL_PIN.into());
+            }
+        }
         Ok((selected, queries))
     }
 
@@ -1170,7 +1256,11 @@ impl RetrievalEngine {
                 &focus_terms,
                 &signals[index],
             );
-            let score = score_result(&item.source, raw_norm, specificity[index], &signals[index], gate);
+            let score = apply_edition_penalty(
+                query,
+                &item.source_name,
+                score_result(&item.source, raw_norm, specificity[index], &signals[index], gate),
+            );
             scored.push((index, score, item.score));
         }
         scored.sort_by(|a, b| {
@@ -1211,7 +1301,8 @@ impl RetrievalEngine {
     ) -> Result<Vec<RetrievalItem>, String> {
         let filtered = self.filter_retrieval_results(query, results, top_k);
         let expanded = self.expand_structured_section_evidence(query, filtered).await;
-        self.expand_parent_evidence(expanded).await
+        let expanded = self.expand_parent_evidence(expanded).await?;
+        Ok(prefer_distinct_sources(expanded))
     }
 
     /// 复刻 _expand_structured_section_evidence：同 Sheet parent 聚合为可读证据。
@@ -1310,7 +1401,12 @@ impl RetrievalEngine {
             max_citation = max_citation.max(identifiers.len());
             requested_top_k = requested_top_k.max(identifiers.len() as i64);
         }
-        let resolved_top_k = requested_top_k.min(max_citation as i64).max(1) as usize;
+        let resolved_top_k = if structured_lookup {
+            requested_top_k.min(max_citation as i64).max(1) as usize
+        } else {
+            // 非结构化检索按调用方 top_k 返回不同文档，不再卡在 3 条引文。
+            requested_top_k.clamp(1, 10) as usize
+        };
 
         let candidates: Vec<RetrievalItem> = results
             .into_iter()
@@ -1375,6 +1471,9 @@ impl RetrievalEngine {
                 } else {
                     pool
                 };
+                if chosen.is_empty() {
+                    chosen = ranking_pool[..resolved_top_k.min(ranking_pool.len())].to_vec();
+                }
                 chosen.sort_by(|&a, &b| {
                     structured_schema_score(&reranked[b], query)
                         .partial_cmp(&structured_schema_score(&reranked[a], query))
@@ -1411,8 +1510,21 @@ impl RetrievalEngine {
                 }
             }
         }
+        // 原始查询 dense/sparse 各自前 2 份文档直接占位，避免融合后再被门控或文件名重合度挤掉。
+        let mut pinned_seen: HashSet<String> = HashSet::new();
+        for (index, item) in reranked.iter().enumerate() {
+            if item.section_name.as_deref() != Some(CHANNEL_PIN) {
+                continue;
+            }
+            if item.source_name.is_empty() || !pinned_seen.insert(item.source_name.clone()) {
+                continue;
+            }
+            if !protected.contains(&index) {
+                protected.push(index);
+            }
+        }
 
-        select_final_indexes(
+        let mut indexes = select_final_indexes(
             &protected,
             &filtered_indexes,
             &ranking_pool,
@@ -1420,10 +1532,25 @@ impl RetrievalEngine {
             query,
             resolved_top_k,
             structured_lookup,
-        )
-        .into_iter()
-        .map(|index| reranked[index].clone())
-        .collect()
+        );
+        if indexes.is_empty() && !reranked.is_empty() {
+            let pool = if ranking_pool.is_empty() {
+                (0..reranked.len()).collect::<Vec<_>>()
+            } else {
+                ranking_pool.clone()
+            };
+            indexes = pool.into_iter().take(resolved_top_k).collect();
+        }
+        indexes
+            .into_iter()
+            .map(|index| {
+                let mut item = reranked[index].clone();
+                if item.section_name.as_deref() == Some(CHANNEL_PIN) {
+                    item.section_name = None;
+                }
+                item
+            })
+            .collect()
     }
 
     async fn expand_parent_evidence(
@@ -2017,6 +2144,96 @@ mod tests {
             matched_sources: Vec::new(),
             fusion_score: None,
         }
+    }
+
+    #[test]
+    fn current_query_downranks_2024_edition_only() {
+        assert!(query_prefers_current("现在首班还是废止表上的时间吗"));
+        assert!(query_prefers_current("按 2026 年仍生效的时刻表"));
+        assert!(!query_prefers_current("已废止的 2024 年时刻表里，班车首班是几点"));
+        assert!(source_is_obsolete_edition("16_澄川实验室_班车时刻表_2024.md"));
+        assert!(!source_is_obsolete_edition("17_澄川实验室_班车时刻表_2026.md"));
+        let obsolete = apply_edition_penalty("现在的首班", "16_班车_2024.md", 1.0);
+        let current = apply_edition_penalty("现在的首班", "17_班车_2026.md", 1.0);
+        let historical = apply_edition_penalty("已废止的 2024 年时刻表", "16_班车_2024.md", 1.0);
+        assert!(obsolete < current);
+        assert!((historical - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn code_queries_stay_identifier_queries() {
+        assert!(eks_kernels::rerank::is_identifier_query(
+            "要给绛浦课题值班写信，CX-E061 的邮箱地址是哪一个？"
+        ));
+        assert!(eks_kernels::rerank::is_identifier_query("EMP-C9001 的房间"));
+        assert!(eks_kernels::rerank::is_identifier_query(
+            "产品号 NC-OSS-IA 的存储单价是多少？"
+        ));
+    }
+
+    #[test]
+    fn final_indexes_lead_with_protected_and_keep_distinct_sources() {
+        let obsolete = sheet_item("16_班车_2024.md", "已废止时刻表中的首班是 08:08", 0.9, "a");
+        let current = sheet_item("17_班车_2026.md", "现行班车首班是 06:25", 0.4, "b");
+        let other = sheet_item("08_通讯录.md", "邮箱", 0.2, "c");
+        let extra = sheet_item("16_班车_2024.md", "另一条已废止切块", 0.85, "a2");
+        let reranked = vec![obsolete, current, other, extra];
+        let indexes = select_final_indexes(
+            &[1],
+            &[0, 3, 1, 2],
+            &[0, 3, 1, 2],
+            &reranked,
+            "现在首班",
+            3,
+            false,
+        );
+        assert_eq!(indexes.first().copied(), Some(1));
+        let names: Vec<&str> = indexes
+            .iter()
+            .map(|&index| reranked[index].source_name.as_str())
+            .collect();
+        let distinct = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), distinct.len());
+        assert!(names.len() >= 2);
+        let structured = select_final_indexes(
+            &[],
+            &[0, 3, 1, 2],
+            &[0, 3, 1, 2],
+            &reranked,
+            "现在首班",
+            3,
+            true,
+        );
+        let structured_names: Vec<&str> = structured
+            .iter()
+            .map(|&index| reranked[index].source_name.as_str())
+            .collect();
+        assert_eq!(
+            structured_names.len(),
+            structured_names.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+        assert_eq!(structured_names.first().copied(), Some("16_班车_2024.md"));
+    }
+
+    #[test]
+    fn distinct_sources_lead_the_result_list() {
+        let first = sheet_item("16_班车_2024.md", "旧", 0.9, "a");
+        let second = sheet_item("16_班车_2024.md", "旧2", 0.8, "a2");
+        let third = sheet_item("17_班车_2026.md", "新", 0.7, "b");
+        let ordered = prefer_distinct_sources(vec![first, second, third]);
+        assert_eq!(ordered[0].source_name, "16_班车_2024.md");
+        assert_eq!(ordered[1].source_name, "17_班车_2026.md");
+        assert_eq!(ordered[2].source_name, "16_班车_2024.md");
+    }
+
+    #[test]
+    fn abstain_flag_when_chunk_says_unrecorded() {
+        let recorded = sheet_item("26_档案摘录.md", "CX-E001 的档案不记载预算金额。", 0.5, "r");
+        let value = recorded.to_json();
+        assert_eq!(value["metadata"]["abstain"], true);
+        let answerable = sheet_item("17_班车_2026.md", "现行班车首班是 06:25。", 0.5, "c");
+        let value = answerable.to_json();
+        assert!(value["metadata"].get("abstain").is_none());
     }
 
     #[test]

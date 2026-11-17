@@ -21,11 +21,13 @@ import statistics
 import sys
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.client import HTTPConnection, HTTPSConnection
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUITE_PATH = Path(__file__).resolve().parent / "suite.json"
@@ -34,6 +36,25 @@ STOPWORDS = {
     "什么", "怎么", "多少", "哪些", "哪个", "是否", "能否", "可以", "请问",
     "根据", "基于", "查询", "检索",
 }
+DIFFICULTIES = {"简单", "中等", "困难"}
+SCENARIOS = {
+    "单跳事实",
+    "领域问答",
+    "声明核验",
+    "表格图表",
+    "模糊查询",
+    "多跳推理",
+    "多文档综合",
+    "拒答边界",
+    "噪声干扰",
+    "长上下文",
+    "知识冲突",
+    "跨语言",
+    "时效性",
+}
+REFUSAL_ANSWER = "资料不足，应拒答"
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+X_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 
 def load_suite() -> dict[str, Any]:
@@ -92,6 +113,63 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
+def compact_text(text: str) -> str:
+    return "".join(text.split())
+
+
+def docx_text(path: Path) -> str:
+    lines: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    for para in root.iter(W_NS + "p"):
+        line = "".join(node.text or "" for node in para.iter(W_NS + "t")).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def xlsx_text(path: Path) -> str:
+    lines: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(X_NS + "si"):
+                shared.append("".join(node.text or "" for node in item.iter(X_NS + "t")))
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        sheets = list(workbook.iter(X_NS + "sheet"))
+        for index, _sheet in enumerate(sheets, start=1):
+            root = ET.fromstring(archive.read(f"xl/worksheets/sheet{index}.xml"))
+            for row in root.iter(X_NS + "row"):
+                cells: list[str] = []
+                for cell in row.findall(X_NS + "c"):
+                    kind = cell.get("t")
+                    if kind == "inlineStr":
+                        cells.append("".join(node.text or "" for node in cell.iter(X_NS + "t")))
+                    elif kind == "s":
+                        value = cell.find(X_NS + "v")
+                        if value is not None and value.text and value.text.isdigit():
+                            cells.append(shared[int(value.text)])
+                    else:
+                        value = cell.find(X_NS + "v")
+                        if value is not None and value.text:
+                            cells.append(value.text)
+                if any(cells):
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def read_corpus_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".md", ".txt"}:
+        return path.read_text(encoding="utf-8")
+    if suffix == ".docx":
+        return docx_text(path)
+    if suffix == ".xlsx":
+        return xlsx_text(path)
+    return ""
+
+
 def load_queries(slice_name: str, spec: dict[str, Any]) -> list[dict[str, Any]]:
     path = repo_path(spec["queries"])
     fmt = spec.get("query_format", "jsonl")
@@ -110,20 +188,43 @@ def load_queries(slice_name: str, spec: dict[str, Any]) -> list[dict[str, Any]]:
                 "id": item["id"],
                 "slice": slice_name,
                 "task": item.get("task") or item.get("category") or "enterprise",
+                "scenario": item.get("scenario") or "",
+                "difficulty": item.get("difficulty") or "",
                 "inspired_by": item.get("inspired_by", "enterprise domain RAG"),
                 "query": item["query"],
                 "relevant_sources": list(item.get("relevant_sources") or []),
+                "distractor_sources": list(item.get("distractor_sources") or []),
                 "bait_sources": list(item.get("bait_sources") or []),
                 "answers": list(item.get("answers") or []),
+                "evidence": list(item.get("evidence") or []),
             }
         )
     return queries
 
 
+def corpus_patterns(spec: dict[str, Any]) -> list[str]:
+    raw = spec["corpus_glob"]
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list) and raw and all(isinstance(item, str) and item for item in raw):
+        return list(raw)
+    raise SystemExit(f"corpus_glob 必须是字符串或非空字符串列表: {raw!r}")
+
+
+def corpus_label(spec: dict[str, Any]) -> str:
+    return "；".join(corpus_patterns(spec))
+
+
 def corpus_files(spec: dict[str, Any]) -> list[Path]:
-    pattern = spec["corpus_glob"]
-    files = sorted(REPO_ROOT.glob(pattern))
-    return [path for path in files if path.is_file() and not path.name.startswith(".")]
+    found: list[Path] = []
+    seen: set[str] = set()
+    for pattern in corpus_patterns(spec):
+        for path in sorted(REPO_ROOT.glob(pattern)):
+            if not path.is_file() or path.name.startswith(".") or path.name in seen:
+                continue
+            seen.add(path.name)
+            found.append(path)
+    return found
 
 
 def source_hit(result: dict[str, Any], relevant: list[str]) -> bool:
@@ -196,6 +297,9 @@ def summarize_records(records: list[dict[str, Any]], k_values: list[int], top_k:
         if unanswerable:
             rejected = sum(1 for item in unanswerable if item.get("bait_hit_rank") is None or item["bait_hit_rank"] > k)
             quality[f"reject@{k}"] = round(rejected / len(unanswerable), 4)
+            if k == 5:
+                abstained = sum(1 for item in unanswerable if item.get("abstain"))
+                quality["abstain@5"] = round(abstained / len(unanswerable), 4)
 
     latencies = [item["seconds"] for item in records]
     latencies_sorted = sorted(latencies)
@@ -390,7 +494,7 @@ class ApiClient:
 def ingest_slice(client: ApiClient, spec: dict[str, Any]) -> None:
     files = corpus_files(spec)
     if not files:
-        raise SystemExit(f"语料为空: {spec['corpus_glob']}")
+        raise SystemExit(f"语料为空: {corpus_label(spec)}")
     listed = {item.get("original_filename"): item for item in client.list_documents()}
     uploaded = []
     for path in files:
@@ -446,16 +550,22 @@ def evaluate_system(
             bait = item["bait_sources"]
             hit_ranks, _ = match_sources(results, relevant, 10) if relevant else ([], [])
             bait_ranks, _ = match_sources(results, bait, 10) if bait else ([], [])
+            abstain = any(
+                (entry.get("metadata") or {}).get("abstain") for entry in results[:5]
+            )
             return {
                 "id": item["id"],
                 "slice": item["slice"],
                 "task": item["task"],
+                "scenario": item.get("scenario") or "",
+                "difficulty": item.get("difficulty") or "",
                 "query": item["query"],
                 "seconds": round(elapsed, 4),
                 "result_count": len(results),
                 "relevant_count": len(relevant),
                 "hit_ranks": hit_ranks,
                 "bait_hit_rank": bait_ranks[0] if bait_ranks else None,
+                "abstain": abstain,
                 "top_sources": [
                     (entry.get("metadata") or {}).get("source_name") for entry in results[:3]
                 ],
@@ -528,19 +638,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     errors: list[str] = []
     seen_ids: set[str] = set()
     counts = {"queries": 0, "docs": 0, "slices": {}}
+    scenario_counts: dict[str, int] = {}
+    difficulty_counts: dict[str, int] = {}
+    slice_scenario: dict[str, dict[str, int]] = {}
+    slice_difficulty: dict[str, dict[str, int]] = {}
     for slice_name, spec in suite["slices"].items():
         files = corpus_files(spec)
         if not files:
-            errors.append(f"{slice_name}: 语料不存在 {spec['corpus_glob']}")
+            errors.append(f"{slice_name}: 语料不存在 {corpus_label(spec)}")
         names = {path.name for path in files}
         counts["docs"] += len(files)
         queries = load_queries(slice_name, spec)
         counts["slices"][slice_name] = {"docs": len(files), "queries": len(queries)}
         counts["queries"] += len(queries)
-        texts = {}
-        for path in files:
-            if path.suffix.lower() in {".md", ".txt"}:
-                texts[path.name] = path.read_text(encoding="utf-8")
+        texts = {path.name: read_corpus_text(path) for path in files}
         for item in queries:
             qid = item["id"]
             if qid in seen_ids:
@@ -548,23 +659,53 @@ def cmd_check(args: argparse.Namespace) -> int:
             seen_ids.add(qid)
             if not item["query"].strip():
                 errors.append(f"{qid}: 空 query")
-            for src in item["relevant_sources"] + item["bait_sources"]:
+            if item["difficulty"] not in DIFFICULTIES:
+                errors.append(f"{qid}: 难度必须是简单/中等/困难")
+            else:
+                difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
+                diff_bucket = slice_difficulty.setdefault(slice_name, {})
+                diff_bucket[item["difficulty"]] = diff_bucket.get(item["difficulty"], 0) + 1
+            if item["scenario"] not in SCENARIOS:
+                errors.append(f"{qid}: 场景分类无效：{item['scenario'] or '空'}")
+            else:
+                scenario_counts[item["scenario"]] = scenario_counts.get(item["scenario"], 0) + 1
+                slice_bucket = slice_scenario.setdefault(slice_name, {})
+                slice_bucket[item["scenario"]] = slice_bucket.get(item["scenario"], 0) + 1
+            for src in item["relevant_sources"] + item["bait_sources"] + item["distractor_sources"]:
                 if src not in names:
                     errors.append(f"{qid}: 找不到语料 {src}")
-            if item["task"] == "unanswerable":
+            if item["task"] == "unanswerable" or item["scenario"] == "拒答边界":
+                if item["task"] != "unanswerable" or item["scenario"] != "拒答边界":
+                    errors.append(f"{qid}: 拒答题的 task 与场景必须同时标记为拒答")
                 if item["relevant_sources"]:
-                    errors.append(f"{qid}: unanswerable 不应带 relevant_sources")
+                    errors.append(f"{qid}: 拒答题不应带 relevant_sources")
+                if not item["bait_sources"]:
+                    errors.append(f"{qid}: 拒答题缺少 bait_sources")
+                if item["answers"] != [REFUSAL_ANSWER]:
+                    errors.append(f"{qid}: 拒答标准答案应为「{REFUSAL_ANSWER}」")
                 continue
             if not item["relevant_sources"]:
                 errors.append(f"{qid}: 可答题缺少 relevant_sources")
                 continue
-            gold_text = "\n".join(texts[src] for src in item["relevant_sources"] if src in texts)
+            if not item["answers"]:
+                errors.append(f"{qid}: 可答题缺少标准答案")
+            if not item["evidence"]:
+                errors.append(f"{qid}: 可答题缺少参考上下文 evidence")
+            gold_text = "\n".join(texts[src] for src in item["relevant_sources"] if src in texts and texts[src])
             if not gold_text:
-                continue  # binary enterprise docs
+                errors.append(f"{qid}: 无法读取 gold 文本")
+                continue
             q_tokens = {tok for tok in tokenize(item["query"]) if len(tok) >= 2}
             g_tokens = set(tokenize(gold_text))
             if q_tokens and q_tokens.isdisjoint(g_tokens):
                 errors.append(f"{qid}: 与 gold 文档无词法重叠，GT 可能标错")
+            gold_compact = compact_text(gold_text)
+            for answer in item["answers"]:
+                if compact_text(answer) not in gold_compact:
+                    errors.append(f"{qid}: 标准答案不在参考文档中：{answer}")
+            for span in item["evidence"]:
+                if compact_text(span) not in gold_compact:
+                    errors.append(f"{qid}: 参考上下文不在参考文档中：{span}")
 
     # 指标函数钉扎
     fake_ranks = [1]
@@ -573,11 +714,29 @@ def cmd_check(args: argparse.Namespace) -> int:
     if abs(ndcg_at_k([2], 1, 5) - (1 / math.log2(3))) > 1e-9:
         errors.append("nDCG@2 自检失败")
 
+    standard_n = counts["slices"].get("standard", {}).get("queries", 0)
+    if standard_n != 1000:
+        errors.append(f"standard 场景集应为 1000 题，当前 {standard_n}")
+    std_scenario = slice_scenario.get("standard", {})
+    if set(std_scenario) != SCENARIOS:
+        missing = sorted(SCENARIOS - set(std_scenario))
+        extra = sorted(set(std_scenario) - SCENARIOS)
+        errors.append(f"standard 场景集合不完整：缺 {missing} 多 {extra}")
+    off_balance = {name: n for name, n in std_scenario.items() if n not in (76, 77)}
+    if off_balance:
+        errors.append(f"standard 各场景应接近均分（76 或 77 题）：{off_balance}")
+    expect_diff = {"简单": 300, "中等": 400, "困难": 300}
+    std_diff = slice_difficulty.get("standard", {})
+    if std_diff != expect_diff:
+        errors.append(f"standard 难度分布应为 {expect_diff}，当前 {std_diff}")
     if errors:
         print("数据集检查失败：")
         for err in errors:
             print(f"  - {err}")
         return 1
+    counts["scenario"] = scenario_counts
+    counts["scenario_by_slice"] = slice_scenario
+    counts["difficulty"] = difficulty_counts
     print("数据集检查通过")
     print(json.dumps(counts, ensure_ascii=False, indent=2))
     return 0
@@ -636,7 +795,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "slices": slices,
         "systems": results,
     }
-    metric_keys = [f"hit@{args.top_k}", f"recall@{args.top_k}", "mrr@10", "ndcg@10", "reject@5"]
+    metric_keys = [
+        f"hit@{args.top_k}",
+        f"recall@{args.top_k}",
+        "mrr@10",
+        "ndcg@10",
+        "reject@5",
+        "abstain@5",
+    ]
     markdown = [f"# {suite['name']} 对拍报告", "", f"查询数 {len(queries)}；切片 {', '.join(slices)}", ""]
     for method in methods:
         markdown.append(compare_table(results, method, metric_keys))

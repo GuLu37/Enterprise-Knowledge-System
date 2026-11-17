@@ -268,6 +268,10 @@ impl RetrievalItem {
                 map.insert("chunk_indices".into(), json!(self.chunk_indices));
             }
         }
+        // 切块写明该字段未记载时，供评测单独统计「应拒答判断」，不从结果里删文档。
+        if content_declares_unrecorded(&self.content) {
+            map.insert("abstain".into(), json!(true));
+        }
         json!({
             "content": self.content,
             "metadata": metadata,
@@ -278,6 +282,12 @@ impl RetrievalItem {
 }
 
 // ---------------- 多查询扩展 ----------------
+
+/// 切块正文声明资料未记载该字段。
+pub fn content_declares_unrecorded(content: &str) -> bool {
+    const MARKERS: [&str; 3] = ["不记载", "没有记载", "未记载"];
+    MARKERS.iter().any(|marker| content.contains(marker))
+}
 
 pub fn collapse_spaces(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

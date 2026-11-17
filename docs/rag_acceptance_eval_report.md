@@ -1,5 +1,7 @@
 # RAG 验收评测：Python vs Rust（2026-11-12）
 
+本轮是评测历史的第二轮（74 题）。三轮对照见 `docs/rag_acceptance_history.md`。
+
 生成时间：2026-11-12 11:33（Asia/Shanghai）
 
 口径：`eval/rag_acceptance` 74 条 GT（enterprise 41 + standard 33），16 篇语料，top_k=5。两端打同一套 `POST /api/v1/retrieval/search/{dense,sparse,hybrid}`。Cross-Encoder 关闭。逐查询尝试清缓存。

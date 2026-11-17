@@ -835,7 +835,8 @@ pub async fn retrieval_cache_clear(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AuthError> {
     require_current_user(&state, &headers).await?;
-    state.engine.invalidate().await;
+    // 只清结果缓存。稀疏索引由入库/删文档的 invalidate 重建，避免每条查询重做 BM25。
+    state.engine.clear_result_cache().await;
     Ok(Json(json!({ "cleared": true })))
 }
 
