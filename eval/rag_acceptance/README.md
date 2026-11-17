@@ -74,7 +74,7 @@ python eval/rag_acceptance/run.py compare \
 ```
 
 - Python 无 `/retrieval/rag` 时自动跳过该方法。
-- `--limit N` 冒烟；`--concurrency 8` 测吞吐（默认 1，保证延迟口径与验收报告一致：逐条清缓存）。
+- `--limit N` 冒烟；`--concurrency 8` 测吞吐（默认 1，保证延迟口径与验收报告一致：逐条调用 `POST /retrieval/cache-clear`）。该接口现在只清检索结果缓存，不拆除稀疏 BM25 索引；删文档或重新入库才会让稀疏索引失效。
 - `--slices enterprise` 只跑原 41 条，便于对照旧报告。
 
 ## 目录

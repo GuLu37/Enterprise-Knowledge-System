@@ -94,7 +94,7 @@ RAG 使用统一工具名 `search_knowledge_base`。工具描述和参数 schema
 4. `CROSS_ENCODER_ENABLED=true` 时，对候选池前 N 条进行 Cross-Encoder 精排；默认关闭，不影响基础检索链路。
 5. 去重、补 Parent 上下文并组装有限长度的 RAG context。
 
-检索结果支持进程内 TTL 缓存。文档入库或删除后会清空缓存；ReAct 循环也会跳过同 query 的重复检索。
+检索结果支持进程内 TTL 缓存。`POST /api/v1/retrieval/cache-clear` 只清空这份结果缓存，不拆除、也不重建稀疏 BM25 索引。删除文档或重新入库仍会使稀疏索引失效，并在下次稀疏或混合检索时重建。ReAct 循环也会跳过同 query 的重复检索。
 
 ### 4. 记忆的渐进式披露
 
