@@ -293,7 +293,7 @@ docker compose --profile mysql up -d --build
 | `SEARCH_TOP_K` | 默认检索数量 |
 | `SIMILARITY_THRESHOLD` | Dense 检索阈值配置 |
 | `CROSS_ENCODER_ENABLED` | 是否启用 Cross-Encoder 精排，默认关闭 |
-| `CROSS_ENCODER_CANDIDATE_K` | Cross-Encoder 精排候选数 |
+| `CROSS_ENCODER_CANDIDATE_K` | Cross-Encoder 精排候选数，默认 8 |
 | `ENABLE_CACHE` / `CACHE_TTL` | 检索结果缓存开关和 TTL |
 | `REACT_MAX_ITERATIONS` | RAG ReAct 最大迭代轮数，默认 3 |
 | `UNIFIED_REACT_ENABLED` | 统一 ReAct 编排开关，默认 `true`；关闭后回退 rag 专用循环 |
@@ -326,11 +326,25 @@ docker compose --profile mysql up -d --build
 │   └── package.json
 ├── docs/
 │   ├── images/demo.png
-│   └── rag_accuracy_demo/ # 01–07 企业样例，08–26 澄川评测合订卷
+│   └── rag_accuracy_demo/ # 01–07 企业样例，08–26 澄川合订卷，27–39 朔方精密台账
 ├── docker-compose.yml
 ├── docker-compose.lite.yml
 └── README.md
 ```
+
+## 验收评测
+
+1500 题是 `enterprise` 41 + `standard` 1000 + `supplement` 459。`compare` 不写 `--slices` 时就跑这三套。完整命令：
+
+```bash
+python eval/rag_acceptance/run.py compare \
+  --system rust=http://127.0.0.1:8000 \
+  --slices enterprise,standard,supplement \
+  --methods dense,sparse,hybrid \
+  --ingest --out eval/rag_acceptance/runs/full_1500.json
+```
+
+只要历史 1041 题时显式传入 `--slices enterprise,standard`。口径和结果见 `eval/rag_acceptance/README.md`。
 
 ## 使用建议
 
