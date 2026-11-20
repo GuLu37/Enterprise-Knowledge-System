@@ -4,6 +4,8 @@
 !py_vs_rust.md
 !full_141.json
 !full_141.md
+!full_141_release.json
+!full_141_release.md
 !full_1041.json
 !full_1041.md
 !full_1041_opt.json
@@ -14,3 +16,7 @@
 !full_1500_ce.md
 !full_1500_ce_gate.json
 !full_1500_ce_gate.md
+!full_1041_main_box.json
+!full_1041_main_box.md
+!full_1041_pr9_box.json
+!full_1041_pr9_box.md

@@ -16,8 +16,10 @@
 | 企业基线 | 2026-11-06 12:47 | enterprise 41 | Python 与 Rust | 开启 | Rust 为 DirectML GPU | [`docs/acceptance_py_vs_rust_report.md`](acceptance_py_vs_rust_report.md) |
 | 74 题对拍 | 2026-11-12 11:33 | enterprise 41 + standard 33 | Python 与 Rust | 关闭 | 同机 CPU | [`docs/rag_acceptance_eval_report.md`](rag_acceptance_eval_report.md)，[`eval/rag_acceptance/runs/py_vs_rust.json`](../eval/rag_acceptance/runs/py_vs_rust.json) |
 | 141 题全量 | 2026-11-13 14:36 | enterprise 41 + standard 100 | 仅 Rust（Python 实现已移除） | 关闭 | CPU，debug 构建 | [`eval/rag_acceptance/runs/full_141.json`](../eval/rag_acceptance/runs/full_141.json) |
+| 141 题复跑 | 2026-11-13 15:12 | 同一 141 题 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_141_release.json`](../eval/rag_acceptance/runs/full_141_release.json) |
 | 1041 题全量 | 2026-11-13 16:22 | enterprise 41 + standard 1000 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1041.json`](../eval/rag_acceptance/runs/full_1041.json) |
 | 1500 题全量 | 2026-11-13 17:28 | enterprise 41 + standard 1000 + supplement 459 | 仅 Rust | 关闭 | CPU，release 构建 | [`eval/rag_acceptance/runs/full_1500.json`](../eval/rag_acceptance/runs/full_1500.json) |
+| PR #9 相对 main 的 1041 题对照 | 2026-11-20 14:01–14:15 | enterprise 41 + standard 1000 | 仅 Rust，main vs PR #9 | 开启（adaptive，margin 0.08，k=8） | 共享 box CPU，fp32 ONNX | [`eval/rag_acceptance/runs/full_1041_main_box.json`](../eval/rag_acceptance/runs/full_1041_main_box.json)，[`eval/rag_acceptance/runs/full_1041_pr9_box.json`](../eval/rag_acceptance/runs/full_1041_pr9_box.json) |
 
 ## 2026-11-06：企业 41 题基线
 
@@ -117,6 +119,24 @@ sparse 在 standard 的可答题上 Hit@5 和 Recall@5 都是 100%。dense 的�
 `struct_03` 和 `sh_01` 在 dense、sparse 单独检索时都是第 1 名，hybrid 的响应是空列表。`tm_07` 的 sparse 把现行 2026 时刻表排在第 1，hybrid 把已废止的 2024 年表排到了前面。
 
 拒答失败的共同情况是：诱饵文档就是题目提到的那份材料，文中写明没有预算、手机号、售价或司机姓名。词面检索会把这份材料召回，Reject@5 于是记为失败。
+
+## 2026-11-13 15:12：同一 141 题，release 复跑
+
+查表过滤收窄之后重跑。只有问句里同时有「工号 / 员工号」和具体编号（如 E0011）才丢弃非表格结果。四位数字（5000、2024）和「账号 / 邮箱 / 编号」不再触发整表聚合。问「今天 / 是否仍是」时，已召回的现行文档排在已废止文档前面。dense、sparse 的 HTTP 路径没有改，也没有增加嵌入、BM25 或 Cross-Encoder。
+
+可答题 131，拒答题 10。设备仍是同机 CPU，二进制改为 release。
+
+| 方法 | Hit@5 | Recall@5 | MRR@10 | nDCG@10 | Reject@5 | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dense | 91.6% | 90.8% | 0.897 | 0.894 | 40% | 22.7 ms | 29.9 ms |
+| sparse | 99.2% | 99.2% | 0.933 | 0.947 | 10% | 16.9 ms | 21.6 ms |
+| hybrid | 100% | 98.9% | 0.962 | 0.962 | 10% | 57.9 ms | 84.6 ms |
+
+dense、sparse 的准确度和 14:36 那次逐项相同。延迟低于那次，是因为那次是 debug 构建；这两路的检索代码没有改。和 11 月 12 日的 release 比（当时 74 题、语料更少）：dense p50 35.6 → 22.7 ms，sparse 24.7 → 16.9 ms，hybrid 111.5 → 57.9 ms；p95 分别是 40.9 → 29.9、33.8 → 21.6、138.8 → 84.6 ms。三路都没有变慢。
+
+hybrid 可答 Hit@5 从 91.6% 到 100%。14:36 没进 top-5 的 11 道可答题全部命中，包括 `expense_01`、`expense_02`、`faq_04`、`procurement_01`、`hr_01`、`struct_02`、`struct_03`、`fz_03`、`sh_01`、`sh_03`、`tm_07`。没有可答题从命中变成未命中。
+
+Reject@5 从 30% 降到 10%。`rj_05`（顾清和的手机号）和 `rj_07`（鹤鸣 SDK 仓库地址）原先返回空列表或员工总表，诱饵不在 top-5，指标算成功。现在返回写明「没有这项」的那篇文档，和 dense、sparse 一致。其余拒答题的成败没有变。
 
 ## 数据集扩到 1000 题
 
@@ -263,3 +283,30 @@ supplement 的 23 道拒答里，有 3 道诱饵没进 top-5：`sf_rj_07`、`sf_
 hybrid Hit@5 仍是 1399/1400，没进 top-5 的还是 `struct_02`。和 17:50 那轮比，p95 从 1357 ms 降到 270 ms，p50 从 68 ms 升到 89 ms。MRR@10 0.981 → 0.978，nDCG@10 0.942 → 0.939，都仍高于 17:28 关精排时的 0.976 和 0.937。超过 200 ms 的请求从 367 次降到 197 次。
 
 多跳 300 道 Hit@5 仍是 300/300，文档齐全仍是 148 道。新增 4 跳 p50 从 1230 ms 降到 191 ms，p95 从 1303 ms 降到 237 ms，Recall@5 仍约 50.3%。明细在 `eval/rag_acceptance/runs/full_1500_ce_gate.json`。
+
+## 2026-11-20 14:01–14:15（Asia/Shanghai）：PR #9 相对当前 main 的 1041 题对照
+
+在共享 box 上对照当前 main `94b2ae73067838cb55e3532737073d4cc424be3d`（已含 #8 与 #11）和 PR #9 头 `d5dc4295997f3e4f636416a9ecba21a9e9b9c665`。同一份已入库语料（51 份文档、7921 行稀疏索引）、同一配置：Cross-Encoder 两边都开，adaptive，margin 0.08，`ce_candidate_k=8`，CPU fp32 ONNX。切片 `enterprise,standard` 共 1041 题（可答 964，拒答 77），concurrency=1，每题先清结果缓存。判断只用本次 1041 对照，不用 2026-11-13 的 141 题旧数字。结论是**有条件有效**。
+
+明细在 [`eval/rag_acceptance/runs/full_1041_main_box.json`](../eval/rag_acceptance/runs/full_1041_main_box.json) 和 [`eval/rag_acceptance/runs/full_1041_pr9_box.json`](../eval/rag_acceptance/runs/full_1041_pr9_box.json)。
+
+| 方法 | 端 | Hit@5 | Recall@5 | MRR@10 | nDCG@10 | Reject@5 | Abstain@5 | p50 | p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| dense | main | 0.8714（840/964） | 0.8013 | 0.8674 | 0.8165 | 0.0779（6/77） | 0.8961 | 22.3 ms | 29.0 ms |
+| dense | PR9 | 0.8714（840/964） | 0.8013 | 0.8674 | 0.8165 | 0.0779（6/77） | 0.8961 | 22.3 ms | 27.9 ms |
+| sparse | main | 0.9263（893/964） | 0.8932 | 0.8758 | 0.8600 | 0.0130（1/77） | 0.961 | 4.0 ms | 5.3 ms |
+| sparse | PR9 | 0.9263（893/964） | 0.8932 | 0.8758 | 0.8600 | 0.0130（1/77） | 0.961 | 4.0 ms | 5.9 ms |
+| hybrid | main | 0.9990（963/964） | 0.9938 | 0.9779 | 0.9755 | 0.0000（0/77） | 0.961 | 61.8 ms | 304.1 ms |
+| hybrid | PR9 | 0.9990（963/964） | 0.9938 | 0.9784 | 0.9759 | 0.0000（0/77） | 0.961 | 57.2 ms | 279.5 ms |
+
+dense、sparse 的逐题命中、拒答、abstain 和 top 来源与 main 完全一致（可答未命中分别是 124 题和 71 题）。hybrid 的 Hit@5 / Recall@5 / Reject@5 也与 main 相同。
+
+hybrid 唯一发生 `hit_ranks` 变化的是时效题 `tm_07`（问句含「今天 / 是否仍是」）：现行 2026 卷从第 2 升到第 1。main 的 top-1 是 `16_澄川实验室_班车时刻表_2024.md`，gold `27_时效_泊岸班车_2026.md` 在第 2；PR9 把现行 2026 卷提到第 1。这是本 PR「按正文把已召回的现行文档前移」的目标行为，也使 hybrid MRR@10 从 0.9779 到 0.9784，nDCG@10 从 0.9755 到 0.9759。
+
+三路 p50 / p95 没有明显回退。hybrid p50 61.8→57.2 ms，p95 304.1→279.5 ms。dense p50 持平，p95 略降。sparse p50 持平，p95 5.3→5.9 ms，是毫秒级抖动。
+
+hybrid 唯一可答未进 top-5 的仍是 `struct_02`（两边都失败）。本 PR 把查表过滤收窄为「工号类词语 + 具体编号」才走，单测写明这道题不应触发该过滤，所以本 PR 不应改这道题的查表过滤口径。
+
+11 道只用「现在」的同类时效题 `ex_tm_059`–`ex_tm_069` 两边排序未变：第 1 仍是 `16_澄川实验室_班车时刻表_2024.md`，现行卷在第 2，Hit@5 仍成功。按要求没有改「现在」触发词。
+
+hybrid 有 13 道题的 `abstain` 标记翻转，但不影响 Hit@5 / Reject@5；摘要里的 Abstain@5 仍是 0.961。
